@@ -56,7 +56,7 @@ fn encoded_jpeg_surfaces_admit_exact_expansion_and_release_after_retry_or_cancel
                 .iter()
                 .filter(|shift| shift.is_subsampled())
                 .count() as u64;
-            let request = GpuOutputRequest::color(FrameSurfaceEncoding::Srgb.format()).unwrap();
+            let request = GpuOutputRequest::color(FrameSurfaceEncoding::SRGB.format()).unwrap();
             let open = |request: &GpuOutputRequest| {
                 engine
                     .open_with_inventory(

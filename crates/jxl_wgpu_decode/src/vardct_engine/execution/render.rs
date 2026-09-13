@@ -279,7 +279,7 @@ pub(super) fn encode_frame_render(
             } else {
                 source.packet.profile.channel_shifts
             };
-            if let crate::color_output::ColorOutputTransform::Ycbcr { channel_shifts } =
+            if let crate::color_output::ColorOutputTransform::Ycbcr { channel_shifts, .. } =
                 &mut config.transform
             {
                 // Plane geometry and color conversion must agree, including when noise alone

@@ -3,6 +3,7 @@ struct Params {
     extent: vec4<u32>, // output width/height, source width/height
     format: vec4<u32>, // channels, valid bits, bytes per sample, row bytes
     output: vec4<u32>, // logical bytes, dispatch width, orientation, alpha conversion
+    color: vec4<u32>, // original transfer selector, reserved
     source: vec4<u32>, // plane stride, first alpha plane, selected scalar plane, flags (F32, linear RGB)
 };
 @group(0) @binding(0) var<storage, read> source: array<f32>;
@@ -12,9 +13,8 @@ struct Params {
 fn surface_value(word: u32) -> f32 { return source[word]; }
 fn original_rgb(rgb: vec3<f32>) -> vec3<f32> {
     if (params.source.w & 2u) == 0u { return rgb; }
-    let magnitude = abs(rgb);
-    return sign(rgb) * select(1.055 * pow(magnitude, vec3<f32>(1.0 / 2.4)) - 0.055,
-        12.92 * magnitude, magnitude <= vec3<f32>(0.0031308));
+    return vec3<f32>(transfer_from_linear(rgb.r, params.color.x),
+        transfer_from_linear(rgb.g, params.color.x), transfer_from_linear(rgb.b, params.color.x));
 }
 
 fn output_byte(offset: u32) -> u32 {

@@ -283,9 +283,9 @@ fn scalar_primaries_transform(
 ) -> [f32; 3] {
     let source_to_xyz = match source {
         RgbPrimaries::Bt709 => [
-            [0.412_456_4, 0.357_576_1, 0.180_437_5],
-            [0.212_672_9, 0.715_152_2, 0.072_175],
-            [0.019_333_9, 0.119_192, 0.950_304_1],
+            [0.4123908, 0.3575843, 0.1804808],
+            [0.212_639, 0.7151687, 0.0721923],
+            [0.0193308, 0.1191948, 0.9505322],
         ],
         RgbPrimaries::Bt2020 => [
             [0.636_958, 0.144_616_9, 0.168_881],
@@ -301,9 +301,9 @@ fn scalar_primaries_transform(
     };
     let xyz_to_target = match target {
         ColorSpace::Bt709 => [
-            [3.240_454_2, -1.537_138_5, -0.498_531_4],
-            [-0.969_266, 1.876_010_8, 0.041_556],
-            [0.055_643_4, -0.204_025_9, 1.057_225_2],
+            [3.240_97, -1.5373832, -0.4986108],
+            [-0.9692436, 1.8759675, 0.0415551],
+            [0.0556301, -0.203_977, 1.0569715],
         ],
         ColorSpace::Bt2020 => [
             [1.716_651_2, -0.355_670_8, -0.253_366_3],
@@ -339,13 +339,13 @@ fn scalar_color_transform(
         quantize8(match target_transfer {
             TransferFunction::Linear => value,
             TransferFunction::Srgb | TransferFunction::Sycc => srgb_from_linear(value),
-            TransferFunction::Bt709 => signed_map(value, |magnitude| {
-                if magnitude < 0.018 {
-                    4.5 * magnitude
+            TransferFunction::Bt709 => {
+                if value <= 0.018 {
+                    4.5 * value
                 } else {
-                    1.099 * magnitude.powf(0.45) - 0.099
+                    1.099 * value.powf(0.45) - 0.099
                 }
-            }),
+            }
             TransferFunction::Pq => pq_from_linear(value),
             TransferFunction::Hlg => hlg_from_linear(value),
             TransferFunction::Bt2020 => bt2020_from_linear(value),

@@ -3,6 +3,7 @@ use super::super::refinement_tests::{
 };
 use super::super::test_support::{drain, fixture, read};
 use super::super::*;
+use jxl_gpu_formats::{PixelFormat, RgbChannelOrder};
 use jxl_wgpu::WgpuBackend;
 
 fn open(

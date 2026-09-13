@@ -24,16 +24,13 @@ fn spot_metadata_admission_is_exact_retryable_and_completion_owned() {
         crate::SpotColorPolicy::Render,
         crate::SpotColorPolicy::Preserve,
     ] {
-        let request = GpuOutputRequest::color(FrameSurfaceEncoding::Srgb.format())
+        let request = GpuOutputRequest::color(FrameSurfaceEncoding::SRGB.format())
             .unwrap()
             .with_spot_color_policy(policy);
         let compositor = Compositor::new(
             backend.clone(),
             Extent2d::new(image.width, image.height),
-            &image.extra_channels,
-            false,
-            image.bit_depth,
-            OutputOrientation::from_exif_value(1).unwrap(),
+            image,
             &request,
         )
         .unwrap();

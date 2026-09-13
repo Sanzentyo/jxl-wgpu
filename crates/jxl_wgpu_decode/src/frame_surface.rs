@@ -3,7 +3,9 @@
 //! that have already been upsampled while color components still await frame features.
 
 use jxl_gpu_formats::{Channel, ImageLayout, PixelFormat, RgbChannelOrder, SampleKind};
-use jxl_gpu_protocol::{ChangedRegions, Extent2d, OutputId, Region};
+use jxl_gpu_protocol::{
+    ChangedRegions, Extent2d, OutputId, Region, RgbColorEncoding, RgbPrimaries,
+};
 use jxl_wgpu::{GpuBufferLease, GpuImageOutput, UnvalidatedGpuImageOutput};
 
 /// A component surface can leave the producer before or after frame features. This is
@@ -19,34 +21,70 @@ pub(crate) enum FrameRenderStage {
 /// can retain linear RGB until output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FrameSurfaceEncoding {
-    Srgb,
-    Linear,
+    Rgb(RgbColorEncoding),
     /// Codec components before the inverse color transform. The private producer contract
     /// carries this tag explicitly; a pixel format alone can never identify this domain.
     Encoded,
 }
 
 impl FrameSurfaceEncoding {
+    pub(crate) const SRGB: Self = Self::Rgb(RgbColorEncoding::SRGB_BT709);
+
     pub(crate) fn format(self) -> PixelFormat {
         let mut color = crate::vardct_rgb8_format().color_spec;
-        if self != Self::Srgb
-            && let jxl_gpu_formats::ColorSpecification::Defined(ref mut color) = color
-        {
-            color.transfer = jxl_gpu_formats::TransferFunction::Linear;
+        // The component tag remains authoritative for Encoded storage. Its carrier layout
+        // supplies an identity transfer to private packers and is never a public RGB output.
+        let encoding = self
+            .rgb_encoding()
+            .unwrap_or(RgbColorEncoding::LINEAR_BT709);
+        if let jxl_gpu_formats::ColorSpecification::Defined(ref mut color) = color {
+            color.space = match encoding.primaries {
+                RgbPrimaries::Bt709 => jxl_gpu_formats::ColorSpace::Bt709,
+                RgbPrimaries::Bt2020 => jxl_gpu_formats::ColorSpace::Bt2020,
+                RgbPrimaries::DisplayP3 => jxl_gpu_formats::ColorSpace::DisplayP3,
+                RgbPrimaries::Undefined => unreachable!("validated frame RGB primaries"),
+            };
+            color.transfer = match encoding.transfer {
+                jxl_gpu_protocol::TransferFunction::Linear => {
+                    jxl_gpu_formats::TransferFunction::Linear
+                }
+                jxl_gpu_protocol::TransferFunction::Srgb => jxl_gpu_formats::TransferFunction::Srgb,
+                jxl_gpu_protocol::TransferFunction::Bt709 => {
+                    jxl_gpu_formats::TransferFunction::Bt709
+                }
+                _ => unreachable!("validated frame RGB transfer"),
+            };
         }
         PixelFormat::rgb_f32(RgbChannelOrder::Rgb, true, color)
     }
 
     pub(crate) fn from_format(format: &PixelFormat) -> Option<Self> {
-        [Self::Srgb, Self::Linear]
-            .into_iter()
-            .find(|encoding| *format == encoding.format())
+        [
+            RgbPrimaries::Bt709,
+            RgbPrimaries::Bt2020,
+            RgbPrimaries::DisplayP3,
+        ]
+        .into_iter()
+        .flat_map(|primaries| {
+            [
+                jxl_gpu_protocol::TransferFunction::Linear,
+                jxl_gpu_protocol::TransferFunction::Srgb,
+                jxl_gpu_protocol::TransferFunction::Bt709,
+            ]
+            .map(|transfer| {
+                Self::Rgb(RgbColorEncoding {
+                    primaries,
+                    transfer,
+                })
+            })
+        })
+        .find(|encoding| *format == encoding.format())
     }
 
-    pub(crate) const fn rgb_encoding(self) -> jxl_gpu_protocol::RgbColorEncoding {
+    pub(crate) const fn rgb_encoding(self) -> Option<RgbColorEncoding> {
         match self {
-            Self::Srgb => jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709,
-            Self::Linear | Self::Encoded => jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709,
+            Self::Rgb(encoding) => Some(encoding),
+            Self::Encoded => None,
         }
     }
 }
@@ -72,14 +110,6 @@ pub(crate) struct FrameSurfaceLayout {
 }
 
 impl FrameSurfaceLayout {
-    pub(crate) fn new(
-        extent: Extent2d,
-        extra_count: usize,
-        limits: &wgpu::Limits,
-    ) -> Result<Self, FrameSurfaceError> {
-        Self::with_encoding(extent, extra_count, FrameSurfaceEncoding::Srgb, limits)
-    }
-
     pub(crate) fn with_encoding(
         extent: Extent2d,
         extra_count: usize,
@@ -253,6 +283,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn canonical_rgb_layouts_round_trip_without_claiming_a_component_domain() {
+        for primaries in [
+            RgbPrimaries::Bt709,
+            RgbPrimaries::Bt2020,
+            RgbPrimaries::DisplayP3,
+        ] {
+            for transfer in [
+                jxl_gpu_protocol::TransferFunction::Linear,
+                jxl_gpu_protocol::TransferFunction::Srgb,
+                jxl_gpu_protocol::TransferFunction::Bt709,
+            ] {
+                let encoding = FrameSurfaceEncoding::Rgb(RgbColorEncoding {
+                    primaries,
+                    transfer,
+                });
+                assert_eq!(
+                    FrameSurfaceEncoding::from_format(&encoding.format()),
+                    Some(encoding)
+                );
+                let interleaved =
+                    PixelFormat::rgb_f32(RgbChannelOrder::Rgb, false, encoding.format().color_spec);
+                assert_eq!(FrameSurfaceEncoding::from_format(&interleaved), None);
+            }
+        }
+        assert_eq!(FrameSurfaceEncoding::Encoded.rgb_encoding(), None);
+        assert_eq!(
+            FrameSurfaceEncoding::from_format(&FrameSurfaceEncoding::Encoded.format()),
+            Some(FrameSurfaceEncoding::Rgb(RgbColorEncoding::LINEAR_BT709))
+        );
+    }
+
+    #[test]
     fn retention_checks_the_complete_allocation_before_building_channel_views() {
         let limits = wgpu::Limits {
             max_buffer_size: 65536,
@@ -260,23 +322,46 @@ mod tests {
             ..Default::default()
         };
         let extent = Extent2d::new(513, 5);
-        let rgb = FrameSurfaceLayout::new(extent, 0, &limits).unwrap();
+        let rgb = FrameSurfaceLayout::with_encoding(extent, 0, FrameSurfaceEncoding::SRGB, &limits)
+            .unwrap();
         assert!(rgb.storage_bytes < 65536);
         assert!(matches!(
-            FrameSurfaceLayout::new(extent, 9, &limits),
+            FrameSurfaceLayout::with_encoding(extent, 9, FrameSurfaceEncoding::SRGB, &limits),
             Err(FrameSurfaceError::Limit {
                 resource: "storage",
                 ..
             })
         ));
-        assert!(FrameSurfaceLayout::new(Extent2d::new(1, 1), usize::MAX, &limits).is_err());
-        assert!(FrameSurfaceLayout::new(Extent2d::new(u32::MAX, u32::MAX), 1, &limits).is_err());
+        assert!(
+            FrameSurfaceLayout::with_encoding(
+                Extent2d::new(1, 1),
+                usize::MAX,
+                FrameSurfaceEncoding::SRGB,
+                &limits
+            )
+            .is_err()
+        );
+        assert!(
+            FrameSurfaceLayout::with_encoding(
+                Extent2d::new(u32::MAX, u32::MAX),
+                1,
+                FrameSurfaceEncoding::SRGB,
+                &limits
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn independent_views_address_only_their_plane_and_include_the_real_prefix() {
         let limits = wgpu::Limits::default();
-        let surface = FrameSurfaceLayout::new(Extent2d::new(3, 5), 9, &limits).unwrap();
+        let surface = FrameSurfaceLayout::with_encoding(
+            Extent2d::new(3, 5),
+            9,
+            FrameSurfaceEncoding::SRGB,
+            &limits,
+        )
+        .unwrap();
         let mut end = 0;
         for plane in surface.layouts().flat_map(|layout| &layout.planes) {
             assert!(plane.offset >= end);

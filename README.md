@@ -61,6 +61,14 @@ floating samples, nine extra channels and four nine-layer animations. Full JPEG 
 and the remaining color/render/container/encoder work are tracked in
 [`docs/FULL_JPEG_XL_ROADMAP.md`](docs/FULL_JPEG_XL_ROADMAP.md).
 
+Original SDR metadata now reaches both decoders and frame composition: D65 BT.709, BT.2020 and
+Display-P3 with Linear/sRGB/BT.709, plus gray, across RGB/XYB/YCbCr. An explicit surface domain
+preserves original primaries and transfer through references and blending. A 148-stream corpus
+checks native references, progressive lifetime, requested color conversion and numeric color/alpha;
+74 stills also match jxl-oxide. See the [original color corpus](crates/jxl_wgpu_decode/test-data/original_color_generator/README.md)
+for generation and remaining conformance limits. ICC/custom profiles and HDR luminance mapping
+remain incomplete.
+
 Creating an encoder or decoder requires a compatible `wgpu` backend. Unsupported codestream
 features or device limits return typed errors before a partial output becomes authoritative.
 

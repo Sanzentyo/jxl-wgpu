@@ -3796,3 +3796,32 @@ Regenerate and validate the component references after regenerating the native s
 cargo run -p jxl_wgpu_decode --example regenerate_patch_references
 cargo test -p jxl_wgpu_decode --test patches references:: -- --test-threads=1
 ```
+
+## Original SDR profiles and original-domain composition
+
+`crates/jxl_wgpu_decode/test-data/original_color` contains 148 native-reference cases, declared in
+`tools/jxl_test_support/src/fixtures/original_color.rs`. The native C API generates original
+Modular/VarDCT RGB and XYB sources in D65 BT.709/BT.2020/Display-P3 or gray with Linear/sRGB/BT.709.
+YCbCr cases preserve separately identified 8-bit RGB component entropy and explicitly rewrite only
+the frame transform flag plus full-resolution sampling fields. All resulting streams are reparsed
+and independently decoded by libjxl before reference storage. There are 332 fixture files.
+
+| Evidence | Scope |
+| --- | --- |
+| Native original RGBA F32 | All 148 streams, 370 final presentations; 74 six-frame sequences include all five blend modes, independent alpha Replace, crops, hidden layers and overwritten slots 1/2 |
+| Independent jxl-oxide | All 74 original stills; XYB uses its unbounded linear BT.709 output plus independent f64 conversion to avoid CMS clipping; its extra source-selector header defect is documented for these sequences |
+| GPU streaming and ownership | Whole input, 256-byte windows / 43-byte async fragments, progressive snapshots, held-image immutability, final-only byte equality, exact final count and zero reservations |
+| Requested output | Linear BT.709 F32, sRGB8, original RGBA12, selected original color F32 and independent alpha F32 for every case |
+| Exact native samples | 27 color-metadata variants of existing integer fixtures preserve byte-identical physical frames and exact 17/31-bit RGB and 5/24/31-bit alpha through native RGB and scalar selection, with whole and bounded fragmented input |
+| Colorimetry | Independent f64 primary matrices from CIE xy and a common D65; fixed source-error intervals propagated through signed matrices and piecewise transfer functions |
+| Metadata rejection | ICC, custom white/primaries, gamma/DCI/PQ/HLG/unknown transfer and inconsistent Gray/RGB inventories are rejected by the shared admission boundary |
+
+Source reconstruction uses normalized error `1e-5` for original Modular and `1/1024` for
+XYB/VarDCT; alpha is checked separately at `2e-6`. Conversion adds `5e-6*(1+abs(reference))` and one
+integer code when quantized. BT.709 explicitly extends its linear toe below zero, matching native
+libjxl and jxl-oxide; Rust jxl 0.6.0's reflected negative curve is not substituted as an oracle.
+Unchanged generic transfer tests check the other sign-reflected functions. Primary matrices now
+use the same exact D65 white in image output and display. See the
+[generator notes](../crates/jxl_wgpu_decode/test-data/original_color_generator/README.md) for pinned
+sources and reproduction. ICC/custom profiles, HDR luminance mapping, wide-gamut feature/LF
+combinations and full conformance remain roadmap work.

@@ -1541,33 +1541,22 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
 }
 
 fn display_primary_matrix(space: jxl_gpu_formats::ColorSpace) -> Result<(u8, [[f32; 4]; 3])> {
-    let (code, matrix) = match space {
-        jxl_gpu_formats::ColorSpace::Bt709 => {
-            (0, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-        }
-        jxl_gpu_formats::ColorSpace::Bt2020 => (
-            1,
-            [
-                [1.660_491, -0.587_641_1, -0.072_849_9],
-                [-0.124_550_5, 1.132_899_9, -0.008_349_4],
-                [-0.018_150_8, -0.100_578_9, 1.118_729_7],
-            ],
-        ),
-        jxl_gpu_formats::ColorSpace::DisplayP3 => (
-            2,
-            [
-                [1.224_745_3, -0.224_904_4, -0.000_000_1],
-                [-0.042_058_1, 1.042_081, -0.000_000_1],
-                [-0.019_642_3, -0.078_654_9, 1.098_537_2],
-            ],
-        ),
+    use jxl_gpu_formats::ColorSpace;
+    use jxl_gpu_protocol::RgbPrimaries;
+    let (code, primaries) = match space {
+        ColorSpace::Bt709 => (0, RgbPrimaries::Bt709),
+        ColorSpace::Bt2020 => (1, RgbPrimaries::Bt2020),
+        ColorSpace::DisplayP3 => (2, RgbPrimaries::DisplayP3),
         unsupported => {
             return Err(Error::Unsupported(format!(
                 "display conversion to linear BT.709 does not implement {unsupported:?} primaries"
             )));
         }
     };
-    Ok((code, matrix.map(|row| [row[0], row[1], row[2], 0.0])))
+    Ok((
+        code,
+        crate::image_output::primaries_transform(primaries, ColorSpace::Bt709)?,
+    ))
 }
 
 fn classify_display_format(format: &PixelFormat) -> Result<ColorFormatClass> {
@@ -1814,7 +1803,11 @@ fn image_shader_source(destination: wgpu::TextureFormat) -> String {
         wgpu::TextureFormat::Rgba16Float => "rgba16float",
         unsupported => unreachable!("validated display texture format {unsupported:?}"),
     };
-    include_str!("../shaders/display_image.wgsl").replace(
+    concat!(
+        include_str!("../shaders/image_transfer.wgsl"),
+        include_str!("../shaders/display_image.wgsl"),
+    )
+    .replace(
         "texture_storage_2d<rgba8unorm, write>",
         &format!("texture_storage_2d<{storage_format}, write>"),
     )
@@ -2248,7 +2241,7 @@ mod tests {
         let expected = (1..=36).collect::<Vec<_>>();
         assert_eq!(abi_words(&image), expected);
         assert_wgsl_fields(
-            include_str!("../shaders/display_image.wgsl"),
+            &image_shader_source(wgpu::TextureFormat::Rgba8Unorm),
             "Params",
             &[
                 "width",

@@ -1226,6 +1226,7 @@ impl OutputPlan {
             ));
         }
         if float_rgb
+            && !request.retains_frame_surface()
             && !matches!(format.color_spec, ColorSpecification::Defined(spec) if spec.space == ColorSpace::Bt709)
         {
             return Err(Error::UnsupportedOutputFormat(

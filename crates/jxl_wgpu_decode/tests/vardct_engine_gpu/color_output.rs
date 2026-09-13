@@ -24,23 +24,23 @@ fn source_rgb_for_target(samples: &[f32], format: &PixelFormat) -> [Vec<f32>; 3]
                     return value;
                 }
                 let magnitude = value.abs();
-                let linear = if magnitude <= 0.04045 {
+                let linear = (if magnitude <= 0.04045 {
                     magnitude / 12.92
                 } else {
                     ((magnitude + 0.055) / 1.055).powf(2.4)
-                };
-                let encoded = match color.transfer {
+                })
+                .copysign(value);
+                match color.transfer {
                     TransferFunction::Linear => linear,
                     TransferFunction::Bt709 => {
-                        if linear < 0.018 {
+                        if linear <= 0.018 {
                             4.5 * linear
                         } else {
                             1.099 * linear.powf(0.45) - 0.099
                         }
                     }
                     other => panic!("unhandled oracle transfer {other:?}"),
-                };
-                encoded.copysign(value)
+                }
             })
             .collect()
     })
@@ -70,6 +70,9 @@ fn assert_color_codes(
         // the same threshold would impose a different reconstruction tolerance by brightness.
         // The shared output tests separately check the OETF itself in encoded coordinates.
         let to_linear = |value: f32| {
+            if color.transfer == TransferFunction::Bt709 && value <= 0.081 {
+                return value / 4.5;
+            }
             let magnitude = value.abs();
             let linear = match color.transfer {
                 TransferFunction::Linear => magnitude,

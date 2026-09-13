@@ -174,41 +174,7 @@ fn yuv_rgb(pixel: vec2<u32>) -> vec3<f32> {
 }
 
 fn to_linear(encoded: f32) -> f32 {
-    let value = abs(encoded);
-    var linear = value;
-    if params.transfer == 0u {
-        linear = value;
-    } else if params.transfer == 1u {
-        linear = select(pow((value + 0.055) / 1.055, 2.4), value / 12.92, value <= 0.04045);
-    } else if params.transfer == 2u {
-        linear = select(pow((value + 0.099) / 1.099, 1.0 / 0.45), value / 4.5, value < 0.081);
-    } else if params.transfer == 3u {
-        let m1 = 2610.0 / 16384.0;
-        let m2 = (2523.0 / 4096.0) * 128.0;
-        let c1 = 3424.0 / 4096.0;
-        let c2 = (2413.0 / 4096.0) * 32.0;
-        let c3 = (2392.0 / 4096.0) * 32.0;
-        let powered = pow(value, 1.0 / m2);
-        linear = pow(max(powered - c1, 0.0) / max(c2 - c3 * powered, 1e-10), 1.0 / m1);
-    } else if params.transfer == 4u {
-        let hlg_a = 0.17883277;
-        let hlg_b = 1.0 - 4.0 * hlg_a;
-        let hlg_c = 0.5599107295;
-        linear = select(
-            (exp((value - hlg_c) / hlg_a) + hlg_b) / 12.0,
-            value * value / 3.0,
-            value <= 0.5,
-        );
-    } else {
-        let alpha = 1.09929682680944;
-        let beta = 0.018053968510807;
-        linear = select(
-            pow((value + (alpha - 1.0)) / alpha, 1.0 / 0.45),
-            value / 4.5,
-            value < 4.5 * beta,
-        );
-    }
-    return select(linear, -linear, encoded < 0.0);
+    return transfer_to_linear(encoded, params.transfer);
 }
 
 fn constant_luminance_yuv_linear(pixel: vec2<u32>) -> vec3<f32> {

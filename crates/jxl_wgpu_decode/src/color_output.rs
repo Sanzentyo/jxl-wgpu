@@ -59,6 +59,8 @@ pub enum ColorOutputTransform {
     /// JPEG reconstruction's encoded YCbCr, including component upsampling.
     Ycbcr {
         channel_shifts: [JpegComponentShift; 3],
+        /// RGB encoding after the JPEG component matrix, before requested output conversion.
+        encoding: RgbColorEncoding,
     },
 }
 
@@ -152,7 +154,7 @@ impl ColorOutputConfig {
                 encoding: match self.transform {
                     ColorOutputTransform::Rgb(encoding) => encoding,
                     ColorOutputTransform::Xyb(_) => RgbColorEncoding::LINEAR_BT709,
-                    ColorOutputTransform::Ycbcr { .. } => RgbColorEncoding::SRGB_BT709,
+                    ColorOutputTransform::Ycbcr { encoding, .. } => encoding,
                 },
             },
             dispatch_width,
@@ -647,7 +649,7 @@ fn validate_inputs(
         ColorOutputTransform::Xyb(_) | ColorOutputTransform::Rgb(_) => {
             [[inputs.config.extent.width, inputs.config.extent.height]; 3]
         }
-        ColorOutputTransform::Ycbcr { channel_shifts } => {
+        ColorOutputTransform::Ycbcr { channel_shifts, .. } => {
             let mut extents = [[0; 2]; 3];
             for (channel, shift) in channel_shifts.into_iter().enumerate() {
                 if shift.horizontal > 1 || shift.vertical > 1 {
@@ -714,7 +716,7 @@ fn validate_inputs(
             ColorOutputTransform::Xyb(_) | ColorOutputTransform::Rgb(_) => {
                 JpegComponentShift::default()
             }
-            ColorOutputTransform::Ycbcr { channel_shifts } => channel_shifts[plane],
+            ColorOutputTransform::Ycbcr { channel_shifts, .. } => channel_shifts[plane],
         };
         plane_geometry[plane] = [
             stride,

@@ -4,10 +4,6 @@ use crate::color_output::{ColorOutputConfig, ColorOutputPlan, ColorOutputTransfo
 use crate::modular_scalar_output::{ModularScalarOutputConfig, ModularScalarOutputPlan};
 use crate::vardct_frontend::VarDctColorTransform;
 use crate::{GpuOutputMapping, GpuOutputRequest};
-use jxl_gpu_bitstream::{
-    ColourEncodingInventory, ColourSpaceInventory, PrimariesInventory, TransferFunctionInventory,
-    WhitePointInventory,
-};
 use jxl_gpu_formats::ImageLayout;
 use jxl_gpu_protocol::{Extent2d, OutputOrientation, RgbColorEncoding};
 use jxl_wgpu::{KernelVariant, WgpuBackend};
@@ -108,18 +104,8 @@ pub(super) fn prepare_presentation(
         return Err(VarDctDecodeError::UnsupportedOutput);
     }
 
-    if !matches!(
-        inventory.image_header.colour_encoding,
-        ColourEncodingInventory::Enumerated {
-            colour_space: ColourSpaceInventory::Rgb | ColourSpaceInventory::Grey,
-            white_point: WhitePointInventory::D65,
-            primaries: PrimariesInventory::Srgb,
-            transfer_function: TransferFunctionInventory::Srgb,
-            rendering_intent: _,
-        }
-    ) {
-        return Err(VarDctDecodeError::UnsupportedColorEncoding);
-    }
+    let original = crate::image_color::original_encoding(&inventory.image_header)
+        .ok_or(VarDctDecodeError::UnsupportedColorEncoding)?;
     let (output_transform, quant_biases) = match profile.color_transform {
         VarDctColorTransform::Xyb => {
             let opsin = inventory
@@ -142,11 +128,12 @@ pub(super) fn prepare_presentation(
         }
         VarDctColorTransform::Ycbcr | VarDctColorTransform::Rgb => (
             if profile.color_transform == VarDctColorTransform::Rgb {
-                ColorOutputTransform::Rgb(RgbColorEncoding::SRGB_BT709)
+                ColorOutputTransform::Rgb(original)
             } else {
                 ColorOutputTransform::Ycbcr {
                     // Execution resolves these shifts from the planes that reach presentation.
                     channel_shifts: profile.channel_shifts,
+                    encoding: original,
                 }
             },
             // Non-XYB image metadata omits the optional opsin object that otherwise carries these

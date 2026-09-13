@@ -113,7 +113,9 @@ fn recursive_lf_rendering_clips_odd_grids_and_accounts_levels_one_through_four()
                 renderer = renderer
                     .for_surface(
                         Extent2d::new(width, height),
-                        crate::frame_surface::FrameSurfaceEncoding::Linear,
+                        crate::frame_surface::FrameSurfaceEncoding::Rgb(
+                            jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709,
+                        ),
                     )
                     .unwrap();
             }

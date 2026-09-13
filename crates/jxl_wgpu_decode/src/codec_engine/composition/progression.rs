@@ -60,22 +60,20 @@ impl LfPreview {
                 super::gpu::Compositor::new(
                     backend.clone(),
                     Extent2d::new(image.width, image.height),
-                    &image.extra_channels,
-                    image.grayscale,
-                    image.bit_depth,
-                    OutputOrientation::from_exif_value(image.orientation).ok_or(
-                        Error::InvalidImageOrientation {
-                            value: image.orientation,
-                        },
-                    )?,
+                    image,
                     request,
                 )
             })
             .transpose()?
             .map(Arc::new);
-        let working = request
-            .clone()
-            .for_frame_surface(crate::frame_surface::FrameSurfaceEncoding::Linear);
+        let working =
+            request
+                .clone()
+                .for_frame_surface(crate::frame_surface::FrameSurfaceEncoding::Rgb(
+                    crate::image_color::linear_encoding(
+                        crate::image_color::require_original_encoding(image)?,
+                    ),
+                ));
         let render_request = if canonical { &working } else { request };
         let inverse_opsin = InverseOpsin::from_image(image).ok_or(Error::EngineContract(
             "LF presentation has no inverse opsin metadata",
@@ -121,10 +119,7 @@ impl LfPreview {
             backend,
         };
         if canonical {
-            preview.for_surface(
-                config.extent,
-                crate::frame_surface::FrameSurfaceEncoding::Linear,
-            )
+            preview.for_surface(config.extent, working.frame_surface_encoding())
         } else {
             Ok(preview)
         }

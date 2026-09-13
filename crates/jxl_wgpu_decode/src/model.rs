@@ -561,6 +561,17 @@ impl GpuOutputRequest {
         self.mapping
     }
 
+    /// Numeric samples and native formats without an explicit color target retain the original
+    /// sample domain. Color metadata alone must not route exact integer words through F32.
+    pub(crate) fn uses_original_sample_domain(&self) -> bool {
+        matches!(self.mapping, GpuOutputMapping::Numeric(_))
+            || (native_modular_format(&self.format).is_some()
+                && matches!(
+                    self.format.color_spec,
+                    ColorSpecification::Default | ColorSpecification::Undefined
+                ))
+    }
+
     #[must_use]
     pub const fn alpha_output_policy(&self) -> AlphaOutputPolicy {
         self.alpha

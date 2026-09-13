@@ -4,6 +4,7 @@ pub mod jpeg_sampling;
 pub mod modular_passes;
 pub mod modular_ycbcr;
 pub mod noise;
+pub mod original_color;
 pub mod patch_features;
 pub mod patch_references;
 pub mod patches;

@@ -4,13 +4,13 @@ use crate::modular_grouping::{
 };
 
 use jxl_gpu_bitstream::{
-    CodestreamInventory, ColourEncodingInventory, ColourSpaceInventory, ExtraChannelTypeInventory,
-    FiniteF16, FrameBlendInfo, FrameEncoding, FrameSectionKind, FrameType, ImageHeaderInventory,
-    PrimariesInventory, SampleBitDepth, TransferFunctionInventory, WhitePointInventory,
+    CodestreamInventory, ExtraChannelTypeInventory, FiniteF16, FrameBlendInfo, FrameEncoding,
+    FrameSectionKind, FrameType, ImageHeaderInventory, SampleBitDepth,
 };
 #[cfg(test)]
 use jxl_gpu_bitstream::{
-    EdgePreservingFilterInventory, GaborishInventory, RestorationFilterInventory,
+    ColourEncodingInventory, ColourSpaceInventory, EdgePreservingFilterInventory,
+    GaborishInventory, RestorationFilterInventory,
 };
 use jxl_gpu_protocol::OutputOrientation;
 
@@ -168,26 +168,7 @@ fn validate_image_header(
             value: image.orientation,
         },
     )?;
-    let colour_space = if image.grayscale {
-        ColourSpaceInventory::Grey
-    } else {
-        ColourSpaceInventory::Rgb
-    };
-    if image.embedded_icc.is_some()
-        || !matches!(image.colour_encoding, ColourEncodingInventory::Enumerated {
-            colour_space: actual,
-            white_point: WhitePointInventory::D65,
-            primaries: PrimariesInventory::Srgb,
-            transfer_function: TransferFunctionInventory::Srgb,
-            rendering_intent: _,
-        } if actual == colour_space)
-    {
-        return Err(UnsupportedProfile::new(
-            UnsupportedCodestreamFeature::ColorEncoding,
-            "the Modular presentation profile requires enumerated D65 sRGB color",
-        )
-        .into());
-    }
+    crate::image_color::require_original_encoding(image)?;
     validate_extra_channels(image, channels)?;
     Ok(orientation)
 }

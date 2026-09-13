@@ -57,16 +57,21 @@ struct NativeParams {
     extent: [u32; 4],
     format: [u32; 4],
     output: [u32; 4],
+    color: [u32; 4],
     source: [u32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<NativeParams>() == 64);
+const _: () = assert!(std::mem::size_of::<NativeParams>() == 80);
 const _: () = assert!(std::mem::align_of::<NativeParams>() == 16);
-const _: () = assert!(std::mem::offset_of!(NativeParams, source) == 48);
+const _: () = assert!(std::mem::offset_of!(NativeParams, color) == 48);
+const _: () = assert!(std::mem::offset_of!(NativeParams, source) == 64);
 
 #[derive(Debug)]
 enum Packing {
-    Color(Box<[ImageOutputParams; 2]>),
+    Color {
+        original: Box<ImageOutputParams>,
+        linear: Box<ImageOutputParams>,
+    },
     Native(NativeParams),
 }
 
@@ -74,6 +79,7 @@ enum Packing {
 pub(super) struct Compositor {
     backend: WgpuBackend,
     canvas: Extent2d,
+    original: jxl_gpu_protocol::RgbColorEncoding,
     extras: Vec<ExtraChannelInventory>,
     surface: FrameSurfaceLayout,
     blend: wgpu::ComputePipeline,
@@ -89,16 +95,28 @@ impl Compositor {
     pub(super) fn new(
         backend: WgpuBackend,
         canvas: Extent2d,
-        extras: &[ExtraChannelInventory],
-        grayscale: bool,
-        sample_bit_depth: SampleBitDepth,
-        orientation: OutputOrientation,
+        image: &jxl_gpu_bitstream::ImageHeaderInventory,
         request: &GpuOutputRequest,
     ) -> Result<Self> {
+        let extras = &image.extra_channels;
+        let grayscale = image.grayscale;
+        let sample_bit_depth = image.bit_depth;
+        let original = crate::image_color::require_original_encoding(image)?;
+        let orientation = OutputOrientation::from_exif_value(image.orientation).ok_or(
+            Error::InvalidImageOrientation {
+                value: image.orientation,
+            },
+        )?;
         let orientation = request.orientation_policy().resolve(orientation);
+
         let layout = ImageLayout::packed(orientation.map_extent(canvas), request.format().clone())?;
         let device = backend.device();
-        let surface = FrameSurfaceLayout::new(canvas, extras.len(), &device.limits())?;
+        let surface = FrameSurfaceLayout::with_encoding(
+            canvas,
+            extras.len(),
+            FrameSurfaceEncoding::Rgb(original),
+            &device.limits(),
+        )?;
         let output_size = aligned(layout.logical_size)?;
         validate_size(device, output_size)?;
         let bindings = device.limits().max_storage_buffers_per_shader_stage;
@@ -186,7 +204,10 @@ impl Compositor {
             validate_size(device, std::mem::size_of_val(spots.as_slice()) as u64)?;
         }
         let spot_source = spot_shader(!spots.is_empty());
-        let native = crate::model::native_modular_format(request.format());
+        let native = crate::model::native_modular_format(request.format()).filter(|_| {
+            request.uses_original_sample_domain()
+                || original == jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709
+        });
         let source_depth = selected.map_or(sample_bit_depth, |(_, extra)| extra.bit_depth);
         let source_float = matches!(source_depth, SampleBitDepth::Float { .. });
         let wrong_numeric_type = match request.mapping() {
@@ -263,6 +284,17 @@ impl Compositor {
                         orientation.to_exif_value() - 1,
                         alpha_conversion as u32,
                     ],
+                    color: [
+                        match original.transfer {
+                            jxl_gpu_protocol::TransferFunction::Linear => 0,
+                            jxl_gpu_protocol::TransferFunction::Srgb => 1,
+                            jxl_gpu_protocol::TransferFunction::Bt709 => 2,
+                            _ => unreachable!("validated original transfer"),
+                        },
+                        0,
+                        0,
+                        0,
+                    ],
                     source: [
                         (surface.color_plane_bytes / 4) as u32,
                         alpha_channel,
@@ -271,8 +303,9 @@ impl Compositor {
                     ],
                 }),
                 format!(
-                    "{IMAGE_ORIENTATION_SHADER}\n{}\n{spot_source}\n{}",
+                    "{IMAGE_ORIENTATION_SHADER}\n{}\n{}\n{spot_source}\n{}",
                     jxl_wgpu::ALPHA_OUTPUT_SHADER,
+                    jxl_wgpu::IMAGE_TRANSFER_SHADER,
                     crate::modular_sample::shader(include_str!("native.wgsl"))
                 ),
             )
@@ -287,17 +320,21 @@ impl Compositor {
                         extent: canvas,
                         orientation,
                         strides: [canvas.width; 3],
-                        encoding: encoding.rgb_encoding(),
+                        encoding: encoding
+                            .rgb_encoding()
+                            .ok_or(Error::EngineContract("packing requires RGB"))?,
                     },
                     output_dispatch[0] * 64,
                 )?
                 .with_alpha_conversion(alpha_conversion))
             };
             (
-                Packing::Color(Box::new([
-                    params(FrameSurfaceEncoding::Srgb)?,
-                    params(FrameSurfaceEncoding::Linear)?,
-                ])),
+                Packing::Color {
+                    original: Box::new(params(FrameSurfaceEncoding::Rgb(original))?),
+                    linear: Box::new(params(FrameSurfaceEncoding::Rgb(
+                        crate::image_color::linear_encoding(original),
+                    ))?),
+                },
                 format!(
                     "{IMAGE_OUTPUT_SHADER}\n{spot_source}\n{}",
                     include_str!("output.wgsl")
@@ -310,7 +347,7 @@ impl Compositor {
             include_str!("blend.wgsl"),
             &[],
         );
-        let constants = if matches!(packing, Packing::Color(_)) {
+        let constants = if matches!(packing, Packing::Color { .. }) {
             vec![
                 ("wg_x", 64.0),
                 ("wg_y", 1.0),
@@ -327,6 +364,7 @@ impl Compositor {
         Ok(Self {
             backend,
             canvas,
+            original,
             extras: extras.to_vec(),
             surface,
             blend,
@@ -390,7 +428,7 @@ impl Compositor {
         Surface {
             buffer,
             layout: Arc::new(self.surface.clone()),
-            encoding: FrameSurfaceEncoding::Srgb,
+            encoding: FrameSurfaceEncoding::Rgb(self.original),
         }
     }
 
@@ -407,11 +445,11 @@ impl Compositor {
                 .then(|| references[index].clone())
                 .flatten()
         });
-        if foreground.encoding != FrameSurfaceEncoding::Srgb
+        if foreground.encoding != FrameSurfaceEncoding::Rgb(self.original)
             || references
                 .iter()
                 .flatten()
-                .any(|base| base.encoding != FrameSurfaceEncoding::Srgb)
+                .any(|base| base.encoding != FrameSurfaceEncoding::Rgb(self.original))
         {
             return Err(Error::EngineContract(
                 "blending requires original-encoding RGB surfaces",
@@ -481,9 +519,12 @@ impl Compositor {
     }
 
     pub(super) fn pack(&self, source: &Surface) -> Result<GpuWork> {
-        if source.encoding == FrameSurfaceEncoding::Encoded {
+        if source.encoding != FrameSurfaceEncoding::Rgb(self.original)
+            && source.encoding
+                != FrameSurfaceEncoding::Rgb(crate::image_color::linear_encoding(self.original))
+        {
             return Err(Error::EngineContract(
-                "codec components cannot be presented as RGB",
+                "presentation source is outside its original RGB encoding",
             ));
         }
         if source.extent() != self.canvas
@@ -495,16 +536,21 @@ impl Compositor {
         }
         let mut native;
         let (params, output_binding, uniform_binding): (&[u8], _, _) = match &self.packing {
-            Packing::Color(params) => (
+            Packing::Color { original, linear } => (
                 bytemuck::bytes_of(
-                    &params[usize::from(source.encoding == FrameSurfaceEncoding::Linear)],
+                    if source.encoding == FrameSurfaceEncoding::Rgb(self.original) {
+                        original.as_ref()
+                    } else {
+                        linear.as_ref()
+                    },
                 ),
                 3,
                 4,
             ),
             Packing::Native(params) => {
                 native = *params;
-                native.source[3] |= u32::from(source.encoding == FrameSurfaceEncoding::Linear) << 1;
+                native.source[3] |=
+                    u32::from(source.encoding != FrameSurfaceEncoding::Rgb(self.original)) << 1;
                 (bytemuck::bytes_of(&native), 1, 2)
             }
         };

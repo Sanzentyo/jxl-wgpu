@@ -236,6 +236,7 @@ pub enum EpfPass {
 pub enum TransferFunction {
     Linear,
     Srgb,
+    /// BT.709 with the linear toe extended below zero, matching libjxl color conversion.
     Bt709,
     Pq,
     Hlg,

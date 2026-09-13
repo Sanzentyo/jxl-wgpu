@@ -1,5 +1,6 @@
 use super::test_support::{drain, fixture, read};
 use super::*;
+use jxl_gpu_formats::{PixelFormat, RgbChannelOrder};
 use jxl_wgpu::WgpuBackend;
 
 fn backend() -> WgpuBackend {

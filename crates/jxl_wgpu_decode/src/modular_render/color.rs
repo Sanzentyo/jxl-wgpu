@@ -23,25 +23,32 @@ use crate::jpeg_sampling::{JpegComponentShift, component_shifts};
 
 #[derive(Clone, Debug, PartialEq)]
 enum ModularColorTransform {
-    Rgb,
-    Xyb { lf: [f32; 3], inverse: InverseOpsin },
-    Ycbcr { shifts: [JpegComponentShift; 3] },
+    Rgb(RgbColorEncoding),
+    Xyb {
+        lf: [f32; 3],
+        inverse: InverseOpsin,
+    },
+    Ycbcr {
+        shifts: [JpegComponentShift; 3],
+        encoding: RgbColorEncoding,
+    },
 }
 
 impl ModularColorTransform {
     fn shifts(&self) -> [JpegComponentShift; 3] {
         match self {
-            Self::Ycbcr { shifts } => *shifts,
-            Self::Rgb | Self::Xyb { .. } => [JpegComponentShift::default(); 3],
+            Self::Ycbcr { shifts, .. } => *shifts,
+            Self::Rgb(_) | Self::Xyb { .. } => [JpegComponentShift::default(); 3],
         }
     }
 
     fn output(&self) -> ColorOutputTransform {
         match self {
-            Self::Rgb => ColorOutputTransform::Rgb(RgbColorEncoding::SRGB_BT709),
+            Self::Rgb(encoding) => ColorOutputTransform::Rgb(*encoding),
             Self::Xyb { inverse, .. } => ColorOutputTransform::Xyb(*inverse),
-            Self::Ycbcr { .. } => ColorOutputTransform::Ycbcr {
+            Self::Ycbcr { encoding, .. } => ColorOutputTransform::Ycbcr {
                 channel_shifts: [JpegComponentShift::default(); 3],
+                encoding: *encoding,
             },
         }
     }
@@ -78,6 +85,10 @@ impl ModularColorConfig {
         if epf.is_some() && sigma < 1e-8 {
             return Err(crate::RestorationError::InvalidModularSigma { value: sigma }.into());
         }
+        let original =
+            crate::image_color::original_encoding(image).ok_or(ModularRenderError::Invalid {
+                reason: "unsupported original image color encoding",
+            })?;
         let transform = if image.xyb_encoded {
             ModularColorTransform::Xyb {
                 lf: lf.map(|value| value / 128.0),
@@ -88,28 +99,38 @@ impl ModularColorConfig {
         } else if frame.do_ycbcr {
             ModularColorTransform::Ycbcr {
                 shifts: component_shifts(frame.jpeg_upsampling),
+                encoding: original,
             }
         } else {
-            ModularColorTransform::Rgb
+            ModularColorTransform::Rgb(original)
         };
         let noise = noise.and_then(|noise| noise.parameters(frame, [0.0, 1.0]));
-        Ok((transform != ModularColorTransform::Rgb
-            || gaborish.is_some()
-            || epf.is_some()
-            || noise.is_some())
-        .then(|| Self {
-            encoded_output: false,
-            noise,
-            transform,
-            gaborish,
-            epf: epf.map_or_else(Vec::new, |epf| epf.passes()),
-            inverse_sigma: -1.171_572_9 / sigma,
-        }))
+        Ok(
+            (transform != ModularColorTransform::Rgb(RgbColorEncoding::SRGB_BT709)
+                || gaborish.is_some()
+                || epf.is_some()
+                || noise.is_some())
+            .then(|| Self {
+                encoded_output: false,
+                noise,
+                transform,
+                gaborish,
+                epf: epf.map_or_else(Vec::new, |epf| epf.passes()),
+                inverse_sigma: -1.171_572_9 / sigma,
+            }),
+        )
     }
 
     pub(crate) fn for_encoded_output(mut self) -> Self {
         self.encoded_output = true;
         self
+    }
+
+    pub(crate) fn is_plain_rgb(&self) -> bool {
+        matches!(self.transform, ModularColorTransform::Rgb(_))
+            && self.gaborish.is_none()
+            && self.epf.is_empty()
+            && self.noise.is_none()
     }
 
     pub(crate) fn noise_parameters(&self) -> Option<jxl_wgpu::ResidentNoiseParameters> {
@@ -805,7 +826,7 @@ mod tests {
                     let config = ModularColorConfig {
                         encoded_output: false,
                         noise: None,
-                        transform: ModularColorTransform::Rgb,
+                        transform: ModularColorTransform::Rgb(RgbColorEncoding::SRGB_BT709),
                         gaborish: gaborish.then_some(ResidentGaborishWeights::DEFAULT),
                         epf: if iterations == 0 {
                             Vec::new()
@@ -890,7 +911,7 @@ mod tests {
         let config = ModularColorConfig {
             encoded_output: false,
             noise: None,
-            transform: ModularColorTransform::Rgb,
+            transform: ModularColorTransform::Rgb(RgbColorEncoding::SRGB_BT709),
             gaborish: Some(ResidentGaborishWeights::DEFAULT),
             epf: crate::restoration::restoration_config(RestorationFilterInventory::Default)
                 .unwrap()

@@ -35,6 +35,7 @@ mod error;
 mod frame_plan;
 mod frame_resampling;
 mod frame_surface;
+mod image_color;
 mod image_selection;
 mod inflight;
 mod input_budget;

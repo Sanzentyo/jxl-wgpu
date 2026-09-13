@@ -375,8 +375,7 @@ XYB coefficients or the integer Modular words used by progressive-DC dependencie
 plus 27 rendering fixtures including five nine-layer animations and a real progressive-DC dependency.
 Whole and 256-byte-window fragmented async output agree exactly, and reservations return to zero.
 `cargo run -p jxl_wgpu_decode --example regenerate_floating` reproduces the corpus using offline
-libjxl 0.12 tools; the production crates do not link that codec. Original non-sRGB/ICC domains and
-pre-transform references remain separate requirements.
+libjxl 0.12 tools; the production crates do not link that codec. ICC, custom chromaticities and HDR luminance mapping remain separate requirements.
 
 Codestream topology is separate from native pixel formats: `DecodeProfile::Modular`
 contains `ModularChannelCounts`, with `color_count()`, `extra_count()` and total `count()`.
@@ -457,7 +456,7 @@ reference chains, Gray/RGB, both coding modes, distributed groups, shifted resam
 presentations. Admission retries and cancellation release every hidden plane and its shared lease.
 
 The private frame surface records its RGB domain explicitly. Unreferenced XYB presentations keep
-linear RGB; blending and post-transform reference storage use the original sRGB encoding. Spots
+linear RGB in the original primaries; blending and post-transform references use the original encoding. Spots
 execute in that stage's domain, matching libjxl's pipeline ordering. This avoids a transfer round
 trip before standalone VarDCT presentation. Ten deterministic multi-spot stills additionally cover
 five inks, independent 1/4/6/10/12-bit coverage, negative/extended RGB and solidity, two alpha planes,
@@ -467,7 +466,7 @@ RGB/RGBA, F32 RGB/BGRA, NV12, packed 4:2:2 and BT.2020 constant-luminance P010. 
 encodings and HDR luminance mapping remain separate roadmap gates.
 
 Image admission uses the validated inventory's color, depth, and alpha semantics rather than
-reparsing a fixed header bit pattern. Enumerated D65 sRGB Gray/RGB, integer extras,
+reparsing a fixed header bit pattern. Enumerated D65 SDR Gray/RGB, integer extras,
 all orientations, intrinsic-size hints, and named channel declarations can use the supported
 reconstruction path. Unsupported ICC/color and Modular restoration remain
 rejected. Unknown image,
@@ -605,11 +604,41 @@ streams in pass/group order, all use the same bounded-window executor and aggreg
 one global inverse/finalizer runs after assembly. One through eleven passes produce a complete final
 image; optional intermediate images run the same inverse/finalizer on independent arena copies.
 The low-level Modular producer requires patches and splines to be handled by the common frame
-executor. Broader original color profiles remain typed unsupported profiles.
+executor. ICC, custom chromaticities, gamma/DCI and HDR original profiles remain typed unsupported profiles.
 The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard stream once, and selects a producer for each physical frame from
 `FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
 mode-specific bindings and pipeline caches while sharing the backend byte budget.
+
+### Original SDR color encodings
+
+Both decoders accept enumerated D65 BT.709, BT.2020 and Display-P3 primaries with Linear,
+sRGB or BT.709 transfer, plus D65 gray. Original Modular/VarDCT RGB and YCbCr carry this encoding
+through reconstruction, and XYB converts from its linear-BT.709 intermediate into the requested
+working primaries. Composition and post-transform references retain original encoding; an
+unreferenced XYB presentation can keep linear RGB in the original primaries. Numeric color
+selection returns original component values; numeric extras remain independent of color transfer.
+
+The shared image header resolver rejects ICC, custom chromaticities, gamma/DCI and HDR profiles
+until their full interpretation is connected. The private surface tag includes both RGB primaries
+and transfer, with a separate codec-component variant. `ColorOutputTransform::Ycbcr` now requires
+an explicit original encoding. Native output with Default/Undefined color meaning uses the original
+encoding; explicit sRGB output converts to sRGB. Native depth conversion and non-portable native
+VarDCT bit packings use the common surface and final quantizer.
+Color metadata alone does not introduce F32 conversion for native or numeric Modular output;
+unfiltered samples retain exact source words, including integer precision above 24 bits.
+
+`tests/original_color` covers 148 streams with independent native references: integer/F32, gray/RGBA,
+RGB/XYB/YCbCr, cropped/hidden frames, all five blend modes and overwritten references. Whole and
+bounded async input, retained progressive images, final-only equality, linear BT.709 F32, sRGB
+RGBA8, original RGBA12 and numeric color/alpha are checked. jxl-oxide independently verifies the 74
+stills; its extra-channel source-selector parsing defect prevents sequence comparison. A further
+27 metadata variants check exact 17/31-bit Modular color and independent 5/24/31-bit alpha through
+native RGB and every scalar selection under whole and bounded fragmented input. The
+[generator notes](test-data/original_color_generator/README.md) record generation, precision,
+the second-oracle limitation and the explicit BT.709 linear extension below zero. Matrix conversion
+uses a common exact D65 white with host F64 multiplication and one F32 uniform lowering. Wide-gamut
+spot/patch/spline/LF combinations and complete color management still require conformance work.
 
 ### Frame execution and animation
 
@@ -625,14 +654,14 @@ RGB/XYB/JPEG color boundary, replacing the former `vardct::output` API. It prese
 inverse opsin matrix, biases, intensity target and grayscale projection. The Modular finalizer
 does not reapply the transfer already performed by this packer. Unreferenced XYB presentations
 retain linear RGB so spot colors are applied before transfer conversion; referenced/blended
-frames retain original sRGB. All temporary color/filter/upsampling planes and uniforms participate
+frames retain the original encoding. All temporary color/filter/upsampling planes and uniforms participate
 in `modular_render_bytes` and the backend's shared memory reservation.
 
 `tests/lossy_modular/main.rs` checks 19 libjxl streams, all delivered extra planes and presentations,
 whole versus 256-byte bounded fragmented input, requested RGB8/RGBA8/16-bit quantization and
 reservation release. Fifteen stills and the initial Replace presentation of four animations also
 match Rust `jxl`; subsequent reference chains use libjxl because of the documented Rust oracle's
-clamped-Multiply defect. Enumerated D65 sRGB remains the admitted original color profile; full
+clamped-Multiply defect. The original SDR profiles described below now extend this boundary; full
 color management remains separate work.
 
 The common executor now retains explicitly tagged codec components before inverse color
@@ -786,7 +815,7 @@ input/GPU reservations after callbacks retire.
 
 Sequences containing crops, blends, or reference-only frames use the same ordered LF/physical
 executor, including hidden zero-duration layers. The working surface is
-unrounded, unrotated planar F32 RGB in the original enumerated D65 sRGB encoding, followed by
+unrounded, unrotated planar F32 RGB in the validated original D65 SDR encoding, followed by
 every extra plane at its own normalized depth. Up to four reference
 slots retain accounted buffer leases; an overwritten slot releases its old version after any
 submitted consumer completes. Empty references are zero, with opaque presentation alpha for

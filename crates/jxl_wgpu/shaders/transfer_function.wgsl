@@ -40,13 +40,8 @@ fn linear_to_srgb(value: f32) -> f32 {
 }
 
 fn linear_to_bt709(value: f32) -> f32 {
-    let magnitude = abs(value);
-    let encoded = select(
-        1.099 * pow(magnitude, 0.45) - 0.099,
-        4.5 * magnitude,
-        magnitude <= 0.018,
-    );
-    return signed_value(encoded, value);
+    if value <= 0.018 { return 4.5 * value; }
+    return 1.099 * pow(value, 0.45) - 0.099;
 }
 
 fn linear_to_pq(value: f32) -> f32 {

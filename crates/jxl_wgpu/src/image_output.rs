@@ -23,8 +23,13 @@ use jxl_gpu_protocol::{
 pub const IMAGE_OUTPUT_SHADER: &str = concat!(
     include_str!("../shaders/image_orientation.wgsl"),
     include_str!("../shaders/alpha_output.wgsl"),
+    include_str!("../shaders/image_transfer.wgsl"),
     include_str!("../shaders/image_output.wgsl"),
 );
+
+/// Shared unbounded EOTF/OETF helpers with the same transfer selectors as image output.
+/// BT.709 uses a linear negative extension; sRGB, PQ, HLG and BT.2020 reflect by sign.
+pub const IMAGE_TRANSFER_SHADER: &str = include_str!("../shaders/image_transfer.wgsl");
 
 /// WGSL forward/inverse image-coordinate helpers using zero-based Exif orientation codes.
 /// Callers validate nonempty extents and coordinate bounds before invoking either helper.
@@ -33,6 +38,7 @@ pub const IMAGE_ORIENTATION_SHADER: &str = include_str!("../shaders/image_orient
 pub(crate) const RGB_TO_IMAGE_SHADER: &str = concat!(
     include_str!("../shaders/image_orientation.wgsl"),
     include_str!("../shaders/alpha_output.wgsl"),
+    include_str!("../shaders/image_transfer.wgsl"),
     include_str!("../shaders/image_output.wgsl"),
     include_str!("../shaders/rgb_to_image.wgsl"),
 );
@@ -154,7 +160,8 @@ impl ImageOutputParams {
             target_transfer: color.target_transfer,
             identity_color_transform: u32::from(
                 color.source_transfer == color.target_transfer
-                    && color.primaries == IDENTITY_3.map(|row| [row[0], row[1], row[2], 0.0]),
+                    && color.primaries
+                        == IDENTITY_3.map(|row| [row[0] as f32, row[1] as f32, row[2] as f32, 0.0]),
             ),
             primaries_r: color.primaries[0],
             primaries_g: color.primaries[1],
@@ -426,41 +433,46 @@ pub(crate) fn image_color_transform(
     })
 }
 
-type Matrix3 = [[f32; 3]; 3];
+type Matrix3 = [[f64; 3]; 3];
 
 const IDENTITY_3: Matrix3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+// All matrices use the same D65 xy = (0.3127, 0.3290). Mixing rounded XYZ
+// whites changes neutral RGB when crossing primaries, including original-domain blends.
 const BT709_TO_XYZ: Matrix3 = [
-    [0.412_456_4, 0.357_576_1, 0.180_437_5],
-    [0.212_672_9, 0.715_152_2, 0.072_175],
-    [0.019_333_9, 0.119_192, 0.950_304_1],
+    [0.412390799265959, 0.357584339383878, 0.180480788401834],
+    [0.21263900587151, 0.715168678767756, 0.0721923153607337],
+    [0.0193308187155918, 0.119194779794626, 0.950532152249661],
 ];
 const BT2020_TO_XYZ: Matrix3 = [
-    [0.636_958, 0.144_616_9, 0.168_881],
-    [0.262_700_2, 0.677_998_1, 0.059_301_7],
-    [0.0, 0.028_072_7, 1.060_985_1],
+    [0.636958048301291, 0.144616903586208, 0.168880975164172],
+    [0.262700212011267, 0.677998071518871, 0.059301716469862],
+    [4.99410657446608e-17, 0.0280726930490874, 1.06098505771079],
 ];
 const DISPLAY_P3_TO_XYZ: Matrix3 = [
-    [0.486_570_95, 0.265_667_7, 0.198_217_29],
-    [0.228_974_57, 0.691_738_55, 0.079_286_91],
-    [0.0, 0.045_113_38, 1.043_944_4],
+    [0.486570948648216, 0.265667693169093, 0.198217285234362],
+    [0.228974564069749, 0.691738521836506, 0.079286914093745],
+    [-3.97207551693349e-17, 0.0451133818589026, 1.04394436890098],
 ];
 const XYZ_TO_BT709: Matrix3 = [
-    [3.240_454_2, -1.537_138_5, -0.498_531_4],
-    [-0.969_266, 1.876_010_8, 0.041_556],
-    [0.055_643_4, -0.204_025_9, 1.057_225_2],
+    [3.24096994190452, -1.53738317757009, -0.498610760293003],
+    [-0.96924363628088, 1.87596750150772, 0.0415550574071756],
+    [0.0556300796969937, -0.203976958888977, 1.05697151424288],
 ];
 const XYZ_TO_BT2020: Matrix3 = [
-    [1.716_651_2, -0.355_670_8, -0.253_366_3],
-    [-0.666_684_4, 1.616_481_2, 0.015_768_5],
-    [0.017_639_9, -0.042_770_6, 0.942_103_1],
+    [1.71665118797127, -0.355670783776392, -0.25336628137366],
+    [-0.666684351832489, 1.61648123663494, 0.0157685458139111],
+    [0.0176398574453108, -0.0427706132578085, 0.942103121235474],
 ];
 const XYZ_TO_DISPLAY_P3: Matrix3 = [
-    [2.493_497, -0.931_383_6, -0.402_710_8],
-    [-0.829_489, 1.762_664, 0.023_624_7],
-    [0.035_845_8, -0.076_172_4, 0.956_884_5],
+    [2.49349691194142, -0.931383617919124, -0.402710784450717],
+    [-0.829488969561575, 1.76266406031835, 0.0236246858419436],
+    [0.0358458302437845, -0.0761723892680418, 0.956884524007687],
 ];
 
-fn primaries_transform(source: RgbPrimaries, target: ColorSpace) -> Result<[[f32; 4]; 3]> {
+pub(crate) fn primaries_transform(
+    source: RgbPrimaries,
+    target: ColorSpace,
+) -> Result<[[f32; 4]; 3]> {
     let source_index = match source {
         RgbPrimaries::Bt709 => 0,
         RgbPrimaries::Bt2020 => 1,
@@ -488,7 +500,7 @@ fn primaries_transform(source: RgbPrimaries, target: ColorSpace) -> Result<[[f32
         let xyz_to_target = [XYZ_TO_BT709, XYZ_TO_BT2020, XYZ_TO_DISPLAY_P3][target_index];
         multiply_matrix3(xyz_to_target, source_to_xyz)
     };
-    Ok(matrix.map(|row| [row[0], row[1], row[2], 0.0]))
+    Ok(matrix.map(|row| [row[0] as f32, row[1] as f32, row[2] as f32, 0.0]))
 }
 
 fn multiply_matrix3(lhs: Matrix3, rhs: Matrix3) -> Matrix3 {

@@ -1421,13 +1421,13 @@ mod tests {
                         1.055 * magnitude.powf(1.0 / 2.4) - 0.055
                     }
                 }),
-                ProtocolTransferFunction::Bt709 => signed_map(value, |magnitude| {
-                    if magnitude <= 0.018 {
-                        4.5 * magnitude
+                ProtocolTransferFunction::Bt709 => {
+                    if value <= 0.018 {
+                        4.5 * value
                     } else {
-                        1.099 * magnitude.powf(0.45) - 0.099
+                        1.099 * value.powf(0.45) - 0.099
                     }
-                }),
+                }
                 ProtocolTransferFunction::Gamma => {
                     signed_map(value, |magnitude| magnitude.powf(gamma))
                 }

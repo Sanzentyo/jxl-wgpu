@@ -160,6 +160,9 @@ fn signed_map(value: f32, map: impl FnOnce(f32) -> f32) -> f32 {
 }
 
 fn display_to_linear(value: f32, transfer: TransferFunction) -> f32 {
+    if transfer == TransferFunction::Bt709 && value <= 0.081 {
+        return value / 4.5;
+    }
     signed_map(value, |value| match transfer {
         TransferFunction::Linear => value,
         TransferFunction::Srgb | TransferFunction::Sycc => {
@@ -225,9 +228,9 @@ fn bt2020_from_linear(value: f32) -> f32 {
 fn to_linear_bt709(space: ColorSpace, linear: [f32; 3]) -> [f32; 3] {
     let source_to_xyz = match space {
         ColorSpace::Bt709 => [
-            [0.412_456_4, 0.357_576_1, 0.180_437_5],
-            [0.212_672_9, 0.715_152_2, 0.072_175],
-            [0.019_333_9, 0.119_192, 0.950_304_1],
+            [0.4123908, 0.3575843, 0.1804808],
+            [0.212_639, 0.7151687, 0.0721923],
+            [0.0193308, 0.1191948, 0.9505322],
         ],
         ColorSpace::Bt2020 => [
             [0.636_958, 0.144_616_9, 0.168_881],
@@ -243,9 +246,9 @@ fn to_linear_bt709(space: ColorSpace, linear: [f32; 3]) -> [f32; 3] {
     };
     let xyz = source_to_xyz.map(|row| row[0] * linear[0] + row[1] * linear[1] + row[2] * linear[2]);
     [
-        [3.240_454_2, -1.537_138_5, -0.498_531_4],
-        [-0.969_266, 1.876_010_8, 0.041_556],
-        [0.055_643_4, -0.204_025_9, 1.057_225_2],
+        [3.240_97, -1.5373832, -0.4986108],
+        [-0.9692436, 1.8759675, 0.0415551],
+        [0.0556301, -0.203_977, 1.0569715],
     ]
     .map(|row| row[0] * xyz[0] + row[1] * xyz[1] + row[2] * xyz[2])
 }

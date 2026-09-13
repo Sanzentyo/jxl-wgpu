@@ -126,7 +126,7 @@ name shown in parentheses.
 | `jxl_wgpu_decode/vardct_raw_matrix.wgsl` | `RawMatrixParams` / `RawMatrixParams` | denominator, raster width/height, target count, then padded four-lane source offsets, source strides, and resident resource target offsets | 64 | 16 | uniform |
 | `jxl_wgpu_decode/codec_engine/composition/blend.wgsl` | `BlendParams` / `Params` | canvas, intersection, source, dispatch, four reference geometry/presence records | 128 | 16 | uniform |
 | `jxl_wgpu_decode/codec_engine/composition/blend.wgsl` | `BlendChannel` / `Channel` | mode, background slot, alpha plane, clamp/association flags, alpha-background slot, three pads | 32 | 16 | read-only storage element |
-| `jxl_wgpu_decode/codec_engine/composition/native.wgsl` | `NativeParams` / `Params` | extent, format, output, source (plane words, first alpha, scalar plane, flags: F32/linear RGB) | 64 | 16 | uniform |
+| `jxl_wgpu_decode/codec_engine/composition/native.wgsl` | `NativeParams` / `Params` | extent, format, output, original transfer/reserved, source (plane words, first alpha, scalar plane, flags: F32/linear-original RGB) | 80 | 16 | uniform |
 | `jxl_wgpu_decode/codec_engine/composition/spot.wgsl` | `SpotColor` | absolute plane word offset and three pads; declared RGBA | 32 | 16 | read-only storage element, presentation binding 7 |
 
 The Modular finalizer has its own 176-byte, 16-byte-aligned `ModularFinalizeParams` uniform at
@@ -431,8 +431,9 @@ Target chroma subsampling averages only valid oriented pixels, then packing quan
 8/10/12/16-bit codes, or writes IEEE 754 F32 RGB components without quantization. RGB storage kinds
 0/1 use `bits = storage_bits = 32` for F32 and 8 for U8. Every invocation still owns one output word;
 byte extraction supports unaligned float plane starts and row pitches. A source fragment supplies
-`source_rgb_at` and linear `source_alpha_at` in output coordinates: unclipped linear BT.709 for XYB or encoded sRGB
-for JPEG; no intermediate RGB allocation or queue submission is added. The requested `ImageLayout`
+`source_rgb_at` and linear `source_alpha_at` in output coordinates: unclipped linear BT.709 for XYB
+or the validated original RGB encoding after JPEG component conversion; no intermediate RGB
+allocation or queue submission is added. The requested `ImageLayout`
 defines output lease bytes, plane gaps, row pitches, and four-byte final storage rounding. Range
 checks stop at the last row payload instead of treating unused row-tail capacity as part of a plane,
 and dispatch padding exits before multiplying a word index into a byte index. The GPU test covers
@@ -744,15 +745,25 @@ Add add, with virtual opaque alpha at presentation. References keep the image-he
 the physical producer requests Preserve, and only final output may change association.
 
 Final packing uses either the shared 192-byte `ImageOutputParams` with planar source overrides or
-the 64-byte, 16-byte-aligned `NativeParams`: output/source extents, channel/depth/row format,
-byte-size/dispatch/orientation/alpha-conversion, then source plane stride, first-alpha plane,
-selected scalar plane and flags at byte 48 (bit 0: F32 output; bit 1: linear RGB source).
-The common packer selects one 192-byte parameter set for the actual source domain; the native
-packer encodes linear RGB to sRGB before association/quantization, leaving extras unchanged.
+the 80-byte, 16-byte-aligned `NativeParams`: output/source extents, channel/depth/row format,
+byte-size/dispatch/orientation/alpha-conversion, original transfer and three reserved words at byte
+48, then source plane stride, first-alpha plane, selected scalar plane and flags at byte 64
+(bit 0: F32 output; bit 1: convert linear-original RGB to original transfer).
+The common packer selects one 192-byte parameter set for the actual original or linear-original
+domain. Native packing applies the original OETF before association/quantization, leaving extras
+unchanged. `image_transfer.wgsl` shares unbounded transfer functions with color output and display;
+BT.709 extends the linear toe below zero. Original Linear never receives an extra OETF.
 Native color and selected extras clamp and round
 once at presentation; scalar F32 preserves extended normalized values without color/alpha
 conversion. One invocation owns one output word including tail padding. Both shaders support 2-D
 linear dispatch and checked u32 byte addressing, buffer/binding sizes and arithmetic overflow.
+
+The private RGB domain carries both primaries and transfer. D65 BT.709/BT.2020/Display-P3 with
+Linear/sRGB/BT.709 are admitted from the image inventory, including original RGB/gray/YCbCr and XYB.
+Composition and reference storage use original encoding; standalone XYB can retain linear-original
+primaries. Primary matrices share one exact D65 chromaticity, are multiplied in host F64 and lowered
+once to F32 uniforms, including display conversion. Component surfaces retain a separate explicit
+tag. Their identity carrier layout never claims that codec components are public linear RGB.
 
 When Render applies to color with spot declarations, either packer also binds a readonly ink table
 at binding 7. Each 32-byte, 16-byte-aligned `SpotColor` stores the absolute plane word offset at

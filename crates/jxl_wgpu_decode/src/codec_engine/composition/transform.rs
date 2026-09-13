@@ -3,7 +3,7 @@
 use std::num::NonZeroU64;
 
 use jxl_gpu_bitstream::{FrameInventory, ImageHeaderInventory};
-use jxl_gpu_protocol::{OutputOrientation, RgbColorEncoding};
+use jxl_gpu_protocol::OutputOrientation;
 use jxl_wgpu::{GpuBufferLease, ResidentStorageBinding, WgpuBackend};
 
 use super::gpu::Surface;
@@ -81,9 +81,10 @@ pub(super) fn convert(
         } else if frame.do_ycbcr {
             ColorOutputTransform::Ycbcr {
                 channel_shifts: Default::default(),
+                encoding: crate::image_color::require_original_encoding(image)?,
             }
         } else {
-            ColorOutputTransform::Rgb(RgbColorEncoding::SRGB_BT709)
+            ColorOutputTransform::Rgb(crate::image_color::require_original_encoding(image)?)
         },
         alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
     };

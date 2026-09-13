@@ -484,7 +484,8 @@ impl WgpuSubmissionEngine {
             .extra_channel()
             .is_none()
             .then_some(profile.color_render.clone())
-            .flatten();
+            .flatten()
+            .filter(|config| !request.uses_original_sample_domain() || !config.is_plain_rgb());
         let color_render = if request.retains_frame_surface()
             && request.frame_surface_encoding()
                 == crate::frame_surface::FrameSurfaceEncoding::Encoded

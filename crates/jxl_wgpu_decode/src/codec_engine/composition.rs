@@ -7,14 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
-use jxl_gpu_bitstream::{
-    CodestreamInventory, ColourEncodingInventory, ColourSpaceInventory, FrameType,
-    PrimariesInventory, TransferFunctionInventory, WhitePointInventory,
-};
-use jxl_gpu_formats::{ImageLayout, PixelFormat, RgbChannelOrder};
-use jxl_gpu_protocol::{
-    ChangedRegions, Extent2d, OutputId, OutputOrientation, Region, SubmissionToken,
-};
+use jxl_gpu_bitstream::{CodestreamInventory, FrameType};
+use jxl_gpu_formats::ImageLayout;
+use jxl_gpu_protocol::{ChangedRegions, Extent2d, OutputId, Region, SubmissionToken};
 use jxl_wgpu::{
     GpuImageFrame, GpuImageOutput, UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput,
 };
@@ -26,7 +21,7 @@ use crate::progressive_dc::ProgressiveDcXybPlanes;
 use crate::{
     Error, FrameExecutionPlan, FrameMetadata, FramePlanError, FrameProgression, GpuCodestream,
     GpuOutputRequest, GpuPendingFrame, GpuSubmissionSession, Result, SubmittedGpuFrame,
-    SubmittedGpuUpdate, UnsupportedCodestreamFeature, UnsupportedProfile,
+    SubmittedGpuUpdate,
 };
 
 mod blend;
@@ -72,6 +67,9 @@ pub(super) fn needs_surface(
                 && matches!(spec.transfer, TransferFunction::Srgb | TransferFunction::Sycc
                     | TransferFunction::Linear | TransferFunction::Bt709 | TransferFunction::Bt2020));
     let image = &inventory.image_header;
+    let original_conversion = !request.uses_original_sample_domain()
+        && crate::image_color::original_encoding(image)
+            != Some(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709);
     let native = crate::model::native_modular_format(request.format());
     let direct_integer = native.is_some_and(|format| {
         image.bit_depth
@@ -82,10 +80,12 @@ pub(super) fn needs_surface(
     let source_conversion = match image.bit_depth {
         jxl_gpu_bitstream::SampleBitDepth::Float { .. } => !direct_float,
         jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample } => {
-            bits_per_sample > 16 && !direct_float && !direct_integer
+            (native.is_some() && !direct_integer)
+                || (bits_per_sample > 16 && !direct_float && !direct_integer)
         }
     };
-    let wide_vardct_output = native.is_some_and(|format| format.bits_per_sample > 16)
+    let native_vardct_output = native.is_some()
+        && classify_pixel_format(request.format()).is_err()
         && inventory
             .frames
             .iter()
@@ -111,10 +111,11 @@ pub(super) fn needs_surface(
             .frames
             .iter()
             .any(|frame| frame.encoding == jxl_gpu_bitstream::FrameEncoding::VarDct);
-    modular_rendering
+    original_conversion
+        || modular_rendering
         || inventory.frames.iter().any(|frame| frame.flags & 0x12 != 0)
         || numeric_vardct_color
-        || ((source_conversion || wide_vardct_output)
+        || ((source_conversion || native_vardct_output)
             && request.mapping() == crate::GpuOutputMapping::Color)
         || request.renders_spot_colors(&inventory.image_header.extra_channels)
         || plan.nodes.iter().any(|node| node.needs_composition)
@@ -390,7 +391,7 @@ impl DependentSession {
         {
             let working;
             let request = if matches!(output, Output::Composed(_)) {
-                working = GpuOutputRequest::color(FrameSurfaceEncoding::Srgb.format())?
+                working = GpuOutputRequest::color(FrameSurfaceEncoding::SRGB.format())?
                     .with_orientation_policy(crate::OrientationPolicy::Keep);
                 &working
             } else {
@@ -539,25 +540,15 @@ fn composed_source(
         )
         .into());
     }
-    let working = GpuOutputRequest::color(PixelFormat::rgb_f32(
-        RgbChannelOrder::Rgb,
-        true,
-        crate::vardct_rgb8_format().color_spec,
-    ))?
-    .for_frame_surface(FrameSurfaceEncoding::Srgb)
-    .with_progressive_output(request.progressive_output())
-    .with_max_frame_slots(request.max_frame_slots());
+    let original = FrameSurfaceEncoding::Rgb(crate::image_color::require_original_encoding(image)?);
+    let working = GpuOutputRequest::color(original.format())?
+        .for_frame_surface(original)
+        .with_progressive_output(request.progressive_output())
+        .with_max_frame_slots(request.max_frame_slots());
     let compositor = Arc::new(Compositor::new(
         engine.backend().clone(),
         Extent2d::new(image.width, image.height),
-        &image.extra_channels,
-        image.grayscale,
-        image.bit_depth,
-        OutputOrientation::from_exif_value(image.orientation).ok_or(
-            Error::InvalidImageOrientation {
-                value: image.orientation,
-            },
-        )?,
+        image,
         request,
     )?);
     let source = SequenceSource {
@@ -573,12 +564,13 @@ fn composed_source(
                     if frame.flags & 0x12 != 0
                         || (node.save_reference.is_some() && frame.save_before_color_transform)
                     {
-                        FrameSurfaceEncoding::Encoded
+                        Ok(FrameSurfaceEncoding::Encoded)
                     } else {
                         presentation_encoding(image, node, frame)
                     }
                 })
-                .collect(),
+                .collect::<Result<Vec<_>>>()?
+                .into(),
         ),
     };
     Ok((source, compositor))
@@ -588,37 +580,24 @@ fn presentation_encoding(
     image: &jxl_gpu_bitstream::ImageHeaderInventory,
     node: &crate::FrameExecutionNode,
     frame: &jxl_gpu_bitstream::FrameInventory,
-) -> FrameSurfaceEncoding {
+) -> Result<FrameSurfaceEncoding> {
+    let original = crate::image_color::require_original_encoding(image)?;
     if image.xyb_encoded
         && !frame.do_ycbcr
         && !node.needs_composition
         && (node.save_reference.is_none() || frame.save_before_color_transform)
     {
-        FrameSurfaceEncoding::Linear
+        Ok(FrameSurfaceEncoding::Rgb(
+            crate::image_color::linear_encoding(original),
+        ))
     } else {
-        FrameSurfaceEncoding::Srgb
+        Ok(FrameSurfaceEncoding::Rgb(original))
     }
 }
 
 fn validate(inventory: &CodestreamInventory, plan: &FrameExecutionPlan) -> Result<()> {
     let image = &inventory.image_header;
-    if !matches!(
-        image.colour_encoding,
-        ColourEncodingInventory::Enumerated {
-            colour_space: ColourSpaceInventory::Grey | ColourSpaceInventory::Rgb,
-            white_point: WhitePointInventory::D65,
-            primaries: PrimariesInventory::Srgb,
-            transfer_function: TransferFunctionInventory::Srgb,
-            ..
-        }
-    ) || image.embedded_icc.is_some()
-    {
-        return Err(UnsupportedProfile::new(
-            UnsupportedCodestreamFeature::ColorEncoding,
-            "frame composition requires the original enumerated D65 sRGB encoding",
-        )
-        .into());
-    }
+    crate::image_color::require_original_encoding(image)?;
     for (node, frame) in plan.nodes.iter().zip(&inventory.frames) {
         if frame.flags & 2 != 0 && frame.upsampling != 1 {
             for (channel, &factor) in frame.extra_channel_upsampling.iter().enumerate() {
@@ -1194,7 +1173,7 @@ impl DependentPending {
         if self.physical + 1 != self.end && frame.save_before_color_transform {
             return self.advance();
         }
-        let encoding = presentation_encoding(&carry.source.inventory.image_header, node, frame);
+        let encoding = presentation_encoding(&carry.source.inventory.image_header, node, frame)?;
         let work = transform::convert(
             carry.source.engine.backend(),
             &surface,
@@ -1831,7 +1810,8 @@ impl DependentPending {
         let node = &self.nodes[index - self.first];
         let frame = &carry.source.inventory.frames[index];
         let render = if surface.encoding == FrameSurfaceEncoding::Encoded {
-            let encoding = presentation_encoding(&carry.source.inventory.image_header, node, frame);
+            let encoding =
+                presentation_encoding(&carry.source.inventory.image_header, node, frame)?;
             RefinementRender::Transform {
                 work: transform::convert(
                     carry.source.engine.backend(),
