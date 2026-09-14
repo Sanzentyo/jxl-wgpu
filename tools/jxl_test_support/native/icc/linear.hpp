@@ -100,7 +100,8 @@ inline scalar::References Reference(const scalar::Profile& profile, const Linear
 }
 
 inline std::vector<float> Native(cmsHPROFILE profile, const LinearSpace& space,
-                                  const std::vector<float>& input, bool to_linear) {
+                                  const std::vector<float>& input, bool to_linear,
+                                  unsigned intent = INTENT_RELATIVE_COLORIMETRIC) {
   const size_t channels = cmsGetColorSpace(profile) == cmsSigGrayData ? 1 : 3;
   const size_t pixels = input.size() / (to_linear ? channels : 3);
   const cmsUInt32Number format = channels == 1 ? TYPE_GRAY_FLT : TYPE_RGB_FLT;
@@ -109,7 +110,7 @@ inline std::vector<float> Native(cmsHPROFILE profile, const LinearSpace& space,
   const std::unique_ptr<void, decltype(&cmsDeleteTransform)> transform(
       cmsCreateTransform(to_linear ? profile : xyz.get(), to_linear ? format : TYPE_XYZ_DBL,
                          to_linear ? xyz.get() : profile, to_linear ? TYPE_XYZ_DBL : format,
-                         INTENT_RELATIVE_COLORIMETRIC, cmsFLAGS_NOOPTIMIZE | cmsFLAGS_NOCACHE), cmsDeleteTransform);
+                         intent, cmsFLAGS_NOOPTIMIZE | cmsFLAGS_NOCACHE), cmsDeleteTransform);
   if (!transform) throw std::runtime_error("create native linear connection");
   const Matrix matrix = to_linear ? scalar::Invert(space.ToPcs()) : space.ToPcs();
   std::vector<double> intermediate(pixels * 3);

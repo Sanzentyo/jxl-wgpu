@@ -18,6 +18,7 @@ use wgpu::util::DeviceExt;
 
 mod analytic;
 mod connection;
+mod intents;
 mod metadata;
 
 #[derive(Deserialize)]

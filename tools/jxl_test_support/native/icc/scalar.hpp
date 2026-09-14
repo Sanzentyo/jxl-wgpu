@@ -56,33 +56,43 @@ struct Curve {
     const bool terminal = y == Forward(1.0);
     double best_x = 0;
     double best_error = std::numeric_limits<double>::infinity();
-    auto candidate = [&](double x) {
+    auto candidate = [&](double x, double attained) {
       x = std::clamp(x, 0.0, 1.0);
-      const double error = std::abs(Forward(x) - y);
+      const double error = std::abs(attained - y);
       if (error < best_error || (error == best_error && (terminal ? x < best_x : x > best_x))) {
         best_x = x; best_error = error;
       }
     };
-    candidate(0); candidate(1);
+    const auto endpoint = [&](double x) { candidate(x, Forward(x)); };
+    // An analytical root attains y by construction. Re-evaluating it can round
+    // just below y and incorrectly prefer a distant endpoint with zero residual,
+    // notably x=1 over the first point of a clipped terminal plateau (Annex F.1).
+    const auto root = [&](double x, double lower, double upper) {
+      if (x >= lower && x <= upper) candidate(x, y);
+    };
+    endpoint(0); endpoint(1);
     if (type == 0) {
       const double scale = static_cast<double>(samples.size() - 1);
       for (size_t i = 0; i + 1 < samples.size(); ++i) {
-        candidate(i / scale); candidate((i + 1) / scale);
+        endpoint(i / scale); endpoint((i + 1) / scale);
         if (samples[i + 1] > samples[i]) {
-          const double t = std::clamp((y - samples[i]) / (samples[i + 1] - samples[i]), 0.0, 1.0);
-          candidate((i + t) / scale);
+          const double attained = std::clamp(y, samples[i], samples[i + 1]);
+          const double t = (attained - samples[i]) / (samples[i + 1] - samples[i]);
+          candidate((i + t) / scale, attained);
         }
       }
-    } else if (type == 1) candidate(std::pow(y, 1.0 / p[0]));
+    } else if (type == 1) root(std::pow(y, 1.0 / p[0]), 0, 1);
     else {
-      const double split = std::clamp(type <= 3 ? -p[2] / p[1] : p[4], 0.0, 1.0);
-      candidate(split);
-      if (split > 0) candidate(std::nextafter(split, 0.0));
+      const double branch = type <= 3 ? -p[2] / p[1] : p[4];
+      const double split = std::clamp(branch, 0.0, 1.0);
+      endpoint(split);
+      if (split > 0) endpoint(std::nextafter(split, 0.0));
       const double offset = type == 3 ? p[3] : (type == 5 ? p[5] : 0.0);
-      candidate(std::clamp((std::pow(std::max(0.0, y - offset), 1.0 / p[0]) - p[2]) / p[1], split, 1.0));
+      if (branch <= 1 && y >= offset)
+        root((std::pow(y - offset, 1.0 / p[0]) - p[2]) / p[1], split, 1);
       if (type >= 4 && p[3] > 0 && split > 0) {
         const double lower_offset = type == 5 ? p[6] : 0.0;
-        candidate(std::clamp((y - lower_offset) / p[3], 0.0, std::nextafter(split, 0.0)));
+        root((y - lower_offset) / p[3], 0, branch > 1 ? 1 : std::nextafter(split, 0.0));
       }
     }
     return best_x;

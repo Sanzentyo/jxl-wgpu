@@ -647,8 +647,10 @@ extended values; conversion returns its actual layout along with its buffer.
 For these inputs, requested enumerated SDR output and other RGB/Gray matrix/TRC profiles execute
 the resident ICC pipeline. The original profile is parsed once per selected image and its selected
 GPU program uploads lazily once, with exact budget admission, retry and completion ownership.
-`with_icc_rendering_intent` defaults to relative colorimetric; other intents and non-Bradford
-conversion currently return typed errors. Same-profile U8/F32 planar/interleaved Gray/RGB output
+`with_icc_rendering_intent` defaults to relative colorimetric and executes all four matrix/TRC
+intents, including absolute media-white scaling and v4 perceptual/saturation black compensation.
+Non-Bradford conversion and unsupported selected LUT/MPE methods return typed errors.
+Same-profile U8/F32 planar/interleaved Gray/RGB output
 performs only packing, orientation and requested alpha association, with no CMS curve evaluation.
 F32 with preserved association retains the existing Modular IEEE words, including nonfinite values,
 when no inverse YCbCr arithmetic is required.
@@ -677,7 +679,7 @@ both output layouts and whole/fragmented input. A selection registry shares one 
 across reconstruction and presentation, with exact-budget cancellation coverage.
 
 Broader ICC XYB alpha/crop/reference conformance, enumerated-source-to-ICC conversion, spot-ink rendering, LUT/MPE,
-CMYK, full intents, HDR luminance mapping and standalone codec color admission remain open.
+CMYK, broader ICC intent/gamut policies, HDR luminance mapping and standalone codec color admission remain open.
 Numeric and extra-channel bypasses keep their existing independent contracts.
 
 `tests/original_color` covers 228 streams with independent native references: integer/F32, gray/RGBA,

@@ -1312,8 +1312,11 @@ while the generic BT.709 color space retains the standard CIE coordinates.
 
 ## Resident ICC matrix/TRC records
 
-The reusable ICC metadata buffer contains an 80-byte header (three F32 matrix rows, source and
-target curve offsets) and one 48-byte record per distinct curve. Each sampled curve appends its
+The reusable ICC metadata buffer contains an 80-byte header (three F32 affine matrix rows, source and
+target curve offsets) and one 48-byte record per distinct curve. Each matrix row's fourth word
+stores its F32 offset; the shader adds it after the three-component dot product. Media-white
+scaling and black compensation are combined in f64 before this single lowering. The header,
+bindings and byte accounting do not grow. Each sampled curve appends its
 exact u16 entries as u32 words; offsets are checked u32 word indices. Sample coordinates use an
 exact u32 significand product split into two words before fractional-weight conversion, so large
 tables do not lose their interpolation position to an F32 multiplication. Parametric records preserve

@@ -7,7 +7,7 @@ use jxl_wgpu::WgpuBackend;
 use jxl_wgpu_decode::{AlphaOutputPolicy, GpuDecoder, GpuOutputRequest, WgpuDecodeEngine};
 use std::num::NonZeroU64;
 
-fn reference(case: corpus::Case, kind: &str) -> Vec<u32> {
+pub(super) fn reference(case: corpus::Case, kind: &str) -> Vec<u32> {
     jxl_test_support::offline::unhex(
         &std::fs::read_to_string(
             corpus::directory().join(format!("{}.{kind}.f32.hex", case.name())),
@@ -267,28 +267,12 @@ fn same_icc_device_output_preserves_ieee_words_without_selecting_a_cms_method() 
 }
 
 #[test]
-fn icc_conversion_rejects_unimplemented_intent_and_adaptation_before_submission() {
-    use jxl_gpu_protocol::{
-        WhitePointAdaptation,
-        icc::{IccError, IccRenderingIntent},
-    };
+fn icc_conversion_rejects_non_bradford_adaptation_before_submission() {
+    use jxl_gpu_protocol::WhitePointAdaptation;
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
     let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     for case in corpus::cases().filter(|case| !case.xyb) {
         let request = GpuOutputRequest::color(jxl_wgpu_decode::vardct_rgb8_format()).unwrap();
-        for intent in [
-            IccRenderingIntent::Perceptual,
-            IccRenderingIntent::Saturation,
-            IccRenderingIntent::Absolute,
-        ] {
-            assert!(
-                matches!(decoder.open(&case.bytes(), request.clone().with_icc_rendering_intent(intent)), Err(jxl_wgpu_decode::Error::Icc(IccError::RenderingIntent { intent: selected })) if selected == intent)
-            );
-            assert_eq!(
-                backend.transient_memory_budget().snapshot().reserved_bytes,
-                0
-            );
-        }
         assert!(matches!(
             decoder.open(
                 &case.bytes(),

@@ -15,8 +15,9 @@ pixel, coefficient, restoration, color, packing, and display work executes in WG
 operations, layouts, precision contracts, and device limits return typed errors before an output
 is authoritative.
 
-`ResidentIccProgram` and `ResidentIccPipeline` execute relative colorimetric RGB/Gray ICC
-matrix/TRC conversion on resident planar F32 channels. A checked profile retains exact colorants,
+`ResidentIccProgram` and `ResidentIccPipeline` execute all four RGB/Gray ICC matrix/TRC intents
+on resident planar F32 channels, including absolute media white and v4 perceptual/saturation
+black compensation. A checked profile retains exact colorants,
 independent curves and original ICC bytes; LUT precedence is never silently bypassed. The
 same program connects profiles to unbounded linear RGB using shared f64 CIE/Bradford metadata
 before one F32 lowering; signed and above-one linear values remain intact. Owned ICC pixel

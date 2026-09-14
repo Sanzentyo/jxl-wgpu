@@ -7,7 +7,11 @@ pub(super) fn lower_program(
     let curves = unique_curves(transform);
     let mut header = ProgramHeader::zeroed();
     for (r, row) in transform.matrix().iter().enumerate() {
-        for (c, value) in row.iter().enumerate() {
+        for (c, value) in row
+            .iter()
+            .chain(std::iter::once(&transform.offset()[r]))
+            .enumerate()
+        {
             header.matrix[r][c] = *value as f32;
             if !header.matrix[r][c].is_finite() {
                 return Err(ResidentIccError::Precision);

@@ -79,7 +79,7 @@ selected extra channels through Modular and VarDCT in the supported single-frame
 [eight-stream native corpus](crates/jxl_wgpu_decode/test-data/embedded_icc_generator/README.md)
 checks exact numeric words through complete and fragmented input. The common decoder also handles
 ICC RGB/Gray color surfaces, including XYB and YCbCr reconstruction, original-domain reference composition,
-relative matrix/TRC conversion to enumerated SDR or another ICC profile, and U8/F32 device packing.
+all four matrix/TRC intents for conversion to enumerated SDR or another ICC profile, and U8/F32 device packing.
 Same-profile output preserves device values without evaluating curves. Programs are shared per
 selected image and accounted through GPU completion. ICC YCbCr has 146 source cases covering
 sampling, precision, restoration, resampling and both-codec composition; separate independently
@@ -90,6 +90,9 @@ four additive sequences and seven LF/patch substitutions check this boundary; se
 A further 48 alpha sequences cover all five blend modes, both associations and independently
 selected background alpha. Identical reconstruction/presentation connections share one accounted
 GPU program, including when cancellation outlives the image context.
+An additional 3,744 ICC/linear connections check white-point and black-point intent policies
+against native and independent references. Public decoder tests cover all four intents on
+original/XYB RGB/Gray in 768 whole/fragmented planar/interleaved presentations.
 Broader ICC XYB conformance, enumerated sources targeting ICC, spot rendering, LUT/CMYK and full
 intent/HDR policies remain incomplete.
 

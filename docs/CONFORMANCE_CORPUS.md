@@ -4026,3 +4026,28 @@ immutable held buffers are checked through the public decoder. A separate alloca
 leaves no room for a duplicate reconstruction/presentation program and verifies cancellation
 retains and releases the shared reservation once. Full ICC conformance remains open; see the
 [generator and precision contract](../crates/jxl_wgpu_decode/test-data/embedded_icc_xyb_generator/README.md).
+
+## Matrix/TRC rendering intents through resident and decoder APIs
+
+`crates/jxl_wgpu/test-data/icc/intents` adds 26 exact native RGB/Gray v2/v4 profiles, all 2,704
+ordered profile/intent connections and 1,040 bidirectional linear RGB connections. Every one of
+the 1,225,224 additional resident output components is checked against independent f64 curves,
+CIE/Bradford geometry and PCS affine policy. Relative, absolute media white and v4
+perceptual/saturation black compensation are distinct where applicable. Signed and above-one
+linear values remain unbounded. Native boundary masks preserve observed values and never skip
+the primary GPU assertion. [Generation and masks](../crates/jxl_wgpu/test-data/icc_generator/README.md).
+
+A further 192 references connect the eight existing original/XYB RGB/Gray streams to six profiles
+with tinted media white, nonzero/chromatic black and legacy v2 policy. Decoder tests execute 768
+planar/interleaved, whole/fragmented presentations. They preserve alpha and held outputs, check
+budget release, and propagate the existing codec bounds through independent curve/affine error
+boxes. Applicable non-relative intervals must differ from relative; merely selecting an enum is
+insufficient. Metadata-only MPE fixtures ensure that a higher-priority selected method still
+fails before allocation and that direct XYB never evaluates an unused original-profile method.
+
+The independent scalar inverse now ranks analytical roots by their solved values. A sub-ULP
+forward re-evaluation residual previously selected x=1 over a clipped plateau's first point in
+154 newly generated intent records. The generator checks 31 exact offset cases. The change keeps
+all 1,015 pre-existing resident/embedded/YCbCr/XYB/alpha files byte-identical and leaves all GPU
+precision bounds unchanged. Matrix/TRC intents do not complete LUT/MPE/Lab/CMYK, gamut mapping,
+HDR luminance or the full JPEG XL conformance gates.

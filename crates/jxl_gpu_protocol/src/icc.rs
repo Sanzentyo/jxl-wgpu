@@ -107,8 +107,6 @@ pub enum IccError {
         field: &'static str,
         signature: IccSignature,
     },
-    #[error("ICC rendering intent {intent:?} is not implemented")]
-    RenderingIntent { intent: IccRenderingIntent },
     #[error("ICC transform selects {tag}; its execution is not implemented")]
     TransformTag { tag: IccSignature },
     #[error("ICC tag {tag} has invalid curve parameters")]

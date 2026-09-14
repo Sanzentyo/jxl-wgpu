@@ -5,8 +5,8 @@ JPEG XL decoding now admits embedded ICC for unfiltered original Modular numeric
 independent extra-channel output in the supported single-frame paths through both codecs. Codec
 reconstruction and LF configuration are independent of color conversion. The common decoder now
 also handles original and XYB ICC RGB/Gray color surfaces, including YCbCr reconstruction,
-original-domain references and composition, relative matrix/TRC conversion and U8/F32 requested output.
-Broader ICC XYB conformance, enumerated-source-to-ICC conversion, spot rendering, full intents
+original-domain references and composition, all four matrix/TRC intents and U8/F32 requested output.
+Broader ICC XYB conformance, enumerated-source-to-ICC conversion, spot rendering, other ICC methods
 and HDR mapping remain open.
 This checkpoint does not change the full JPEG XL support claim.
 
@@ -61,7 +61,7 @@ upload is lazy, budgeted and retryable; each dispatch retains its uploaded progr
 completion even if the image session is dropped. Intermediate color surfaces, unchanged extra
 planes, output words, the 80-byte ICC uniform and 208-byte packing uniform are all accounted.
 No frame readback or CPU pixel CMS is involved. `GpuOutputRequest::with_icc_rendering_intent`
-defaults to relative colorimetric; non-Bradford conversion and unimplemented intents return errors.
+defaults to relative colorimetric; non-Bradford conversion and unsupported selected methods return errors.
 Exact same-profile packing does not select a CMS method and therefore does not require an
 executable matrix/TRC or inverse curve.
 
@@ -83,9 +83,24 @@ evaluations checks the mathematical domain of parametric curves and monotonicity
 `IccProfile::matrix_trc` selects a direction and explicit intent. Higher-priority DToB/BToD or
 AToB/BToA tags produce a typed unsupported error, including the perceptual-LUT fallback when the
 requested LUT is absent. They are never silently discarded in favour of colorants/TRCs.
-Only media-relative colorimetric intent is executed at this checkpoint. RGB input/display and
+All four rendering intents execute for matrix/TRC connections. RGB input/display and
 monochrome input/display/output classes with XYZ PCS are supported. Lab, CMYK, other profile
-classes, LUTs, absolute/perceptual/saturation policies and black-point compensation remain open.
+classes, LUT/MPE execution and broader gamut/HDR policies remain open.
+
+Relative intent connects the profiles in media-relative PCS. Absolute intent uses fully adapted
+media-white scaling, `source_white / target_white`, between the original PCS matrices. V2 display
+profiles use PCS D50 as their effective media white, as required for their legacy display policy;
+other profiles retain their exact `wtpt`. Perceptual and saturation matrix-shaper intent use black
+compensation when the target is v4. Their PCS affine connection preserves D50 and maps source
+black to target black: `scale = (D50 - target_black) / (D50 - source_black)` and
+`offset = target_black - scale * source_black`. V2 targets do not enable this automatic compensation.
+This is a declared matrix-shaper CMM policy, not a substitute for profile-supplied gamut mapping.
+
+Black is obtained by evaluating at most three curve endpoints and the profile's colorant matrix.
+The CMM darker-colorant policy clips Lab L* to 0–50, resets L* above 95 to zero, and retains a*/b*.
+The policy uses decimal PCS D50 `(0.9642, 1, 0.8249)`; encoded colorants and RGB connection geometry
+remain unchanged. No CPU image pixels are evaluated. The resulting affine offset is transformed
+into the target's linear coordinates and occupies the existing matrix rows' fourth F32 lanes.
 
 Matrix columns retain the exact signed fixed-point values, represented losslessly in host f64.
 Media white and chromatic adaptation retain their original signed integer records. ICC colorants
@@ -115,6 +130,8 @@ and 1,000,003 irregular samples, subnormal/near-zero coordinates and exact endpo
 curves from three unbounded linear RGB components. Relative colorimetric intent uses Bradford
 between the RGB reference white and ICC's exact encoded PCS D50. Colorants are connected directly
 in f64; no synthetic quantized profile or approximation by recognized primaries is introduced.
+All intents treat this linear endpoint as an ideal, fully adapted v4 endpoint with PCS D50 white
+and zero black. The same media-white and black-compensation rules therefore work in both directions.
 
 `ColorMatrix` in the backend-neutral protocol owns the shared CIE geometry and white adaptation
 calculation. Existing RGB output/display lower this same implementation to F32. ICC connections
@@ -163,7 +180,7 @@ to apply ICC.1:2022. It shares no parser, matrix inversion or GPU binary-search 
 with the production code. Every component is checked against this independent reference.
 
 Before the inverse curve, the F32 uncertainty is `4e-7 * (1 + magnitude + coefficient_sum)`, where
-`magnitude = sum(abs(matrix[c] * linear[c]))` and `coefficient_sum = sum(abs(matrix[c]))`.
+`magnitude = abs(offset) + sum(abs(matrix[c] * linear[c]))` and `coefficient_sum = sum(abs(matrix[c]))`.
 The independently evaluated inverse at both ends of this interval, plus `2e-7` output rounding,
 forms the acceptance interval. This expresses steep/flat curve conditioning without pretending
 that a fixed output-code error is meaningful everywhere. In the current corpus the largest
@@ -201,6 +218,40 @@ and 294 above-one output components outside a 1e-4 boundary margin. Native seman
 documented masks and still pass every primary scalar/GPU assertion. The original 121 corpus
 files remain byte-identical. The complete corpus now has 223 files and 358,530 checked components.
 
+## Matrix/TRC rendering-intent evidence
+
+The `intents` corpus adds 26 RGB/Gray v2/v4 profiles and 2,704 ordered profile/intent connections,
+with 827,424 output components. It covers tinted input media whites, legacy v2 display white,
+sampled black levels including Lab lightness above 50 and 95, chromatic black, and parametric
+offsets/clipped plateaus. A further 1,040 bidirectional connections to all five linear spaces check
+397,800 components, including signed and above-one RGB. Every GPU component uses the same
+independent pre-inverse precision interval; native precision never relaxes it.
+
+In addition to the original two native boundary masks, bit 2 marks the native inverse's
+extrapolation past a unit-range endpoint (including its existing native uncertainty); bit 3 marks
+native forward evaluation omitting unit-range clipping; bit 4 marks black compensation affected
+by Little CMS dropping the type-3 offset at a zero power base. Native values are retained in every
+record. Profile pairs have 767,812 unmarked native components; linear pairs have 378,914. Every
+marked component still undergoes the full primary scalar/GPU check. ICC.1:2022 section 10.18
+requires parametric function domain and range clipping to [0,1].
+
+The independent analytical inverse scores a valid root by its solved value rather than a rounded
+forward re-evaluation. Otherwise a one-ULP residual could incorrectly prefer x=1 over the first
+point of a clipped final plateau. Generator regressions cover 31 offsets. All 1,015 pre-existing
+resident/embedded/YCbCr/XYB/alpha reference files remain unchanged under their documented build flags.
+
+Decoder references add 192 original/XYB-to-ICC connections from the eight existing native streams
+to six targets with different media white, nonzero/chromatic black and v2 policy. The old source
+bounds are propagated through all source-box corners: original Modular is exact, original VarDCT
+uses 2e-5, and native XYB uses `(1 + abs(linear)) / 1024`. Tests check 768 presentations across both
+layouts and whole/fragmented input, unchanged alpha, held outputs and final budget release. The
+independent intervals also distinguish each non-relative intent from relative in applicable cases.
+Selected MPE rejection and unused-original-method bypass tests retain their original protection.
+
 The normative references are [ICC.1:2022](https://www.color.org/specification/ICC.1-2022-05.pdf),
 sections 7, 8.10, 10.6, 10.18 and Annex F. The observed native boundaries follow Little CMS 2.19
 [`cmsgamma.c`](https://github.com/mm2/Little-CMS/blob/lcms2.19/src/cmsgamma.c), cases 3 and -2.
+The declared matrix-shaper CMM connection policy is independently checked against Little CMS 2.19
+[`cmscnvrt.c`](https://github.com/mm2/Little-CMS/blob/lcms2.19/src/cmscnvrt.c),
+[`cmssamp.c`](https://github.com/mm2/Little-CMS/blob/lcms2.19/src/cmssamp.c) and
+[`cmsio1.c`](https://github.com/mm2/Little-CMS/blob/lcms2.19/src/cmsio1.c).

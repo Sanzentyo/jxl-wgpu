@@ -35,7 +35,7 @@ c++ -std=c++17 -Wall -Wextra -Werror \
   crates/jxl_wgpu/test-data/icc_generator/main.cpp \
   $(pkg-config --cflags --libs lcms2) -o .git/icc-regenerate/generator
 .git/icc-regenerate/generator .git/icc-regenerate/corpus
-diff -rq crates/jxl_wgpu/test-data/icc .git/icc-regenerate/corpus
+diff -rq -x intents crates/jxl_wgpu/test-data/icc .git/icc-regenerate/corpus
 cargo test -p jxl_wgpu --test icc -- --test-threads=1
 ```
 
@@ -57,3 +57,42 @@ All 182,410 additional components have primary scalar intervals and native refer
 same precision and semantics-mask policy. The generator still reproduces every original file
 byte for byte; the complete corpus contains 223 files. The build/regeneration command above
 reproduces both parts together.
+
+## All matrix/TRC rendering intents
+
+`intents.cpp` uses the same pinned Little CMS 2.19, with independent metadata equations in
+`tools/jxl_test_support/native/icc/intents.hpp`. Its 26 profiles cover RGB/Gray, v2.4/v4.4,
+tinted input media whites, legacy display white, nonzero sampled/chromatic black, high-Lab
+black and parametric clipped/offset boundaries. All 2,704 profile/intent pairs and 1,040
+bidirectional linear RGB connections use the existing independent precision intervals.
+The five linear-space declarations remain in `../icc/linear/manifest.json`.
+
+The additional 192 decoder references read the existing embedded native device/alpha and XYB
+linear files. Six requested profiles exercise white scaling, v4 black compensation and v2
+policy through all four intents. Source precision is propagated through every error-box corner;
+no new fixed output tolerance is introduced. The generator never reads GPU-produced pixels.
+
+From the workspace root:
+
+```sh
+c++ -std=c++17 -Wall -Wextra -Werror -ffp-contract=off \
+  -Itools/jxl_test_support/native \
+  crates/jxl_wgpu/test-data/icc_generator/intents.cpp \
+  $(pkg-config --cflags --libs lcms2) -o .git/icc-regenerate/intents
+.git/icc-regenerate/intents crates/jxl_wgpu_decode/test-data/embedded_icc \
+  .git/icc-regenerate/intents-corpus
+diff -rq crates/jxl_wgpu/test-data/icc/intents .git/icc-regenerate/intents-corpus
+```
+
+The output directory must be new. Its 3,990 files contain 26 profiles, 26 profile inputs, a
+manifest, 2,704 profile-pair records, 1,040 linear-connection records and one linear input,
+plus 192 decoder records. Every record retains the original seven-field layout. Additional
+native masks are bit 2 (inverse endpoint extrapolation), bit 3 (forward range clipping) and
+bit 4 (the known zero-base offset error affecting black metadata). Every GPU component is
+still checked against its primary independent interval. See the execution contract for details.
+
+The analytical inverse's clipped-endpoint regression covers 31 exact offset curves. Re-evaluating
+an analytical root in floating point must not discard it in favour of a distant endpoint.
+All 223 original files and all 792 earlier embedded/YCbCr/XYB/alpha files reproduce unchanged
+under their respective documented compiler options. In particular, retain the original generator's
+compiler contraction setting: `linear/input.f32le` itself contains multiply/subtract probes.

@@ -226,7 +226,9 @@ fn original_reconstruction_and_linear_presentation_share_one_program_admission()
 
 #[test]
 fn direct_xyb_never_selects_an_unused_original_profile_intent() {
-    use jxl_gpu_protocol::icc::{IccError, IccRenderingIntent};
+    use jxl_gpu_protocol::icc::{
+        IccDirection, IccError, IccProfile, IccRenderingIntent, IccSignature,
+    };
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
     for case in jxl_test_support::fixtures::embedded_icc::cases().filter(|case| case.xyb) {
         let data = case.bytes();
@@ -242,7 +244,13 @@ fn direct_xyb_never_selects_an_unused_original_profile_intent() {
             let mut image = inventory.image_header.clone();
             let mut profile = case.profile();
             profile[64..68].copy_from_slice(&code.to_be_bytes());
-            image.embedded_icc.as_mut().unwrap().profile = profile.into();
+            let profile = IccProfile::parse(profile.into(), Default::default()).unwrap();
+            let profile = jxl_test_support::fixtures::icc::with_matrix_mpe(
+                &profile,
+                IccDirection::PcsToDevice,
+                intent,
+            );
+            image.embedded_icc.as_mut().unwrap().profile = profile.bytes().clone();
             let linear =
                 FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709);
             let request = GpuOutputRequest::color(linear.format()).unwrap();
@@ -271,7 +279,7 @@ fn direct_xyb_never_selects_an_unused_original_profile_intent() {
             drop(compositor.pack(&reconstructed).unwrap().wait().unwrap());
             assert!(
                 matches!(Compositor::new(backend.clone(), extent, &image, &request, ColorUsage::ORIGINAL),
-                Err(Error::Icc(IccError::RenderingIntent { intent: actual })) if actual == intent)
+                Err(Error::Icc(IccError::TransformTag { tag })) if tag == IccSignature([b'B', b'2', b'D', b'0' + code as u8]))
             );
             drop(reconstructed);
             drop(source);

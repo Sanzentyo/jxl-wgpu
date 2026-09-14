@@ -173,7 +173,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var channel = 0u; channel < params.extent_channels.w; channel++) {
         let base = channel * 4u;
         let row = vec3<f32>(bitcast<f32>(program[base]), bitcast<f32>(program[base + 1u]), bitcast<f32>(program[base + 2u]));
-        var value = dot(row, linear);
+        var value = dot(row, linear) + bitcast<f32>(program[base + 3u]);
         if program[19u] == 0u { value = inverse_curve(program[16u + channel], value); }
         output[params.output_offsets[channel] + id.y * params.output_strides[channel] + id.x] = value;
     }

@@ -124,10 +124,9 @@ fn tag_priority_is_directional_and_never_silently_discards_a_lut() {
         IccRenderingIntent::Absolute,
         IccRenderingIntent::Saturation,
     ] {
-        assert_eq!(
-            IccTransform::new(&profile, &profile, intent),
-            Err(IccError::RenderingIntent { intent })
-        );
+        let transform = IccTransform::new(&profile, &profile, intent).unwrap();
+        assert_eq!(transform.matrix(), &crate::color::matrix::IDENTITY);
+        assert_eq!(transform.offset(), &[0.0; 3]);
     }
 }
 
@@ -354,14 +353,16 @@ fn linear_connections_honor_directional_tag_priority_intent_and_geometry() {
         IccRenderingIntent::Absolute,
         IccRenderingIntent::Saturation,
     ] {
-        assert_eq!(
-            IccTransform::to_linear_rgb(&profile, RgbColorSpace::Bt709, intent),
-            Err(IccError::RenderingIntent { intent })
-        );
-        assert_eq!(
-            IccTransform::from_linear_rgb(RgbColorSpace::Bt709, &profile, intent),
-            Err(IccError::RenderingIntent { intent })
-        );
+        let to = IccTransform::to_linear_rgb(&profile, RgbColorSpace::Bt709, intent).unwrap();
+        let from = IccTransform::from_linear_rgb(RgbColorSpace::Bt709, &profile, intent).unwrap();
+        let product = crate::color::matrix::multiply(*from.matrix(), *to.matrix());
+        for (r, row) in product.into_iter().enumerate() {
+            for (c, value) in row.into_iter().enumerate() {
+                assert!((value - f64::from(r == c)).abs() < 1e-12);
+            }
+        }
+        assert_eq!(to.offset(), &[0.0; 3]);
+        assert_eq!(from.offset(), &[0.0; 3]);
     }
     assert_eq!(
         IccTransform::to_linear_rgb(
@@ -383,4 +384,52 @@ fn linear_connections_honor_directional_tag_priority_intent_and_geometry() {
             crate::ColorMatrixError::UndefinedSource
         ))
     );
+}
+
+#[test]
+fn every_intent_selects_its_mpe_then_its_lut_then_the_default_lut() {
+    for direction in [IccDirection::DeviceToPcs, IccDirection::PcsToDevice] {
+        for intent in [
+            IccRenderingIntent::Perceptual,
+            IccRenderingIntent::Relative,
+            IccRenderingIntent::Saturation,
+            IccRenderingIntent::Absolute,
+        ] {
+            let (mut mpe, mut lut, base) = match direction {
+                IccDirection::DeviceToPcs => (*b"D2B0", *b"A2B0", *b"A2B0"),
+                IccDirection::PcsToDevice => (*b"B2D0", *b"B2A0", *b"B2A0"),
+            };
+            mpe[3] += intent as u8;
+            lut[3] += if intent == IccRenderingIntent::Absolute {
+                1
+            } else {
+                intent as u8
+            };
+            let mut tags = rgb_tags();
+            tags.push((base, element(b"mAB ", &[])));
+            if lut != base {
+                tags.push((lut, element(b"mAB ", &[])));
+            }
+            tags.push((mpe, element(b"mpet", &[])));
+            for expected in [mpe, lut, base] {
+                if !tags.iter().any(|(signature, _)| *signature == expected) {
+                    continue;
+                }
+                let profile = parse(profile_bytes(&tags)).unwrap();
+                assert_eq!(
+                    profile.matrix_trc(direction, intent),
+                    Err(IccError::TransformTag {
+                        tag: IccSignature(expected)
+                    })
+                );
+                tags.retain(|(signature, _)| *signature != expected);
+            }
+            assert!(
+                parse(profile_bytes(&tags))
+                    .unwrap()
+                    .matrix_trc(direction, intent)
+                    .is_ok()
+            );
+        }
+    }
 }

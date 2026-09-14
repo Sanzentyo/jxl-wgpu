@@ -31,6 +31,18 @@ impl IccCurve {
         &self.kind
     }
 
+    /// One metadata endpoint for matrix-shaper black-point selection.
+    pub(super) fn black_level(&self) -> f64 {
+        match &self.kind {
+            IccCurveKind::Identity | IccCurveKind::Gamma(_) => 0.0,
+            IccCurveKind::Sampled(samples) => f64::from(samples[0]) / 65535.0,
+            IccCurveKind::Parametric {
+                function,
+                parameters,
+            } => parameter_value(*function, parameters.map(|v| f64::from(v) / 65536.0), 0.0),
+        }
+    }
+
     pub(super) fn parse(profile: &IccProfile, tag: IccSignature) -> Result<Self, IccError> {
         let data = profile.required(tag)?;
         let kind = data.signature(0)?;

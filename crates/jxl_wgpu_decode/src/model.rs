@@ -602,8 +602,9 @@ impl GpuOutputRequest {
     }
 
     /// Select the intent for requested ICC color conversion. The default is relative
-    /// colorimetric with Bradford adaptation. Unsupported profile methods or intents return
-    /// typed errors. Exact same-profile device output does not evaluate a color transform.
+    /// colorimetric with Bradford adaptation. Matrix/TRC profiles support all four intents;
+    /// unsupported selected methods return typed errors. Exact same-profile device output
+    /// does not evaluate a color transform.
     #[must_use]
     pub const fn with_icc_rendering_intent(
         mut self,

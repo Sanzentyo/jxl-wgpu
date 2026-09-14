@@ -66,7 +66,7 @@ and performs independently checked conversion afterward.
 
 Common original ICC RGB/Gray color execution is a partial capability in the full JPEG XL goal.
 Broader ICC XYB conformance, enumerated-source ICC targets, spot rendering, standalone codec
-color admission, LUT/MPE/Lab/CMYK, full rendering intents and HDR/display integration remain open.
+color admission, LUT/MPE/Lab/CMYK, broader intent/gamut policy and HDR/display integration remain open.
 Neither native reference executable nor CPU pixel conversion is a production dependency.
 
 YCbCr reconstruction and converted presentation use the existing device corpus plus the separate

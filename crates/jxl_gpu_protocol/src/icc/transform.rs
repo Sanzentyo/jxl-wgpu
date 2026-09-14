@@ -1,12 +1,17 @@
 use crate::color::matrix::{IDENTITY, multiply};
 use crate::{Chromaticity, ColorMatrix, RgbColorSpace, WhitePointAdaptation};
 
-use super::{IccCurve, IccDirection, IccError, IccProfile, IccRenderingIntent, IccSignature};
+use super::{
+    IccCurve, IccDirection, IccError, IccHeader, IccProfile, IccRenderingIntent, IccSignature,
+};
+
+mod intent;
 
 /// Exact profile matrix and independent curves selected for one direction. Colorants are
 /// stored PCS-relative: applying `chad` to them again would double-adapt the profile.
 #[derive(Clone, Debug, PartialEq)]
 pub struct IccMatrixTrc {
+    header: IccHeader,
     curves: Vec<IccCurve>,
     matrix: [[f64; 3]; 3],
     media_white: [i32; 3],
@@ -69,9 +74,6 @@ impl IccProfile {
             if self.tag(tag).is_some() {
                 return Err(IccError::TransformTag { tag });
             }
-        }
-        if intent != IccRenderingIntent::Relative {
-            return Err(IccError::RenderingIntent { intent });
         }
         if header.pcs != IccSignature(*b"XYZ ") {
             return Err(IccError::Unsupported {
@@ -145,6 +147,7 @@ impl IccProfile {
             }
         }
         Ok(IccMatrixTrc {
+            header: *header,
             curves,
             matrix,
             media_white,
@@ -190,12 +193,15 @@ impl IccTransformEndpoint {
 
 /// ICC colorimetric program. Device endpoints follow their profile's bounded curve rules;
 /// linear RGB endpoints preserve signed values and values above one. Alpha and extra channels
-/// are outside this transform. Relative intent connects PCS D50 and RGB whites using Bradford.
+/// are outside this transform. Matrix/TRC profiles support all four intents: relative PCS,
+/// fully adapted absolute media white, and perceptual/saturation black compensation for v4
+/// targets. Linear RGB is an ideal adapted v4 endpoint with zero black; its geometry uses Bradford.
 #[derive(Clone, Debug, PartialEq)]
 pub struct IccTransform {
     source: IccTransformEndpoint,
     target: IccTransformEndpoint,
     matrix: [[f64; 3]; 3],
+    offset: [f64; 3],
 }
 
 impl IccTransform {
@@ -207,6 +213,7 @@ impl IccTransform {
         Self::connect(
             IccTransformEndpoint::Profile(source.matrix_trc(IccDirection::DeviceToPcs, intent)?),
             IccTransformEndpoint::Profile(target.matrix_trc(IccDirection::PcsToDevice, intent)?),
+            intent,
         )
     }
 
@@ -220,6 +227,7 @@ impl IccTransform {
         Self::connect(
             IccTransformEndpoint::Profile(source.matrix_trc(IccDirection::DeviceToPcs, intent)?),
             IccTransformEndpoint::LinearRgb(target),
+            intent,
         )
     }
 
@@ -233,12 +241,14 @@ impl IccTransform {
         Self::connect(
             IccTransformEndpoint::LinearRgb(source),
             IccTransformEndpoint::Profile(target.matrix_trc(IccDirection::PcsToDevice, intent)?),
+            intent,
         )
     }
 
     fn connect(
         source: IccTransformEndpoint,
         target: IccTransformEndpoint,
+        intent: IccRenderingIntent,
     ) -> Result<Self, IccError> {
         let source_matrix = match &source {
             IccTransformEndpoint::Profile(profile) => profile.matrix,
@@ -251,7 +261,7 @@ impl IccTransform {
         };
         let target_inverse = match &target {
             IccTransformEndpoint::Profile(profile) if profile.curves.len() == 1 => {
-                // Gray uses PCS Y; no implicit black-point adaptation.
+                // Gray selects PCS Y after the selected intent's PCS connection.
                 [[0.0, 1.0, 0.0], [0.0; 3], [0.0; 3]]
             }
             IccTransformEndpoint::Profile(profile) => inverse(profile.matrix)?,
@@ -262,22 +272,39 @@ impl IccTransform {
             )?
             .rows(),
         };
-        let matrix = if matches!((&source, &target),
+        let connection = intent::Connection::new(&source, &target, intent);
+        let matrix = if connection.is_identity()
+            && matches!((&source, &target),
             (IccTransformEndpoint::Profile(s), IccTransformEndpoint::Profile(t))
                 if s.matrix == t.matrix && s.curves.len() == t.curves.len())
         {
             // Exact cancellation also retains the specified endpoint of sampled plateaus.
             IDENTITY
         } else {
-            multiply(target_inverse, source_matrix)
+            multiply(
+                target_inverse,
+                std::array::from_fn(|r| source_matrix[r].map(|v| v * connection.scale[r])),
+            )
         };
-        if matrix.iter().flatten().any(|v| !v.is_finite()) {
+        let offset = target_inverse.map(|row| {
+            row.into_iter()
+                .zip(connection.offset)
+                .map(|(a, b)| a * b)
+                .sum()
+        });
+        if matrix
+            .iter()
+            .flatten()
+            .chain(&offset)
+            .any(|v| !v.is_finite())
+        {
             return Err(IccError::Matrix);
         }
         Ok(Self {
             source,
             target,
             matrix,
+            offset,
         })
     }
 
@@ -292,6 +319,12 @@ impl IccTransform {
     #[must_use]
     pub const fn matrix(&self) -> &[[f64; 3]; 3] {
         &self.matrix
+    }
+
+    /// Linear target-channel offset, applied after the matrix and before inverse curves.
+    #[must_use]
+    pub const fn offset(&self) -> &[f64; 3] {
+        &self.offset
     }
 }
 

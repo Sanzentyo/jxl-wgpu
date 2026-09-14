@@ -10,6 +10,7 @@ use jxl_wgpu_decode::{
 use std::num::NonZeroU64;
 
 mod color;
+mod intents;
 mod numeric;
 mod output;
 mod profile;
@@ -124,25 +125,45 @@ fn native_icc_declarations_and_scalar_alpha_survive_both_codecs() {
 }
 
 #[test]
-fn icc_color_conversion_requires_execution_and_cannot_be_enabled_by_metadata() {
+fn icc_color_conversion_selects_the_requested_mpe_before_allocating() {
+    use jxl_gpu_formats::{ColorSpecification, PixelFormat, RgbChannelOrder};
+    use jxl_gpu_protocol::icc::{
+        IccDirection, IccError, IccProfile, IccRenderingIntent, IccSignature,
+    };
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
     let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     for case in corpus::cases().filter(|case| !case.xyb) {
         let data = case.bytes();
-        // Original ICC conversion requires a real CMS method. Successful direct linear
-        // XYB output is covered separately and must not select this unused method.
-        let request = GpuOutputRequest::color(jxl_wgpu_decode::vardct_rgb8_format())
-            .unwrap()
-            .with_icc_rendering_intent(jxl_gpu_protocol::icc::IccRenderingIntent::Perceptual);
-        assert!(matches!(
-            decoder.open(&data, request),
-            Err(jxl_wgpu_decode::Error::Icc(
-                jxl_gpu_protocol::icc::IccError::RenderingIntent { .. }
-            ))
-        ));
-        assert_eq!(
-            backend.transient_memory_budget().snapshot().reserved_bytes,
-            0
-        );
+        let original = IccProfile::parse(case.profile().into(), Default::default()).unwrap();
+        for intent in [
+            IccRenderingIntent::Perceptual,
+            IccRenderingIntent::Relative,
+            IccRenderingIntent::Saturation,
+            IccRenderingIntent::Absolute,
+        ] {
+            let target = jxl_test_support::fixtures::icc::with_matrix_mpe(
+                &original,
+                IccDirection::PcsToDevice,
+                intent,
+            );
+            let color = ColorSpecification::Icc(target);
+            let format = if case.gray {
+                PixelFormat::gray_f32(true, false, color)
+            } else {
+                PixelFormat::rgb_f32(RgbChannelOrder::Rgba, false, color)
+            };
+            let request = GpuOutputRequest::color(format)
+                .unwrap()
+                .with_icc_rendering_intent(intent);
+            assert!(matches!(
+                decoder.open(&data, request),
+                Err(jxl_wgpu_decode::Error::Icc(IccError::TransformTag { tag }))
+                    if tag == IccSignature([b'B', b'2', b'D', b'0' + intent as u8])
+            ));
+            assert_eq!(
+                backend.transient_memory_budget().snapshot().reserved_bytes,
+                0
+            );
+        }
     }
 }

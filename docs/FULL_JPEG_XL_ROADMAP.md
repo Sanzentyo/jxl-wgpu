@@ -668,6 +668,19 @@ broader render-graph composition remains required beside those format-completene
 - A CPU oracle, external wrapper, generated fixture, or CPU fallback cannot expand the production
   GPU capability claim.
 
+## Matrix/TRC rendering-intent checkpoint
+
+All four matrix/TRC intents now share one f64 PCS affine program: media-relative conversion,
+fully adapted absolute media white and v4 perceptual/saturation black compensation. Linear RGB
+is an unbounded ideal adapted v4 endpoint; selected LUT/MPE precedence remains authoritative.
+The existing 80-byte program header stores offsets in the matrix rows' fourth lanes with no
+additional allocation or CPU pixel work. All 2,704 profile pairs and 1,040 linear connections
+have native/independent references. Public decoding adds 192 original/XYB connections and 768
+presentations, preserving codec precision, alpha, transport and completion ownership.
+All 1,015 earlier reference files remain unchanged. See [the ICC contract](ICC_MATRIX_TRC.md).
+`COLOR-01/02`, `IO-01`, `QA-03/06` and the full JPEG XL goal remain **Partial**; LUT/MPE/Lab/CMYK,
+other profile policies, gamut/HDR mapping and the remaining conformance requirements are open.
+
 ## Primary references
 
 - [JPEG XL format overview](https://github.com/libjxl/libjxl/blob/main/doc/format_overview.md)
