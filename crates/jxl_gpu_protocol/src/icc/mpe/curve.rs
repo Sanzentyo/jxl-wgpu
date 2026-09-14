@@ -225,9 +225,13 @@ fn validate_formula(kind: &IccCurveSegmentKind, lower: f32, upper: f32) -> Resul
 fn endpoint(segment: &IccCurveSegment, x: f32) -> f32 {
     let x = f64::from(x);
     (match &segment.kind {
-        IccCurveSegmentKind::Power { gamma, a, b, c } => {
-            (f64::from(*a) * x + f64::from(*b)).powf(f64::from(*gamma)) + f64::from(*c)
-        }
+        IccCurveSegmentKind::Power { gamma, a, b, c } => power(
+            x,
+            f64::from(*gamma),
+            f64::from(*a),
+            f64::from(*b),
+            f64::from(*c),
+        ),
         IccCurveSegmentKind::Logarithmic { gamma, a, b, c, d } => {
             f64::from(*a) * logarithm(x, f64::from(*gamma), f64::from(*b), f64::from(*c))
                 + f64::from(*d)
@@ -239,6 +243,45 @@ fn endpoint(segment: &IccCurveSegment, x: f32) -> f32 {
             f64::from(*samples.last().expect("nonempty preceding segment"))
         }
     }) as f32
+}
+
+fn exact_sum(a: f64, b: f64) -> (f64, f64) {
+    let sum = a + b;
+    let recovered = sum - a;
+    (sum, (a - (sum - recovered)) + (b - recovered))
+}
+
+// The product of two F32 metadata values is exact in f64, but adding b can lose
+// an increment that gamma later amplifies. Keep that remainder through log1p;
+// expm1 likewise retains the result when the final constant cancels the unit term.
+fn power(x: f64, gamma: f64, a: f64, b: f64, c: f64) -> f64 {
+    if gamma == 0.0 {
+        return 1.0 + c;
+    }
+    let (base, remainder) = exact_sum(a * x, b);
+    if gamma == 1.0 {
+        let (sum, error) = exact_sum(base, c);
+        return sum + (remainder + error);
+    }
+    if base == 0.0 || (base < 0.0 && gamma.fract() != 0.0) {
+        return base.powf(gamma) + c;
+    }
+    let logarithm = if (0.5..=2.0).contains(&base.abs()) {
+        ((base.abs() - 1.0) + base.signum() * remainder).ln_1p()
+    } else {
+        base.abs().ln() + (remainder / base).ln_1p()
+    };
+    let exponent = gamma * logarithm;
+    let sign = if base < 0.0 && gamma % 2.0 != 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    if exponent.abs() < 0.5 {
+        (sign + c) + sign * exponent.exp_m1()
+    } else {
+        sign * exponent.exp() + c
+    }
 }
 
 // Metadata endpoints can have a finite logarithm even when their power exceeds f64.

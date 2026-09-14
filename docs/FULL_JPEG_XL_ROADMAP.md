@@ -712,3 +712,12 @@ overflowing powers. Thirteen independent scalar profiles cover 10,959 components
 and boundaries (65,754 GPU checks across directions/variants). Earlier native/scalar references
 are unchanged. The feature rows remain **Partial**: entire-segment formula validation, arbitrary
 conditioning and full-range matrix/CLUT/Lab arithmetic still require further work.
+
+MPE affine-power checkpoint: two scaled terms retain the base's product/sum remainder before
+nonlinear amplification, with integer arithmetic independent of GPU `fma` contraction. Near-unit
+logarithms and exponential increments preserve final offset cancellation, including tiny powers
+of far-from-unit bases. Metadata-only implicit sampled endpoints use compensated f64 sums and
+`log1p`/`expm1`. Twenty-two additional independent profiles contribute 72,864 scalar components
+and 437,184 directional/kernel GPU checks; all 160 earlier MPE reference files remain unchanged.
+No feature row is completed by this checkpoint. Complete formula-range validation, arbitrary
+conditioning, remaining ICC methods and all broader full JPEG XL gates remain required.

@@ -216,6 +216,77 @@ fn scaled_divide(a: ScaledFloat, b: ScaledFloat) -> ScaledFloat {
     return result;
 }
 
+// Keep the remainder of an affine base before a nonlinear operation can amplify it.
+// WGSL fma may be unfused; integer significands make the product and two-term sums
+// independent of floating-point contraction or expression reassociation.
+struct ScaledPair { high: ScaledFloat, low: ScaledFloat }
+
+fn pair_digits(upper: u32, lower: u32, exponent: i32, sign: f32) -> ScaledPair {
+    if upper == 0u {
+        var high = scaled(sign * f32(lower));
+        high.exponent += exponent;
+        return ScaledPair(high, scaled(0.0));
+    }
+    let shift = 32u - countLeadingZeros(upper);
+    let leading = (upper << (24u - shift)) | (lower >> shift);
+    let remainder = lower & ((1u << shift) - 1u);
+    var high = scaled(sign * f32(leading));
+    var low = scaled(sign * f32(remainder));
+    high.exponent += exponent + i32(shift);
+    low.exponent += exponent;
+    return ScaledPair(high, low);
+}
+
+fn exact_product(a: ScaledFloat, b: ScaledFloat) -> ScaledPair {
+    if a.significand == 0.0 || b.significand == 0.0 {
+        return ScaledPair(scaled(0.0), scaled(0.0));
+    }
+    let sa = (bitcast<u32>(a.significand) & 0x7fffffu) | 0x800000u;
+    let sb = (bitcast<u32>(b.significand) & 0x7fffffu) | 0x800000u;
+    let product = multiply_wide(sa, sb);
+    let sign = select(1.0, -1.0, (a.significand < 0.0) != (b.significand < 0.0));
+    return pair_digits((product.y << 8u) | (product.x >> 24u), product.x & 0xffffffu, a.exponent + b.exponent - 46, sign);
+}
+
+fn exact_sum(a: ScaledFloat, b: ScaledFloat) -> ScaledPair {
+    if a.significand == 0.0 { return ScaledPair(b, scaled(0.0)); }
+    if b.significand == 0.0 { return ScaledPair(a, scaled(0.0)); }
+    var larger = a;
+    var smaller = b;
+    if a.exponent < b.exponent || (a.exponent == b.exponent && abs(a.significand) < abs(b.significand)) {
+        larger = b; smaller = a;
+    }
+    let distance = u32(larger.exponent - smaller.exponent);
+    if distance > 24u { return ScaledPair(larger, smaller); }
+    let large_significand = (bitcast<u32>(larger.significand) & 0x7fffffu) | 0x800000u;
+    let small_significand = (bitcast<u32>(smaller.significand) & 0x7fffffu) | 0x800000u;
+    var upper = large_significand >> (24u - distance);
+    var lower = (large_significand << distance) & 0xffffffu;
+    if (larger.significand < 0.0) == (smaller.significand < 0.0) {
+        lower += small_significand;
+        upper += lower >> 24u;
+    } else {
+        upper -= u32(lower < small_significand);
+        lower -= small_significand;
+    }
+    return pair_digits(upper, lower & 0xffffffu, smaller.exponent - 23, select(1.0, -1.0, larger.significand < 0.0));
+}
+
+fn pair_add(value: ScaledPair, term: ScaledFloat) -> ScaledPair {
+    let first = exact_sum(value.high, term);
+    let tail = exact_sum(first.low, value.low);
+    let combined = exact_sum(first.high, tail.high);
+    return exact_sum(combined.high, scaled_add(combined.low, tail.low));
+}
+
+fn pair_value(value: ScaledPair) -> ScaledFloat {
+    return scaled_add(value.high, value.low);
+}
+
+fn affine_pair(a: f32, x: f32, b: f32) -> ScaledPair {
+    return pair_add(exact_product(scaled(a), scaled(x)), scaled(b));
+}
+
 fn scaled_value(value: ScaledFloat) -> f32 {
     let bits = bitcast<u32>(value.significand);
     let sign = bits & 0x80000000u;
@@ -348,6 +419,66 @@ fn logarithmic_argument(x: f32, gamma: f32, b: f32, c: f32) -> ScaledFloat {
     return scaled_add(larger, scaled(correction));
 }
 
+fn pair_log_near_one(value: ScaledPair) -> ScaledFloat {
+    let numerator = pair_value(pair_add(value, scaled(-1.0)));
+    let denominator = pair_value(pair_add(value, scaled(1.0)));
+    let z = scaled_divide(numerator, denominator);
+    let coordinate = scaled_value(z);
+    let square = coordinate * coordinate;
+    var series = 1.0 / 19.0;
+    for (var divisor = 17; divisor >= 1; divisor -= 2) { series = 1.0 / f32(divisor) + square * series; }
+    return scaled_multiply(z, scaled((2.0 / log(2.0)) * series));
+}
+
+fn small_exp2_increment(exponent: ScaledFloat) -> ScaledFloat {
+    // exp(u)-1, |u| < ln(2)/16. Keeping u separate preserves even tiny increments.
+    let u = scaled_multiply(exponent, scaled(log(2.0)));
+    let x = scaled_value(u);
+    let factor = 1.0 + x * (0.5 + x * (1.0 / 6.0 + x * (1.0 / 24.0 + x * (1.0 / 120.0 + x / 720.0))));
+    return scaled_multiply(u, scaled(factor));
+}
+
+fn exp2_with_offset(exponent: ScaledFloat, sign: f32, offset: f32) -> f32 {
+    if exponent.significand == 0.0 || exponent.exponent < -4 {
+        let increment = scaled_multiply(small_exp2_increment(exponent), scaled(sign));
+        return scaled_value(pair_value(pair_add(exact_sum(scaled(sign), scaled(offset)), increment)));
+    }
+    return scaled_value(scaled_add(scaled_multiply(scaled(sign), scaled_exp2(exponent)), scaled(offset)));
+}
+
+fn affine_power(x: f32, gamma: f32, a: f32, b: f32, offset: f32) -> f32 {
+    if gamma == 0.0 { return scaled_value(scaled_add(scaled(1.0), scaled(offset))); }
+    let base = affine_pair(a, x, b);
+    if gamma == 1.0 { return scaled_value(pair_value(pair_add(base, scaled(offset)))); }
+    let center = pair_value(base);
+    if center.significand == 0.0 { return offset; }
+    let negative = center.significand < 0.0;
+    let odd = gamma - 2.0 * floor(gamma * 0.5) != 0.0;
+    let sign = select(1.0, -1.0, negative && odd);
+    if center.exponent == -1 || center.exponent == 0 {
+        let factor = select(1.0, -1.0, negative);
+        let magnitude = ScaledPair(scaled_multiply(base.high, scaled(factor)), scaled_multiply(base.low, scaled(factor)));
+        let exponent = scaled_multiply(scaled(gamma), pair_log_near_one(magnitude));
+        return exp2_with_offset(exponent, sign, offset);
+    }
+    // Away from unity a finite result cannot combine an enormous power with a cancelling
+    // logarithm. Preserve the existing integral/fractional exponent split at MAX_F32.
+    let ratio = scaled_divide(base.low, base.high);
+    let r = scaled_value(ratio);
+    let logarithm = scaled_multiply(ratio, scaled((1.0 + r * (-0.5 + r / 3.0)) / log(2.0)));
+    let correction = scaled_multiply(scaled(gamma), logarithm);
+    let exponent = scaled_add(scaled_multiply(scaled(gamma), scaled(scaled_log2(base.high))), correction);
+    if exponent.significand == 0.0 || exponent.exponent < -4 {
+        return exp2_with_offset(exponent, sign, offset);
+    }
+    let power = scaled_power(base.high, scaled(gamma));
+    if correction.significand == 0.0 || correction.exponent < -4 {
+        let increment = scaled_multiply(power, small_exp2_increment(correction));
+        return scaled_value(pair_value(pair_add(exact_sum(power, scaled(offset)), increment)));
+    }
+    return scaled_value(scaled_add(scaled_multiply(power, scaled_exp2(correction)), scaled(offset)));
+}
+
 fn float_order(value: f32) -> u32 {
     let bits = bitcast<u32>(value);
     if (bits & 0x7fffffffu) == 0u { return 0x80000000u; }
@@ -389,8 +520,7 @@ fn segmented_curve(base: u32, x: f32) -> f32 {
     let p3 = bitcast<f32>(program[record + 7u]);
     let p4 = bitcast<f32>(program[record + 8u]);
     if mode == 0u {
-        let base_value = scaled_add(scaled_multiply(scaled(p1), scaled(x)), scaled(p2));
-        return scaled_value(scaled_add(scaled_power(base_value, scaled(p0)), scaled(p3)));
+        return affine_power(x, p0, p1, p2, p3);
     }
     if mode == 1u {
         if p1 == 0.0 { return p4; }

@@ -2,15 +2,24 @@ use super::*;
 
 #[test]
 fn full_range_mpe_curves_keep_finite_results_across_large_intermediates() {
+    check_scalar_corpus("mpe/range", 13);
+}
+
+#[test]
+fn affine_powers_preserve_small_terms_through_exponents_and_offset_cancellation() {
+    check_scalar_corpus("mpe/power", 22);
+}
+
+fn check_scalar_corpus(corpus: &str, profile_count: usize) {
     let Some(backend) = backend() else {
         return;
     };
     let manifest: Manifest = serde_json::from_slice(
-        &std::fs::read(directory().join("mpe/range/manifest.json")).unwrap(),
+        &std::fs::read(directory().join(corpus).join("manifest.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(manifest.profiles.len(), 13);
-    let input = floats("mpe/range/input.f32le");
+    assert_eq!(manifest.profiles.len(), profile_count);
+    let input = floats(&format!("{corpus}/input.f32le"));
     let extent = Extent2d::new(manifest.width, manifest.height);
     let identity = profile("mpe/identity");
     let mut components = 0;
@@ -21,10 +30,13 @@ fn full_range_mpe_curves_keep_finite_results_across_large_intermediates() {
     ] {
         let pipeline = ResidentIccPipeline::with_variant(backend.device(), variant).unwrap();
         for record in &manifest.profiles {
-            let selected = profile(&format!("mpe/range/{}", record.name));
-            let bytes =
-                std::fs::read(directory().join(format!("mpe/range/{}.reference", record.name)))
-                    .unwrap();
+            let selected = profile(&format!("{corpus}/{}", record.name));
+            let bytes = std::fs::read(
+                directory()
+                    .join(corpus)
+                    .join(format!("{}.reference", record.name)),
+            )
+            .unwrap();
             let (references, rest) = bytes.as_chunks::<16>();
             assert!(rest.is_empty());
             assert_eq!(references.len(), input.len());
@@ -59,9 +71,9 @@ fn full_range_mpe_curves_keep_finite_results_across_large_intermediates() {
             }
         }
     }
-    assert_eq!(components, input.len() * 13 * 6);
+    assert_eq!(components, input.len() * profile_count * 6);
     eprintln!(
-        "MPE full-range {components} checked components across both directions and all kernel variants"
+        "{corpus}: {components} checked components across both directions and all kernel variants"
     );
 }
 

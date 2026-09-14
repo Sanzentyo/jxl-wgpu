@@ -166,7 +166,8 @@ until the last submitted consumer completes.
 
 Inputs must be finite. Legacy ICC device curves clamp their domain and range to [0,1]. MPE
 formulas and matrices do not impose that clipping; a CLUT clamps only its input coordinates.
-Pixel arithmetic retains F32 significand precision, and uploaded coefficients use F32. The backend checks finite matrix lowering
+Uploaded coefficients use F32. Pixel arithmetic uses F32 with extended exponents and compensated
+affine bases where needed. The backend checks finite matrix lowering
 and the existing legacy parametric-power bound. Full-range overflow/conditioning coverage for
 arbitrary MPE formulas remains a conformance gate, not an established HDR guarantee.
 
@@ -189,6 +190,9 @@ Stored `float32Number` values reject subnormals as well as infinities/NaNs (ICC.
 computed subnormals remain valid inputs to the resident interpreter. An empty sampled segment
 is never selected, but retains its final stored sample for the following segment's implicit
 endpoint. Logarithmic metadata endpoints do not materialize a potentially overflowing power.
+Power metadata endpoints retain the affine sum's f64 remainder through `log1p` and use `expm1`
+when an outer constant cancels the unit term. This also covers minimum-normal increments
+amplified by maximum F32 exponents; ordinary f64 evaluation would round the base to one.
 
 MPE curves keep an F32 significand and separate integer exponent for intermediate arithmetic.
 This avoids overflow in affine power bases, exponential multipliers and sampled interval widths.
@@ -197,6 +201,13 @@ are retained before the outer scale. Near unity, a bounded atanh series avoids s
 rounded logarithms; the complementary exponential also uses a bounded series near cancellation.
 Final conversion rounds subnormals with integer bits, and zero formula scales
 avoid evaluating irrelevant powers. Curve evaluation remains entirely on the GPU.
+
+Power curves preserve two scaled terms for their affine base. Integer significand multiplication
+and addition retain product and sum remainders before a nonlinear exponent can amplify them;
+this does not depend on [`fma` being fused](https://www.w3.org/TR/WGSL/#fma-builtin), which WGSL
+does not guarantee. The near-unit logarithm uses the compensated difference, and a scaled
+`exp2` increment retains small results after unit-offset cancellation. A tiny exponent uses
+this increment even when its base is far from one. The program ABI and upload size are unchanged.
 
 Default MPE limits are 4,096 processing elements, sixteen processing channels, 4,096 segments
 per curve and 4,194,304 CLUT component values, in addition to the profile/tag/sample limits above.
@@ -236,6 +247,13 @@ sampled segments. Identity values and rounded halves are exact; other intervals 
 before GPU execution with explicit cancellation conditioning. Little CMS's finite substitutes
 for infinite segment endpoints prevent using it as a full-range oracle. See the
 [range equations and bounds](../crates/jxl_wgpu/test-data/icc_generator/README.md).
+
+The 46-file `power` corpus adds twenty-two profiles and 72,864 independent scalar components,
+checked 437,184 times across both directions and all kernel variants. It covers affine increments
+amplified by large positive/negative exponents, exact-product remainders, signed integer powers,
+tiny exponents, offset cancellation and four implicit sampled endpoints. Its radii are relative
+to the result plus half a minimum-subnormal ULP, so loss of a small representable result cannot
+hide inside an absolute unit-scale tolerance. All 160 earlier MPE reference files are unchanged.
 This improves execution of representable results; it does not prove that every admitted formula
 has a finite result across its entire segment. Complete formula-range validation, arbitrary
 ill-conditioning, and full-range matrix/CLUT/Lab arithmetic remain open.

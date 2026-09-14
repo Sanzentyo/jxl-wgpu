@@ -250,6 +250,72 @@ fn logarithmic_sample_endpoints_retain_small_differences_before_large_scales() {
 }
 
 #[test]
+fn power_sample_endpoints_preserve_affine_remainders_and_offset_cancellation() {
+    let small = f64::from(f32::MIN_POSITIVE);
+    let large = f64::from(f32::MAX);
+    let product_gamma = 2_f32.powi(46);
+    for (parameters, breakpoint, expected) in [
+        (
+            [f32::MAX, f32::MIN_POSITIVE, 1.0, 0.0],
+            1.0,
+            (large * small.ln_1p()).exp(),
+        ),
+        (
+            [f32::MAX, -f32::MIN_POSITIVE, 1.0, 0.0],
+            1.0,
+            (large * (-small).ln_1p()).exp(),
+        ),
+        (
+            [2.0, f32::MIN_POSITIVE, 1.0, -1.0],
+            1.0,
+            (2.0 * small.ln_1p()).exp_m1(),
+        ),
+        (
+            [3.0, f32::MIN_POSITIVE, -1.0, 1.0],
+            1.0,
+            -(3.0 * (-small).ln_1p()).exp_m1(),
+        ),
+        ([1.0, f32::MIN_POSITIVE, 1.0, -1.0], 1.0, small),
+        (
+            [f32::MIN_POSITIVE, 1.0, 0.0, -1.0],
+            2.0,
+            (small * 2_f64.ln()).exp_m1(),
+        ),
+        (
+            [product_gamma, 1.0 + 2_f32.powi(-23), 0.0, 0.0],
+            1.0 - 2_f32.powi(-23),
+            (f64::from(product_gamma) * (-2_f64.powi(-46)).ln_1p()).exp(),
+        ),
+    ] {
+        let mut curve = element(
+            b"curf",
+            &[
+                4 << 16,
+                0,
+                breakpoint.to_bits(),
+                (breakpoint + 1.0).to_bits(),
+            ],
+        );
+        curve.extend(formula(0, &[1.0, 0.0, 0.0, 0.0]));
+        curve.extend(formula(0, &parameters));
+        curve.extend(element(b"samf", &[1, 1_f32.to_bits()]));
+        curve.extend(formula(0, &[1.0, 0.0, 0.0, 1.0]));
+        let cvst = container(b"cvst", 3, 3, &[curve], &[0, 0, 0]);
+        let selected = select(container(b"mpet", 3, 3, &[cvst], &[0])).unwrap();
+        let IccStage::SegmentedCurves(curves) = &selected.program().stages()[0] else {
+            panic!()
+        };
+        let IccCurveSegmentKind::Samples(samples) = &curves[0].segments()[2].kind else {
+            panic!()
+        };
+        assert_eq!(
+            samples[0], expected as f32,
+            "{parameters:?} at {breakpoint}"
+        );
+    }
+}
+
+#[test]
 fn stored_mpe_floats_exclude_subnormals_but_allow_signed_zero_and_normal_extremes() {
     for value in [
         0.0,

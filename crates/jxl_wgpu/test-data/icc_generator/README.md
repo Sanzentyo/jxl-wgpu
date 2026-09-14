@@ -150,3 +150,25 @@ for these equations, including transcendental lowering and interpolation. The wi
 it does not promise small relative output error near the midpoint. All radii are calculated
 before GPU execution. Tests require finite results in both directions and all three kernel
 variants, checking 65,754 components and the existing buffer guards.
+
+The `power` subdirectory adds 46 files (206 MPE files total): twenty-two profiles, a 1,104-pixel
+RGB input, a manifest and twenty-two scalar references using the same two-f64 record layout.
+The inputs retain every earlier range probe and add dense segment interiors and neighboring
+F32 values around cancellation points. Reduced equations use independent f64 `log1p`, `expm1`
+and `exp`; products of two F32 inputs are exact in f64. In particular,
+`(1 + 2^-23) * (1 - 2^-23) = 1 - 2^-46` raised to `2^46` approaches `exp(-1)`.
+The ordinary rounded F32 product would incorrectly produce one.
+
+Other cases amplify a minimum-normal affine increment with either sign of the maximum F32
+exponent, preserve positive/negative-base odd/even/reciprocal powers, cancel the final unit
+offset, and retain tiny exponents on bases spanning the positive F32 range. Separate affine
+and outer constants test cancellation after an exact product. Four sampled curves test implicit
+metadata endpoints after the same operations. Their independent initial samples round to F32
+before interpolation, matching the stored resident sample format.
+
+Every new radius is `16 * 4e-7 * abs(result) + MIN_SUBNORMAL / 2`, fixed before GPU execution.
+It scales with the result, rather than the large operands that cancel, so returning zero for
+a small representable result fails. No older radius or reference is changed. The 72,864 scalar
+components are checked 437,184 times across both directions and all three kernel variants,
+including buffer guards. These are scalar comparisons; they do not claim native CMM coverage
+of these extreme profiles or arbitrary ill-conditioned power/offset combinations.

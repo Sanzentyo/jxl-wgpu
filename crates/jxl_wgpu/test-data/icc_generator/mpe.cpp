@@ -16,6 +16,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -294,15 +295,60 @@ void Decoder(const std::vector<Case>& cases, const fs::path& base, const fs::pat
 // substitutes +/-1e22 for unbounded segment endpoints (cmstypes.c), so it cannot
 // supply a full-F32-range oracle. These equations use host f64 log1p/sqrt/exp2;
 // they share neither the production scaled arithmetic nor a pixel evaluator.
-void ScalarRange(const fs::path& out) {
+struct ScalarProbe { std::string name; Curve curve; std::function<Value(double)> expected; };
+void ScalarCorpus(const fs::path& out, const std::vector<ScalarProbe>& probes, const std::vector<float>& values) {
   fs::create_directories(out);
+  Bytes input;
+  for (size_t pixel = 0; pixel < values.size(); ++pixel) for (size_t c = 0; c < 3; ++c) LE(input,Bits(values[(pixel + c*17) % values.size()]));
+  Save(out / "input.f32le",input);
+  std::ofstream manifest(out / "manifest.json");
+  manifest << "{\"width\":" << values.size() << ",\"height\":1,\"profiles\":[";
+  for (size_t i = 0; i < probes.size(); ++i) {
+    const auto& p = probes[i];
+    const Case c{p.name,false,{Curves({p.curve,p.curve,p.curve})}};
+    Save(out / (p.name + ".icc"),Profile(c,true));
+    manifest << (i ? "," : "") << "{\"name\":\"" << p.name << "\",\"channels\":3}";
+    Bytes reference;
+    for (size_t pixel = 0; pixel < values.size(); ++pixel) for (size_t channel = 0; channel < 3; ++channel) {
+      const auto value = p.expected(values[(pixel + channel*17) % values.size()]);
+      Check(std::isfinite(value.x) && std::abs(value.x) <= std::numeric_limits<float>::max() && std::isfinite(value.radius),"finite range reference");
+      for (double v : {value.x,value.radius}) {
+        uint64_t word; std::memcpy(&word,&v,8); for (unsigned b = 0; b < 8; ++b) reference.push_back(static_cast<uint8_t>(word >> (b*8)));
+      }
+    }
+    Save(out / (p.name + ".reference"),reference);
+  }
+  manifest << "]}\n"; Check(bool(manifest),"write range manifest");
+  std::cout << out.filename() << " independent MPE components: " << probes.size()*values.size()*3 << '\n';
+}
+
+std::vector<float> RangeInputs() {
+  const double largest = std::numeric_limits<float>::max(), smallest = std::numeric_limits<float>::min();
+  std::vector<float> values{0,-0.0f,std::numeric_limits<float>::denorm_min(),-std::numeric_limits<float>::denorm_min(),
+    std::nextafter(static_cast<float>(smallest),0.0f),static_cast<float>(smallest),-static_cast<float>(smallest),
+    static_cast<float>(largest),-static_cast<float>(largest)};
+  for (unsigned word = 2; word <= 17; ++word) {
+    const float value = std::ldexp(static_cast<float>(word),-149);
+    values.push_back(value); values.push_back(-value);
+  }
+  for (int exponent = -126; exponent <= 127; exponent += 5) {
+    const float x = std::ldexp(.75f,exponent);
+    for (float v : {x,-x,std::nextafter(x,0.0f),std::nextafter(x,std::numeric_limits<float>::infinity())}) values.push_back(v);
+  }
+  for (float x : {-2.f,-1.f,-.5f,0.f,.5f,1.f,2.f,3.f,1e-30f,1e-20f,1e-10f,1e-5f}) {
+    values.push_back(std::nextafter(x,-std::numeric_limits<float>::infinity()));
+    values.push_back(x); values.push_back(std::nextafter(x,std::numeric_limits<float>::infinity()));
+  }
+  return values;
+}
+
+void ScalarRange(const fs::path& out) {
   const double inf = std::numeric_limits<double>::infinity();
   const double largest = std::numeric_limits<float>::max(), smallest = std::numeric_limits<float>::min();
-  struct Probe { const char* name; Curve curve; std::function<Value(double)> expected; };
   auto bounded = [](double value, double magnitude = 0) {
     return Value{value, 16 * epsilon * (1 + std::max(std::abs(value), magnitude))};
   };
-  const std::vector<Probe> probes{
+  const std::vector<ScalarProbe> probes{
     {"identity", {{inf,0,{1,1,0,0}}}, [](double x) { return Value{x,0}; }},
     {"half", {{inf,0,{1,.5,0,0}}}, [](double x) { return Value{x/2,static_cast<double>(std::numeric_limits<float>::denorm_min())/2}; }},
     {"log_square", {{inf,1,{2,1,1,1,0}}}, [=](double x) { return bounded(std::log1p(x*x) / std::log(10.0)); }},
@@ -324,43 +370,71 @@ void ScalarRange(const fs::path& out) {
     {"sampled_narrow", {{-smallest,0,{1,0,0,-.5}}, {smallest,3,{.5}}, {inf,0,{1,0,0,.5}}}, [=](double x) { return bounded(std::clamp(x / (2*smallest), -.5, .5)); }},
     {"sampled_empty", {{0,0,{1,0,0,.25}}, {0,3,{7,8}}, {1,3,{9}}, {inf,0,{1,0,0,9}}}, [=](double x) { return bounded(x <= 0 ? .25 : x <= 1 ? 8+x : 9); }},
   };
-  std::vector<float> values{0,-0.0f,std::numeric_limits<float>::denorm_min(),-std::numeric_limits<float>::denorm_min(),
-    std::nextafter(static_cast<float>(smallest),0.0f),static_cast<float>(smallest),-static_cast<float>(smallest),
-    static_cast<float>(largest),-static_cast<float>(largest)};
-  for (unsigned word = 2; word <= 17; ++word) {
-    const float value = std::ldexp(static_cast<float>(word),-149);
-    values.push_back(value); values.push_back(-value);
+  ScalarCorpus(out,probes,RangeInputs());
+}
+
+void PowerRange(const fs::path& out) {
+  const double inf = std::numeric_limits<double>::infinity();
+  const double largest = std::numeric_limits<float>::max(), smallest = std::numeric_limits<float>::min();
+  const double step = 0x1p-23;
+  // Relative error plus half a subnormal ULP makes cancellation probes non-vacuous.
+  // These bounds are fixed independently of the GPU and never use the cancelled operands.
+  auto tight = [](double value) {
+    return Value{value,16 * epsilon * std::abs(value) + static_cast<double>(std::numeric_limits<float>::denorm_min()) / 2};
+  };
+  std::vector<ScalarProbe> probes;
+  auto add = [&](const std::string& name, Curve curve, std::function<double(double)> equation) {
+    probes.push_back({name,std::move(curve),[=](double x) { return tight(equation(x)); }});
+  };
+  auto bounded = [&](const std::string& name, std::vector<double> parameters, double lower, double upper, std::function<double(double)> equation) {
+    add(name,{{lower,0,{1,0,0,.25}}, {upper,0,std::move(parameters)}, {inf,0,{1,0,0,.5}}},
+      [=](double x) { return x <= lower ? .25 : x > upper ? .5 : equation(x); });
+  };
+  for (bool negative_gamma : {false,true}) for (bool negative_slope : {false,true}) {
+    const double gamma = negative_gamma ? -largest : largest, a = negative_slope ? -smallest : smallest;
+    bounded(std::string("unit_") + (negative_gamma ? "negative" : "positive") + "_" + (negative_slope ? "decrease" : "increase"),
+      {gamma,a,1,0},-1,1,[=](double x) { return std::exp(gamma * std::log1p(a*x)); });
   }
-  for (int exponent = -126; exponent <= 127; exponent += 5) {
-    const float x = std::ldexp(.75f,exponent);
-    for (float v : {x,-x,std::nextafter(x,0.0f),std::nextafter(x,std::numeric_limits<float>::infinity())}) values.push_back(v);
+  bounded("positive_offset",{2,smallest,1,-1},-1,1,[=](double x) { return std::expm1(2 * std::log1p(smallest*x)); });
+  bounded("negative_odd_offset",{3,smallest,-1,1},-1,1,[=](double x) { return -std::expm1(3 * std::log1p(-smallest*x)); });
+  bounded("negative_even_offset",{2,smallest,-1,-1},-1,1,[=](double x) { return std::expm1(2 * std::log1p(-smallest*x)); });
+  bounded("negative_reciprocal_offset",{-1,smallest,-1,1},-1,1,[=](double x) { return -std::expm1(-std::log1p(-smallest*x)); });
+  for (bool negative : {false,true}) {
+    const double gamma = negative ? -smallest : smallest;
+    add(negative ? "tiny_negative_gamma" : "tiny_positive_gamma",{{0,0,{1,0,0,.25}}, {inf,0,{gamma,1,0,-1}}},
+      [=](double x) { return x <= 0 ? .25 : std::expm1(gamma * std::log(x)); });
   }
-  for (float x : {-2.f,-1.f,-.5f,0.f,.5f,1.f,2.f,3.f,1e-30f,1e-20f,1e-10f,1e-5f}) {
-    values.push_back(std::nextafter(x,-std::numeric_limits<float>::infinity()));
-    values.push_back(x); values.push_back(std::nextafter(x,std::numeric_limits<float>::infinity()));
-  }
-  Bytes input;
-  for (size_t pixel = 0; pixel < values.size(); ++pixel) for (size_t c = 0; c < 3; ++c) LE(input,Bits(values[(pixel + c*17) % values.size()]));
-  Save(out / "input.f32le",input);
-  std::ofstream manifest(out / "manifest.json");
-  manifest << "{\"width\":" << values.size() << ",\"height\":1,\"profiles\":[";
-  for (size_t i = 0; i < probes.size(); ++i) {
-    const auto& p = probes[i];
-    const Case c{p.name,false,{Curves({p.curve,p.curve,p.curve})}};
-    Save(out / (std::string(p.name) + ".icc"),Profile(c,true));
-    manifest << (i ? "," : "") << "{\"name\":\"" << p.name << "\",\"channels\":3}";
-    Bytes reference;
-    for (size_t pixel = 0; pixel < values.size(); ++pixel) for (size_t channel = 0; channel < 3; ++channel) {
-      const auto value = p.expected(values[(pixel + channel*17) % values.size()]);
-      Check(std::isfinite(value.x) && std::abs(value.x) <= largest && std::isfinite(value.radius),"finite range reference");
-      for (double v : {value.x,value.radius}) {
-        uint64_t word; std::memcpy(&word,&v,8); for (unsigned b = 0; b < 8; ++b) reference.push_back(static_cast<uint8_t>(word >> (b*8)));
-      }
+  // Each f64 product below is exact: both multiplicands are F32. At the upper
+  // breakpoint it is 1 - 2^-46, whose discarded remainder determines exp(-1).
+  bounded("product_below_one",{0x1p46,1+step,0,0},.5,1-step,[=](double x) { return std::exp(0x1p46 * std::log1p((1+step)*x-1)); });
+  bounded("product_above_one",{0x1p46,1-step,0,0},.5,1+step,[=](double x) { return std::exp(0x1p46 * std::log1p((1-step)*x-1)); });
+  bounded("product_negative_odd",{16777215,-(1+step),0,0},.5,1-step,[=](double x) { return -std::exp(16777215 * std::log1p((1+step)*x-1)); });
+  bounded("product_squared_offset",{2,1+step,0,-1},.5,1-step,[=](double x) { const double delta = (1+step)*x-1; return delta*(2+delta); });
+  bounded("product_affine_offset",{1,1+step,-1,0},-1,1,[=](double x) { return (1+step)*x-1; });
+  bounded("product_outer_offset",{1,1+step,0,-1},-1,1,[=](double x) { return (1+step)*x-1; });
+  add("affine_double_offset",{{inf,0,{1,smallest,1,-1}}},[=](double x) { return smallest*x; });
+  add("zero_gamma",{{inf,0,{0,largest,largest,-1}}},[](double) { return 0; });
+  auto sampled = [&](const std::string& name, std::vector<double> parameters, double end, std::function<double(double)> equation) {
+    const double initial = static_cast<float>(equation(1));
+    add(name,{{-1,0,{1,0,0,.25}}, {1,0,std::move(parameters)}, {2,3,{end}}, {inf,0,{1,0,0,end}}},
+      [=](double x) { return x <= -1 ? .25 : x <= 1 ? equation(x) : x <= 2 ? initial+(x-1)*(end-initial) : end; });
+  };
+  sampled("sampled_increase",{largest,smallest,1,0},.5,[=](double x) { return std::exp(largest * std::log1p(smallest*x)); });
+  sampled("sampled_decrease",{largest,-smallest,1,0},.5,[=](double x) { return std::exp(largest * std::log1p(-smallest*x)); });
+  sampled("sampled_positive_offset",{2,smallest,1,-1},4*smallest,[=](double x) { return std::expm1(2 * std::log1p(smallest*x)); });
+  sampled("sampled_negative_odd_offset",{3,smallest,-1,1},6*smallest,[=](double x) { return -std::expm1(3 * std::log1p(-smallest*x)); });
+  auto values = RangeInputs();
+  for (int n = -256; n <= 512; ++n) values.push_back(static_cast<float>(n) / 256);
+  for (float center : {static_cast<float>(1-step),static_cast<float>(1+step),-.5f,.5f,1.f,2.f}) {
+    float below = center, above = center;
+    values.push_back(center);
+    for (unsigned n = 0; n < 4; ++n) {
+      below = std::nextafter(below,-std::numeric_limits<float>::infinity());
+      above = std::nextafter(above,std::numeric_limits<float>::infinity());
+      values.push_back(below); values.push_back(above);
     }
-    Save(out / (std::string(p.name) + ".reference"),reference);
   }
-  manifest << "]}\n"; Check(bool(manifest),"write range manifest");
-  std::cout << "independent full-range MPE components: " << probes.size()*values.size()*3 << '\n';
+  ScalarCorpus(out,probes,values);
 }
 
 int main(int argc, char** argv) try {
@@ -414,5 +488,6 @@ int main(int argc, char** argv) try {
   manifest << "]}\n"; Check(bool(manifest), "write manifest"); cmsCloseProfile(identity_profile);
   Decoder(cases, argv[1], out / "decoder");
   ScalarRange(out / "range");
+  PowerRange(out / "power");
   std::cout << "independent and native MPE components: " << components << '\n';
 } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
