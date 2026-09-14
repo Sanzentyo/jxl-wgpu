@@ -12,6 +12,12 @@ use crate::{
 /// location remain in [`PixelFormat::color_spec`] and must still be negotiated by the consumer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ColorFormatClass {
+    IccDevice {
+        sample: ColorSample,
+        storage: ColorStorage,
+        channels: u8,
+        alpha: bool,
+    },
     Rgb {
         sample: ColorSample,
         storage: ColorStorage,
@@ -48,7 +54,7 @@ pub enum ColorStorage {
     Planar,
 }
 
-/// Component representation of a color-bearing RGB or gray image.
+/// Component representation of a color-bearing image.
 /// Floating-point color preserves values outside the nominal `0..=1` range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ColorSample {
@@ -136,11 +142,81 @@ pub fn classify_pixel_format(
         ColorModel::NonColor => classify_numeric(format).map(PixelFormatClass::Numeric),
         ColorModel::Rgb => classify_rgb(format).map(PixelFormatClass::Color),
         ColorModel::Gray => classify_gray(format).map(PixelFormatClass::Color),
+        ColorModel::IccDevice => classify_icc_device(format).map(PixelFormatClass::Color),
         ColorModel::Ycbcr => classify_ycbcr(format).map(PixelFormatClass::Color),
         unsupported => Err(PixelFormatClassificationError::UnsupportedColorModel(
             unsupported,
         )),
     }
+}
+
+fn classify_icc_device(
+    format: &PixelFormat,
+) -> Result<ColorFormatClass, PixelFormatClassificationError> {
+    let crate::ColorSpecification::Icc(profile) = &format.color_spec else {
+        unreachable!("format validation requires an ICC profile");
+    };
+    let channels = profile
+        .header()
+        .device_space
+        .device_channels()
+        .expect("validated device space");
+    let sample = match format.sample_kind {
+        SampleKind::Unsigned => ColorSample::U8,
+        SampleKind::Float => ColorSample::F32,
+        other => {
+            return Err(PixelFormatClassificationError::UnsupportedColorSampleKind(
+                other,
+            ));
+        }
+    };
+    if format.swizzle != Swizzle::Device
+        || format.chroma_subsampling != ChromaSubsampling::None
+        || !format.planes.iter().all(is_full_sample_plane)
+    {
+        return Err(PixelFormatClassificationError::UnsupportedColorPacking);
+    }
+    let planes = format
+        .planes
+        .iter()
+        .map(stored_plane)
+        .collect::<Option<Vec<_>>>()
+        .ok_or(PixelFormatClassificationError::UnsupportedColorPacking)?;
+    let stored: Vec<_> = planes
+        .iter()
+        .flat_map(|p| p.channels.iter().copied())
+        .collect();
+    let alpha = stored.contains(&Channel::Alpha);
+    let mut indices = stored
+        .iter()
+        .map(|&channel| match channel {
+            Channel::Device(index) if index < channels => Some(index),
+            Channel::Alpha => Some(channels),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or(PixelFormatClassificationError::UnsupportedColorPacking)?;
+    indices.sort_unstable();
+    if indices != (0..channels + u8::from(alpha)).collect::<Vec<_>>()
+        || planes
+            .iter()
+            .any(|p| p.bits != sample.bits() || p.storage_bits != sample.bits())
+    {
+        return Err(PixelFormatClassificationError::UnsupportedColorPacking);
+    }
+    let storage = if planes.len() == 1 {
+        ColorStorage::Interleaved
+    } else if planes.iter().all(|p| p.channels.len() == 1) {
+        ColorStorage::Planar
+    } else {
+        return Err(PixelFormatClassificationError::UnsupportedColorPacking);
+    };
+    Ok(ColorFormatClass::IccDevice {
+        sample,
+        storage,
+        channels,
+        alpha,
+    })
 }
 
 fn classify_numeric(

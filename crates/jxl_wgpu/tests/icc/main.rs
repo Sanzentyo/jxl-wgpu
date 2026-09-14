@@ -19,6 +19,7 @@ use wgpu::util::DeviceExt;
 mod analytic;
 mod black;
 mod connection;
+mod device_output;
 mod intents;
 mod linear;
 mod lut;

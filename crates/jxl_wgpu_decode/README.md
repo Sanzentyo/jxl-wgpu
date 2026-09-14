@@ -708,8 +708,16 @@ ICC device-curve range contract. The [32-stream spot corpus](test-data/icc_spots
 checks 3,456 final images and 6,912 held progressive updates, all three alpha policies, both
 layouts, orientation and bounded fragmented input against independent color intervals.
 
+`PixelFormat::icc_device(profile, sample, storage, alpha)` requests explicit ICC device components,
+including CMYK plus independent alpha and targets with up to fifteen components. U8/F32 and
+planar/interleaved storage are supported. `Channel::Device(index)` and `Channel::Alpha` identify
+physical packing fields; CMYK F32 values are unit ink amounts, with zero meaning no ink.
+Original CMYK retains its separately composed Black plane until this output boundary. Same-profile
+output bypasses CMS evaluation. See [device output semantics and evidence](../../docs/ICC_COLOR.md#profile-component-output).
+
 Broader ICC XYB alpha/crop/reference conformance,
-complete MPE ranges, CMYK image plumbing, other profile
+
+complete MPE ranges, XYB-to-original CMYK reconstruction, other profile
 classes, HDR/gamut policies and standalone codec color admission remain open.
 Numeric and extra-channel bypasses keep their existing independent contracts.
 

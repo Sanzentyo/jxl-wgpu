@@ -234,31 +234,41 @@ fn same_icc_device_output_preserves_ieee_words_without_selecting_a_cms_method() 
     for name in ["5-2", "16-5", "24-7", "32-8"] {
         let (data, expected) = super::numeric::sample_fixture("floating", name);
         let data = super::profile::replace(&data, &donor.bytes());
-        let format = PixelFormat::gray_f32(false, true, ColorSpecification::Icc(profile.clone()));
-        let request = GpuOutputRequest::color(format.clone())
-            .unwrap()
-            .with_alpha_output_policy(AlphaOutputPolicy::Preserve)
-            .with_icc_rendering_intent(IccRenderingIntent::Perceptual)
-            .with_white_point_adaptation(WhitePointAdaptation::None);
-        let mut session = decoder.open(&data, request).unwrap();
-        let frame = pollster::block_on(session.next_frame_async())
-            .unwrap()
-            .unwrap();
-        let output = &frame.output().outputs[0];
-        assert_eq!(output.layout.format, format);
-        assert_eq!(
-            planes::read_bytes(&backend, output),
-            expected
-                .iter()
-                .flat_map(|word| word.to_le_bytes())
-                .collect::<Vec<_>>(),
-            "{name}"
-        );
-        assert!(
-            pollster::block_on(session.next_frame_async())
+        for format in [
+            PixelFormat::gray_f32(false, true, ColorSpecification::Icc(profile.clone())),
+            PixelFormat::icc_device(
+                profile.clone(),
+                jxl_gpu_formats::ColorSample::F32,
+                jxl_gpu_formats::ColorStorage::Planar,
+                false,
+            )
+            .unwrap(),
+        ] {
+            let request = GpuOutputRequest::color(format.clone())
                 .unwrap()
-                .is_none()
-        );
+                .with_alpha_output_policy(AlphaOutputPolicy::Preserve)
+                .with_icc_rendering_intent(IccRenderingIntent::Perceptual)
+                .with_white_point_adaptation(WhitePointAdaptation::None);
+            let mut session = decoder.open(&data, request).unwrap();
+            let frame = pollster::block_on(session.next_frame_async())
+                .unwrap()
+                .unwrap();
+            let output = &frame.output().outputs[0];
+            assert_eq!(output.layout.format, format);
+            assert_eq!(
+                planes::read_bytes(&backend, output),
+                expected
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .collect::<Vec<_>>(),
+                "{name}"
+            );
+            assert!(
+                pollster::block_on(session.next_frame_async())
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
     assert_eq!(
         backend.transient_memory_budget().snapshot().reserved_bytes,

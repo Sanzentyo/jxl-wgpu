@@ -3,3 +3,4 @@
 *.icc binary
 *.f32 binary
 *.bounds binary
+*.reference binary

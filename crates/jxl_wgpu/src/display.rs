@@ -1357,9 +1357,9 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
     );
     let (kind, channels, order, bits, storage_bits, matrix, range, siting_x, siting_y) = match class
     {
-        ColorFormatClass::Gray { .. } => {
+        ColorFormatClass::Gray { .. } | ColorFormatClass::IccDevice { .. } => {
             return Err(Error::Unsupported(
-                "gray display requires an explicit gray color conversion stage".into(),
+                "gray and ICC device display require an explicit color conversion stage".into(),
             ));
         }
         ColorFormatClass::Rgb {
@@ -1464,7 +1464,9 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
                     siting_x,
                     siting_y,
                 ),
-                ColorFormatClass::Rgb { .. } | ColorFormatClass::Gray { .. } => {
+                ColorFormatClass::Rgb { .. }
+                | ColorFormatClass::Gray { .. }
+                | ColorFormatClass::IccDevice { .. } => {
                     unreachable!("RGB and gray color classes were handled before YCbCr lowering")
                 }
             }

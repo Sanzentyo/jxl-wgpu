@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-/// Interpretation of the canonical X/Y/Z/W channels.
+/// Interpretation of the stored sample channels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ColorModel {
     NonColor,
@@ -8,6 +8,8 @@ pub enum ColorModel {
     Rgb,
     /// One color-bearing gray component X, with optional alpha W.
     Gray,
+    /// Components in the exact ICC profile's device domain, with optional independent alpha.
+    IccDevice,
     Raw(RawPattern),
     Xyz,
 }
@@ -242,6 +244,10 @@ pub enum Channel {
     Y,
     Z,
     W,
+    /// Zero-based device component in an ICC profile's declared order.
+    Device(u8),
+    /// Opacity, independent of every ICC device component (including CMYK Black).
+    Alpha,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -254,60 +260,64 @@ pub enum SwizzleComponent {
     One,
 }
 
-/// Selects stored X/Y/Z/W values for the canonical output components.
+/// Maps canonical X/Y/Z/W components or uses explicit ICC device channels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Swizzle(pub [SwizzleComponent; 4]);
+pub enum Swizzle {
+    Xyzw([SwizzleComponent; 4]),
+    /// Device components and alpha are identified directly by their packing fields.
+    Device,
+}
 
 impl Swizzle {
-    pub const X001: Self = Self([
+    pub const X001: Self = Self::Xyzw([
         SwizzleComponent::X,
         SwizzleComponent::Zero,
         SwizzleComponent::Zero,
         SwizzleComponent::One,
     ]);
-    pub const X00W: Self = Self([
+    pub const X00W: Self = Self::Xyzw([
         SwizzleComponent::X,
         SwizzleComponent::Zero,
         SwizzleComponent::Zero,
         SwizzleComponent::W,
     ]);
-    pub const X000: Self = Self([
+    pub const X000: Self = Self::Xyzw([
         SwizzleComponent::X,
         SwizzleComponent::Zero,
         SwizzleComponent::Zero,
         SwizzleComponent::Zero,
     ]);
-    pub const XY00: Self = Self([
+    pub const XY00: Self = Self::Xyzw([
         SwizzleComponent::X,
         SwizzleComponent::Y,
         SwizzleComponent::Zero,
         SwizzleComponent::Zero,
     ]);
-    pub const XYZ0: Self = Self([
+    pub const XYZ0: Self = Self::Xyzw([
         SwizzleComponent::X,
         SwizzleComponent::Y,
         SwizzleComponent::Z,
         SwizzleComponent::Zero,
     ]);
-    pub const XYZ1: Self = Self([
+    pub const XYZ1: Self = Self::Xyzw([
         SwizzleComponent::X,
         SwizzleComponent::Y,
         SwizzleComponent::Z,
         SwizzleComponent::One,
     ]);
-    pub const XYZW: Self = Self([
+    pub const XYZW: Self = Self::Xyzw([
         SwizzleComponent::X,
         SwizzleComponent::Y,
         SwizzleComponent::Z,
         SwizzleComponent::W,
     ]);
-    pub const ZYX1: Self = Self([
+    pub const ZYX1: Self = Self::Xyzw([
         SwizzleComponent::Z,
         SwizzleComponent::Y,
         SwizzleComponent::X,
         SwizzleComponent::One,
     ]);
-    pub const ZYXW: Self = Self([
+    pub const ZYXW: Self = Self::Xyzw([
         SwizzleComponent::Z,
         SwizzleComponent::Y,
         SwizzleComponent::X,
@@ -449,7 +459,7 @@ pub struct PixelFormat {
 }
 
 impl PixelFormat {
-    pub const MAX_PLANES: usize = 6;
+    pub const MAX_PLANES: usize = 16;
 
     pub fn new(
         model: ColorModel,
@@ -474,14 +484,21 @@ impl PixelFormat {
     }
 
     pub fn validate(&self) -> Result<(), PixelFormatError> {
+        if self.model == ColorModel::IccDevice
+            && !matches!(self.color_spec, ColorSpecification::Icc(_))
+        {
+            return Err(PixelFormatError::IccProfileRequired);
+        }
         if let ColorSpecification::Icc(profile) = &self.color_spec {
             let signature = profile.header().device_space;
-            if !matches!(
-                (self.model, &signature.0),
-                (ColorModel::Rgb, b"RGB ")
-                    | (ColorModel::Gray, b"GRAY")
-                    | (ColorModel::Xyz, b"XYZ ")
-            ) {
+            if !(self.model == ColorModel::IccDevice && signature.device_channels().is_some())
+                && !matches!(
+                    (self.model, &signature.0),
+                    (ColorModel::Rgb, b"RGB ")
+                        | (ColorModel::Gray, b"GRAY")
+                        | (ColorModel::Xyz, b"XYZ ")
+                )
+            {
                 return Err(PixelFormatError::IccDeviceSpace {
                     model: self.model,
                     signature,
@@ -511,6 +528,53 @@ impl PixelFormat {
             }
         }
         Ok(())
+    }
+
+    /// Canonical ICC device storage. Samples use the selected ICC program's device units;
+    /// CMYK stores normalized ink amounts, so zero means no ink and one means full ink.
+    /// Alpha is stored after the device components and never occupies a color component.
+    pub fn icc_device(
+        profile: jxl_gpu_protocol::icc::IccProfile,
+        sample: crate::ColorSample,
+        storage: crate::ColorStorage,
+        alpha: bool,
+    ) -> Result<Self, PixelFormatError> {
+        let count = profile.header().device_space.device_channels().ok_or(
+            PixelFormatError::IccDeviceSpace {
+                model: ColorModel::IccDevice,
+                signature: profile.header().device_space,
+            },
+        )?;
+        let channels: Vec<_> = (0..count)
+            .map(Channel::Device)
+            .chain(alpha.then_some(Channel::Alpha))
+            .collect();
+        let planes = if storage == crate::ColorStorage::Planar {
+            channels
+                .iter()
+                .map(|&c| PlaneFormat::separate_words(PlaneSampling::FULL, 1, &[c], sample.bits()))
+                .collect()
+        } else {
+            vec![PlaneFormat::separate_words(
+                PlaneSampling::FULL,
+                1,
+                &channels,
+                sample.bits(),
+            )]
+        };
+        Self::new(
+            ColorModel::IccDevice,
+            ColorSpecification::Icc(profile),
+            ChromaSubsampling::None,
+            if sample == crate::ColorSample::F32 {
+                SampleKind::Float
+            } else {
+                SampleKind::Unsigned
+            },
+            ByteOrder::Native,
+            Swizzle::Device,
+            planes,
+        )
     }
 
     #[must_use]
@@ -949,12 +1013,14 @@ pub enum RgbChannelOrder {
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum PixelFormatError {
+    #[error("ICC device storage requires an explicit ICC profile")]
+    IccProfileRequired,
     #[error("ICC device space {signature} is incompatible with pixel color model {model:?}")]
     IccDeviceSpace {
         model: ColorModel,
         signature: jxl_gpu_protocol::icc::IccSignature,
     },
-    #[error("pixel format has {0} planes; expected 1..=6")]
+    #[error("pixel format has {0} planes; expected 1..=16")]
     PlaneCount(usize),
     #[error("plane {plane} has a zero sampling divisor")]
     ZeroSamplingDivisor { plane: usize },

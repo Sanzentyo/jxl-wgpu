@@ -368,6 +368,9 @@ fn prepare_output(layout: &ImageLayout, gray_device: bool) -> Result<PreparedIma
 
     let class = classify_image_output_format(&layout.format)?;
     match class {
+        ColorFormatClass::IccDevice { .. } => Err(Error::Unsupported(
+            "ICC device output requires the device component packer".into(),
+        )),
         ColorFormatClass::Gray {
             sample,
             storage,
@@ -461,7 +464,9 @@ fn prepare_output(layout: &ImageLayout, gray_device: bool) -> Result<PreparedIma
                 ColorFormatClass::Yuv422Packed { order } => {
                     (6, 3, u32::from(order == Packed422Order::Uyvy), 8, 8)
                 }
-                ColorFormatClass::Rgb { .. } | ColorFormatClass::Gray { .. } => {
+                ColorFormatClass::Rgb { .. }
+                | ColorFormatClass::Gray { .. }
+                | ColorFormatClass::IccDevice { .. } => {
                     unreachable!("RGB and gray color classes were handled before YCbCr lowering")
                 }
             };

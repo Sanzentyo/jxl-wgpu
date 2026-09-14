@@ -34,7 +34,7 @@ pub(super) struct Presentation {
     working_encoding: FrameSurfaceEncoding,
     output: ImageLayout,
     pipeline: wgpu::ComputePipeline,
-    params: ImageOutputParams,
+    params: Vec<u8>,
     dispatch: [u32; 2],
 }
 
@@ -73,13 +73,27 @@ impl Presentation {
         {
             return Err(crate::color_output::ColorOutputError::HdrLuminanceMappingRequired.into());
         }
+        let device_output = output.format.model == jxl_gpu_formats::ColorModel::IccDevice;
+        let target_encoding = |profile: &jxl_gpu_protocol::icc::IccProfile| {
+            if device_output {
+                FrameSurfaceEncoding::Device(profile.clone())
+            } else {
+                FrameSurfaceEncoding::Icc(profile.clone())
+            }
+        };
         let (encoding, selected) = match (&source_encoding, &output.format.color_spec) {
             (
-                FrameSurfaceEncoding::Icc(profile) | FrameSurfaceEncoding::Cmyk { profile, .. },
+                FrameSurfaceEncoding::Icc(profile)
+                | FrameSurfaceEncoding::Device(profile)
+                | FrameSurfaceEncoding::Cmyk { profile, .. },
                 ColorSpecification::Icc(target),
             ) => (
-                FrameSurfaceEncoding::Icc(target.clone()),
-                if target == profile && matches!(source_encoding, FrameSurfaceEncoding::Icc(_)) {
+                if target == profile {
+                    source_encoding.clone()
+                } else {
+                    target_encoding(target)
+                },
+                if target == profile {
                     None
                 } else {
                     Some(IccTransform::new(
@@ -90,7 +104,9 @@ impl Presentation {
                 },
             ),
             (
-                FrameSurfaceEncoding::Icc(profile) | FrameSurfaceEncoding::Cmyk { profile, .. },
+                FrameSurfaceEncoding::Icc(profile)
+                | FrameSurfaceEncoding::Device(profile)
+                | FrameSurfaceEncoding::Cmyk { profile, .. },
                 ColorSpecification::Defined(_),
             ) => (
                 FrameSurfaceEncoding::Rgb(RgbColorEncoding::LINEAR_BT709),
@@ -101,7 +117,7 @@ impl Presentation {
                 )?),
             ),
             (FrameSurfaceEncoding::Rgb(encoding), ColorSpecification::Icc(target)) => (
-                FrameSurfaceEncoding::Icc(target.clone()),
+                target_encoding(target),
                 Some(IccTransform::from_rgb(
                     *encoding,
                     target,
@@ -124,12 +140,16 @@ impl Presentation {
                 "ICC color conversion currently requires Bradford adaptation".into(),
             ));
         }
-        let working = FrameSurfaceLayout::with_encoding(
-            source.color.extent,
-            source.extras.len(),
-            encoding.clone(),
-            &device.limits(),
-        )?;
+        let working = if selected.is_none() {
+            source.clone()
+        } else {
+            FrameSurfaceLayout::with_encoding(
+                source.color.extent,
+                source.extras.len(),
+                encoding.clone(),
+                &device.limits(),
+            )?
+        };
         let size = aligned(output.logical_size)?;
         validate_size(device, size)?;
         let dispatch = dispatch(device, size / 4)?;
@@ -138,48 +158,97 @@ impl Presentation {
             orientation,
             strides: [source.color.extent.width; 3],
         };
-        let params = match &encoding {
-            FrameSurfaceEncoding::Icc(target) => {
-                ImageOutputParams::for_icc_device(&output, geometry, target, dispatch[0] * 64)?
-            }
-            FrameSurfaceEncoding::Rgb(encoding) => ImageOutputParams::new(
+        let params = if device_output {
+            let planes = working.icc_planes(&encoding)?;
+            let alpha = alpha_extra.map(|index| {
+                let plane = &working.extras[index].planes[0];
+                jxl_wgpu::ResidentIccPlane {
+                    offset: (plane.offset / 4) as u32,
+                    stride: (plane.row_stride / 4) as u32,
+                }
+            });
+            bytemuck::bytes_of(&jxl_wgpu::DeviceOutputParams::new(
                 &output,
-                ImageOutputSource {
-                    extent: geometry.extent,
+                jxl_wgpu::DeviceOutputSource {
+                    profile: encoding
+                        .icc_profile()
+                        .ok_or(Error::EngineContract("ICC output has no device profile"))?,
+                    extent: source.color.extent,
                     orientation,
-                    strides: geometry.strides,
-                    encoding: *encoding,
+                    planes: &planes,
+                    alpha,
+                    input_words: working.storage_bytes / 4,
+                    sample_encoding: encoding.icc_sample_encoding(),
+                    alpha_conversion: request.alpha_conversion(extras),
                 },
                 dispatch[0] * 64,
-                request.white_point_adaptation(),
-            )?,
-            FrameSurfaceEncoding::Encoded | FrameSurfaceEncoding::Cmyk { .. } => {
-                unreachable!("resolved presentation color")
-            }
+            )?)
+            .to_vec()
+        } else {
+            bytemuck::bytes_of(
+                &match &encoding {
+                    FrameSurfaceEncoding::Icc(target) => ImageOutputParams::for_icc_device(
+                        &output,
+                        geometry,
+                        target,
+                        dispatch[0] * 64,
+                    )?,
+                    FrameSurfaceEncoding::Rgb(encoding) => ImageOutputParams::new(
+                        &output,
+                        ImageOutputSource {
+                            extent: geometry.extent,
+                            orientation,
+                            strides: geometry.strides,
+                            encoding: *encoding,
+                        },
+                        dispatch[0] * 64,
+                        request.white_point_adaptation(),
+                    )?,
+                    FrameSurfaceEncoding::Encoded
+                    | FrameSurfaceEncoding::Device(_)
+                    | FrameSurfaceEncoding::Cmyk { .. } => {
+                        unreachable!("resolved presentation color")
+                    }
+                }
+                .with_alpha_conversion(request.alpha_conversion(extras)),
+            )
+            .to_vec()
+        };
+        if params.len() as u64 > device.limits().max_uniform_buffer_binding_size {
+            return Err(Error::CompositionResourceLimit {
+                resource: "ICC output uniform bytes",
+                requested: params.len() as u64,
+                limit: device.limits().max_uniform_buffer_binding_size,
+            });
         }
-        .with_alpha_conversion(request.alpha_conversion(extras));
         let color_count = working.color.planes.len() as u32;
         let alpha_channel = alpha_extra.map_or(u32::MAX, |index| color_count + index as u32);
-        let shader = format!(
-            "{}\n{}\n{}",
-            jxl_wgpu::IMAGE_OUTPUT_SHADER,
-            super::super::spot::shader(false),
-            include_str!("../output.wgsl")
-        );
-        let pipeline = pipeline(
-            device,
-            "JPEG XL ICC presentation packing",
-            &shader,
-            &[
-                ("wg_x", 64.0),
-                ("wg_y", 1.0),
+        let shader = if device_output {
+            jxl_wgpu::DEVICE_OUTPUT_SHADER.to_owned()
+        } else {
+            format!(
+                "{}\n{}\n{}",
+                jxl_wgpu::IMAGE_OUTPUT_SHADER,
+                super::super::spot::shader(false),
+                include_str!("../output.wgsl")
+            )
+        };
+        let mut constants = vec![("wg_x", 64.0), ("wg_y", 1.0)];
+        if !device_output {
+            constants.extend([
                 (
                     "surface_plane_words",
                     (working.color_plane_bytes / 4) as f64,
                 ),
                 ("surface_alpha_channel", f64::from(alpha_channel)),
                 ("surface_color_channels", f64::from(color_count)),
-            ],
+            ]);
+        }
+        let pipeline = pipeline(
+            device,
+            "JPEG XL ICC presentation packing",
+            &shader,
+            &constants,
         );
         let transform = selected
             .map(|selected| transforms.select(backend, selected))
@@ -207,7 +276,7 @@ impl Presentation {
         let poll = backend.submission_poller().try_reserve()?;
         let output_size = aligned(self.output.logical_size)?;
         let output_permit = backend.transient_memory_budget().try_reserve(output_size)?;
-        let transient_bytes = std::mem::size_of::<ImageOutputParams>() as u64
+        let transient_bytes = self.params.len() as u64
             + completion_fence_bytes()
             + self.spots.as_ref().map_or(0, Rendering::memory_bytes)
             + self.transform.as_ref().map_or(0, |transform| {
@@ -282,7 +351,7 @@ impl Presentation {
         let input = converted.as_ref().unwrap_or(source_buffer);
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("JPEG XL ICC packing parameters"),
-            contents: bytemuck::bytes_of(&self.params),
+            contents: &self.params,
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {

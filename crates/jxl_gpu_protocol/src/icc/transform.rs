@@ -310,21 +310,13 @@ fn validated_white(profile: &IccProfile) -> Result<[i32; 3], IccError> {
 }
 
 fn device_channels(signature: IccSignature) -> Result<usize, IccError> {
-    Ok(match &signature.0 {
-        b"GRAY" => 1,
-        b"CMYK" => 4,
-        b"RGB " | b"XYZ " | b"Lab " | b"Luv " | b"YCbr" | b"Yxy " | b"HSV " | b"HLS " | b"CMY " => {
-            3
-        }
-        [n @ b'2'..=b'9', b'C', b'L', b'R'] => usize::from(n - b'0'),
-        [n @ b'A'..=b'F', b'C', b'L', b'R'] => usize::from(n - b'A' + 10),
-        _ => {
-            return Err(IccError::Unsupported {
-                field: "device space",
-                signature,
-            });
-        }
-    })
+    signature
+        .device_channels()
+        .map(usize::from)
+        .ok_or(IccError::Unsupported {
+            field: "device space",
+            signature,
+        })
 }
 
 /// A selected directional profile or an enumerated RGB endpoint. RGB transfers preserve their

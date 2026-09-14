@@ -52,7 +52,7 @@ adds 18 three-frame sequences with three LUT formats, both PCS domains, non-lead
 independent Black references, F32 extras, both codecs and YCbCr. Native reconstruction and
 independent F64/native ICC references check RGB/Gray presentation under four intents, spot
 Render/Preserve, both layouts, bounded input, held frames and memory release. Missing or ambiguous
-Black declarations remain typed unsupported profiles. Requested CMYK output layouts,
+Black declarations remain typed unsupported profiles.
 XYB-to-original CMYK reconstruction, wider sampling/range/profile combinations and full JPEG XL
 conformance remain open.
 
@@ -107,11 +107,52 @@ Requested color conversion uses a selected immutable program shared across physi
 upload is lazy, budgeted and retryable; each dispatch retains its uploaded program through GPU
 completion even if the image session is dropped. Intermediate color surfaces, unchanged extra
 planes, output words, the 320-byte ICC dispatch storage, optional four-byte validation word
-and 208-byte packing uniform are all accounted.
+and the 208-byte RGB/Gray or 320-byte device packing uniform are all accounted.
 No frame readback or CPU pixel CMS is involved. `GpuOutputRequest::with_icc_rendering_intent`
 defaults to relative colorimetric; non-Bradford conversion and unsupported selected methods return errors.
 Exact same-profile packing does not select a CMS method and therefore does not require an
 executable matrix/TRC or inverse curve.
+
+## Profile component output
+
+`PixelFormat::icc_device(profile, sample, storage, alpha)` creates explicit profile component
+storage for `GpuOutputRequest::color`. `ColorModel::IccDevice`, `Channel::Device(index)` and
+`Channel::Alpha` distinguish each profile component from opacity. `Swizzle::Device` reads these
+semantic fields directly; physical component/plane order may differ. Canonical constructors put
+alpha last. `Swizzle::Xyzw` retains the existing four-component mapping for other formats.
+The format supports one through fifteen device components and an independent alpha plane,
+U8/F32 samples, and interleaved/planar storage. Unsupported selected profile methods still return
+typed errors; recognizing a device signature does not establish executable color conversion.
+
+F32 uses the selected ICC program's device units. CMYK and multicolor ink values use unit amounts,
+with zero meaning no ink and one meaning full ink. Original JPEG XL CMYK complements are converted
+only at the output boundary. U8 clamps each component to [0,1] and rounds `255 * value` with ties
+upward. Alpha association applies after color conversion, independently to all device components.
+Same-profile output selects no CMS program and preserves extended F32 samples. Numeric requests
+retain their original codec-component convention.
+
+`DeviceOutputParams` validates actual input plane offsets/strides, exact profile identity, output
+packing, rotated extent and bounded byte addressing. Its 320-byte uniform carries separate source
+and target mappings. Each shader invocation owns one output word and gathers its bytes, so odd
+row pitches, unaligned F32 planes and an incomplete final word need no overlapping writes. Padding
+bytes are zero. The selected color connection and output packer share the existing completion-owned
+budget, retry and cancellation path. Display consumers require an explicit RGB conversion.
+
+The [device output recipe](../crates/jxl_wgpu_decode/test-data/device_output_generator/README.md)
+redecodes 42 unchanged JPEG XL sources and reproduces their frozen native sample words. Independent
+F64 and Little CMS references cover 403,920 components, all four intents and both PCS domains.
+CMYK inputs exercise each 1/2/3/4/5/15-component target through original Modular, original VarDCT
+and YCbCr. Public decoder tests compare 3,231,360 color components in 4,224 presentations, with
+independent alpha, spot policies, U8/F32, both layouts and whole/bounded input. Same-profile tests
+add 624 presentations and 323,136 original components. Twenty enumerated RGB/Gray sources add
+800 presentations and 1,417,248 independently bounded components across all reconstruction modes.
+
+The standalone packer checks 1,152 guarded dispatches and 931,040 bytes, including all eight
+orientations, component permutations, varied plane pitches, missing alpha and alpha conversion.
+Exact-budget tests include fifteen-component targets, dynamic black preparation, same-profile
+CMYK, failed admission, retry, concurrent submissions and cancellation. These checks do not
+complete XYB-to-original CMYK reconstruction, uncommon device-space image conformance, HDR,
+full profile range/conditioning or the remaining full JPEG XL requirements.
 
 ## Model and supported scope
 
@@ -139,7 +180,7 @@ selected matrix/TRC method; LUT/MPE callers use the general selected program.
 Matrix/TRC covers RGB input/display and monochrome input/display/output classes with XYZ PCS.
 LUT/MPE supports input/display/output profiles, recognized device channel counts and XYZ/Lab PCS;
 this resident metadata support is broader than JPEG XL decoder admission, which still uses
-RGB/Gray and original CMYK image color surfaces. Requested CMYK layouts, XYB-to-original CMYK
+RGB/Gray and original CMYK source surfaces. Requested device outputs support up to fifteen color components. XYB-to-original CMYK
 reconstruction, other profile classes,
 full floating-point-range conformance and broader gamut/HDR policies remain open.
 

@@ -2,6 +2,8 @@ use super::super::{ColorUsage, Compositor};
 use super::*;
 use jxl_gpu_protocol::Extent2d;
 
+mod device;
+
 #[test]
 fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();

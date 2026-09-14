@@ -9,6 +9,22 @@ pub(super) fn frames(
     request: GpuOutputRequest,
     limit: Option<NonZeroU64>,
 ) -> Vec<Vec<u32>> {
+    frames_bytes(backend, data, request, limit)
+        .into_iter()
+        .map(|bytes| {
+            let (words, tail) = bytes.as_chunks::<4>();
+            assert!(tail.is_empty(), "word output must contain complete words");
+            words.iter().map(|word| u32::from_le_bytes(*word)).collect()
+        })
+        .collect()
+}
+
+pub(super) fn frames_bytes(
+    backend: &WgpuBackend,
+    data: &[u8],
+    request: GpuOutputRequest,
+    limit: Option<NonZeroU64>,
+) -> Vec<Vec<u8>> {
     let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
     if let Some(limit) = limit {
         engine = engine.with_stream_window_limit(limit);
@@ -24,14 +40,17 @@ pub(super) fn frames(
     while let Some(frame) = pollster::block_on(session.next_frame_async()).unwrap() {
         let output = &frame.output().outputs[0];
         assert_eq!(output.layout.format, format);
-        let pixels = planes::read(backend, output);
+        let pixels = planes::read_bytes(backend, output);
         held.push((frame, pixels));
     }
     drop(session);
     let frames = held
         .into_iter()
         .map(|(frame, pixels)| {
-            assert_eq!(planes::read(backend, &frame.output().outputs[0]), pixels);
+            assert_eq!(
+                planes::read_bytes(backend, &frame.output().outputs[0]),
+                pixels
+            );
             pixels
         })
         .collect();

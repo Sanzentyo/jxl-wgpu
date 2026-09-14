@@ -593,7 +593,9 @@ impl Compositor {
             FrameSurfaceEncoding::Rgb(original) => {
                 FrameSurfaceEncoding::Rgb(crate::image_color::linear_encoding(*original))
             }
-            FrameSurfaceEncoding::Icc(_) | FrameSurfaceEncoding::Cmyk { .. } => {
+            FrameSurfaceEncoding::Icc(_)
+            | FrameSurfaceEncoding::Device(_)
+            | FrameSurfaceEncoding::Cmyk { .. } => {
                 FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709)
             }
             FrameSurfaceEncoding::Encoded => unreachable!("original image color domain"),

@@ -27,6 +27,23 @@ pub use transform::{IccMatrixTrc, IccProfileProgram, IccTransform, IccTransformE
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IccSignature(pub [u8; 4]);
 
+impl IccSignature {
+    /// Number of device components declared by a recognized ICC color-space signature.
+    /// This inspects metadata only and does not select or evaluate a profile method.
+    #[must_use]
+    pub const fn device_channels(self) -> Option<u8> {
+        Some(match &self.0 {
+            b"GRAY" => 1,
+            b"CMYK" => 4,
+            b"RGB " | b"XYZ " | b"Lab " | b"Luv " | b"YCbr" | b"Yxy " | b"HSV " | b"HLS "
+            | b"CMY " => 3,
+            [n @ b'2'..=b'9', b'C', b'L', b'R'] => *n - b'0',
+            [n @ b'A'..=b'F', b'C', b'L', b'R'] => *n - b'A' + 10,
+            _ => return None,
+        })
+    }
+}
+
 impl std::fmt::Debug for IccSignature {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", String::from_utf8_lossy(&self.0))

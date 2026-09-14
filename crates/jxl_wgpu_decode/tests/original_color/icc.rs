@@ -97,6 +97,15 @@ fn frames(
 
 #[test]
 fn enumerated_color_converts_to_requested_icc_through_stills_and_reference_composition() {
+    verify(false);
+}
+
+#[test]
+fn enumerated_color_reaches_explicit_device_output_through_all_reconstruction_modes() {
+    verify(true);
+}
+
+fn verify(device_output: bool) {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let directory = root.join("test-data/rgb_icc");
@@ -110,11 +119,19 @@ fn enumerated_color_converts_to_requested_icc_through_stills_and_reference_compo
         .into_iter()
         .chain(corpus::analytic_cases())
         .collect();
+    let mut selected = Vec::new();
     let mut components = 0;
     let mut presentations = 0;
     let mut targets = std::collections::BTreeSet::new();
     for (case, original) in manifest.cases.into_iter().zip(corpus) {
         assert_eq!(case.name, original.name);
+        if device_output {
+            let key = (original.mode, original.profile.grayscale, original.sequence);
+            if selected.contains(&key) {
+                continue;
+            }
+            selected.push(key);
+        }
         targets.insert(case.target.clone());
         let data = original.bytes();
         let baseline = frames(
@@ -151,7 +168,19 @@ fn enumerated_color_converts_to_requested_icc_through_stills_and_reference_compo
             let mut final_baseline = None;
             for planar in [false, true] {
                 let color = ColorSpecification::Icc(profile.clone());
-                let format = if case.channels == 1 {
+                let format = if device_output {
+                    PixelFormat::icc_device(
+                        profile.clone(),
+                        jxl_gpu_formats::ColorSample::F32,
+                        if planar {
+                            jxl_gpu_formats::ColorStorage::Planar
+                        } else {
+                            jxl_gpu_formats::ColorStorage::Interleaved
+                        },
+                        true,
+                    )
+                    .unwrap()
+                } else if case.channels == 1 {
                     PixelFormat::gray_f32(true, planar, color)
                 } else {
                     PixelFormat::rgb_f32(RgbChannelOrder::Rgba, planar, color)
@@ -212,9 +241,15 @@ fn enumerated_color_converts_to_requested_icc_through_stills_and_reference_compo
             }
         }
     }
-    assert_eq!(targets.len(), 9);
-    assert_eq!(presentations, 9120);
-    assert_eq!(components, 16_197_120);
+    if device_output {
+        assert_eq!(selected.len(), 20);
+        assert_eq!(presentations, 800);
+        assert_eq!(components, 1_417_248);
+    } else {
+        assert_eq!(targets.len(), 9);
+        assert_eq!(presentations, 9120);
+        assert_eq!(components, 16_197_120);
+    }
     eprintln!(
         "enumerated to ICC: {presentations} presentations, {components} independent components"
     );

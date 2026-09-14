@@ -27,6 +27,8 @@ pub(crate) enum FrameSurfaceEncoding {
     Rgb(RgbColorEncoding),
     /// Original device values with their exact profile, with one gray or three RGB planes.
     Icc(IccProfile),
+    /// Complete device values produced for an ICC output, in profile component order.
+    Device(IccProfile),
     /// Original JPEG XL CMY components and their independently stored Black extra channel.
     /// Stored samples are complements of ICC ink amounts. Reference blending stays in this
     /// codestream domain; a four-channel ICC view borrows Black without duplicating it.
@@ -41,6 +43,15 @@ pub(crate) enum FrameSurfaceEncoding {
 
 impl FrameSurfaceEncoding {
     pub(crate) fn format(&self) -> PixelFormat {
+        if let Self::Device(profile) = self {
+            return PixelFormat::icc_device(
+                profile.clone(),
+                jxl_gpu_formats::ColorSample::F32,
+                jxl_gpu_formats::ColorStorage::Planar,
+                false,
+            )
+            .expect("validated ICC output device space");
+        }
         if let Self::Icc(profile) = self {
             let color = jxl_gpu_formats::ColorSpecification::Icc(profile.clone());
             return if profile.header().device_space == IccSignature(*b"GRAY") {
@@ -105,7 +116,11 @@ impl FrameSurfaceEncoding {
     pub(crate) fn from_format(format: &PixelFormat) -> Option<Self> {
         format.validate().ok()?;
         if let jxl_gpu_formats::ColorSpecification::Icc(profile) = &format.color_spec {
-            let encoding = Self::Icc(profile.clone());
+            let encoding = if format.model == jxl_gpu_formats::ColorModel::IccDevice {
+                Self::Device(profile.clone())
+            } else {
+                Self::Icc(profile.clone())
+            };
             return (*format == encoding.format()).then_some(encoding);
         }
         let jxl_gpu_formats::ColorSpecification::Defined(color) = format.color_spec else {
@@ -121,13 +136,15 @@ impl FrameSurfaceEncoding {
     pub(crate) const fn rgb_encoding(&self) -> Option<RgbColorEncoding> {
         match self {
             Self::Rgb(encoding) => Some(*encoding),
-            Self::Icc(_) | Self::Cmyk { .. } | Self::Encoded => None,
+            Self::Icc(_) | Self::Device(_) | Self::Cmyk { .. } | Self::Encoded => None,
         }
     }
 
     pub(crate) fn icc_profile(&self) -> Option<&IccProfile> {
         match self {
-            Self::Icc(profile) | Self::Cmyk { profile, .. } => Some(profile),
+            Self::Icc(profile) | Self::Device(profile) | Self::Cmyk { profile, .. } => {
+                Some(profile)
+            }
             Self::Rgb(_) | Self::Encoded => None,
         }
     }

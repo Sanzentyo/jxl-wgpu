@@ -805,3 +805,25 @@ presentations; scalar original components and retained memory ownership are chec
 `COLOR-01/02/03/04`, `IO-01`, `QA-03/06` and the full JPEG XL goal remain **Partial**. Requested CMYK
 layouts, XYB-to-original CMYK reconstruction, wider sampling/profile/range conformance, HDR and
 all remaining codestream/container/encoder gates still require work.
+
+ICC device output checkpoint: `ColorModel::IccDevice` and explicit `Channel::Device(index)` /
+`Channel::Alpha` packing replace the four-component assumption for profile-owned output.
+U8/F32 planar/interleaved layouts support up to fifteen profile components plus alpha, arbitrary
+component order, all orientations and padded byte addressing. CMYK output uses unit ink amounts;
+same-profile requests preserve original F32 values with only the declared sample convention
+conversion. The 320-byte packer uniform and all intermediate/device resources participate in
+exact admission, retry, concurrent completion and cancellation ownership.
+
+Forty-two unchanged JPEG XL sources provide 403,920 independent F64/native output references.
+CMYK covers each 1/2/3/4/5/15-component target through Modular, VarDCT and YCbCr, all four intents
+and both spot policies. Public decoder checks compare 3,231,360 converted components in 4,224
+presentations and 323,136 same-profile components in 624 presentations. Twenty enumerated sources
+add 800 presentations / 1,417,248 independently bounded components across all reconstruction
+modes. The resident packer checks 1,152 guarded dispatches / 931,040 bytes, including alpha,
+orientation, component permutations and unaligned pitches. Existing source/profile/reference
+fixtures remain unchanged. See [the device output recipe](../crates/jxl_wgpu_decode/test-data/device_output_generator/README.md).
+
+This completes the requested CMYK layout gap described above. `COLOR-01/02/03/04`, `IO-01`,
+`QA-03/06` and the full JPEG XL goal remain **Partial**: XYB-to-original CMYK reconstruction,
+uncommon device-space image conformance, broader profile/range/conditioning and sampling,
+HDR, container, encoder and the other roadmap gates still require work.

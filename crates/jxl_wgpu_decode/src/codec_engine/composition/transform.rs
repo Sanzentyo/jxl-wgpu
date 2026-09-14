@@ -157,6 +157,11 @@ pub(super) fn convert(
                 FrameSurfaceEncoding::Rgb(encoding) => ColorOutputEncoding::Rgb(*encoding),
                 FrameSurfaceEncoding::Icc(profile) => ColorOutputEncoding::Icc(profile.clone()),
                 FrameSurfaceEncoding::Cmyk { .. } => ColorOutputEncoding::Components,
+                FrameSurfaceEncoding::Device(_) => {
+                    return Err(Error::EngineContract(
+                        "ICC output devices cannot be original codec components",
+                    ));
+                }
                 FrameSurfaceEncoding::Encoded => {
                     return Err(Error::EngineContract(
                         "original color interpretation cannot be codec components",

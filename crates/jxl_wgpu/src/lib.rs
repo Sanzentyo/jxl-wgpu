@@ -26,6 +26,7 @@ mod buffer_pool;
 #[cfg(not(target_arch = "wasm32"))]
 mod capability;
 mod context;
+mod device_output;
 mod display;
 mod error;
 mod image_output;
@@ -55,6 +56,7 @@ pub use buffer_pool::WgpuBufferPoolStats;
 pub use context::{
     DirectReadbackPolicy, ShaderF64Policy, WgpuBackend, WgpuBackendConfig, WgpuMemoryPolicy,
 };
+pub use device_output::{DEVICE_OUTPUT_SHADER, DeviceOutputParams, DeviceOutputSource};
 pub use display::{
     DisplayColorEncoding, DisplayLuminanceEncoding, DisplayPipeline, DisplayPipelineCacheStats,
     DisplaySubmission, DisplayTexture, DisplayTextureDescriptor, NumericDisplayChannels,

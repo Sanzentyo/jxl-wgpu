@@ -80,6 +80,9 @@ selected extra channels through Modular and VarDCT in the supported single-frame
 checks exact numeric words through complete and fragmented input. The common decoder also handles
 ICC RGB/Gray color surfaces, including XYB and YCbCr reconstruction, original-domain reference composition,
 all four matrix/TRC intents for conversion to enumerated SDR or another ICC profile, and U8/F32 device packing.
+`PixelFormat::icc_device` also exposes explicit ICC components, including CMYK plus independent
+alpha and targets with up to fifteen components, in U8/F32 planar/interleaved storage.
+[Device output semantics and evidence](docs/ICC_COLOR.md#profile-component-output).
 Same-profile output preserves device values without evaluating curves. Programs are shared per
 selected image and accounted through GPU completion. ICC YCbCr has 146 source cases covering
 sampling, precision, restoration, resampling and both-codec composition; separate independently
@@ -109,7 +112,7 @@ retained outputs and fragmented input. Spot presentation now also precedes ICC c
 the actual source color domain. A [32-stream corpus](crates/jxl_wgpu_decode/test-data/icc_spots_generator/README.md)
 covers both codecs, RGB/Gray, original/XYB and retained animations, with independent color
 intervals, numeric bypass and completion-owned ink metadata. Broader ICC XYB conformance,
-CMYK image plumbing and full intent/HDR
+XYB-to-original CMYK reconstruction and full intent/HDR
 policies remain incomplete.
 
 Creating an encoder or decoder requires a compatible `wgpu` backend. Unsupported codestream

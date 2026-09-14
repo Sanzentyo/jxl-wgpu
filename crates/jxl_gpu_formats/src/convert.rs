@@ -202,6 +202,11 @@ fn sample_for_channel(
                     Channel::Z => chroma[1],
                     Channel::W => 1.0,
                     Channel::X => unreachable!(),
+                    Channel::Device(_) | Channel::Alpha => {
+                        return Err(ConversionError::UnsupportedPacking(
+                            "ICC device channel in YCbCr packing",
+                        ));
+                    }
                 })
             }
         }
@@ -215,10 +220,18 @@ fn stored_channel_source(format: &PixelFormat, stored: Channel) -> Result<usize,
         Channel::Y => SwizzleComponent::Y,
         Channel::Z => SwizzleComponent::Z,
         Channel::W => SwizzleComponent::W,
+        Channel::Device(_) | Channel::Alpha => {
+            return Err(ConversionError::UnsupportedPacking(
+                "ICC device channel in RGB packing",
+            ));
+        }
     };
-    format
-        .swizzle
-        .0
+    let crate::Swizzle::Xyzw(swizzle) = &format.swizzle else {
+        return Err(ConversionError::UnsupportedPacking(
+            "RGB packing requires an RGBA swizzle",
+        ));
+    };
+    swizzle
         .iter()
         .position(|candidate| *candidate == component)
         .ok_or(ConversionError::UnsupportedPacking(
