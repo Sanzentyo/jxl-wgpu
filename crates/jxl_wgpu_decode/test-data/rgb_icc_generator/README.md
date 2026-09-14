@@ -77,5 +77,8 @@ cargo test --locked -p jxl_wgpu_decode --test original_color icc:: -- --test-thr
 
 Both output directories must be new. Two independent source exports and native generations
 reproduce every file exactly. Fixture generation and GPU tests run against fixed source trees.
-This corpus establishes the stated SDR connection coverage; complete HDR mapping, ICC spot
-rendering, CMYK image plumbing, arbitrary MPE range/conditioning and full JPEG XL remain open.
+The independent ICC evaluator is shared in `tools/jxl_test_support/native/icc/rgb.hpp` with the
+[HDR/ICC corpus](../hdr_icc_generator/README.md); extracting it preserves all 913 SDR files exactly.
+This corpus establishes SDR connection coverage. Later corpora separately cover image-relative
+HDR, ICC spot rendering and CMYK image plumbing. Physical display adaptation, arbitrary MPE
+range/conditioning and full JPEG XL remain open.

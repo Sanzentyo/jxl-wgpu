@@ -147,8 +147,12 @@ fn original_icc_reconstruction_admits_exact_storage_retries_and_retains_cancelle
 fn original_reconstruction_and_linear_presentation_share_one_program_admission() {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
     let memory = backend.transient_memory_budget();
-    for case in jxl_test_support::fixtures::embedded_icc::cases().filter(|case| case.xyb) {
-        let inventory = jxl_gpu_bitstream::parse(&case.bytes(), Default::default())
+    for (case, nits) in jxl_test_support::fixtures::embedded_icc::cases()
+        .filter(|case| case.xyb)
+        .flat_map(|case| [100, 255, 1000, 4000].map(|nits| (case, nits)))
+    {
+        let data = jxl_test_support::fixtures::hdr::intensity::replace(&case.bytes(), nits);
+        let inventory = jxl_gpu_bitstream::parse(&data, Default::default())
             .unwrap()
             .codestream_inventory(Default::default())
             .unwrap();

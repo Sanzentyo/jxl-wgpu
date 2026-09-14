@@ -1373,16 +1373,19 @@ one reserved word, then normalized source endpoint values. The nested source pro
 same headers and records. Its curves/CLUTs share existing immutable payloads. This internally
 constructed probe cannot contain another connection.
 
-Opcode 10 applies an enumerated RGB transfer. Its three-word payload stores the transfer
-selector, F32 gamma exponent bits and direction (one for linearization, zero for encoding).
-It has three input/output channels and uses the shared image-transfer WGSL functions. A nonlinear
-endpoint adds one 16-byte stage record and 12-byte payload; linear endpoints add neither.
-Dispatch storage, bindings and per-image intermediates are unchanged.
+Opcode 10 applies an enumerated RGB transfer. Its eight-word payload stores the transfer
+selector, F32 gamma exponent bits, direction (one for linearization, zero for encoding), F32
+image intensity, and a four-F32 primary-luminance/OOTF vector. Zero intensity retains generic
+absolute-normalized PQ / scene-linear HLG. It has three input/output channels and invokes the
+shared display-relative WGSL transfer on the RGB vector, allowing HLG's coupled OOTF. A nonlinear
+endpoint adds one 16-byte stage record and 32-byte payload; linear endpoints add neither.
+The 320-byte dispatch storage, bindings and per-image intermediates are unchanged by this stage.
 
-The 304-byte, 16-byte-aligned writable dispatch storage stores extent/channel counts at byte 0
+The 320-byte, 16-byte-aligned writable dispatch storage stores extent/channel counts at byte 0
 and four sixteen-entry u32 plane arrays at bytes 16, 80, 144 and 208: input offsets, input strides,
 output offsets and output strides. Four scale values start at 272 (the fourth is padding),
-three offset values at 288, and the status word at 300. Naga checks every offset and the span.
+three offset values at 288, the status word at 300, and the image sample-encoding flags at 304.
+Naga checks every offset and the span.
 The backend limits live channel count to sixteen, including source-probe intermediates;
 metadata limits are separate from this device execution policy.
 
@@ -1437,7 +1440,7 @@ needs a profile transform, it selects one host program and uploads it on its fir
 The program buffer has its own exact `MemoryPermit`, shared by an image-owned cache and each
 submitted dispatch. Failed initial admission leaves the cache empty; later frames reuse the same
 program reservation. A conversion reserves a separate full target-color/extra intermediate,
-the 304-byte ICC dispatch storage, optional four-byte validation map, the 240-byte output-packing
+the 320-byte ICC dispatch storage, optional four-byte validation map, the 240-byte output-packing
 uniform and the browser completion fence. Packed output has its own lease. Completion owns all
 input/intermediate/dispatch/program handles, even if pending work and the image session are
 dropped. Dynamic ICC completion maps and checks metadata status before publishing success;
@@ -1470,5 +1473,8 @@ positive mantissa logarithm; WGSL never raises a negative base to a fractional p
 image storage, CPU image pass, extra dispatch or readback. Existing GPU source/extra bindings,
 word ownership, association order, lifetimes and portable shader validation remain intact.
 
-These parameters do not add tone/gamut mapping or an ICC luminance connection. Display texture
+HDR-to-ICC programs lower the same image intensity and source luminance/OOTF vector into opcode 10.
+ICC-to-HDR presentation passes image intensity to the final output uniform. PCS Y=1 corresponds
+to image unit white; complete encoding/intensity metadata participates in shared program identity.
+These parameters do not add physical display adaptation or tone/gamut mapping. Display texture
 metadata and the render graph's standalone transfer stage retain their separate contracts.

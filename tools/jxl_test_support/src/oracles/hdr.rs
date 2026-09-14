@@ -1,6 +1,6 @@
 //! Independent F64 transfer equations and tabulated CIE luminances; no production GPU helpers.
+use super::color;
 use jxl_gpu_formats::{ColorSpace, TransferFunction};
-use jxl_test_support::oracles::color;
 
 fn luminance(space: ColorSpace) -> [f64; 3] {
     match space {
@@ -47,7 +47,7 @@ fn ootf(rgb: [f64; 3], space: ColorSpace, nits: f64, inverse: bool) -> [f64; 3] 
     rgb.map(|v| v * factor)
 }
 
-pub(super) fn to_linear(
+pub fn to_linear(
     rgb: [f64; 3],
     transfer: TransferFunction,
     space: ColorSpace,
@@ -61,7 +61,7 @@ pub(super) fn to_linear(
     }
 }
 
-pub(super) fn from_linear(
+pub fn from_linear(
     rgb: [f64; 3],
     transfer: TransferFunction,
     space: ColorSpace,
@@ -75,7 +75,7 @@ pub(super) fn from_linear(
     rgb.map(|v| color::from_linear(v, transfer))
 }
 
-pub(super) fn convert(
+pub fn convert(
     rgb: [f64; 3],
     source: TransferFunction,
     target: TransferFunction,
@@ -91,48 +91,6 @@ pub(super) fn convert(
 
 type Interval = [f64; 2];
 
-pub(super) fn original_bounds(
-    case: &super::corpus::Case,
-    original: &[f32],
-    linear: Option<&[f32]>,
-    pixel: usize,
-) -> [Interval; 4] {
-    let expected = &original[pixel * 4..][..4];
-    if case.xyb && !case.sequence {
-        // PQ's derivative grows sharply around black. Apply the existing native
-        // linear reconstruction budget before the OETF; an encoded fixed epsilon
-        // would conflate IDCT/XYB rounding with the separately tested transfer.
-        let linear = &linear.unwrap()[pixel * 4..][..4];
-        let rgb = [linear[0], linear[1], linear[2]].map(f64::from);
-        let bounds = interval(
-            rgb,
-            TransferFunction::Linear,
-            case.transfer,
-            case.space,
-            case.space,
-            case.nits,
-            f64::from(case.tolerance()),
-        );
-        std::array::from_fn(|c| {
-            if c == 3 {
-                [f64::from(expected[c]) - 2e-6, f64::from(expected[c]) + 2e-6]
-            } else {
-                let packing = 5e-5 * (1.0 + f64::from(expected[c]).abs());
-                [bounds[c][0] - packing, bounds[c][1] + packing]
-            }
-        })
-    } else {
-        std::array::from_fn(|c| {
-            let value = f64::from(expected[c]);
-            let tolerance = if c == 3 {
-                2e-6
-            } else {
-                f64::from(case.tolerance()) * (1.0 + value.abs())
-            };
-            [value - tolerance, value + tolerance]
-        })
-    }
-}
 fn product(a: Interval, b: Interval) -> Interval {
     let values = [a[0] * b[0], a[0] * b[1], a[1] * b[0], a[1] * b[1]];
     [
@@ -173,12 +131,31 @@ fn ootf_interval(rgb: [Interval; 3], space: ColorSpace, nits: f64, inverse: bool
 
 /// Propagate the predeclared codec error through EOTF, coupled OOTF, signed
 /// primary matrix and OETF, retaining channel/luminance dependence conservatively.
-pub(super) fn interval(
+pub fn interval(
     rgb: [f64; 3],
     source: TransferFunction,
     target: TransferFunction,
     source_space: ColorSpace,
     target_space: ColorSpace,
+    nits: f64,
+    error: f64,
+) -> [Interval; 3] {
+    let linear = linear_interval(rgb, source, source_space, nits, error);
+    let target_linear = color::matrix(source_space, target_space).map(|row| {
+        std::array::from_fn(|edge| {
+            (0..3)
+                .map(|c| row[c] * linear[c][if row[c] >= 0.0 { edge } else { 1 - edge }])
+                .sum()
+        })
+    });
+    from_linear_interval(target_linear, target, target_space, nits)
+}
+
+/// Decode a fixed source-error interval into display-linear light.
+pub fn linear_interval(
+    rgb: [f64; 3],
+    source: TransferFunction,
+    source_space: ColorSpace,
     nits: f64,
     error: f64,
 ) -> [Interval; 3] {
@@ -192,13 +169,16 @@ pub(super) fn interval(
     if source == TransferFunction::Hlg {
         linear = ootf_interval(linear, source_space, nits, false);
     }
-    let mut target_linear = color::matrix(source_space, target_space).map(|row| {
-        std::array::from_fn(|edge| {
-            (0..3)
-                .map(|c| row[c] * linear[c][if row[c] >= 0.0 { edge } else { 1 - edge }])
-                .sum()
-        })
-    });
+    linear
+}
+
+/// Encode predeclared linear-light uncertainty through the coupled OOTF and OETF.
+pub fn from_linear_interval(
+    mut target_linear: [Interval; 3],
+    target: TransferFunction,
+    target_space: ColorSpace,
+    nits: f64,
+) -> [Interval; 3] {
     if target == TransferFunction::Pq {
         target_linear = target_linear.map(|channel| channel.map(|v| v * nits / 10000.0));
     }

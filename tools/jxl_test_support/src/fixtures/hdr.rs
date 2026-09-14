@@ -7,7 +7,9 @@ use jxl_gpu_formats::{
 };
 use std::path::PathBuf;
 
-pub(super) struct Case {
+pub mod intensity;
+
+pub struct Case {
     pub name: String,
     pub width: usize,
     pub height: usize,
@@ -22,10 +24,10 @@ pub(super) struct Case {
 }
 
 fn directory() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-data/hdr")
+    crate::decoder_directory().join("test-data/hdr")
 }
 
-pub(super) fn cases() -> Vec<Case> {
+pub fn cases() -> Vec<Case> {
     let manifest = std::fs::read_to_string(directory().join("manifest.txt")).unwrap();
     let cases: Vec<_> = manifest
         .lines()
@@ -65,7 +67,7 @@ pub(super) fn cases() -> Vec<Case> {
 
 impl Case {
     pub fn bytes(&self) -> Vec<u8> {
-        jxl_test_support::offline::hex::unhex(
+        crate::offline::hex::unhex(
             &std::fs::read_to_string(directory().join(format!("{}.jxl.hex", self.name))).unwrap(),
         )
     }

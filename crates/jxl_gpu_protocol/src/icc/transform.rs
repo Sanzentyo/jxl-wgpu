@@ -1,5 +1,5 @@
 use crate::{
-    Chromaticity, ColorMatrix, RgbColorEncoding, RgbColorSpace, TransferFunction,
+    Chromaticity, ColorMatrix, DisplayIntensity, RgbColorEncoding, RgbColorSpace, TransferFunction,
     WhitePointAdaptation,
 };
 
@@ -324,7 +324,11 @@ fn device_channels(signature: IccSignature) -> Result<usize, IccError> {
 #[derive(Clone, Debug, PartialEq)]
 pub enum IccTransformEndpoint {
     Profile(Box<IccProfileProgram>),
-    Rgb(RgbColorEncoding),
+    Rgb {
+        encoding: RgbColorEncoding,
+        /// PCS Y=1 represents this image white. None uses the transfer's generic units.
+        intensity: Option<DisplayIntensity>,
+    },
 }
 
 impl IccTransformEndpoint {
@@ -332,21 +336,24 @@ impl IccTransformEndpoint {
     pub fn channels(&self) -> usize {
         match self {
             Self::Profile(p) => p.channels(),
-            Self::Rgb(_) => 3,
+            Self::Rgb { .. } => 3,
         }
     }
     #[must_use]
     pub fn profile(&self) -> Option<&IccProfileProgram> {
         match self {
             Self::Profile(p) => Some(p),
-            Self::Rgb(_) => None,
+            Self::Rgb { .. } => None,
         }
     }
 
     fn stages(&self, direction: IccDirection) -> Result<Vec<IccStage>, IccError> {
         match self {
             Self::Profile(p) => Ok(p.program.stages().to_vec()),
-            Self::Rgb(encoding) => {
+            Self::Rgb {
+                encoding,
+                intensity,
+            } => {
                 let matrix = match direction {
                     IccDirection::DeviceToPcs => ColorMatrix::rgb_to_xyz(
                         encoding.space,
@@ -367,7 +374,8 @@ impl IccTransformEndpoint {
                 )?)];
                 if encoding.transfer != TransferFunction::Linear {
                     let transfer = IccStage::RgbTransfer {
-                        transfer: encoding.transfer,
+                        encoding: *encoding,
+                        intensity: *intensity,
                         to_linear: direction == IccDirection::DeviceToPcs,
                     };
                     if direction == IccDirection::DeviceToPcs {
@@ -441,7 +449,10 @@ impl IccTransform {
     ) -> Result<Self, IccError> {
         Self::connect(
             IccTransformEndpoint::Profile(source.select(IccDirection::DeviceToPcs, intent)?.into()),
-            IccTransformEndpoint::Rgb(target),
+            IccTransformEndpoint::Rgb {
+                encoding: target,
+                intensity: None,
+            },
             intent,
         )
     }
@@ -453,8 +464,48 @@ impl IccTransform {
         intent: IccRenderingIntent,
     ) -> Result<Self, IccError> {
         Self::connect(
-            IccTransformEndpoint::Rgb(source),
+            IccTransformEndpoint::Rgb {
+                encoding: source,
+                intensity: None,
+            },
             IccTransformEndpoint::Profile(target.select(IccDirection::PcsToDevice, intent)?.into()),
+            intent,
+        )
+    }
+
+    /// Connect display-relative RGB to the selected ICC method. PCS unit white is the
+    /// declared image intensity; profile rendering intent still governs its PCS connection.
+    /// The transfer includes PQ absolute scaling or HLG's coupled OOTF, without tone mapping.
+    pub fn from_rgb_with_intensity(
+        source: RgbColorEncoding,
+        intensity: DisplayIntensity,
+        target: &IccProfile,
+        intent: IccRenderingIntent,
+    ) -> Result<Self, IccError> {
+        Self::connect(
+            IccTransformEndpoint::Rgb {
+                encoding: source,
+                intensity: Some(intensity),
+            },
+            IccTransformEndpoint::Profile(target.select(IccDirection::PcsToDevice, intent)?.into()),
+            intent,
+        )
+    }
+
+    /// Encode the selected profile's relative PCS light as RGB with an explicit image white.
+    /// This does not infer a display luminance from an ICC `lumi` tag or change the image peak.
+    pub fn to_rgb_with_intensity(
+        source: &IccProfile,
+        target: RgbColorEncoding,
+        intensity: DisplayIntensity,
+        intent: IccRenderingIntent,
+    ) -> Result<Self, IccError> {
+        Self::connect(
+            IccTransformEndpoint::Profile(source.select(IccDirection::DeviceToPcs, intent)?.into()),
+            IccTransformEndpoint::Rgb {
+                encoding: target,
+                intensity: Some(intensity),
+            },
             intent,
         )
     }

@@ -20,6 +20,7 @@ mod analytic;
 mod black;
 mod connection;
 mod device_output;
+mod hdr;
 mod intents;
 mod linear;
 mod lut;

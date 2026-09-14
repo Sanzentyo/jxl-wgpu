@@ -255,14 +255,24 @@ impl<'a> Encoder<'a> {
                     (Opcode::BlackPointConnection, payload)
                 }
                 IccStage::RgbTransfer {
-                    transfer,
+                    encoding,
+                    intensity,
                     to_linear,
                 } => {
-                    let (code, gamma) = crate::image_output::transfer_parameters(*transfer);
-                    let payload = self.sink.allocate(3)?;
+                    let (code, gamma) = crate::image_output::transfer_parameters(encoding.transfer);
+                    let luminance = intensity.map_or(Ok([0.0; 4]), |intensity| {
+                        crate::display_luminance(encoding.space, intensity.nits(), !to_linear)
+                            .map_err(|_| ResidentIccError::Precision)
+                    })?;
+                    let payload = self.sink.allocate(8)?;
                     self.sink.word(payload, code);
                     self.sink.word(payload + 1, gamma.to_bits());
                     self.sink.word(payload + 2, u32::from(*to_linear));
+                    self.sink
+                        .word(payload + 3, intensity.map_or(0.0, |v| v.nits()).to_bits());
+                    for (c, value) in luminance.into_iter().enumerate() {
+                        self.sink.word(payload + 4 + c as u32, value.to_bits());
+                    }
                     (Opcode::RgbTransfer, payload)
                 }
                 IccStage::LabToXyz => (Opcode::LabToXyz, 0),

@@ -98,6 +98,35 @@ impl GammaExponent {
     }
 }
 
+/// Positive finite luminance, in cd/m², represented by unit display-linear RGB.
+/// This declares the image white; it does not select tone mapping or a display peak.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DisplayIntensity(u32);
+
+impl DisplayIntensity {
+    #[must_use]
+    pub const fn new(nits: f32) -> Option<Self> {
+        if nits.is_finite() && nits > 0.0 {
+            Some(Self(nits.to_bits()))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn nits(self) -> f32 {
+        f32::from_bits(self.0)
+    }
+}
+
+impl std::fmt::Debug for DisplayIntensity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DisplayIntensity")
+            .field(&self.nits())
+            .finish()
+    }
+}
+
 /// Treatment of the reference whites during a colorimetric RGB conversion.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum WhitePointAdaptation {

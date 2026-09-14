@@ -1,9 +1,11 @@
 #![cfg(not(target_arch = "wasm32"))]
 
-mod corpus;
+use jxl_test_support::fixtures::hdr as corpus;
+use jxl_test_support::oracles::hdr as oracle;
+mod icc;
 mod independent;
-mod oracle;
 mod output;
+mod reference;
 mod transfer;
 
 use jxl_test_support::gpu::planes;
@@ -82,7 +84,7 @@ fn original_hdr_stills_and_composed_progression_match_native_whole_and_bounded()
                     let mut maximum = 0.0_f64;
                     for (pixel, words) in words.as_chunks::<4>().0.iter().enumerate() {
                         let index = frames * case.width * case.height + pixel;
-                        let bounds = oracle::original_bounds(
+                        let bounds = reference::original_bounds(
                             &case,
                             &reference,
                             linear_reference.as_deref(),
@@ -147,44 +149,5 @@ fn original_hdr_stills_and_composed_progression_match_native_whole_and_bounded()
         assert!(session.next_frame().unwrap().is_none());
         drop(session);
         assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
-    }
-}
-
-#[test]
-fn hdr_to_icc_requires_a_defined_luminance_connection_before_submission() {
-    use jxl_gpu_formats::{ColorSpecification, PixelFormat, RgbChannelOrder};
-    let profile = jxl_gpu_protocol::icc::IccProfile::parse(
-        std::fs::read(
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../jxl_wgpu/test-data/icc/srgb.icc"),
-        )
-        .unwrap()
-        .into(),
-        Default::default(),
-    )
-    .unwrap();
-    let backend = backend();
-    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
-    let request = GpuOutputRequest::color(PixelFormat::rgb_f32(
-        RgbChannelOrder::Rgba,
-        false,
-        ColorSpecification::Icc(profile),
-    ))
-    .unwrap();
-    for case in corpus::cases()
-        .into_iter()
-        .filter(|case| case.nits == 255.0 && !case.sequence)
-    {
-        assert!(matches!(
-            decoder.open(&case.bytes(), request.clone()),
-            Err(jxl_wgpu_decode::Error::ColorOutput(
-                jxl_wgpu_decode::color_output::ColorOutputError::HdrIccLuminanceMappingRequired
-            ))
-        ));
-        assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
-        assert_eq!(
-            backend.transient_memory_budget().snapshot().reserved_bytes,
-            0
-        );
     }
 }

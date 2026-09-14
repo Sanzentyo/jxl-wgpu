@@ -640,15 +640,22 @@ fn process_program(start: u32, input_values: array<f32, 16>) -> array<f32, 16> {
             }
             else if opcode == CLUT || opcode == MULTILINEAR_CLUT { next[c] = clut_value(base, p, c, &values, opcode == MULTILINEAR_CLUT); }
             else if opcode == BLACK_POINT_CONNECTION { next[c] = params.connection_scale[c] * values[c] + params.connection_offset[c]; }
-            else if opcode == RGB_TRANSFER {
-                let transfer = program[base];
-                let gamma = bitcast<f32>(program[base + 1u]);
-                if program[base + 2u] != 0u { next[c] = transfer_to_linear(values[c], transfer, gamma); }
-                else { next[c] = transfer_from_linear(values[c], transfer, gamma); }
-            }
             else if opcode == SEGMENTED_CURVES { next[c] = segmented_curve(program[base + c], values[c]); }
         }
-        if opcode == LAB_TO_XYZ {
+        if opcode == RGB_TRANSFER {
+            let transfer = program[base];
+            let gamma = bitcast<f32>(program[base + 1u]);
+            let intensity = bitcast<f32>(program[base + 3u]);
+            let luminance = vec4<f32>(bitcast<f32>(program[base + 4u]), bitcast<f32>(program[base + 5u]),
+                bitcast<f32>(program[base + 6u]), bitcast<f32>(program[base + 7u]));
+            let rgb = vec3<f32>(values[0], values[1], values[2]);
+            var converted: vec3<f32>;
+            if program[base + 2u] != 0u { converted = display_to_linear(rgb, transfer, gamma, intensity, luminance); }
+            else { converted = display_from_linear(rgb, transfer, gamma, intensity, luminance); }
+            next[0] = converted.x;
+            next[1] = converted.y;
+            next[2] = converted.z;
+        } else if opcode == LAB_TO_XYZ {
             let fy = (values[0] + 16.0) / 116.0;
             next[0] = 0.9642 * lab_inverse(fy + values[1] / 500.0);
             next[1] = lab_inverse(fy);

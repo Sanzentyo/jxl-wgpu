@@ -164,18 +164,8 @@ impl Compositor {
         let sample_bit_depth = image.bit_depth;
         let original = crate::image_color::original_domain(image)?;
         let intensity_target = image.tone_mapping.intensity_target.to_f32();
-        if matches!(
-            original.rgb_encoding().map(|encoding| encoding.transfer),
-            Some(jxl_gpu_protocol::TransferFunction::Pq | jxl_gpu_protocol::TransferFunction::Hlg)
-        ) && matches!(
-            request.format().color_spec,
-            jxl_gpu_formats::ColorSpecification::Icc(_)
-        ) && request.mapping() == crate::GpuOutputMapping::Color
-        {
-            return Err(
-                crate::color_output::ColorOutputError::HdrIccLuminanceMappingRequired.into(),
-            );
-        }
+        let intensity = jxl_gpu_protocol::DisplayIntensity::new(intensity_target)
+            .ok_or(crate::color_output::ColorOutputError::InvalidIntensityTarget)?;
         let orientation = OutputOrientation::from_exif_value(image.orientation).ok_or(
             Error::InvalidImageOrientation {
                 value: image.orientation,
@@ -320,8 +310,9 @@ impl Compositor {
         {
             Some(transforms.select(
                 &backend,
-                jxl_gpu_protocol::icc::IccTransform::from_linear_rgb(
-                    jxl_gpu_protocol::RgbColorSpace::Bt709,
+                jxl_gpu_protocol::icc::IccTransform::from_rgb_with_intensity(
+                    jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709,
+                    intensity,
                     profile,
                     profile.header().rendering_intent,
                 )?,
@@ -348,8 +339,11 @@ impl Compositor {
                     &source,
                     encoding,
                     icc::Output::Color(request),
-                    orientation,
-                    extras,
+                    icc::ImageMetadata {
+                        orientation,
+                        intensity,
+                        extras,
+                    },
                     &mut transforms,
                 )
             };
@@ -558,8 +552,11 @@ impl Compositor {
                                     params,
                                     profile,
                                 },
-                                orientation,
-                                extras,
+                                icc::ImageMetadata {
+                                    orientation,
+                                    intensity,
+                                    extras,
+                                },
                                 &mut transforms,
                             )
                         })

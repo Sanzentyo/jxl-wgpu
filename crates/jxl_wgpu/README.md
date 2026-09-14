@@ -29,8 +29,12 @@ comparisons across both directions and all three kernels.
 
 The same program connects profiles to declared RGB encodings using shared f64 CIE/Bradford metadata
 before one F32 lowering. `IccTransform::from_rgb` and `to_rgb` include an explicit GPU transfer
-stage around the PCS connection; linear RGB needs no transfer stage. Enumerated transfers keep
-their own extended-range rules, separately from ICC device-curve clipping. Owned ICC pixel formats and Gray/alpha storage describe these domains
+stage around the PCS connection; linear RGB needs no transfer stage. The corresponding
+`from_rgb_with_intensity` and `to_rgb_with_intensity` constructors take a validated
+`DisplayIntensity`: PCS Y=1 corresponds to the declared image white, with PQ absolute scaling
+and HLG's coupled three-component OOTF. Generic constructors retain absolute-normalized PQ and
+scene-linear HLG. Enumerated transfers keep their own extended-range rules, separately from ICC
+device-curve clipping. Owned ICC pixel formats and Gray/alpha storage describe these domains
 independently of execution admission. The [ICC execution contract](../../docs/ICC_COLOR.md)
 documents stage semantics, memory ownership, native/scalar evidence and remaining conformance.
 

@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 mod color;
 pub use color::{
-    Chromaticity, ColorMatrix, ColorMatrixError, GammaExponent, RgbChromaticities,
-    WhitePointAdaptation,
+    Chromaticity, ColorMatrix, ColorMatrixError, DisplayIntensity, GammaExponent,
+    RgbChromaticities, WhitePointAdaptation,
 };
 pub mod icc;
 mod vardct;

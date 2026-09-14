@@ -1,4 +1,4 @@
-use super::{backend, compare, corpus, oracle, planes};
+use super::{backend, compare, corpus, oracle, planes, reference};
 use jxl_gpu_formats::{Channel, ColorSpace, PixelFormat, SampleKind, TransferFunction};
 use jxl_wgpu_decode::{
     AlphaOutputPolicy, GpuDecoder, GpuOutputRequest, ModularChannels, NumericSampleMapping,
@@ -132,9 +132,12 @@ fn hdr_linear_conversion_and_numeric_original_output_match_independent_reference
                     let expected = original[frames * case.frame_words() + pixel * 4 + channel];
                     let actual = f32::from_bits(actual);
                     let index = frames * case.width * case.height + pixel;
-                    let [low, high] =
-                        oracle::original_bounds(&case, &original, native_linear.as_deref(), index)
-                            [channel];
+                    let [low, high] = reference::original_bounds(
+                        &case,
+                        &original,
+                        native_linear.as_deref(),
+                        index,
+                    )[channel];
                     assert!(
                         actual.is_finite() && f64::from(actual) >= low && f64::from(actual) <= high,
                         "{} numeric {channel}/{frames}/{pixel}: {actual}, native {expected}",
@@ -168,9 +171,12 @@ fn hdr_linear_conversion_and_numeric_original_output_match_independent_reference
                     let actual = f32::from(u16::from_le_bytes(*actual)) / 65535.0;
                     let expected = original[frames * case.frame_words() + pixel * 4 + channel];
                     let index = frames * case.width * case.height + pixel;
-                    let [low, high] =
-                        oracle::original_bounds(&case, &original, native_linear.as_deref(), index)
-                            [channel];
+                    let [low, high] = reference::original_bounds(
+                        &case,
+                        &original,
+                        native_linear.as_deref(),
+                        index,
+                    )[channel];
                     assert!(
                         f64::from(actual) >= low.clamp(0.0, 1.0) - 1.0 / 65535.0
                             && f64::from(actual) <= high.clamp(0.0, 1.0) + 1.0 / 65535.0,

@@ -4361,7 +4361,7 @@ requires its original color profile, so sequence conversion uses independent F64
   transfer when that output is checked; alpha is bounded separately by `2e-6`.
 - 1728 actual-GPU RGB transfer probes against F64 at nine intensities, including the HLG OOTF
   threshold and its explicit negative-luminance reconstruction extension; error budget `5e-5`.
-  Same-encoding output is word-exact. An undefined HDR↔ICC connection fails before submission.
+  Same-encoding output is word-exact. The following checkpoint extends HDR admission to ICC.
 
 On Apple M5 Metal, the independent linear maximum is `0.000047218684`; the native linear maximum
 is `0.0005264366`. The largest native original PQ encoded difference is `0.0181252823` near black,
@@ -4369,3 +4369,37 @@ inside the propagated reconstruction interval. It is not reported as an encoded 
 Native CMS linear references for original RGB may include PQ black approximation and HLG gamut
 normalization; unbounded conversion is tested against F64 instead. Tone/gamut policy, broad HDR/
 LF/feature combinations, full-range arithmetic and full ISO conformance remain open.
+
+## HDR and ICC relative image-white connections
+
+The [HDR/ICC generator](../crates/jxl_wgpu_decode/test-data/hdr_icc_generator/README.md) adds
+225 files: one manifest and 224 references. All 56 HDR streams and 80 presented images retain
+their existing bytes. Each source is explicitly paired with one of nine RGB/Gray matrix/TRC,
+XYZ/Lab LUT or identity-MPE targets under all four intents. This is not a Cartesian profile set.
+PCS Y=1 represents the declared image white; PQ absolute scaling and HLG's primary-dependent
+OOTF surround that connection. Physical display adaptation and tone/gamut mapping remain separate.
+
+The offline exporter propagates the existing native codec bounds through independent F64 HDR
+and CIE/Bradford equations. A shared C++ evaluator then applies independent ICC equations and
+Little CMS 2.19 to those PCS values. The 489,536 reference components each retain primary and
+native intervals, with the established native-semantics mask; no mask skips any assertion.
+The existing 913-file SDR corpus must also reproduce exactly through the extracted evaluator.
+
+GPU tests check 1,958,144 color components in 1,280 presentations, using planar/interleaved
+output and whole/43-byte fragmented input with 256-byte GPU windows. Original and composed
+sources also compare directly to independent PCS equations. Retained progressive updates remain
+immutable after session destruction, final words agree across configurations, alpha remains exact,
+and complete input/backend/image reservations return to zero.
+
+The reverse connection uses eight embedded ICC RGB/Gray × Modular/VarDCT × original/XYB sources
+at four intensities. Metadata-only header rewriting preserves compressed ICC and all physical
+frame bytes exactly; jxl-oxide independently parses the resulting intensity. Existing native XYB
+light and uncertainty scale before output conversion, while original ICC retains its independent
+scalar linear reference and absolute `2e-4` allowance. PQ/HLG and BT.2020/Display-P3 yield 512
+outputs across both layouts and transports. Separate resident ICC checks cover 11,664 components,
+all three kernel variants, nine intensities, three primary sets and both directions.
+
+The new transfer payload adds no image pass or per-transfer image, and the current 320-byte ICC
+dispatch ABI is unchanged. Exact program sharing/admission, completion and cancellation remain
+regression requirements. Wider HDR/CMYK/feature/LF combinations, ICC `lumi` display policy,
+tone/gamut mapping, full numeric range and full JPEG XL conformance remain open.

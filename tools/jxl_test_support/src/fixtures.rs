@@ -1,6 +1,7 @@
 //! Codestream assembly and explicit conformance manifests; no GPU rendering.
 pub mod embedded_icc;
 pub mod frame_features;
+pub mod hdr;
 pub mod icc;
 pub mod icc_spots;
 pub mod jpeg_sampling;

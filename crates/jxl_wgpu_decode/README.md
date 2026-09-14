@@ -375,7 +375,8 @@ XYB coefficients or the integer Modular words used by progressive-DC dependencie
 plus 27 rendering fixtures including five nine-layer animations and a real progressive-DC dependency.
 Whole and 256-byte-window fragmented async output agree exactly, and reservations return to zero.
 `cargo run -p jxl_wgpu_decode --example regenerate_floating` reproduces the corpus using offline
-libjxl 0.12 tools; the production crates do not link that codec. ICC, complete rendering intents and HDR luminance mapping remain separate requirements.
+libjxl 0.12 tools; the production crates do not link that codec. Broader ICC conformance,
+complete rendering intents and physical HDR display adaptation remain separate requirements.
 
 Codestream topology is separate from native pixel formats: `DecodeProfile::Modular`
 contains `ModularChannelCounts`, with `color_count()`, `extra_count()` and total `count()`.
@@ -611,8 +612,8 @@ streams in pass/group order, all use the same bounded-window executor and aggreg
 one global inverse/finalizer runs after assembly. One through eleven passes produce a complete final
 image; optional intermediate images run the same inverse/finalizer on independent arena copies.
 The low-level Modular producer requires patches and splines to be handled by the common frame
-executor. The common renderer handles enumerated PQ/HLG with explicit image intensity; HDR↔ICC
-connections still require a defined luminance policy.
+executor. The common renderer handles enumerated PQ/HLG with explicit image intensity, including
+ICC connections relative to that image white.
 The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard stream once, and selects a producer for each physical frame from
 `FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
@@ -622,7 +623,7 @@ mode-specific bindings and pipeline caches while sharing the backend byte budget
 
 Both decoders accept standard or custom RGB chromaticities with D65/E/DCI/custom white points,
 Linear/sRGB/BT.709 or parameterized Gamma/DCI transfer, and gray. Non-D65 white points currently
-require relative rendering intent; full ICC and HDR reconstruction remain incomplete. XYB inverse
+require relative rendering intent; broader ICC/HDR conformance remains incomplete. XYB inverse
 matrices carry their linear RGB chromaticities explicitly. Original RGB/YCbCr and post-transform
 references preserve the original transfer; unreferenced XYB can retain linear original RGB.
 `GpuOutputRequest::with_white_point_adaptation` selects Bradford or absolute XYZ for requested
@@ -762,9 +763,23 @@ inverse before submission. The shared output uniform is 240 bytes; composed nati
 The [HDR generator](test-data/hdr_generator/README.md) documents 56 streams/80 presentations,
 native and independent Rust references, negative-luminance interoperability, PQ dark precision,
 whole/bounded progression and numeric color/alpha selection. Generic backend presentation retains
-its own declared absolute-normalized PQ / scene-linear HLG contract. This work does not change
-display peak, tone/gamut map, or establish an ICC luminance connection: the latter returns
-`HdrIccLuminanceMappingRequired`. HDR feature/LF combinations and full conformance remain open.
+its own declared absolute-normalized PQ / scene-linear HLG contract.
+
+HDR and ICC connect relative to image white: PCS Y=1 corresponds to the declared intensity.
+RGB-to-ICC programs carry the complete RGB encoding and validated intensity; PQ absolute scaling
+or the coupled HLG OOTF precedes the PCS matrix. ICC-to-RGB presentation uses the same intensity
+in the final GPU packer. Profile method selection, media-white connection and black compensation
+retain the requested rendering intent. Reconstruction and presentation share a program when
+their complete endpoint metadata agree. No additional per-transfer image or submission is needed.
+
+The [HDR/ICC recipe](test-data/hdr_icc_generator/README.md) adds 224 native/independent references
+for all 56 HDR streams, nine paired RGB/Gray profiles and four intents. GPU tests check 1,958,144
+components in 1,280 presentations across both layouts and input modes. Eight embedded RGB/Gray
+ICC sources, including both codecs and XYB, also produce 512 PQ/HLG outputs at four intensities;
+only their tone-mapping headers change, with compressed ICC and frame bytes retained exactly.
+Held progressive images, alpha, complete memory release and direct resident transfer checks
+remain covered. Physical display adaptation, ICC `lumi` policy, tone/gamut mapping, broader
+HDR/CMYK/feature/LF combinations and full-range conformance remain open.
 
 ### Frame execution and animation
 
@@ -1330,8 +1345,8 @@ plane starts, last-row tails, opaque alpha, and unused sample/storage bits have 
 Thirty integer layout/transfer cases match both float CPU oracles within one code at 8–12 bits and at most
 three codes at 16 bits on Apple M5. Dedicated Display-P3 and BT.2020 cases match requested `djxl`
 color output within one RGB8 code. Scalar numeric color requests use the common frame surface and
-packer described above. Legacy Gray8 numeric layouts, broader ICC conformance and HDR↔ICC
-luminance mapping remain typed or unproven gaps. Enumerated PQ/HLG uses explicit image intensity.
+packer described above. Legacy Gray8 numeric layouts, broader ICC conformance and physical HDR
+display adaptation remain typed or unproven gaps. Enumerated PQ/HLG and ICC use explicit image white.
 
 Nine additional F32 layout/transfer cases preserve unclipped color without integer quantization.
 The CPU comparisons measure reconstruction error in linear light and report encoded error as well;
@@ -1457,7 +1472,7 @@ operation.
 This is not full VarDCT coverage. Broader progressive
 intermediates, larger/transformed raw-matrix conformance, broader asymmetric JPEG
 restoration/resampling combinations and other Modular side images,
-legacy Gray8 numeric layout output, HDR↔ICC luminance mapping,
+legacy Gray8 numeric layout output, physical HDR display adaptation,
 and complete progressive presentation remain typed or unproven gaps. Crop/blend
 animation and post-transform references are supported through the common frame executor. Unsupported paths return typed
 errors. They are not substituted with dummy coefficients or a CPU implementation.

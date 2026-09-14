@@ -34,6 +34,12 @@ pub(super) enum Output<'a> {
     },
 }
 
+pub(super) struct ImageMetadata<'a> {
+    pub(super) orientation: OutputOrientation,
+    pub(super) intensity: jxl_gpu_protocol::DisplayIntensity,
+    pub(super) extras: &'a [ExtraChannelInventory],
+}
+
 #[derive(Debug)]
 pub(super) struct Presentation {
     pub(super) source_encoding: FrameSurfaceEncoding,
@@ -54,10 +60,14 @@ impl Presentation {
         source: &FrameSurfaceLayout,
         source_encoding: FrameSurfaceEncoding,
         output: Output<'_>,
-        orientation: OutputOrientation,
-        extras: &[ExtraChannelInventory],
+        image: ImageMetadata<'_>,
         transforms: &mut Transforms,
     ) -> Result<Self> {
+        let ImageMetadata {
+            orientation,
+            intensity,
+            extras,
+        } = image;
         let (request, numeric) = match output {
             Output::Color(request) => (request, None),
             Output::Numeric {
@@ -86,13 +96,6 @@ impl Presentation {
             orientation.map_extent(source.color.extent),
             request.format().clone(),
         )?;
-        if matches!(output.format.color_spec, ColorSpecification::Defined(color)
-            if matches!(color.transfer, jxl_gpu_formats::TransferFunction::Pq | jxl_gpu_formats::TransferFunction::Hlg))
-        {
-            return Err(
-                crate::color_output::ColorOutputError::HdrIccLuminanceMappingRequired.into(),
-            );
-        }
         let device_output = output.format.model == jxl_gpu_formats::ColorModel::IccDevice;
         let target_encoding = |profile: &jxl_gpu_protocol::icc::IccProfile| {
             if device_output || numeric.is_some() {
@@ -143,7 +146,9 @@ impl Presentation {
             ),
             (FrameSurfaceEncoding::Rgb(encoding), ColorSpecification::Icc(target)) => (
                 target_encoding(target),
-                Some(IccTransform::from_rgb(*encoding, target, intent)?),
+                Some(IccTransform::from_rgb_with_intensity(
+                    *encoding, intensity, target, intent,
+                )?),
             ),
             (FrameSurfaceEncoding::Rgb(_), ColorSpecification::Defined(_)) => {
                 (source_encoding.clone(), None)
@@ -226,17 +231,20 @@ impl Presentation {
                         target,
                         dispatch[0] * 64,
                     )?,
-                    FrameSurfaceEncoding::Rgb(encoding) => ImageOutputParams::new(
-                        &output,
-                        ImageOutputSource {
-                            extent: geometry.extent,
-                            orientation,
-                            strides: geometry.strides,
-                            encoding: *encoding,
-                        },
-                        dispatch[0] * 64,
-                        request.white_point_adaptation(),
-                    )?,
+                    FrameSurfaceEncoding::Rgb(encoding) => {
+                        ImageOutputParams::new_with_intensity_target(
+                            &output,
+                            ImageOutputSource {
+                                extent: geometry.extent,
+                                orientation,
+                                strides: geometry.strides,
+                                encoding: *encoding,
+                            },
+                            dispatch[0] * 64,
+                            request.white_point_adaptation(),
+                            intensity.nits(),
+                        )?
+                    }
                     FrameSurfaceEncoding::Encoded
                     | FrameSurfaceEncoding::Device(_)
                     | FrameSurfaceEncoding::Cmyk { .. } => {

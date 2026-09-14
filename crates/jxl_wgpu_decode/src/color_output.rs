@@ -470,9 +470,6 @@ pub enum ColorOutputError {
     /// The common output contract rejected color or layout metadata.
     #[error(transparent)]
     ImageOutput(#[from] jxl_wgpu::Error),
-    /// The ICC connection does not yet carry the image's display-luminance context.
-    #[error("HDR conversion through an ICC profile requires an explicit luminance mapping")]
-    HdrIccLuminanceMappingRequired,
     /// Checked size arithmetic overflowed.
     #[error("reconstructed color output arithmetic overflow while computing {field}")]
     ArithmeticOverflow { field: &'static str },

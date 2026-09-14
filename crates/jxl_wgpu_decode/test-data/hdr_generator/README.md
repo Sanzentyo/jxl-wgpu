@@ -85,5 +85,6 @@ PQ↔HLG, primary conversion, identity, black/negative samples and nine intensit
 HLG near-unity threshold. Its F64 budget is `5e-5`; same-encoding values retain their F32 bits.
 Full streams check whole input against 256-byte GPU windows with 43-byte fragments, retained
 progressive outputs, final-only equality, original numeric color/alpha, and zero reservations
-after release. HDR↔ICC still requires a defined luminance connection and is rejected before
-submission. This corpus does not close the full color/HDR or ISO conformance roadmap gates.
+after release. The subsequent [HDR/ICC corpus](../hdr_icc_generator/README.md) reuses these exact
+streams and references to test the explicit image-white connection in both directions.
+These corpora do not close the full color/HDR or ISO conformance roadmap gates.

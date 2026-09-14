@@ -11,9 +11,11 @@ Requested RGB MPE output and embedded/requested RGB/Gray LUTs are also exercised
 Original CMYK sources now connect to RGB/Gray through the independently composed Black extra,
 including YCbCr reconstruction and source-domain spot presentation.
 Enumerated SDR sources also target ICC through original/XYB/YCbCr reconstruction and composition.
+PQ/HLG sources and embedded RGB/Gray ICC connect through explicit image white in both codecs,
+including XYB and original-domain composition.
 Spot presentation runs before ICC connections in the actual source domain, after reference storage.
 Broader ICC XYB conformance, other ICC methods
-and HDR mapping remain open.
+and physical HDR display adaptation remain open.
 This checkpoint does not change the full JPEG XL support claim.
 
 ICC spot presentation retains the existing
@@ -270,7 +272,7 @@ and 1,000,003 irregular samples, subnormal/near-zero coordinates and exact endpo
 ## Enumerated RGB connections
 
 `IccTransform::to_rgb` and `from_rgb` connect the selected profile to a declared
-`RgbColorEncoding`. `IccTransformEndpoint::Rgb` owns both its geometry and transfer;
+`RgbColorEncoding`. `IccTransformEndpoint::Rgb` owns its geometry, transfer and optional image intensity;
 `to_linear_rgb` and `from_linear_rgb` are convenience constructors with a linear transfer.
 Relative colorimetric intent uses Bradford
 between the RGB reference white and ICC's exact encoded PCS D50. Colorants are connected directly
@@ -290,9 +292,9 @@ ICC curve contract. This does not extend arbitrary ICC device curves to unbounde
 
 Nonlinear RGB adds one `IccStage::RgbTransfer` before the input PCS matrix or after the output
 PCS matrix. Its WGSL functions are shared with image output, with explicit transfer selector,
-gamma exponent and direction. Linear, sRGB, BT.709, BT.2020, PQ, HLG, Gamma and DCI retain their
-declared extended-range rules. This resident normalized-transfer API does not admit PQ/HLG JPEG XL
-metadata or establish HDR luminance mapping. The decoder still admits its existing SDR declarations.
+gamma exponent, direction, intensity and primary-luminance/OOTF vector. Linear, sRGB, BT.709,
+BT.2020, PQ, HLG, Gamma and DCI retain their declared extended-range rules. Constructors without
+image intensity keep generic absolute-normalized PQ and scene-linear HLG semantics.
 No surrogate ICC profile, CPU pixel conversion or additional linearization image is introduced.
 
 Requested ICC output enters the common compositor even for a plain unreferenced sRGB stream.
@@ -310,6 +312,33 @@ The independent input bound includes codec reconstruction before propagating thr
 curves, matrices, Lab and CLUTs. Little CMS's rounded reference-black Z has a separate native
 model; it never enlarges the primary GPU interval. Standalone resident tests additionally cover
 both directions, all eight transfers, five RGB geometries and three kernel variants.
+
+## HDR connections relative to image white
+
+`DisplayIntensity` admits only positive finite luminance in nits. The typed
+`IccTransform::from_rgb_with_intensity` and `to_rgb_with_intensity` constructors map this unit
+image white to PCS Y=1. PQ scales absolute 10000-nit light, and HLG applies the source or target
+primary-dependent display OOTF before or after the PCS matrix. The transfer stage operates on
+all three components together. Linear endpoints need no transfer stage; their intensity still
+participates in endpoint identity and program sharing.
+
+The decoder carries the image's `intensity_target` through HDR-to-ICC reconstruction and
+presentation, including original-domain references and blending. The reverse connection converts
+ICC to linear RGB and supplies the same image context to final packing. Selected ICC methods,
+media-white connection and black compensation retain all four rendering intents. This defines
+a relative image-white connection; it does not infer physical display adaptation from `lumi`,
+select a new display peak, or add tone/gamut mapping.
+
+The [HDR/ICC recipe](../crates/jxl_wgpu_decode/test-data/hdr_icc_generator/README.md) records
+the specification basis and independent precision contracts. It adds 489,536 native/independent
+reference components for 56 HDR streams paired with nine profiles under four intents. GPU tests
+check 1,958,144 components across 1,280 presentations, plus independent direct PCS comparisons.
+The reverse direction checks 512 outputs from embedded RGB/Gray ICC and XYB at four intensities.
+Compressed ICC and physical frame bytes stay unchanged when those fixture headers are rewritten.
+The resident primitive checks 11,664 HDR components over three variants, three primary sets,
+nine intensities and both directions. Existing codec and arithmetic bounds propagate through
+nonlinear operations before comparison; no GPU observations set the tolerances. Wider HDR/CMYK,
+feature/LF combinations, physical display policy and full-range conformance remain open.
 
 ## GPU contract
 

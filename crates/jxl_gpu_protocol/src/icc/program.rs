@@ -83,7 +83,9 @@ pub enum IccStage {
     SegmentedCurves(Arc<[IccSegmentedCurve]>),
     /// An enumerated three-channel RGB transfer, with its own extended-range rules.
     RgbTransfer {
-        transfer: crate::TransferFunction,
+        encoding: crate::RgbColorEncoding,
+        /// Unit linear white maps to PCS Y=1. None retains transfer-defined PQ/HLG units.
+        intensity: Option<crate::DisplayIntensity>,
         to_linear: bool,
     },
     /// CIE Lab in physical units (L*, a*, b*) to PCS XYZ, without unit-range clipping.
