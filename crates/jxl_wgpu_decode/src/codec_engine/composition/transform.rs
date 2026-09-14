@@ -9,7 +9,9 @@ use jxl_wgpu::{GpuBufferLease, ResidentStorageBinding, WgpuBackend};
 
 use super::gpu::{Compositor, Surface};
 use super::icc_transform::ColorBinding;
-use super::submission::{GpuWork, completion_fence_bytes, submit_recorded};
+use super::submission::{
+    GpuWork, IccWork, completion_fence_bytes, submit_icc_recorded, submit_recorded,
+};
 use crate::color_output::{
     ColorOutputConfig, ColorOutputEncoding, ColorOutputInputs, ColorOutputPacker, ColorOutputPlan,
     ColorOutputPlane, ColorOutputTransform, InverseOpsin,
@@ -96,7 +98,7 @@ pub(super) fn convert(
             + linear_layout
                 .as_ref()
                 .map_or(0, |layout| layout.storage_bytes)
-            + connection.map_or(0, |connection| connection.memory.dispatch_uniform_bytes),
+            + connection.map_or(0, |connection| connection.memory.transient_bytes()),
     )?;
     let program = connection
         .map(|connection| connection.resident(backend))
@@ -190,7 +192,7 @@ pub(super) fn convert(
             config: &config,
         },
     )?;
-    let icc_uniform = if let (Some(connection), Some(program), Some(linear)) =
+    let icc_dispatch = if let (Some(connection), Some(program), Some(linear)) =
         (connection, &program, &linear)
     {
         Some(connection.encode(
@@ -226,7 +228,7 @@ pub(super) fn convert(
         },
         &layout,
     )?;
-    submit_recorded(
+    submit_icc_recorded(
         backend,
         encoder,
         Surface {
@@ -235,7 +237,10 @@ pub(super) fn convert(
             encoding,
         },
         vec![source.buffer.clone()],
-        (scratch, linear, icc_uniform, program),
+        IccWork {
+            resources: (scratch, linear, program),
+            dispatch: icc_dispatch,
+        },
         permit,
         poll,
     )

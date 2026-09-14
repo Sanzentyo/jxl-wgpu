@@ -50,8 +50,19 @@ fn reference(directory: &Path, name: &str, intent: IccRenderingIntent) -> Vec<[f
 
 #[test]
 fn embedded_legacy_luts_convert_gray_and_rgb_through_both_codecs_and_all_intents() {
+    verify_decoder_corpus("lut");
+}
+
+#[test]
+fn embedded_v2_luts_prepare_black_connections_through_both_codecs_and_all_intents() {
+    verify_decoder_corpus("black");
+}
+
+fn verify_decoder_corpus(corpus: &str) {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
-    let profiles = Path::new(env!("CARGO_MANIFEST_DIR")).join("../jxl_wgpu/test-data/icc/lut");
+    let profiles = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../jxl_wgpu/test-data/icc")
+        .join(corpus);
     let directory = profiles.join("decoder");
     let manifest: Manifest =
         serde_json::from_slice(&std::fs::read(directory.join("manifest.json")).unwrap()).unwrap();
@@ -158,6 +169,6 @@ fn embedded_legacy_luts_convert_gray_and_rgb_through_both_codecs_and_all_intents
     assert_eq!(distinct[1], 0);
     assert_eq!(distinct[3], 0); // Equal media whites; absolute selects the relative LUT.
     eprintln!(
-        "legacy LUT decoder: {presentations} presentations, {components} components, distinct from relative {distinct:?}"
+        "{corpus} LUT decoder: {presentations} presentations, {components} components, distinct from relative {distinct:?}"
     );
 }

@@ -9,16 +9,18 @@ use jxl_gpu_protocol::{
     icc::{IccProfile, IccRenderingIntent, IccTransform},
 };
 use jxl_wgpu::{
-    DirectReadbackPolicy, KernelVariant, ResidentIccInputs, ResidentIccMemoryPlan,
-    ResidentIccPipeline, ResidentIccPlane, ResidentIccProgram, ResidentStorageBinding, WgpuBackend,
-    WgpuBackendConfig,
+    DirectReadbackPolicy, KernelVariant, ResidentIccDispatch, ResidentIccInputs,
+    ResidentIccMemoryPlan, ResidentIccPipeline, ResidentIccPlane, ResidentIccProgram,
+    ResidentStorageBinding, WgpuBackend, WgpuBackendConfig,
 };
 use serde::Deserialize;
 use wgpu::util::DeviceExt;
 
 mod analytic;
+mod black;
 mod connection;
 mod intents;
+mod linear;
 mod lut;
 mod metadata;
 mod mpe;
@@ -181,7 +183,7 @@ fn run(
     let plan = ResidentIccMemoryPlan::new(transform, &backend.device().limits()).unwrap();
     let program = ResidentIccProgram::new(backend.device(), transform).unwrap();
     assert_eq!(program.memory_plan(), plan);
-    assert_eq!(plan.dispatch_uniform_bytes, 272);
+    assert_eq!(plan.dispatch_bytes, 304);
     run_program(backend, pipeline, &program, extent, input, padding)
 }
 
@@ -214,7 +216,7 @@ fn run_program(
         mapped_at_creation: false,
     });
     let mut encoder = backend.device().create_command_encoder(&Default::default());
-    let uniform = pipeline
+    let dispatch = pipeline
         .encode(
             backend.device(),
             &mut encoder,
@@ -236,6 +238,13 @@ fn run_program(
         .map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
+    let status = dispatch.validation_buffer().map(|buffer| {
+        let (send, receive) = mpsc::sync_channel(1);
+        buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+            let _ = send.send(result);
+        });
+        (buffer, receive)
+    });
     backend
         .device()
         .poll(wgpu::PollType::Wait {
@@ -244,6 +253,13 @@ fn run_program(
         })
         .unwrap();
     receiver.recv().unwrap().unwrap();
+    if let Some((buffer, receive)) = status {
+        receive.recv().unwrap().unwrap();
+        let bytes = buffer.slice(..).get_mapped_range().unwrap();
+        ResidentIccDispatch::validate_status(&bytes).unwrap();
+        drop(bytes);
+        buffer.unmap();
+    }
     let mapped = staging.slice(..).get_mapped_range().unwrap();
     let data: &[f32] = bytemuck::cast_slice(&mapped);
     let start = target.offset as usize / 4;
@@ -270,7 +286,7 @@ fn run_program(
     );
     drop(mapped);
     staging.unmap();
-    drop(uniform);
+    drop(dispatch);
     result
 }
 

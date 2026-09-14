@@ -11,6 +11,7 @@ struct Recipe {
   unsigned channels;
   unsigned version = 4;
   bool matrix = true, clut = true, shared = false;
+  double output_floor = .0625, output_gain = 1;
 };
 struct Pipeline {
   Bytes bytes;
@@ -30,7 +31,8 @@ inline Pipeline Tables(const Recipe &recipe, unsigned intent, bool reverse) {
     }));
   for (unsigned c = 0; c < q; ++c)
     output.push_back(Table(m, precision, [=](double x) {
-      return .0625 + (.875 - intent / 64.0) * std::pow(x, 1.1 + c / 16.0);
+      return recipe.output_floor + recipe.output_gain * (.875 - intent / 64.0) *
+                                       std::pow(x, 1.1 + c / 16.0);
     }));
   const auto matrix =
       Matrix(reverse && !recipe.lab

@@ -6,10 +6,19 @@ use jxl_gpu_protocol::Extent2d;
 fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
     let memory = backend.transient_memory_budget();
-    for case in jxl_test_support::fixtures::embedded_icc::cases()
+    let matrix = jxl_test_support::fixtures::embedded_icc::cases()
         .filter(|case| !case.xyb && case.encoding == jxl_gpu_bitstream::FrameEncoding::Modular)
-    {
-        let bytes = case.bytes();
+        .map(|case| case.bytes());
+    let black = ["lut8_xyz_1", "lut16_lab_3", "low_1", "bright_3"].map(|name| {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../jxl_wgpu/test-data/icc/black/decoder")
+                .join(format!("{name}_modular.jxl")),
+        )
+        .unwrap()
+    });
+    let mut dynamic = 0;
+    for bytes in matrix.chain(black) {
         let image = jxl_gpu_bitstream::parse(&bytes, Default::default())
             .unwrap()
             .codestream_inventory(Default::default())
@@ -19,7 +28,8 @@ fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
             FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709).format(),
         )
         .unwrap()
-        .with_alpha_output_policy(crate::AlphaOutputPolicy::Preserve);
+        .with_alpha_output_policy(crate::AlphaOutputPolicy::Preserve)
+        .with_icc_rendering_intent(jxl_gpu_protocol::icc::IccRenderingIntent::Perceptual);
         let compositor = Compositor::new(
             backend.clone(),
             Extent2d::new(image.width, image.height),
@@ -36,6 +46,7 @@ fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
             panic!("ICC presentation plan")
         };
         let transform = presentation.transform.as_ref().unwrap();
+        dynamic += usize::from(transform.memory.validation_bytes == 4);
         assert!(super::super::super::lock(&transform.uploaded).is_none());
         assert_eq!(memory.snapshot().reserved_bytes, 0);
         let size = compositor.surface.storage_bytes;
@@ -51,7 +62,7 @@ fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
         let source = compositor.completed_surface(buffer);
         let output_size = aligned(compositor.layout.logical_size).unwrap();
         let transient =
-            208 + transform.memory.dispatch_uniform_bytes + presentation.working.storage_bytes;
+            208 + transform.memory.transient_bytes() + presentation.working.storage_bytes;
         let program_bytes = transform.memory.program_bytes;
         for (available, requested) in [
             (output_size - 1, output_size),
@@ -83,7 +94,14 @@ fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
             size + program_bytes + output_size
         );
         drop(output);
-        // The second dispatch fits without reserving another program. Abandon its work and
+        // Concurrent submissions share immutable metadata, but own their status and dispatch
+        // allocations. Completing in reverse consumer order must release both reservations.
+        let first = compositor.pack(&source).unwrap();
+        let second = compositor.pack(&source).unwrap();
+        drop(second.wait().unwrap());
+        drop(first.wait().unwrap());
+        assert_eq!(memory.snapshot().reserved_bytes, size + program_bytes);
+        // The next dispatch fits without reserving another program. Abandon its work and
         // image context while the completion callback keeps every submitted allocation alive.
         let held = memory
             .try_reserve(memory.snapshot().available_bytes - output_size - transient)
@@ -105,4 +123,5 @@ fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
         drop(output);
         assert_eq!(memory.snapshot().reserved_bytes, 0);
     }
+    assert_eq!(dynamic, 4);
 }

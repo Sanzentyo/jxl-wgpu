@@ -3,7 +3,7 @@
 //! immutable and shared; no shader address is derived from unchecked profile bytes.
 use std::collections::{BTreeMap, HashMap};
 
-use jxl_gpu_protocol::icc::{IccClutInterpolation, IccCurveSegmentKind, IccStage};
+use jxl_gpu_protocol::icc::{IccClutInterpolation, IccCurveSegmentKind, IccProgram, IccStage};
 
 use super::*;
 
@@ -18,6 +18,7 @@ enum Opcode {
     XyzToLab = 6,
     ClampedAffine = 7,
     MultilinearClut = 8,
+    BlackPointConnection = 9,
 }
 
 pub(super) fn program_size(transform: &IccTransform, limit: u64) -> Result<u64, ResidentIccError> {
@@ -100,136 +101,169 @@ impl Sink {
     }
 }
 
-fn encode(transform: &IccTransform, mut sink: Sink) -> Result<Sink, ResidentIccError> {
-    let stages = transform.program().stages();
-    sink.allocate(4 + stages.len() * 4)?;
-    sink.word(0, stages.len() as u32);
-    let mut curves: HashMap<&IccCurve, u32> = HashMap::new();
-    let mut segmented = BTreeMap::new();
-    let mut cluts = BTreeMap::new();
-    for (index, stage) in stages.iter().enumerate() {
-        let (opcode, payload) = match stage {
-            IccStage::Curves {
-                curves: selected,
-                inverse,
-            } => {
-                let payload = sink.allocate(selected.len())?;
-                for (c, curve) in selected.iter().enumerate() {
-                    let offset = if let Some(offset) = curves.get(curve) {
-                        *offset
-                    } else {
-                        let offset = legacy_curve(&mut sink, curve)?;
-                        curves.insert(curve, offset);
-                        offset
-                    };
-                    sink.word(payload + c as u32, offset);
-                }
-                (
-                    if *inverse {
-                        Opcode::InverseCurves
-                    } else {
-                        Opcode::ForwardCurves
-                    },
-                    payload,
-                )
-            }
-            IccStage::Matrix(matrix) => {
-                let p = matrix.input_channels();
-                let payload = sink.allocate(matrix.offset().len() * (p + 1))?;
-                for (r, offset) in matrix.offset().iter().enumerate() {
-                    for (c, value) in matrix.matrix()[r * p..(r + 1) * p]
-                        .iter()
-                        .chain([offset])
-                        .enumerate()
-                    {
-                        sink.finite(payload + (r * (p + 1) + c) as u32, *value)?;
+fn encode(transform: &IccTransform, sink: Sink) -> Result<Sink, ResidentIccError> {
+    let mut encoder = Encoder {
+        sink,
+        curves: HashMap::new(),
+        segmented: BTreeMap::new(),
+        cluts: BTreeMap::new(),
+    };
+    let start = encoder.program(transform.program())?;
+    debug_assert_eq!(start, 0);
+    Ok(encoder.sink)
+}
+
+struct Encoder<'a> {
+    sink: Sink,
+    curves: HashMap<&'a IccCurve, u32>,
+    segmented: BTreeMap<usize, u32>,
+    cluts: BTreeMap<usize, u32>,
+}
+
+impl<'a> Encoder<'a> {
+    fn program(&mut self, program: &'a IccProgram) -> Result<u32, ResidentIccError> {
+        let stages = program.stages();
+        let start = self.sink.allocate(4 + stages.len() * 4)?;
+        self.sink.word(start, stages.len() as u32);
+        for (index, stage) in stages.iter().enumerate() {
+            let (opcode, payload) = match stage {
+                IccStage::Curves {
+                    curves: selected,
+                    inverse,
+                } => {
+                    let payload = self.sink.allocate(selected.len())?;
+                    for (c, curve) in selected.iter().enumerate() {
+                        let offset = if let Some(offset) = self.curves.get(curve) {
+                            *offset
+                        } else {
+                            let offset = legacy_curve(&mut self.sink, curve)?;
+                            self.curves.insert(curve, offset);
+                            offset
+                        };
+                        self.sink.word(payload + c as u32, offset);
                     }
+                    (
+                        if *inverse {
+                            Opcode::InverseCurves
+                        } else {
+                            Opcode::ForwardCurves
+                        },
+                        payload,
+                    )
                 }
-                (
-                    if matrix.clamp_output() {
-                        Opcode::ClampedAffine
-                    } else {
-                        Opcode::Affine
-                    },
-                    payload,
-                )
-            }
-            IccStage::Clut(clut) => {
-                let key = clut.values().as_ptr() as usize;
-                let payload = if let Some(payload) = cluts.get(&key) {
-                    *payload
-                } else {
-                    let payload = sink.allocate(clut.grid().len() * 2)?;
-                    let mut stride = clut.output_channels() as u32;
-                    for (c, &grid) in clut.grid().iter().enumerate().rev() {
-                        sink.word(payload + c as u32 * 2, u32::from(grid));
-                        sink.word(payload + c as u32 * 2 + 1, stride);
-                        stride = stride
-                            .checked_mul(u32::from(grid))
-                            .ok_or(ResidentIccError::Addressing)?;
-                    }
-                    sink.floats(clut.values())?;
-                    cluts.insert(key, payload);
-                    payload
-                };
-                let opcode = match clut.interpolation() {
-                    IccClutInterpolation::Tetrahedral => Opcode::Clut,
-                    IccClutInterpolation::Multilinear => Opcode::MultilinearClut,
-                };
-                (opcode, payload)
-            }
-            IccStage::SegmentedCurves(curves) => {
-                let payload = sink.allocate(curves.len())?;
-                for (c, curve) in curves.iter().enumerate() {
-                    let key = curve.segments().as_ptr() as usize;
-                    let offset = if let Some(offset) = segmented.get(&key) {
-                        *offset
-                    } else {
-                        let offset = sink.allocate(1 + curve.segments().len() * 10)?;
-                        sink.word(offset, curve.segments().len() as u32);
-                        for (i, segment) in curve.segments().iter().enumerate() {
-                            let record = offset + 1 + i as u32 * 10;
-                            sink.word(record, segment.upper.to_bits());
-                            sink.word(record + 1, segment.lower.to_bits());
-                            let (kind, values) = match &segment.kind {
-                                IccCurveSegmentKind::Power { gamma, a, b, c } => {
-                                    (0, [*gamma, *a, *b, *c, 0.0])
-                                }
-                                IccCurveSegmentKind::Logarithmic { gamma, a, b, c, d } => {
-                                    (1, [*gamma, *a, *b, *c, *d])
-                                }
-                                IccCurveSegmentKind::Exponential { a, b, c, d, e } => {
-                                    (2, [*a, *b, *c, *d, *e])
-                                }
-                                IccCurveSegmentKind::Samples(samples) => {
-                                    sink.word(record + 3, samples.len() as u32);
-                                    let samples = sink.floats(samples)?;
-                                    sink.word(record + 9, samples);
-                                    (3, [0.0; 5])
-                                }
-                            };
-                            sink.word(record + 2, kind);
-                            for (i, value) in values.into_iter().enumerate() {
-                                sink.word(record + 4 + i as u32, value.to_bits());
-                            }
+                IccStage::Matrix(matrix) => {
+                    let p = matrix.input_channels();
+                    let payload = self.sink.allocate(matrix.offset().len() * (p + 1))?;
+                    for (r, offset) in matrix.offset().iter().enumerate() {
+                        for (c, value) in matrix.matrix()[r * p..(r + 1) * p]
+                            .iter()
+                            .chain([offset])
+                            .enumerate()
+                        {
+                            self.sink
+                                .finite(payload + (r * (p + 1) + c) as u32, *value)?;
                         }
-                        segmented.insert(key, offset);
-                        offset
-                    };
-                    sink.word(payload + c as u32, offset);
+                    }
+                    (
+                        if matrix.clamp_output() {
+                            Opcode::ClampedAffine
+                        } else {
+                            Opcode::Affine
+                        },
+                        payload,
+                    )
                 }
-                (Opcode::SegmentedCurves, payload)
-            }
-            IccStage::LabToXyz => (Opcode::LabToXyz, 0),
-            IccStage::XyzToLab => (Opcode::XyzToLab, 0),
-        };
-        let record = 4 + index as u32 * 4;
-        sink.word(record, opcode as u32);
-        sink.word(record + 1, stage.input_channels() as u32);
-        sink.word(record + 2, stage.output_channels() as u32);
-        sink.word(record + 3, payload);
+                IccStage::Clut(clut) => {
+                    let key = clut.values().as_ptr() as usize;
+                    let payload = if let Some(payload) = self.cluts.get(&key) {
+                        *payload
+                    } else {
+                        let payload = self.sink.allocate(clut.grid().len() * 2)?;
+                        let mut stride = clut.output_channels() as u32;
+                        for (c, &grid) in clut.grid().iter().enumerate().rev() {
+                            self.sink.word(payload + c as u32 * 2, u32::from(grid));
+                            self.sink.word(payload + c as u32 * 2 + 1, stride);
+                            stride = stride
+                                .checked_mul(u32::from(grid))
+                                .ok_or(ResidentIccError::Addressing)?;
+                        }
+                        self.sink.floats(clut.values())?;
+                        self.cluts.insert(key, payload);
+                        payload
+                    };
+                    let opcode = match clut.interpolation() {
+                        IccClutInterpolation::Tetrahedral => Opcode::Clut,
+                        IccClutInterpolation::Multilinear => Opcode::MultilinearClut,
+                    };
+                    (opcode, payload)
+                }
+                IccStage::SegmentedCurves(curves) => {
+                    let payload = self.sink.allocate(curves.len())?;
+                    for (c, curve) in curves.iter().enumerate() {
+                        let key = curve.segments().as_ptr() as usize;
+                        let offset = if let Some(offset) = self.segmented.get(&key) {
+                            *offset
+                        } else {
+                            let offset = self.sink.allocate(1 + curve.segments().len() * 10)?;
+                            self.sink.word(offset, curve.segments().len() as u32);
+                            for (i, segment) in curve.segments().iter().enumerate() {
+                                let record = offset + 1 + i as u32 * 10;
+                                self.sink.word(record, segment.upper.to_bits());
+                                self.sink.word(record + 1, segment.lower.to_bits());
+                                let (kind, values) = match &segment.kind {
+                                    IccCurveSegmentKind::Power { gamma, a, b, c } => {
+                                        (0, [*gamma, *a, *b, *c, 0.0])
+                                    }
+                                    IccCurveSegmentKind::Logarithmic { gamma, a, b, c, d } => {
+                                        (1, [*gamma, *a, *b, *c, *d])
+                                    }
+                                    IccCurveSegmentKind::Exponential { a, b, c, d, e } => {
+                                        (2, [*a, *b, *c, *d, *e])
+                                    }
+                                    IccCurveSegmentKind::Samples(samples) => {
+                                        self.sink.word(record + 3, samples.len() as u32);
+                                        let samples = self.sink.floats(samples)?;
+                                        self.sink.word(record + 9, samples);
+                                        (3, [0.0; 5])
+                                    }
+                                };
+                                self.sink.word(record + 2, kind);
+                                for (i, value) in values.into_iter().enumerate() {
+                                    self.sink.word(record + 4 + i as u32, value.to_bits());
+                                }
+                            }
+                            self.segmented.insert(key, offset);
+                            offset
+                        };
+                        self.sink.word(payload + c as u32, offset);
+                    }
+                    (Opcode::SegmentedCurves, payload)
+                }
+                IccStage::BlackPointConnection(connection) => {
+                    let payload = self.sink.allocate(8 + connection.input().len())?;
+                    let source = self.program(connection.source())?;
+                    self.sink.word(payload, source);
+                    self.sink.word(payload + 1, connection.input().len() as u32);
+                    for (c, value) in connection.target().into_iter().enumerate() {
+                        self.sink.finite(payload + 4 + c as u32, value)?;
+                    }
+                    for (c, value) in connection.input().iter().enumerate() {
+                        self.sink.finite(payload + 8 + c as u32, *value)?;
+                    }
+                    self.sink.word(start + 1, payload);
+                    (Opcode::BlackPointConnection, payload)
+                }
+                IccStage::LabToXyz => (Opcode::LabToXyz, 0),
+                IccStage::XyzToLab => (Opcode::XyzToLab, 0),
+            };
+            let record = start + 4 + index as u32 * 4;
+            self.sink.word(record, opcode as u32);
+            self.sink.word(record + 1, stage.input_channels() as u32);
+            self.sink.word(record + 2, stage.output_channels() as u32);
+            self.sink.word(record + 3, payload);
+        }
+        Ok(start)
     }
-    Ok(sink)
 }
 
 fn legacy_curve(sink: &mut Sink, curve: &IccCurve) -> Result<u32, ResidentIccError> {

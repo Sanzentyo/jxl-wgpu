@@ -1,12 +1,14 @@
 use super::{IccError, IccMatrixTrc, IccRenderingIntent, IccSignature, IccTransformEndpoint};
+use crate::icc::{IccAffine, IccBlackPointConnection, IccStage};
 
 // Decimal PCS D50 used by the ICC CMM connection policy. Profile matrices retain their
 // original fixed-point encoding; neither their colorants nor their CHAD is rewritten.
 const D50: [f64; 3] = [0.9642, 1.0, 0.8249];
 
 pub(super) struct Connection {
-    pub(super) scale: [f64; 3],
-    pub(super) offset: [f64; 3],
+    scale: [f64; 3],
+    offset: [f64; 3],
+    probe: Option<IccBlackPointConnection>,
 }
 
 impl Connection {
@@ -14,14 +16,15 @@ impl Connection {
         source: &IccTransformEndpoint,
         target: &IccTransformEndpoint,
         intent: IccRenderingIntent,
-    ) -> Result<Self, IccError> {
+    ) -> Self {
         if intent == IccRenderingIntent::Absolute {
             let source = media_white(source);
             let target = media_white(target);
-            return Ok(Self {
+            return Self {
                 scale: std::array::from_fn(|c| source[c] / target[c]),
                 offset: [0.0; 3],
-            });
+                probe: None,
+            };
         }
         let compensate = matches!(
             intent,
@@ -30,24 +33,60 @@ impl Connection {
             .profile()
             .is_none_or(|profile| profile.header.version >> 24 == 4);
         if compensate {
-            let source = black(source)?;
-            let target = black(target)?;
-            if source != target {
-                let scale = std::array::from_fn(|c| (D50[c] - target[c]) / (D50[c] - source[c]));
-                return Ok(Self {
+            let target = black(target).expect("automatic compensation targets a v4 endpoint");
+            let Some(source_black) = black(source) else {
+                let profile = source.profile().expect("selected v2 LUT source");
+                return Self {
+                    scale: [1.0; 3],
+                    offset: [0.0; 3],
+                    probe: Some(IccBlackPointConnection {
+                        source: profile.program.clone(),
+                        input: dark_input(profile.header.device_space)
+                            .expect("known darker colorant")
+                            .into(),
+                        target,
+                    }),
+                };
+            };
+            if source_black != target {
+                let scale =
+                    std::array::from_fn(|c| (D50[c] - target[c]) / (D50[c] - source_black[c]));
+                return Self {
                     scale,
-                    offset: std::array::from_fn(|c| target[c] - scale[c] * source[c]),
-                });
+                    offset: std::array::from_fn(|c| target[c] - scale[c] * source_black[c]),
+                    probe: None,
+                };
             }
         }
-        Ok(Self {
+        Self {
             scale: [1.0; 3],
             offset: [0.0; 3],
-        })
+            probe: None,
+        }
     }
 
     pub(super) fn is_identity(&self) -> bool {
-        self.scale == [1.0; 3] && self.offset == [0.0; 3]
+        self.probe.is_none() && self.scale == [1.0; 3] && self.offset == [0.0; 3]
+    }
+
+    pub(super) fn into_stage(self) -> Result<IccStage, IccError> {
+        if let Some(probe) = self.probe {
+            return Ok(IccStage::BlackPointConnection(probe));
+        }
+        Ok(IccStage::Matrix(IccAffine::new(
+            3,
+            (0..9)
+                .map(|i| {
+                    if i / 3 == i % 3 {
+                        self.scale[i / 3]
+                    } else {
+                        0.0
+                    }
+                })
+                .collect(),
+            self.offset.to_vec(),
+            false,
+        )?))
     }
 }
 
@@ -72,22 +111,30 @@ fn media_white(endpoint: &IccTransformEndpoint) -> [f64; 3] {
     }
 }
 
-fn black(endpoint: &IccTransformEndpoint) -> Result<[f64; 3], IccError> {
-    Ok(match endpoint {
+fn black(endpoint: &IccTransformEndpoint) -> Option<[f64; 3]> {
+    Some(match endpoint {
         IccTransformEndpoint::LinearRgb(_) => [0.0; 3],
         IccTransformEndpoint::Profile(profile) => match &profile.matrix_trc {
             Some(matrix) => profile_black(matrix),
             // Selected v4 LUT/MPE perceptual/saturation methods use the PCS reference black.
             // Unused matrix-shaper tags do not change the selected method's meaning.
             None if profile.header.version >> 24 == 4 => [0.00336, 0.0034731, 0.0028646],
-            None => {
-                // A v2 LUT has no declared v4 reference black. Deriving its black requires
-                // executing the selected LUT; do not substitute a v4 value or add CPU CMS.
-                return Err(IccError::LutBlackPoint {
-                    tag: profile.tag.expect("selected LUT method"),
-                });
-            }
+            None if dark_input(profile.header.device_space).is_some() => return None,
+            // The CMM has no darker-colorant endpoint for uncommon device spaces.
+            // An unavailable estimate means zero PCS black, not the v4 reference black.
+            None => [0.0; 3],
         },
+    })
+}
+
+fn dark_input(space: IccSignature) -> Option<&'static [f64]> {
+    Some(match &space.0 {
+        b"GRAY" => &[0.0],
+        b"RGB " => &[0.0; 3],
+        b"CMY " => &[1.0; 3],
+        b"CMYK" => &[1.0; 4],
+        b"Lab " => &[0.0, 128.0 / 255.0, 128.0 / 255.0],
+        _ => return None,
     })
 }
 

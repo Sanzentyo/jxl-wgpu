@@ -3,13 +3,14 @@
 //! Device values follow the ICC unit-domain/range rules. PCS matrix intermediates remain
 //! unclipped. Alpha and extra planes are not included in the supplied color channel views.
 //! This is a resident execution primitive; callers admit its explicit memory plan and retain
-//! the program and returned dispatch uniform through GPU completion, as for other resident
-//! codec stages. It does not submit commands or read image samples back to the host.
+//! the program and returned dispatch resources through GPU completion, as for other resident
+//! codec stages. Dynamic connections require checking a mapped metadata status word. No image
+//! samples are read back and this primitive does not submit commands.
 
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_protocol::{
     Extent2d,
-    icc::{IccCurve, IccCurveKind, IccInverseDirection, IccTransform},
+    icc::{IccCurve, IccCurveKind, IccInverseDirection, IccStage, IccTransform},
 };
 use wgpu::util::DeviceExt;
 
@@ -38,7 +39,9 @@ pub struct ResidentIccInputs<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResidentIccMemoryPlan {
     pub program_bytes: u64,
-    pub dispatch_uniform_bytes: u64,
+    pub dispatch_bytes: u64,
+    /// A mapped status word for a GPU-derived connection; zero for static connections.
+    pub validation_bytes: u64,
 }
 
 impl ResidentIccMemoryPlan {
@@ -61,8 +64,51 @@ impl ResidentIccMemoryPlan {
         let bytes = program_size(transform, limit)?;
         Ok(Self {
             program_bytes: bytes,
-            dispatch_uniform_bytes: std::mem::size_of::<DispatchParams>() as u64,
+            dispatch_bytes: std::mem::size_of::<DispatchParams>() as u64,
+            validation_bytes: if transform
+                .program()
+                .stages()
+                .iter()
+                .any(|stage| matches!(stage, IccStage::BlackPointConnection(_)))
+            {
+                4
+            } else {
+                0
+            },
         })
+    }
+
+    #[must_use]
+    pub const fn transient_bytes(self) -> u64 {
+        self.dispatch_bytes + self.validation_bytes
+    }
+}
+
+/// Completion-owned parameters and optional validation readback. If `validation_buffer` is
+/// present, map it after submission and call `validate_status` before accepting output pixels.
+#[must_use]
+#[derive(Debug)]
+pub struct ResidentIccDispatch {
+    parameters: wgpu::Buffer,
+    validation: Option<wgpu::Buffer>,
+}
+
+impl ResidentIccDispatch {
+    #[must_use]
+    pub const fn parameters(&self) -> &wgpu::Buffer {
+        &self.parameters
+    }
+
+    #[must_use]
+    pub const fn validation_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.validation.as_ref()
+    }
+
+    pub fn validate_status(bytes: &[u8]) -> Result<(), ResidentIccError> {
+        if bytes != [0; 4] {
+            return Err(ResidentIccError::Precision);
+        }
+        Ok(())
     }
 }
 
@@ -141,6 +187,7 @@ pub enum ResidentIccError {
 #[derive(Debug)]
 pub struct ResidentIccPipeline {
     pipeline: wgpu::ComputePipeline,
+    prepare: wgpu::ComputePipeline,
     variant: KernelVariant,
 }
 
@@ -159,9 +206,29 @@ impl ResidentIccPipeline {
             .map_err(|_| ResidentIccError::Workgroup { variant })?;
         let (x, y) = variant.workgroup_size();
         let module = device.create_shader_module(wgpu::include_wgsl!("../shaders/icc.wgsl"));
+        let bindings = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("jxl-wgpu ICC storage layout"),
+            entries: &std::array::from_fn::<_, 4, _>(|binding| wgpu::BindGroupLayoutEntry {
+                binding: binding as u32,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage {
+                        read_only: matches!(binding, 0 | 2),
+                    },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("jxl-wgpu ICC pipeline layout"),
+            bind_group_layouts: &[Some(&bindings)],
+            immediate_size: 0,
+        });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("jxl-wgpu ICC processing"),
-            layout: None,
+            layout: Some(&layout),
             module: &module,
             entry_point: Some("main"),
             compilation_options: wgpu::PipelineCompilationOptions {
@@ -170,18 +237,31 @@ impl ResidentIccPipeline {
             },
             cache: None,
         });
-        Ok(Self { pipeline, variant })
+        let prepare = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("jxl-wgpu ICC source-black detection"),
+            layout: Some(&layout),
+            module: &module,
+            entry_point: Some("prepare_black_point"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Ok(Self {
+            pipeline,
+            prepare,
+            variant,
+        })
     }
 
-    /// Validates all views and records one dispatch. The returned uniform is part of
-    /// the caller's admitted transient allocation and must remain owned through completion.
+    /// Validates views, records optional source-black detection and then pixel conversion.
+    /// The returned resources belong to the caller's admitted transient allocation. A dynamic
+    /// connection's mapped status must be validated before its output becomes authoritative.
     pub fn encode(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         program: &ResidentIccProgram,
         inputs: ResidentIccInputs<'_>,
-    ) -> Result<wgpu::Buffer, ResidentIccError> {
+    ) -> Result<ResidentIccDispatch, ResidentIccError> {
         let limits = device.limits();
         let params = validate_inputs(
             inputs,
@@ -203,10 +283,10 @@ impl ResidentIccPipeline {
                 });
             }
         }
-        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let parameters = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("jxl-wgpu ICC dispatch"),
             contents: bytemuck::bytes_of(&params),
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("jxl-wgpu ICC bindings"),
@@ -226,10 +306,29 @@ impl ResidentIccPipeline {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: uniform.as_entire_binding(),
+                    resource: parameters.as_entire_binding(),
                 },
             ],
         });
+        let validation = if program.memory.validation_bytes != 0 {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("jxl-wgpu ICC connection validation"),
+                size: program.memory.validation_bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("jxl-wgpu ICC source-black detection"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.prepare);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+            drop(pass);
+            Some(buffer)
+        } else {
+            None
+        };
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("jxl-wgpu ICC processing"),
             timestamp_writes: None,
@@ -238,7 +337,19 @@ impl ResidentIccPipeline {
         pass.set_bind_group(0, &group, &[]);
         pass.dispatch_workgroups(groups[0], groups[1], 1);
         drop(pass);
-        Ok(uniform)
+        if let Some(validation) = &validation {
+            encoder.copy_buffer_to_buffer(
+                &parameters,
+                std::mem::offset_of!(DispatchParams, status) as u64,
+                validation,
+                0,
+                4,
+            );
+        }
+        Ok(ResidentIccDispatch {
+            parameters,
+            validation,
+        })
     }
 }
 
@@ -259,19 +370,17 @@ struct DispatchParams {
     input_strides: [u32; MAX_CHANNELS],
     output_offsets: [u32; MAX_CHANNELS],
     output_strides: [u32; MAX_CHANNELS],
+    connection_scale: [f32; 4],
+    connection_offset: [f32; 3],
+    status: u32,
 }
 
 fn validate_capabilities(limits: &wgpu::Limits) -> Result<(), ResidentIccError> {
     for (resource, required, available) in [
         (
             "storage bindings",
-            3,
+            4,
             u64::from(limits.max_storage_buffers_per_shader_stage),
-        ),
-        (
-            "uniform bindings",
-            1,
-            u64::from(limits.max_uniform_buffers_per_shader_stage),
         ),
         ("bind groups", 1, u64::from(limits.max_bind_groups)),
         (
@@ -280,9 +389,11 @@ fn validate_capabilities(limits: &wgpu::Limits) -> Result<(), ResidentIccError> 
             u64::from(limits.max_bindings_per_bind_group),
         ),
         (
-            "uniform binding bytes",
+            "dispatch storage bytes",
             std::mem::size_of::<DispatchParams>() as u64,
-            limits.max_uniform_buffer_binding_size,
+            limits
+                .max_storage_buffer_binding_size
+                .min(limits.max_buffer_size),
         ),
     ] {
         if required > available {
@@ -374,6 +485,9 @@ fn validate_inputs(
         input_strides: strides(inputs.input_planes),
         output_offsets: offsets(inputs.output_planes),
         output_strides: strides(inputs.output_planes),
+        connection_scale: [1.0; 4],
+        connection_offset: [0.0; 3],
+        status: 0,
     })
 }
 
@@ -390,9 +504,11 @@ fn plane_end(plane: ResidentIccPlane, extent: Extent2d) -> Result<u64, ResidentI
 const _: () = {
     assert!(std::mem::size_of::<CurveParams>() == 48);
     assert!(std::mem::offset_of!(CurveParams, parameters) == 16);
-    assert!(std::mem::size_of::<DispatchParams>() == 272);
+    assert!(std::mem::size_of::<DispatchParams>() == 304);
     assert!(std::mem::offset_of!(DispatchParams, input_offsets) == 16);
     assert!(std::mem::offset_of!(DispatchParams, output_strides) == 208);
+    assert!(std::mem::offset_of!(DispatchParams, connection_scale) == 272);
+    assert!(std::mem::offset_of!(DispatchParams, status) == 300);
 };
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 use super::*;
-use jxl_gpu_protocol::icc::{IccClutInterpolation, IccError, IccStage};
+use jxl_gpu_protocol::icc::{IccClutInterpolation, IccStage};
 
 #[test]
 fn legacy_luts_match_independent_stages_in_both_directions_and_all_kernels() {
@@ -48,10 +48,8 @@ fn legacy_luts_match_independent_stages_in_both_directions_and_all_kernels() {
                             IccRenderingIntent::Perceptual | IccRenderingIntent::Saturation
                         )
                     {
-                        assert!(matches!(
-                            IccTransform::new(source, target, intent),
-                            Err(IccError::LutBlackPoint { .. })
-                        ));
+                        // The dedicated source-black corpus covers these new connections.
+                        assert!(IccTransform::new(source, target, intent).is_ok());
                         continue;
                     }
                     let transform = IccTransform::new(source, target, intent).unwrap();

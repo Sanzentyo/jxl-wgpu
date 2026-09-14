@@ -7,6 +7,7 @@ const LAB_TO_XYZ: u32 = 5u;
 const XYZ_TO_LAB: u32 = 6u;
 const CLAMPED_AFFINE: u32 = 7u;
 const MULTILINEAR_CLUT: u32 = 8u;
+const BLACK_POINT_CONNECTION: u32 = 9u;
 
 override wg_x: u32 = 16u;
 override wg_y: u32 = 16u;
@@ -17,11 +18,14 @@ struct Params {
     input_strides: array<vec4<u32>, 4>,
     output_offsets: array<vec4<u32>, 4>,
     output_strides: array<vec4<u32>, 4>,
+    connection_scale: vec4<f32>,
+    connection_offset: vec3<f32>,
+    status: u32,
 }
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
 @group(0) @binding(2) var<storage, read> program: array<u32>;
-@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> params: Params;
 
 fn parameter(base: u32, index: u32) -> f32 { return bitcast<f32>(program[base + 4u + index]); }
 fn sample_value(base: u32, index: u32) -> f32 { return f32(program[base + 12u + index]) / 65535.0; }
@@ -608,15 +612,10 @@ fn lab_inverse(t: f32) -> f32 {
     return (116.0 * t - 16.0) * (27.0 / 24389.0);
 }
 
-@compute @workgroup_size(wg_x, wg_y, 1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= params.extent_channels.x || id.y >= params.extent_channels.y { return; }
-    var values: array<f32, 16>;
-    for (var c = 0u; c < params.extent_channels.z; c++) {
-        values[c] = input[params.input_offsets[c / 4u][c % 4u] + id.y * params.input_strides[c / 4u][c % 4u] + id.x];
-    }
-    for (var stage = 0u; stage < program[0]; stage++) {
-        let record = 4u + stage * 4u;
+fn process_program(start: u32, input_values: array<f32, 16>) -> array<f32, 16> {
+    var values = input_values;
+    for (var stage = 0u; stage < program[start]; stage++) {
+        let record = start + 4u + stage * 4u;
         let opcode = program[record];
         let p = program[record + 1u];
         let q = program[record + 2u];
@@ -638,6 +637,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 next[c] = value;
             }
             else if opcode == CLUT || opcode == MULTILINEAR_CLUT { next[c] = clut_value(base, p, c, &values, opcode == MULTILINEAR_CLUT); }
+            else if opcode == BLACK_POINT_CONNECTION { next[c] = params.connection_scale[c] * values[c] + params.connection_offset[c]; }
             else if opcode == SEGMENTED_CURVES { next[c] = segmented_curve(program[base + c], values[c]); }
         }
         if opcode == LAB_TO_XYZ {
@@ -655,7 +655,54 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         values = next;
     }
+    return values;
+}
+
+@compute @workgroup_size(wg_x, wg_y, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if params.status != 0u || id.x >= params.extent_channels.x || id.y >= params.extent_channels.y { return; }
+    var values: array<f32, 16>;
+    for (var c = 0u; c < params.extent_channels.z; c++) {
+        values[c] = input[params.input_offsets[c / 4u][c % 4u] + id.y * params.input_strides[c / 4u][c % 4u] + id.x];
+    }
+    values = process_program(0u, values);
     for (var c = 0u; c < params.extent_channels.w; c++) {
         output[params.output_offsets[c / 4u][c % 4u] + id.y * params.output_strides[c / 4u][c % 4u] + id.x] = values[c];
+    }
+}
+
+fn finite(value: f32) -> bool {
+    return (bitcast<u32>(value) & 0x7f800000u) != 0x7f800000u;
+}
+
+// Each dispatch owns these coefficients. The immutable program may be used concurrently.
+@compute @workgroup_size(1, 1, 1)
+fn prepare_black_point() {
+    let base = program[1];
+    var input_values: array<f32, 16>;
+    for (var c = 0u; c < program[base + 1u]; c++) {
+        input_values[c] = bitcast<f32>(program[base + 8u + c]);
+    }
+    let evaluated = process_program(program[base], input_values);
+    var black = vec3<f32>(evaluated[0], evaluated[1], evaluated[2]);
+    let white = vec3<f32>(0.9642, 1.0, 0.8249);
+    let fy = lab_f(black.y);
+    let lightness = 116.0 * fy - 16.0;
+    let clipped = select(clamp(lightness, 0.0, 50.0), 0.0, lightness > 95.0);
+    if lightness != clipped {
+        let delta = (clipped + 16.0) / 116.0 - fy;
+        for (var c = 0u; c < 3u; c++) {
+            black[c] = white[c] * lab_inverse(lab_f(black[c] / white[c]) + delta);
+        }
+    }
+    for (var c = 0u; c < 3u; c++) {
+        let target_black = bitcast<f32>(program[base + 4u + c]);
+        let scale = (white[c] - target_black) / (white[c] - black[c]);
+        let offset = target_black - scale * black[c];
+        if !finite(black[c]) || !finite(scale) || !finite(offset) {
+            params.status = 1u;
+        }
+        params.connection_scale[c] = scale;
+        params.connection_offset[c] = offset;
     }
 }

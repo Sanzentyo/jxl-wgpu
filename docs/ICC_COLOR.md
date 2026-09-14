@@ -61,7 +61,8 @@ when an actual profile conversion is requested.
 Requested color conversion uses a selected immutable program shared across physical frames. Program
 upload is lazy, budgeted and retryable; each dispatch retains its uploaded program through GPU
 completion even if the image session is dropped. Intermediate color surfaces, unchanged extra
-planes, output words, the 272-byte ICC uniform and 208-byte packing uniform are all accounted.
+planes, output words, the 304-byte ICC dispatch storage, optional four-byte validation word
+and 208-byte packing uniform are all accounted.
 No frame readback or CPU pixel CMS is involved. `GpuOutputRequest::with_icc_rendering_intent`
 defaults to relative colorimetric; non-Bradford conversion and unsupported selected methods return errors.
 Exact same-profile packing does not select a CMS method and therefore does not require an
@@ -93,7 +94,7 @@ selected matrix/TRC method; LUT/MPE callers use the general selected program.
 Matrix/TRC covers RGB input/display and monochrome input/display/output classes with XYZ PCS.
 LUT/MPE supports input/display/output profiles, recognized device channel counts and XYZ/Lab PCS;
 this resident metadata support is broader than JPEG XL decoder admission, which still uses
-RGB/Gray image color surfaces. V2 LUT black-point connections, complete CMYK image plumbing, other profile classes,
+RGB/Gray image color surfaces. Complete CMYK image plumbing, other profile classes,
 full floating-point-range conformance and broader gamut/HDR policies remain open.
 
 Relative intent connects the profiles in media-relative PCS. Absolute intent uses fully adapted
@@ -199,18 +200,40 @@ and curve clipping boundaries remain explicit and cannot be removed by affine co
 Interpolation is a typed property of the CLUT. Legacy Lab-indexed output LUTs use multilinear
 interpolation; other LUTs use the existing tetrahedral/leading-axis-linear policy. This follows
 Little CMS 2.19's legacy LUT selection without changing floating MPE interpolation. GPU payload
-addresses, shared storage and the 272-byte dispatch uniform retain the existing checked layout.
+addresses and shared payload storage retain checked layouts. The dispatch record is now\n304-byte writable storage so a preparation pass can publish its connection coefficients.
 
-The v4 selected-method black policy also applies to LUTs. V2 LUTs can execute colorimetric
-connections and output connections where no automatic source-black detection is required.
-Perceptual/saturation conversion from a v2 LUT to a v4 or virtual linear endpoint returns
-`IccError::LutBlackPoint`: the v4 reference black is not a substitute for executing the v2
-black-detection program. GPU execution of that metadata program remains required.
+The v4 selected-method black policy also applies to LUTs. Perceptual/saturation conversion
+from a v2 LUT to a v4 or virtual linear endpoint embeds its selected source program and a
+normalized darker-colorant endpoint in `IccStage::BlackPointConnection`. A one-invocation GPU
+metadata pass executes that source program before image conversion. Gray/RGB use device zero,
+CMY/CMYK use device one, and device Lab uses `(0, 128/255, 128/255)`. Recognized device spaces
+without a CMM darker-colorant estimate use zero PCS black; they need no probe. Relative,
+absolute and v2-target connections retain their static policy.
+
+The GPU probe applies the same Lab L* 0–50 / above-95 reset policy while retaining a*/b*.
+Unchanged lightness preserves the evaluated XYZ directly. It builds the PCS scale/offset in
+per-dispatch storage; shared profile metadata remains immutable across concurrent submissions.
+Nonfinite black or connection coefficients set an error status and suppress image writes.
+`ResidentIccDispatch::validation_buffer` exposes a four-byte map whose status must pass
+`validate_status` before output becomes authoritative. Decoder wait/poll performs this check
+and preserves `ResidentIccError::Precision`; completion and cancellation release all admitted
+resources. No pixel data is read back for black detection or validation.
+
+The `black` corpus adds 20 v2 profiles: 8-/16-bit LUTs, XYZ/Lab PCS, Gray/RGB/CMYK/5CLR,
+zero-floor black and above-95 lightness cases. Independent/native source-black references check
+120 components; six target domains and all four intents check 318,240 color components,
+repeated on three GPU kernels for 954,720 comparisons and 576 validated preparations.
+Twenty-four embedded-profile Modular/VarDCT streams add 384 decoder presentations and
+117,504 color checks with exact alpha and bounded transport. The independent connection
+interval encloses the input/black error-box corners of its rational equation and rejects any
+box containing a singular denominator. Every native and GPU interval remains checked.
+CMY/device-Lab endpoint metadata is tested, while native image conformance for those spaces
+and other uncommon device spaces remains open.
 
 The `lut` corpus contains 436 files for 41 profiles and 202,436 independently evaluated/native
 components, checked 607,308 times on all three GPU kernels. It covers RGB, Gray, CMYK, 2/5/15
 channels, XYZ/Lab, table precision, every A/B combination, shared offsets, curve branches and all
-implemented directional/intent connections. V2 black-point rejection is explicitly asserted.
+implemented directional/intent connections; the dedicated `black` corpus covers automatic v2 connections.
 Another 145 files contain 24 libjxl original-color streams and 96 LUT-to-LUT references.
 Their 29,376 components are checked through 384 public decoder presentations (117,504 GPU
 components), with whole/fragmented input, planar/interleaved output, exact alpha, held-image
@@ -348,7 +371,7 @@ component is excluded from the primary GPU assertion.
 Additional GPU tests cover both monotone directions, exact plateau endpoint rules, all parametric
 inverse branches, clipped plateaus/gaps, metadata reuse after abandoned commands, Scalar/Lanes32/
 Tile16x16 dispatches, multiple extents/pitches, exact program limits and invalid bindings.
-The shader is Naga-validated without optional capabilities and its 272-byte uniform is checked
+The shader is Naga-validated without optional capabilities and its 304-byte storage record is checked
 against the parsed WGSL layout.
 
 The `linear` subcorpus adds 100 connections between the ten original profiles and five linear

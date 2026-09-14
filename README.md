@@ -99,8 +99,11 @@ original RGB/Gray decoder presentations through both codecs.
 The same interpreter executes legacy `mft1`, `mft2`, `mAB` and `mBA` LUT methods with explicit
 PCS normalization and interpolation. Forty-one v2/v4 profiles have 607,308 directional/kernel
 GPU comparisons; 24 embedded-LUT images add 384 decoded presentations across both codecs.
-Broader ICC XYB conformance, enumerated sources targeting ICC, spot rendering, CMYK image plumbing,
-v2 LUT black-point connections and full intent/HDR policies remain incomplete.
+V2 LUT source-black detection now executes as a GPU metadata pass, with a checked status word
+before output acceptance. Twenty more profiles add 954,720 resident GPU comparisons, and
+24 embedded-ICC streams add 117,504 decoded color comparisons. Broader ICC XYB conformance,
+enumerated sources targeting ICC, spot rendering, CMYK image plumbing and full intent/HDR
+policies remain incomplete.
 
 Creating an encoder or decoder requires a compatible `wgpu` backend. Unsupported codestream
 features or device limits return typed errors before a partial output becomes authoritative.

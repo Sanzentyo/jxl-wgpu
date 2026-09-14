@@ -186,8 +186,8 @@ a manifest and 312 directional/intent references. All four A/B stage combination
 physical ordering, shared curve sets/suffixes, table precisions and XYZ/Lab PCS are represented.
 Device spaces include Gray, RGB, CMYK, 2CLR, 5CLR and FCLR. Little CMS's CMYK/5–15-channel float
 formatters use percentages; corpus device inputs remain normalized unit values. V2 source LUT
-perceptual/saturation connections to v4 are explicitly excluded from generation and asserted as
-`LutBlackPoint` errors by the GPU test until source black detection executes on the GPU.
+perceptual/saturation connections to v4 are covered by the dedicated source-black corpus below;
+the original resident files retain their previous directional/intent coverage unchanged.
 
 `lut_decoder.cpp` uses libjxl **0.12.0** to encode/decode 24 original-color 17×9 images with the
 exact resident LUT profiles. Both source and data profile queries must preserve the ICC bytes.
@@ -231,3 +231,52 @@ Both native and GPU intervals are asserted for every component, including marked
 Original native values are retained, no GPU pixels enter the generator, and no primary interval
 is widened to cover a different CMM policy. The 202,436 resident and 29,376 decoder components
 produce 607,308 and 117,504 GPU comparisons respectively. All earlier corpora remain unchanged.
+
+## V2 LUT source-black detection
+
+`lut_black.cpp` adds 561 resident files: 20 exact v2 profiles, 20 input planes, 40 source-black
+references, 480 color references and one manifest. `lut/black.hpp` independently evaluates the
+selected LUT at its device endpoint, applies the darker-colorant Lab policy and connects the
+result to target black. Gray/RGB, CMYK and unavailable 5CLR estimates cover both table precisions
+and both PCS domains; low-floor and above-95-lightness profiles exercise clipping/reset behavior.
+Five unbounded linear RGB spaces and a v4 identity MPE target run through all four intents.
+Native Little CMS **2.19** directly checks 120 detected-black components and 318,240 converted
+color components with `NOOPTIMIZE | NOCACHE`.
+
+The policy follows [`cmssamp.c`](https://github.com/mm2/Little-CMS/blob/lcms2.19/src/cmssamp.c)
+and [`cmscnvrt.c`](https://github.com/mm2/Little-CMS/blob/lcms2.19/src/cmscnvrt.c).
+Independent primary/native intervals retain their separate stage rules. Black lightness bounds
+enclose both branches if they cross the strict L*>95 reset. For each component, connection
+bounds evaluate every corner of `target + (D50-target)*(input-black)/(D50-black)`; an interval
+containing a singular denominator is rejected. F32 operation uncertainty adds
+`16*epsilon*(1+abs(value)+abs(scale*input)+abs(scale*black))`, with the existing `epsilon=4e-7`.
+No GPU samples determine these intervals, and mask bit 5 never suppresses either comparison.
+
+`lut_black_decoder.cpp` adds 157 files under `black/decoder`: 24 exact-profile original RGB/Gray
+Modular/VarDCT streams, 24 decoded native F32 images, 96 conversion references, twelve v4 target
+profiles and a manifest. Targets use the opposite color count and PCS. Both codecs preserve
+exact alpha; Modular source words are bit-exact, and VarDCT uses the existing independently
+propagated 2e-5 source uncertainty. Native libjxl is **0.12.0**.
+
+```sh
+c++ -std=c++17 -Wall -Wextra -Werror -ffp-contract=off \
+  -Itools/jxl_test_support/native \
+  crates/jxl_wgpu/test-data/icc_generator/lut_black.cpp \
+  $(pkg-config --cflags --libs lcms2) -o .git/icc-regenerate/lut-black
+.git/icc-regenerate/lut-black crates/jxl_wgpu/test-data/icc/mpe/identity.icc \
+  .git/icc-regenerate/black-corpus
+c++ -std=c++17 -Wall -Wextra -Werror -ffp-contract=off \
+  crates/jxl_wgpu/test-data/icc_generator/lut_black_decoder.cpp \
+  $(pkg-config --cflags --libs libjxl lcms2) -o .git/icc-regenerate/lut-black-decoder
+.git/icc-regenerate/lut-black-decoder .git/icc-regenerate/black-corpus \
+  .git/icc-regenerate/black-corpus/decoder
+diff -rq crates/jxl_wgpu/test-data/icc/black .git/icc-regenerate/black-corpus
+```
+
+Two clean regenerations reproduce all 718 files byte-for-byte. The shared recipe's default
+parameters also reproduce all 581 original LUT files unchanged. Resident tests compare 954,720
+components through three kernel variants and validate 576 actual GPU preparation statuses.
+Decoder tests compare 117,504 components through 384 presentations, with whole/fragmented
+transport, both layouts, retained frames and final memory release. Separate GPU tests reject a
+singular source-black connection without image writes; completion tests retain typed errors
+and cover shared program reuse, exact admission, failed poll/wait and cancellation.

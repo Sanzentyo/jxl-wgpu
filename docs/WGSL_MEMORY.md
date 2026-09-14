@@ -1313,7 +1313,7 @@ while the generic BT.709 color space retains the standard CIE coordinates.
 ## Resident ICC processing records
 
 The reusable ICC storage buffer is an array of u32 words. A 16-byte header carries the stage
-count, followed by one 16-byte record per stage: opcode, input count, output count and payload
+count and optional source-black payload offset (word one; zero when absent), followed by one\n16-byte record per stage: opcode, input count, output count and payload
 word offset. Payloads contain checked variable-size matrices/offsets, curve-reference arrays,
 CLUT grids/strides and float samples, or segmented-curve records. Legacy curve descriptors remain
 48 bytes and store every original parameter; their u16 tables occupy u32 words. Sample positions
@@ -1326,18 +1326,33 @@ grid/stride/sample payload, so a shared table needs no duplicate storage for dif
 Integer LUT samples lower to the existing F32 CLUT payload; embedded sampled curves retain u16
 precision in u32 words. A/B curve sets may share complete curves or suffixes after metadata
 preflight proves their physical spans. Clipped matrix boundaries use opcode 7 and cannot fuse
-with neighboring affine stages. These additions use the existing dispatch uniform and bindings.
+with neighboring affine stages.
 
-The 272-byte, 16-byte-aligned dispatch uniform stores extent/channel counts at byte 0 and four
-sixteen-entry u32 plane arrays at bytes 16, 80, 144 and 208: input offsets, input strides, output
-offsets and output strides. WGSL uses arrays of four vec4 values to preserve portable uniform
-alignment. Its layout is checked against Naga. The backend limits live channel count to sixteen;
+Opcode 9 applies a GPU-derived black-point connection. Its payload contains the selected source
+program offset, endpoint channel count, two reserved words, three target-black F32 values and
+one reserved word, then normalized source endpoint values. The nested source program uses the
+same headers and records. Its curves/CLUTs share existing immutable payloads. This internally
+constructed probe cannot contain another connection.
+
+The 304-byte, 16-byte-aligned writable dispatch storage stores extent/channel counts at byte 0
+and four sixteen-entry u32 plane arrays at bytes 16, 80, 144 and 208: input offsets, input strides,
+output offsets and output strides. Four scale values start at 272 (the fourth is padding),
+three offset values at 288, and the status word at 300. Naga checks every offset and the span.
+The backend limits live channel count to sixteen, including source-probe intermediates;
 metadata limits are separate from this device execution policy.
+
+A one-invocation `prepare_black_point` pass precedes the image pass. It evaluates only the
+metadata endpoint and writes per-dispatch connection coefficients/status. Main invocations
+skip every image write on a nonzero status. Recording copies that word to a separate four-byte
+`MAP_READ | COPY_DST` validation buffer. The immutable program may be shared across concurrent
+submissions; neither coefficients nor completion status are shared between dispatches.
 
 `ResidentIccMemoryPlan` walks the same layout as upload, checking program size before allocating
 or traversing large sample payloads. The caller admits exact program and dispatch bytes and
-retains them through completion. Three storage bindings and one uniform are checked against
-device limits. Color input/output use distinct buffers and checked planar ranges; padding,
+retains them through completion. `transient_bytes()` includes dispatch storage and the optional
+four-byte validation allocation. Four storage bindings (input read-only, output read/write,
+program read-only, parameters read/write) and no uniform bindings are required and checked
+against device limits. Color input/output use distinct buffers and checked planar ranges; padding,
 alpha and extra planes remain outside writes. There is no per-stage image allocation or CPU
 pixel conversion. Affine metadata connects in f64, while non-identity stage execution uses F32.
 Exact identity matrices are omitted, preserving subnormals before discontinuous curves. See
@@ -1377,9 +1392,13 @@ needs a profile transform, it selects one host program and uploads it on its fir
 The program buffer has its own exact `MemoryPermit`, shared by an image-owned cache and each
 submitted dispatch. Failed initial admission leaves the cache empty; later frames reuse the same
 program reservation. A conversion reserves a separate full target-color/extra intermediate,
-the 272-byte ICC dispatch uniform, the 208-byte output-packing uniform and the browser completion
-fence. Packed output has its own lease. Completion owns all input/intermediate/uniform/program
-handles, even if pending work and the image session are dropped.
+the 304-byte ICC dispatch storage, optional four-byte validation map, the 208-byte output-packing
+uniform and the browser completion fence. Packed output has its own lease. Completion owns all
+input/intermediate/dispatch/program handles, even if pending work and the image session are
+dropped. Dynamic ICC completion maps and checks metadata status before publishing success;
+failures retain their typed precision error. Successful and failed wait/poll consume output
+ownership, while cancellation leaves submitted resources retained until the callback releases
+them. The Wasm path uses its local map callback and keeps the existing fence accounted.
 
 Same-profile device output allocates no ICC program or conversion intermediate. The 208-byte
 output ABI is unchanged: stored-channel order 4 identifies Gray/Gray-alpha; absent planar channels

@@ -18,8 +18,8 @@ mod transform;
 pub use curve::{IccCurve, IccCurveKind, IccInverseDirection};
 pub use profile::{IccHeader, IccProfile, IccTag};
 pub use program::{
-    IccAffine, IccClut, IccClutInterpolation, IccCurveSegment, IccCurveSegmentKind, IccProgram,
-    IccSegmentedCurve, IccStage,
+    IccAffine, IccBlackPointConnection, IccClut, IccClutInterpolation, IccCurveSegment,
+    IccCurveSegmentKind, IccProgram, IccSegmentedCurve, IccStage,
 };
 pub use transform::{IccMatrixTrc, IccProfileProgram, IccTransform, IccTransformEndpoint};
 
@@ -125,8 +125,6 @@ pub enum IccError {
     },
     #[error("ICC selected method {tag} is not supported by this operation")]
     TransformTag { tag: IccSignature },
-    #[error("ICC v2 LUT black-point connection for {tag} is not implemented")]
-    LutBlackPoint { tag: IccSignature },
     #[error("ICC tag {tag} has invalid curve parameters")]
     CurveParameters { tag: IccSignature },
     #[error("ICC tag {tag} has unsupported parametric function {function}")]

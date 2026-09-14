@@ -730,7 +730,23 @@ provide 202,436 independent/native components and 607,308 GPU directional/kernel
 Twenty-four compressed-ICC RGB/Gray Modular/VarDCT streams add 96 LUT-to-LUT references and
 384 decoded presentations, with propagated codec precision, exact alpha, bounded fragmented
 input and completion-owned memory. All earlier reference data remain unchanged.
-V2 source-LUT automatic black-point connections return a typed error pending GPU metadata
-execution. `COLOR-01/02`, `IO-01`, `QA-03/06` and the full goal remain **Partial**: that connection,
-CMYK image plumbing, other profile classes, broader MPE/XYB and HDR/gamut policy, full-range
-arithmetic and the remaining conformance/encoder gates are still required. See [ICC processing](ICC_COLOR.md).
+The source-black checkpoint below extends automatic v2 connections. `COLOR-01/02`, `IO-01`,
+`QA-03/06` and the full goal remain **Partial**: CMYK image plumbing, other profile classes,
+broader MPE/XYB and HDR/gamut policy, full-range arithmetic and the remaining conformance/encoder
+gates are still required. See [ICC processing](ICC_COLOR.md).
+
+V2 LUT source-black checkpoint: the selected source program and normalized darker-colorant
+endpoint execute in a separate one-invocation GPU metadata pass. Per-dispatch storage holds
+the derived PCS affine and status while curves/CLUTs retain shared immutable storage.
+Nonfinite connection coefficients suppress image writes and return typed precision failure
+before authoritative output; no CPU pixels or CPU LUT evaluation are involved. Exact memory
+admission includes the 304-byte dispatch and optional four-byte map. Concurrent reuse, failed
+wait/poll and cancellation release their accounted resources.
+
+Twenty v2 LUT profiles add 120 native black references and 318,240 independently bounded/native
+color components, checked 954,720 times across three GPU kernels with 576 validated preparations.
+Twenty-four embedded-profile Modular/VarDCT streams add 384 presentations and 117,504 color
+checks, exact alpha and bounded fragmented input. All 718 new files reproduce twice exactly;
+all 581 prior LUT files also regenerate unchanged. CMY/device-Lab endpoint metadata is covered,
+with native image conformance for those and other uncommon spaces still open. No feature row
+or full JPEG XL completion gate is closed by this checkpoint.

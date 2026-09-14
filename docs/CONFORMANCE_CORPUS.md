@@ -4077,6 +4077,34 @@ those extensions; every component still checks both intervals. Native/GPU pixels
 primary tolerance. Both generators reproduce all 581 files byte-for-byte, and every earlier
 reference remains unchanged. See the [generator and precision contract](../crates/jxl_wgpu/test-data/icc_generator/README.md#legacy-integer-lut-programs).
 
-V2 source-LUT perceptual/saturation connections to v4 or virtual linear RGB explicitly return
-`IccError::LutBlackPoint` until GPU source-black detection exists. CMYK image admission, other
-profile classes, broader MPE/XYB/HDR policies and full JPEG XL conformance remain open.
+The separate source-black corpus below extends automatic v2 connections. CMYK image admission,
+other profile classes, broader MPE/XYB/HDR policies and full JPEG XL conformance remain open.
+
+## V2 LUT GPU black-point preparation
+
+`crates/jxl_wgpu/test-data/icc/black` adds 561 resident files for twenty v2 profiles. Both LUT
+precisions, XYZ/Lab PCS and Gray/RGB/CMYK/5CLR cover selected source-black evaluation, clipped
+lightness, the above-95 reset and unavailable estimates. Forty native black references check
+120 components. Six target domains and all four intents provide 318,240 independent/native
+color components, checked 954,720 times through three actual GPU kernels. All 576 dynamic
+preparations have a validated zero status. Perceptual/saturation results differ from relative
+in 238,203/238,185 resident comparisons; equal media whites make absolute equal to relative.
+
+The 157 decoder files add 24 Modular/VarDCT streams with exact embedded profiles, twelve v4
+target profiles, native decoded images and 96 conversion references. Both layouts and
+whole/fragmented input produce 384 presentations and 117,504 checked color components.
+Perceptual and saturation each differ from relative in 7,344 reference components. Alpha is
+bit-exact, and retained output remains readable after the session releases its resources.
+
+Source-black error propagates through an independent rational connection bound that excludes
+singular denominators. The native and primary paths retain separate LUT/curve interpolation
+rules; every marked component still checks both intervals. Two fresh native generations match
+all 718 files, and the updated shared recipe reproduces all 581 previous LUT files unchanged.
+See the [source-black recipe](../crates/jxl_wgpu/test-data/icc_generator/README.md#v2-lut-source-black-detection).
+
+A deliberately singular GPU probe must return precision failure without touching output on
+all three kernels. Decoder completion tests cover typed wait/poll errors and cancellation;
+exact-budget tests include the 304-byte dispatch storage and four-byte validation word,
+concurrent immutable-program reuse and reverse consumer completion. CMY/device-Lab endpoint
+selection has metadata tests; native image conformance for those and other uncommon spaces,
+complete MPE ranges, other classes and full JPEG XL remain open.

@@ -649,8 +649,10 @@ profiles execute the resident ICC pipeline. The original profile is parsed once 
 GPU program uploads lazily once, with exact budget admission, retry and completion ownership.
 `with_icc_rendering_intent` defaults to relative colorimetric and executes all four matrix/TRC
 intents, including absolute media-white scaling and v4 perceptual/saturation black compensation.
-Non-Bradford conversion, unsupported selected methods and v2 source-LUT connections requiring
-automatic black detection return typed errors.
+V2 source-LUT connections derive black on the GPU when automatic compensation requires it.
+Completion validates a four-byte metadata status before delivering authoritative output;
+nonfinite connection coefficients return a typed `ResidentIccError::Precision`. Non-Bradford
+conversion and unsupported selected methods still return typed errors.
 Same-profile U8/F32 planar/interleaved Gray/RGB output
 performs only packing, orientation and requested alpha association, with no CMS curve evaluation.
 F32 with preserved association retains the existing Modular IEEE words, including nonfinite values,
@@ -684,10 +686,13 @@ interpreter. Twenty-four original RGB/Gray Modular/VarDCT streams cover XYZ/Lab 
 four requested intents through 384 whole/fragmented planar/interleaved presentations.
 The 117,504 color comparisons propagate codec uncertainty through independent LUT equations;
 alpha words remain exact, held frames stay readable, and final release returns the byte budget.
+Another 24 v2 source-LUT streams exercise GPU black preparation through all four intents,
+adding 384 presentations and 117,504 independent color checks. Concurrent reuse, admission
+rollback and cancellation include the dispatch storage and validation word.
 See the [LUT reference recipe](../jxl_wgpu/test-data/icc_generator/README.md#legacy-integer-lut-programs).
 
 Broader ICC XYB alpha/crop/reference conformance, enumerated-source-to-ICC conversion, spot-ink
-rendering, v2 LUT source-black detection, complete MPE ranges, CMYK image plumbing, other profile
+rendering, complete MPE ranges, CMYK image plumbing, other profile
 classes, HDR/gamut policies and standalone codec color admission remain open.
 Numeric and extra-channel bypasses keep their existing independent contracts.
 

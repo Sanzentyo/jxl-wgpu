@@ -101,8 +101,8 @@ pub use resident_gaborish::{
     ResidentGaborishPipeline, ResidentGaborishWeights,
 };
 pub use resident_icc::{
-    ResidentIccError, ResidentIccInputs, ResidentIccMemoryPlan, ResidentIccPipeline,
-    ResidentIccPlane, ResidentIccProgram,
+    ResidentIccDispatch, ResidentIccError, ResidentIccInputs, ResidentIccMemoryPlan,
+    ResidentIccPipeline, ResidentIccPlane, ResidentIccProgram,
 };
 pub use resident_noise::{
     ResidentNoiseError, ResidentNoiseInputs, ResidentNoiseParameters, ResidentNoisePipeline,

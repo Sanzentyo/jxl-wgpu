@@ -63,7 +63,10 @@ impl IccProgram {
     pub fn max_channels(&self) -> usize {
         self.stages
             .iter()
-            .map(IccStage::output_channels)
+            .map(|stage| match stage {
+                IccStage::BlackPointConnection(connection) => connection.source.max_channels(),
+                _ => stage.output_channels(),
+            })
             .fold(self.input_channels, usize::max)
     }
 }
@@ -81,6 +84,8 @@ pub enum IccStage {
     /// CIE Lab in physical units (L*, a*, b*) to PCS XYZ, without unit-range clipping.
     LabToXyz,
     XyzToLab,
+    /// A PCS connection whose source black is computed by a separate GPU metadata program.
+    BlackPointConnection(IccBlackPointConnection),
 }
 
 impl IccStage {
@@ -91,7 +96,7 @@ impl IccStage {
             Self::Matrix(matrix) => matrix.input_channels,
             Self::Clut(clut) => clut.grid.len(),
             Self::SegmentedCurves(curves) => curves.len(),
-            Self::LabToXyz | Self::XyzToLab => 3,
+            Self::LabToXyz | Self::XyzToLab | Self::BlackPointConnection(_) => 3,
         }
     }
 
@@ -102,6 +107,33 @@ impl IccStage {
             Self::Clut(clut) => clut.output_channels,
             _ => self.input_channels(),
         }
+    }
+}
+
+/// Source-black detection for a selected v2 LUT. The source program contains only profile
+/// stages; it cannot contain another connection. Backends evaluate the declared device endpoint,
+/// apply the darker-colorant Lab lightness policy, and build the PCS affine on the GPU.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IccBlackPointConnection {
+    pub(super) source: IccProgram,
+    pub(super) input: Arc<[f64]>,
+    pub(super) target: [f64; 3],
+}
+
+impl IccBlackPointConnection {
+    #[must_use]
+    pub const fn source(&self) -> &IccProgram {
+        &self.source
+    }
+
+    #[must_use]
+    pub fn input(&self) -> &[f64] {
+        &self.input
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> [f64; 3] {
+        self.target
     }
 }
 

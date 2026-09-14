@@ -422,7 +422,7 @@ fn legacy_xyz_device_signature_does_not_turn_input_data_into_pcs() {
 }
 
 #[test]
-fn v2_luts_reject_only_connections_that_need_unimplemented_black_detection() {
+fn v2_luts_plan_gpu_black_detection_only_for_connections_that_need_it() {
     for wide in [false, true] {
         let mut tags = rgb_tags();
         tags.extend([(*b"A2B0", tables(wide)), (*b"B2A0", tables(wide))]);
@@ -445,20 +445,74 @@ fn v2_luts_reject_only_connections_that_need_unimplemented_black_detection() {
                 IccTransform::new(&v2, &v4, intent),
                 IccTransform::to_linear_rgb(&v2, crate::RgbColorSpace::Bt709, intent),
             ] {
+                let transform = selected.unwrap();
+                let probes = transform
+                    .program()
+                    .stages()
+                    .iter()
+                    .filter_map(|stage| match stage {
+                        IccStage::BlackPointConnection(connection) => Some(connection),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
                 if matches!(
                     intent,
                     IccRenderingIntent::Perceptual | IccRenderingIntent::Saturation
                 ) {
+                    assert_eq!(probes.len(), 1);
+                    assert_eq!(probes[0].input(), &[0.0; 3]);
                     assert_eq!(
-                        selected.unwrap_err(),
-                        IccError::LutBlackPoint {
-                            tag: IccSignature(*b"A2B0")
-                        }
+                        probes[0].source(),
+                        v2.select(IccDirection::DeviceToPcs, intent)
+                            .unwrap()
+                            .program()
                     );
                 } else {
-                    assert!(selected.is_ok());
+                    assert!(probes.is_empty());
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn v2_black_metadata_uses_device_endpoints_and_zero_for_unavailable_estimates() {
+    let v4 = IccProfile::parse(profile_bytes(&rgb_tags()).into(), Default::default()).unwrap();
+    for (space, endpoint) in [
+        (*b"RGB ", Some([0.0; 3])),
+        (*b"CMY ", Some([1.0; 3])),
+        (*b"Lab ", Some([0.0, 128.0 / 255.0, 128.0 / 255.0])),
+        (*b"XYZ ", None),
+        (*b"3CLR", None),
+    ] {
+        let mut tags = rgb_tags();
+        tags.push((*b"A2B0", tables(true)));
+        let mut bytes = profile_bytes(&tags);
+        put32(&mut bytes, 8, 0x0240_0000);
+        bytes[16..20].copy_from_slice(&space);
+        let source = IccProfile::parse(bytes.into(), Default::default()).unwrap();
+        let transform = IccTransform::new(&source, &v4, IccRenderingIntent::Perceptual).unwrap();
+        let probe = transform
+            .program()
+            .stages()
+            .iter()
+            .find_map(|stage| match stage {
+                IccStage::BlackPointConnection(connection) => Some(connection),
+                _ => None,
+            });
+        assert_eq!(
+            probe.map(|connection| connection.input()),
+            endpoint.as_ref().map(|values| values.as_slice())
+        );
+        if endpoint.is_none() {
+            // This target's zero black makes the unavailable-estimate connection identical
+            // to relative intent. Falling back to v4 reference black would change the program.
+            assert_eq!(
+                transform.program(),
+                IccTransform::new(&source, &v4, IccRenderingIntent::Relative)
+                    .unwrap()
+                    .program()
+            );
         }
     }
 }

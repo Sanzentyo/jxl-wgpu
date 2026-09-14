@@ -13,7 +13,9 @@ use jxl_wgpu::{
 use wgpu::util::DeviceExt;
 
 use super::super::icc_transform::{ColorBinding, Transform, Transforms};
-use super::super::submission::{GpuWork, completion_fence_bytes, submit_recorded, validate_size};
+use super::super::submission::{
+    GpuWork, IccWork, completion_fence_bytes, submit_icc_recorded, validate_size,
+};
 use super::{Surface, aligned, dispatch, pipeline};
 use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
 use crate::{Error, GpuOutputRequest, Result};
@@ -190,7 +192,7 @@ impl Presentation {
         let transient_bytes = std::mem::size_of::<ImageOutputParams>() as u64
             + completion_fence_bytes()
             + self.transform.as_ref().map_or(0, |transform| {
-                self.working.storage_bytes + transform.memory.dispatch_uniform_bytes
+                self.working.storage_bytes + transform.memory.transient_bytes()
             });
         let permit = backend
             .transient_memory_budget()
@@ -213,7 +215,7 @@ impl Presentation {
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         let mut converted = None;
-        let mut icc_uniform = None;
+        let mut icc_dispatch = None;
         if let (Some(transform), Some(program)) = (&self.transform, &program) {
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("JPEG XL ICC converted device values"),
@@ -228,7 +230,7 @@ impl Presentation {
                     size: NonZeroU64::new(size).expect("nonempty ICC storage"),
                 }
             }
-            icc_uniform = Some(transform.encode(
+            icc_dispatch = Some(transform.encode(
                 backend,
                 &mut encoder,
                 program,
@@ -278,12 +280,15 @@ impl Presentation {
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(self.dispatch[0], self.dispatch[1], 1);
         }
-        submit_recorded(
+        submit_icc_recorded(
             backend,
             encoder,
             output,
             vec![source.buffer.clone()],
-            (uniform, converted, icc_uniform, program),
+            IccWork {
+                resources: (uniform, converted, program),
+                dispatch: icc_dispatch,
+            },
             permit,
             poll,
         )

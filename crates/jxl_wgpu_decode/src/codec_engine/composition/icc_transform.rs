@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use jxl_gpu_formats::ImageLayout;
 use jxl_gpu_protocol::icc::IccTransform;
 use jxl_wgpu::{
-    MemoryPermit, ResidentIccInputs, ResidentIccMemoryPlan, ResidentIccPipeline, ResidentIccPlane,
-    ResidentIccProgram, ResidentStorageBinding, WgpuBackend,
+    MemoryPermit, ResidentIccDispatch, ResidentIccInputs, ResidentIccMemoryPlan,
+    ResidentIccPipeline, ResidentIccPlane, ResidentIccProgram, ResidentStorageBinding, WgpuBackend,
 };
 
 use crate::{Error, Result};
@@ -89,7 +89,7 @@ impl Transform {
         program: &Program,
         source: ColorBinding<'_>,
         target: ColorBinding<'_>,
-    ) -> Result<wgpu::Buffer> {
+    ) -> Result<ResidentIccDispatch> {
         if source.layout.extent != target.layout.extent {
             return Err(Error::EngineContract("ICC connection extent mismatch"));
         }

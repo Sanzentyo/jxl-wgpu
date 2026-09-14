@@ -424,7 +424,7 @@ impl IccTransform {
         target: IccTransformEndpoint,
         intent: IccRenderingIntent,
     ) -> Result<Self, IccError> {
-        let connection = intent::Connection::new(&source, &target, intent)?;
+        let connection = intent::Connection::new(&source, &target, intent);
         let mut first = source.stages(IccDirection::DeviceToPcs)?;
         let mut last = target.stages(IccDirection::PcsToDevice)?;
         let same_geometry = source
@@ -440,20 +440,7 @@ impl IccTransform {
             stages.extend(first);
             stages.extend(last);
         } else {
-            let connection = IccStage::Matrix(IccAffine::new(
-                3,
-                (0..9)
-                    .map(|i| {
-                        if i / 3 == i % 3 {
-                            connection.scale[i / 3]
-                        } else {
-                            0.0
-                        }
-                    })
-                    .collect(),
-                connection.offset.to_vec(),
-                false,
-            )?);
+            let connection = connection.into_stage()?;
             for stage in first.into_iter().chain([connection]).chain(last) {
                 super::program::append(&mut stages, stage)?;
             }

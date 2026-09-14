@@ -1,10 +1,16 @@
 //! Accounted GPU submission and completion lifetime shared by blending and presentation.
 
 use crate::{Error, Result};
-use jxl_wgpu::{GpuBufferLease, MemoryPermit, SubmissionPollPermit, WgpuBackend};
+use jxl_wgpu::{
+    GpuBufferLease, MemoryPermit, ResidentIccDispatch, ResidentIccError, SubmissionPollPermit,
+    WgpuBackend,
+};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 use wgpu::util::DeviceExt;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests;
 
 pub(super) struct Submission<'a> {
     pub pipeline: &'a wgpu::ComputePipeline,
@@ -135,6 +141,43 @@ pub(super) fn submit_recorded<
     permit: MemoryPermit,
     poll: SubmissionPollPermit,
 ) -> Result<GpuWork<O>> {
+    submit_icc_recorded(
+        backend,
+        encoder,
+        output,
+        inputs,
+        IccWork {
+            resources,
+            dispatch: None,
+        },
+        permit,
+        poll,
+    )
+}
+
+pub(super) struct IccWork<R> {
+    pub resources: R,
+    pub dispatch: Option<ResidentIccDispatch>,
+}
+
+pub(super) fn submit_icc_recorded<
+    R: wgpu::WasmNotSendSync + 'static,
+    O: Clone + wgpu::WasmNotSendSync + 'static,
+>(
+    backend: &WgpuBackend,
+    encoder: wgpu::CommandEncoder,
+    output: O,
+    inputs: Vec<GpuBufferLease>,
+    resources: IccWork<R>,
+    permit: MemoryPermit,
+    poll: SubmissionPollPermit,
+) -> Result<GpuWork<O>> {
+    let validation = resources
+        .dispatch
+        .as_ref()
+        .and_then(ResidentIccDispatch::validation_buffer)
+        .cloned();
+    let validate_icc = validation.is_some();
     let guards = inputs
         .iter()
         .map(GpuBufferLease::try_acquire_gpu_submission)
@@ -161,29 +204,48 @@ pub(super) fn submit_recorded<
     // reservations after wait/poll has reported completion.
     let lifetime = Arc::new(Mutex::new(Some(WorkLifetime {
         _buffers: inputs,
-        _resources: (resources, output.clone()),
+        _resources: (resources.resources, resources.dispatch, output.clone()),
         _permit: permit,
         #[cfg(target_arch = "wasm32")]
         _completion_fence: completion_fence.clone(),
     })));
-    let done = Arc::clone(&completion);
-    let retained = Arc::clone(&lifetime);
     #[cfg(not(target_arch = "wasm32"))]
-    encoder.on_submitted_work_done(move || {
-        drop(super::lock(&retained).take());
-        done.complete(Ok(()));
-    });
+    if validation.is_none() {
+        let done = Arc::clone(&completion);
+        let retained = Arc::clone(&lifetime);
+        encoder.on_submitted_work_done(move || {
+            drop(super::lock(&retained).take());
+            done.complete(Ok(()));
+        });
+    }
     let submission = backend.queue().submit([encoder.finish()]);
     drop(guards);
     #[cfg(target_arch = "wasm32")]
-    {
-        let fence_for_callback = completion_fence.clone();
-        completion_fence.map_async(wgpu::MapMode::Read, .., move |result| {
-            if result.is_ok() {
-                fence_for_callback.unmap();
-            }
+    let validation = Some(validation.unwrap_or(completion_fence));
+    if let Some(buffer) = validation {
+        let done = Arc::clone(&completion);
+        let retained = Arc::clone(&lifetime);
+        let mapped = buffer.clone();
+        buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+            let outcome = result.map_err(|error| CompletionFailure::Backend(error.to_string()));
+            let outcome = outcome.and_then(|()| {
+                let outcome = if validate_icc {
+                    mapped
+                        .slice(..)
+                        .get_mapped_range()
+                        .map_err(|error| CompletionFailure::Backend(error.to_string()))
+                        .and_then(|bytes| {
+                            ResidentIccDispatch::validate_status(&bytes)
+                                .map_err(CompletionFailure::Icc)
+                        })
+                } else {
+                    Ok(())
+                };
+                mapped.unmap();
+                outcome
+            });
             drop(super::lock(&retained).take());
-            done.complete(result.map_err(|error| error.to_string()));
+            done.finish(outcome);
         });
     }
     let failed = Arc::clone(&completion);
@@ -237,12 +299,31 @@ pub(super) struct Completion {
 }
 #[derive(Debug, Default)]
 struct CompletionState {
-    result: Option<std::result::Result<(), String>>,
+    result: Option<std::result::Result<(), CompletionFailure>>,
     waker: Option<Waker>,
+}
+
+#[derive(Clone, Debug)]
+enum CompletionFailure {
+    Backend(String),
+    Icc(ResidentIccError),
+}
+
+impl CompletionFailure {
+    fn into_error(self) -> Error {
+        match self {
+            Self::Backend(error) => Error::backend(error),
+            Self::Icc(error) => error.into(),
+        }
+    }
 }
 
 impl Completion {
     pub(super) fn complete(&self, result: std::result::Result<(), String>) {
+        self.finish(result.map_err(CompletionFailure::Backend));
+    }
+
+    fn finish(&self, result: std::result::Result<(), CompletionFailure>) {
         let waker = {
             let mut state = super::lock(&self.state);
             if state.result.is_some() {
@@ -259,7 +340,7 @@ impl Completion {
     pub(super) fn poll(&self, context: &Context<'_>) -> Poll<Result<()>> {
         let mut state = super::lock(&self.state);
         if let Some(result) = state.result.as_ref() {
-            return Poll::Ready(result.clone().map_err(Error::backend));
+            return Poll::Ready(result.clone().map_err(CompletionFailure::into_error));
         }
         state.waker = Some(context.waker().clone());
         Poll::Pending
@@ -278,7 +359,7 @@ impl Completion {
             .as_ref()
             .expect("completion signalled")
             .clone()
-            .map_err(Error::backend)
+            .map_err(CompletionFailure::into_error)
     }
 }
 
@@ -290,8 +371,9 @@ pub(super) struct GpuWork<O = GpuBufferLease> {
 impl<O> GpuWork<O> {
     pub(super) fn poll(&mut self, context: &Context<'_>) -> Poll<Result<O>> {
         self.completion.poll(context).map(|result| {
+            let output = self.output.take();
             result?;
-            self.output.take().ok_or(Error::EngineContract(
+            output.ok_or(Error::EngineContract(
                 "composition completion consumed twice",
             ))
         })

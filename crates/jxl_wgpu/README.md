@@ -21,8 +21,10 @@ The ordered interpreter retains exact profile metadata, explicit curve/matrix cl
 XYZ/Lab PCS boundaries. Each CLUT declares tetrahedral or multilinear interpolation. Unknown
 MPE elements follow the specified fallback; malformed selected methods return typed errors.
 All four rendering intents include absolute media-white scaling and v4 perceptual/saturation
-black compensation. V2 source-LUT black detection remains unsupported where that connection
-requires it. Forty-one LUT profiles cover up to fifteen channels and 607,308 GPU component
+black compensation. V2 source-LUT black detection runs in a separate GPU metadata pass.
+`ResidentIccDispatch` owns a 304-byte storage record and an optional four-byte mapped status;
+callers validate that status before accepting output. Twenty v2 profiles contribute 954,720
+additional component comparisons, including clipped/reset lightness and unavailable estimates. Forty-one LUT profiles cover up to fifteen channels and 607,308 GPU component
 comparisons across both directions and all three kernels.
 
 The same program connects profiles to unbounded linear RGB using shared f64 CIE/Bradford metadata

@@ -82,7 +82,7 @@ fn original_icc_reconstruction_admits_exact_storage_retries_and_retains_cancelle
         let transient = 368
             + completion_fence_bytes()
             + linear.storage_bytes
-            + connection.memory.dispatch_uniform_bytes;
+            + connection.memory.transient_bytes();
         let program_bytes = connection.memory.program_bytes;
         let convert = || {
             super::convert(
@@ -206,7 +206,7 @@ fn original_reconstruction_and_linear_presentation_share_one_program_admission()
         let transient = std::mem::size_of::<jxl_wgpu::ImageOutputParams>() as u64
             + completion_fence_bytes()
             + working_bytes
-            + connection.memory.dispatch_uniform_bytes;
+            + connection.memory.transient_bytes();
         // Leave room only for this dispatch's output and scratch. A second admission of
         // the identical linear-to-original program would fail under this byte budget.
         let held = memory
