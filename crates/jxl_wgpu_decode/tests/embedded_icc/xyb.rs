@@ -6,6 +6,7 @@ use jxl_wgpu::WgpuBackend;
 use jxl_wgpu_decode::{AlphaOutputPolicy, GpuOutputRequest, OrientationPolicy};
 use std::num::NonZeroU64;
 
+mod alpha;
 mod animation;
 mod progression;
 

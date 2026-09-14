@@ -1,6 +1,7 @@
 //! Image-owned ICC selection and completion-owned GPU presentation resources.
 
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use jxl_gpu_formats::{ColorSpecification, ImageLayout};
 use jxl_gpu_protocol::icc::IccTransform;
@@ -11,7 +12,7 @@ use jxl_wgpu::{
 };
 use wgpu::util::DeviceExt;
 
-use super::super::icc_transform::{ColorBinding, Transform};
+use super::super::icc_transform::{ColorBinding, Transform, Transforms};
 use super::super::submission::{GpuWork, completion_fence_bytes, submit_recorded, validate_size};
 use super::{Surface, aligned, dispatch, pipeline};
 use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
@@ -23,7 +24,7 @@ mod tests;
 #[derive(Debug)]
 pub(super) struct Presentation {
     source_encoding: FrameSurfaceEncoding,
-    transform: Option<Transform>,
+    transform: Option<Arc<Transform>>,
     working: FrameSurfaceLayout,
     output: ImageLayout,
     pipeline: wgpu::ComputePipeline,
@@ -35,19 +36,15 @@ impl Presentation {
     pub(super) fn new(
         backend: &WgpuBackend,
         source: &FrameSurfaceLayout,
-        source_encoding: &FrameSurfaceEncoding,
         request: &GpuOutputRequest,
         orientation: OutputOrientation,
         alpha: AlphaConversion,
         alpha_extra: Option<usize>,
+        transforms: &mut Transforms,
     ) -> Result<Self> {
         let device = backend.device();
-        if FrameSurfaceEncoding::from_format(&source.color.format).as_ref() != Some(source_encoding)
-        {
-            return Err(Error::EngineContract(
-                "color presentation source layout mismatch",
-            ));
-        }
+        let source_encoding = FrameSurfaceEncoding::from_format(&source.color.format)
+            .ok_or(Error::EngineContract("color presentation source layout"))?;
         if alpha_extra.is_some_and(|index| index >= source.extras.len()) {
             return Err(Error::EngineContract("color presentation alpha index"));
         }
@@ -61,7 +58,7 @@ impl Presentation {
             return Err(crate::color_output::ColorOutputError::HdrLuminanceMappingRequired.into());
         }
         let (encoding, selected) =
-            match (source_encoding, &output.format.color_spec) {
+            match (&source_encoding, &output.format.color_spec) {
                 (FrameSurfaceEncoding::Icc(profile), ColorSpecification::Icc(target)) => (
                     FrameSurfaceEncoding::Icc(target.clone()),
                     if target == profile {
@@ -167,10 +164,10 @@ impl Presentation {
             ],
         );
         let transform = selected
-            .map(|selected| Transform::new(backend, selected))
+            .map(|selected| transforms.select(backend, selected))
             .transpose()?;
         Ok(Self {
-            source_encoding: source_encoding.clone(),
+            source_encoding,
             transform,
             working,
             output,

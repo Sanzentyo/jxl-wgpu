@@ -1,6 +1,6 @@
 # Full JPEG XL implementation roadmap
 
-Status date: 2026-09-13. This document is the canonical capability and implementation backlog for
+Status date: 2026-09-14. This document is the canonical capability and implementation backlog for
 the workspace. A crate README may explain a component in more detail, but it must not claim a
 broader codec profile than this file.
 
@@ -606,6 +606,14 @@ budget, submission totals, retry before initial admission, terminal late pressur
 Modular LF restoration/resampling and staged global/LF-group extra channels in LF consumers
 now have independent conformance coverage. Remaining `FRAME-01/02`, `FRONT-01` and
 intermediate progressive-output gates still apply, including broader reconstruction color domains.
+
+ICC XYB now has 48 native alpha sequences covering RGB/Gray, both codecs, straight/associated
+F32 alpha, all five blend modes and separate implicit/explicit background-alpha selectors. Independent physical-layer ICC/blend equations and propagated
+precision bounds validate original-device composition, exact alpha, both output layouts and
+whole/fragmented input. An image-owned registry shares selected ICC programs across reconstruction
+and direct linear presentation, including exact-budget cancellation. These extend the existing
+partial color/frame/conformance gates; arbitrary alpha-policy/target/crop/reference combinations,
+complete ICC methods/intents and the remaining full JPEG XL requirements remain open.
 
 ### Structural refactoring gate
 

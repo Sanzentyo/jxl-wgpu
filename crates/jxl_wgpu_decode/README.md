@@ -671,6 +671,10 @@ LF prediction and features retain explicit codec components through their common
 Four native stills, four additive reference sequences and seven LF/patch substitutions cover
 these paths; [reference generation and bounds](test-data/embedded_icc_xyb_generator/README.md)
 keep native reconstruction precision separate from ICC curve conditioning.
+Another 48 native sequences cover straight/associated F32 alpha, all five frame blend modes and
+implicit/explicit background-alpha references. Exact alpha and independent color intervals cover
+both output layouts and whole/fragmented input. A selection registry shares one GPU program
+across reconstruction and presentation, with exact-budget cancellation coverage.
 
 Broader ICC XYB alpha/crop/reference conformance, enumerated-source-to-ICC conversion, spot-ink rendering, LUT/MPE,
 CMYK, full intents, HDR luminance mapping and standalone codec color admission remain open.

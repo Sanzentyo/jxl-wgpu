@@ -3998,3 +3998,31 @@ before final output rounding. The native floating interface receives the same ex
 clamp as the ICC primitive, and all samples are retained. Tests first verify reconstructed device
 values against those source bounds, then check planar/interleaved converted output, fragmented
 equality, and unchanged reconstructed alpha words. No production CPU pixel conversion is used.
+
+## ICC XYB reconstruction, reference color and alpha composition
+
+`embedded_icc_xyb` adds 68 native/scalar files for four stills and four two-frame additive
+sequences. Native physical-layer linear output and independent ICC equations keep XYB
+reconstruction precision separate from inverse-curve conditioning. Four direct linear stills
+also match jxl-oxide; seven metadata-only LF/patch substitutions preserve existing frame bytes,
+dependency IDs and immutable intermediate/final output. Original-device references are built
+before blending, while unused original CMS methods do not block direct linear output.
+
+The `alpha` subdirectory adds 48 two-frame 17×9 codestreams and 576 F32LE references: RGB/Gray,
+Modular/VarDCT, straight/associated F32 alpha, all five frame blend modes, and eight extra Blend
+cases with explicit saved-alpha selection. Forty streams use an independent full-frame Replace
+for alpha, whose implicit source is transparent slot 0; the other eight select saved slot 1.
+Native header reads and Rust inventory checks verify this routing before scalar blending.
+Color Blend publishes combined coverage after the selected extra's own operation.
+
+Native libjxl physical layers, Little CMS conversions and independent f64 ICC/coverage algebra
+supply references without GPU pixels. The original normalized XYB error propagates through
+ICC corner bounds and monotone blend operations with outward rounding. All 28 nontrivial
+Add/Blend/MultiplyAdd cases reject conversion after linear-domain blending; three Multiply
+cases also discriminate the order. Eight straight-alpha sums retain values above one.
+
+Both layouts, complete/43-byte fragmented input, 256-byte entropy windows, exact alpha and
+immutable held buffers are checked through the public decoder. A separate allocation test
+leaves no room for a duplicate reconstruction/presentation program and verifies cancellation
+retains and releases the shared reservation once. Full ICC conformance remains open; see the
+[generator and precision contract](../crates/jxl_wgpu_decode/test-data/embedded_icc_xyb_generator/README.md).

@@ -144,6 +144,87 @@ fn original_icc_reconstruction_admits_exact_storage_retries_and_retains_cancelle
 }
 
 #[test]
+fn original_reconstruction_and_linear_presentation_share_one_program_admission() {
+    let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
+    let memory = backend.transient_memory_budget();
+    for case in jxl_test_support::fixtures::embedded_icc::cases().filter(|case| case.xyb) {
+        let inventory = jxl_gpu_bitstream::parse(&case.bytes(), Default::default())
+            .unwrap()
+            .codestream_inventory(Default::default())
+            .unwrap();
+        let image = &inventory.image_header;
+        let original = crate::image_color::original_domain(image).unwrap();
+        let request = GpuOutputRequest::color(original.format())
+            .unwrap()
+            .with_alpha_output_policy(crate::AlphaOutputPolicy::Preserve);
+        let compositor = Compositor::new(
+            backend.clone(),
+            jxl_gpu_protocol::Extent2d::new(image.width, image.height),
+            image,
+            &request,
+            ColorUsage {
+                original: true,
+                linear: true,
+                reconstruct_original: true,
+            },
+        )
+        .unwrap();
+        let source = source(&backend, image);
+        let original_surface = convert(
+            &backend,
+            &source,
+            image,
+            &inventory.frames[0],
+            &compositor,
+            original,
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        let working_bytes = original_surface.layout.storage_bytes;
+        drop(original_surface);
+        let linear = convert(
+            &backend,
+            &source,
+            image,
+            &inventory.frames[0],
+            &compositor,
+            compositor.linear_encoding(),
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        drop(source);
+        let connection = compositor.reconstruction.as_ref().unwrap();
+        let program_bytes = connection.memory.program_bytes;
+        assert_eq!(
+            memory.snapshot().reserved_bytes,
+            linear.layout.storage_bytes + program_bytes
+        );
+        let output_bytes = compositor.layout.logical_size;
+        assert_eq!(output_bytes % 4, 0);
+        let transient = std::mem::size_of::<jxl_wgpu::ImageOutputParams>() as u64
+            + completion_fence_bytes()
+            + working_bytes
+            + connection.memory.dispatch_uniform_bytes;
+        // Leave room only for this dispatch's output and scratch. A second admission of
+        // the identical linear-to-original program would fail under this byte budget.
+        let held = memory
+            .try_reserve(memory.snapshot().available_bytes - output_bytes - transient)
+            .unwrap();
+        let work = compositor.pack(&linear).unwrap();
+        let output = work.unvalidated().unwrap();
+        drop(work);
+        drop(held);
+        drop(linear);
+        drop(compositor);
+        drain(&backend, output_bytes);
+        drop(output);
+        assert_eq!(memory.snapshot().reserved_bytes, 0);
+    }
+}
+
+#[test]
 fn direct_xyb_never_selects_an_unused_original_profile_intent() {
     use jxl_gpu_protocol::icc::{IccError, IccRenderingIntent};
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();

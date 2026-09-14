@@ -5,7 +5,7 @@ and `pkg-config`. They are not production dependencies. From the repository root
 
 ```sh
 sh crates/jxl_wgpu_decode/test-data/embedded_icc_xyb_generator/regenerate.sh /tmp/icc-xyb
-diff -rq -x README.md crates/jxl_wgpu_decode/test-data/embedded_icc_xyb /tmp/icc-xyb
+diff -rq -x README.md -x alpha crates/jxl_wgpu_decode/test-data/embedded_icc_xyb /tmp/icc-xyb
 ```
 
 The output contains **68 files**. All F32 references are little-endian binary32 bytes.
@@ -61,6 +61,50 @@ frame bytes remain unchanged. Their established non-ICC GPU outputs provide the 
 invariant, including dependency identities, 40-byte windows and immutable retained updates.
 The original fixture suites retain independent native/scalar coverage of those codec pixels.
 
-This checkpoint does not complete ICC XYB conformance. Broader alpha/blend/crop/reference
+## Alpha and independent blend operations
+
+A separate generator requires a clean libjxl **v0.12.0** source checkout at
+`a7a9c787341cf703dede03c2009fa460cae5e5df`, the installed libraries above, and `libhwy`:
+
+```sh
+sh crates/jxl_wgpu_decode/test-data/embedded_icc_xyb_generator/regenerate-alpha.sh /path/to/libjxl /tmp/icc-xyb-alpha
+diff -rq -x README.md crates/jxl_wgpu_decode/test-data/embedded_icc_xyb/alpha /tmp/icc-xyb-alpha
+```
+
+`alpha.cpp` encodes **48 streams**: RGB/Gray × Modular/VarDCT × straight/associated alpha ×
+Replace/Add/Blend/MultiplyAdd/Multiply, plus eight explicit alpha-reference Blend cases. Each has two F32 layers and saves original-device
+reference 1. Alpha cycles through exact 0, 1/8, 1/4, 1/2, 3/4 and 1. All 96 physical outputs
+are identical with built-in and explicit native CMS. Coalesced decoding remains a diagnostic:
+non-Replace second frames fail, and explicit CMS changes first-frame pixels even while DATA
+ICC stays unchanged. Those coalesced values are not used as references.
+
+`alpha_compose.cpp` converts each physical layer to original ICC device values using the
+independent f64 ICC oracle, then evaluates the blend equations independently. It links the
+unmodified native [`alpha.cc`](https://github.com/libjxl/libjxl/blob/a7a9c787341cf703dede03c2009fa460cae5e5df/lib/jxl/alpha.cc)
+(SHA-256 `0935796743e0f4524bf0f506883d0bbc605f344bd8c939c6ba501b10c7c85b52`) to
+cross-check coverage and color algebra. The [`PerformBlending` ordering](https://github.com/libjxl/libjxl/blob/a7a9c787341cf703dede03c2009fa460cae5e5df/lib/jxl/blending.cc)
+explains why color Blend also writes its selected alpha after the independent extra operation.
+Background alpha comes from its own extra-channel selector. Full-frame Replace implicitly
+selects slot 0, so the original 40 streams use transparent background alpha. Eight extra
+`_alpha_ref1` cases encode alpha Blend from saved slot 1; native header reads and Rust
+inventory assertions verify the difference. The oracle applies these selectors before blending.
+
+Native blend versus f64 differs by at most 5.97e-8; native CMS uncertainty remains separate.
+
+The original normalized XYB reconstruction interval is propagated through the existing ICC
+corner bounds and each monotone blend operation, with 2e-7 outward rounding for blend
+arithmetic. Alpha remains exact. All 28 Add/MultiplyAdd and nontrivial Blend cases exclude blending in linear
+RGB before conversion, even with these bounds. Three Multiply cases also discriminate that
+order; Replace and near-homogeneous Multiply cases need not. Eight composed outputs exceed
+one. The **624 files** include native/scalar physical layers, native/scalar composition and
+all lower/upper bounds. Neither GPU output nor an observed GPU error defines any reference.
+
+The public alpha test covers all 48 cases, both layouts, whole/fragmented input, exact alpha,
+association preservation and immutable held frames. Replace also changes the working color
+domain from original-device reference reconstruction to direct linear presentation. An
+image-owned selection registry shares identical ICC programs across these two uses; a byte
+budget test leaves no room for a duplicate program and verifies cancellation releases once.
+
+This checkpoint does not complete ICC XYB conformance. Broader alpha-policy/blend/crop/reference
 combinations, transformed ICC targets after composition, numeric sequence bypasses, full ICC
 methods/intents, and HDR/display policies remain part of the full JPEG XL goal.

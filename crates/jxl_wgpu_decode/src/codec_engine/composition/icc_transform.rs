@@ -11,6 +11,31 @@ use jxl_wgpu::{
 
 use crate::{Error, Result};
 
+/// A planning-time registry. Executable connections retain shared ownership after planning.
+#[derive(Default)]
+pub(super) struct Transforms {
+    connections: Vec<Arc<Transform>>,
+}
+
+impl Transforms {
+    pub(super) fn select(
+        &mut self,
+        backend: &WgpuBackend,
+        selected: IccTransform,
+    ) -> Result<Arc<Transform>> {
+        if let Some(existing) = self
+            .connections
+            .iter()
+            .find(|entry| entry.selected == selected)
+        {
+            return Ok(Arc::clone(existing));
+        }
+        let connection = Arc::new(Transform::new(backend, selected)?);
+        self.connections.push(Arc::clone(&connection));
+        Ok(connection)
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Transform {
     selected: IccTransform,
@@ -32,7 +57,7 @@ pub(super) struct ColorBinding<'a> {
 }
 
 impl Transform {
-    pub(super) fn new(backend: &WgpuBackend, selected: IccTransform) -> Result<Self> {
+    fn new(backend: &WgpuBackend, selected: IccTransform) -> Result<Self> {
         Ok(Self {
             memory: ResidentIccMemoryPlan::new(&selected, &backend.device().limits())?,
             pipeline: ResidentIccPipeline::new(backend.device())?,

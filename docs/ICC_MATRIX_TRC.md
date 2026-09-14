@@ -25,7 +25,10 @@ Only required connections are selected and uploaded. Both stages use the same im
 budgeted ICC program abstraction, including intermediate storage retained through GPU completion.
 Gray reconstruction changes three linear planes into one device plane and keeps extra-channel
 offsets consistent. Four stills, four additive sequences and seven LF/patch substitutions cover
-this boundary. [XYB generator and precision](../crates/jxl_wgpu_decode/test-data/embedded_icc_xyb_generator/README.md).
+this boundary. Forty-eight additional native sequences cover straight/associated F32 alpha and all five
+color blend modes against independent device-domain equations and propagated bounds. Identical
+selected connections share one image-owned GPU program across reconstruction and presentation,
+including mixed original/linear sequences and exact byte-budget cancellation. [XYB generator and precision](../crates/jxl_wgpu_decode/test-data/embedded_icc_xyb_generator/README.md).
 
 `ColorSpecification::Icc(IccProfile)` now carries the exact profile through owned pixel formats
 and layouts. The color specification is `Clone`, not `Copy`; clones share the original bytes and

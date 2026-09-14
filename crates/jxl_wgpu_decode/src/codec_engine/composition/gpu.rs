@@ -142,7 +142,7 @@ pub(super) struct Compositor {
     canvas: Extent2d,
     pub(super) original: FrameSurfaceEncoding,
     pub(super) original_samples: bool,
-    pub(super) reconstruction: Option<super::icc_transform::Transform>,
+    pub(super) reconstruction: Option<Arc<super::icc_transform::Transform>>,
     extras: Vec<ExtraChannelInventory>,
     surface: FrameSurfaceLayout,
     blend: wgpu::ComputePipeline,
@@ -311,11 +311,12 @@ impl Compositor {
                     | crate::NumericSampleMapping::NativeFloat
             )
         ) && matches!(jxl_gpu_formats::classify_pixel_format(request.format()), Ok(jxl_gpu_formats::PixelFormatClass::Numeric(n)) if n.components == 1 && n.sample_kind == jxl_gpu_formats::SampleKind::Float && n.bits_per_component == 32);
+        let mut transforms = super::icc_transform::Transforms::default();
         let reconstruction = if image.xyb_encoded
             && usage.reconstruct_original
             && let FrameSurfaceEncoding::Icc(profile) = &original
         {
-            Some(super::icc_transform::Transform::new(
+            Some(transforms.select(
                 &backend,
                 jxl_gpu_protocol::icc::IccTransform::from_linear_rgb(
                     jxl_gpu_protocol::RgbColorSpace::Bt709,
@@ -332,7 +333,7 @@ impl Compositor {
             if !spots.is_empty() {
                 return Err(Error::UnsupportedOutputFormat("ICC spot-ink rendering is not yet connected; preserve spot channels to return the base color".into()));
             }
-            let presentation = |encoding: FrameSurfaceEncoding| -> Result<_> {
+            let mut presentation = |encoding: FrameSurfaceEncoding| -> Result<_> {
                 let source = FrameSurfaceLayout::with_encoding(
                     canvas,
                     extras.len(),
@@ -342,11 +343,11 @@ impl Compositor {
                 Ok(Box::new(icc::Presentation::new(
                     &backend,
                     &source,
-                    &encoding,
                     request,
                     orientation,
                     alpha_conversion,
                     first_alpha.map(|(index, _)| index),
+                    &mut transforms,
                 )?))
             };
             Packing::Icc {

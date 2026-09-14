@@ -87,6 +87,9 @@ bounded references check linear/sRGB and other-profile output. ICC XYB keeps dir
 linear RGB and reconstructs original device values before references and blending. Four stills,
 four additive sequences and seven LF/patch substitutions check this boundary; see the
 [XYB references](crates/jxl_wgpu_decode/test-data/embedded_icc_xyb_generator/README.md).
+A further 48 alpha sequences cover all five blend modes, both associations and independently
+selected background alpha. Identical reconstruction/presentation connections share one accounted
+GPU program, including when cancellation outlives the image context.
 Broader ICC XYB conformance, enumerated sources targeting ICC, spot rendering, LUT/CMYK and full
 intent/HDR policies remain incomplete.
 
