@@ -48,6 +48,7 @@ impl ToneMappingParams {
         if threshold >= source_white || threshold >= target_white {
             // Preserving absolute light takes precedence when the protected region reaches
             // either peak. This avoids a decreasing shoulder or a discontinuity at the threshold.
+            params.range[3] = 5.0;
         } else if source_white <= target_white && source_black == target_black {
             // The source range already fits; preserve its absolute light, including equal
             // degenerate ranges, where an identity request must retain the input values.

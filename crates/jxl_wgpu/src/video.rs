@@ -33,6 +33,7 @@ pub struct ImageOutputRequest {
     pub source_encoding: RgbColorEncoding,
     pub format: PixelFormat,
     pub white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation,
+    pub gamut_mapping: Option<jxl_gpu_protocol::GamutMapping>,
 }
 
 impl ImageOutputRequest {
@@ -41,6 +42,7 @@ impl ImageOutputRequest {
             source_encoding,
             format,
             white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,
+            gamut_mapping: None,
         }
     }
 
@@ -50,6 +52,12 @@ impl ImageOutputRequest {
         adaptation: jxl_gpu_protocol::WhitePointAdaptation,
     ) -> Self {
         self.white_point_adaptation = adaptation;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_gamut_mapping(mut self, mapping: jxl_gpu_protocol::GamutMapping) -> Self {
+        self.gamut_mapping = Some(mapping);
         self
     }
 }

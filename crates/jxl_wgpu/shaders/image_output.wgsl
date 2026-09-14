@@ -42,6 +42,7 @@ struct Params {
     source_luminance: vec4<f32>,
     target_luminance: vec4<f32>,
     tone_mapping: ToneMappingParams,
+    gamut_mapping: GamutMappingParams,
 };
 
 @group(0) @binding(0) var<storage, read> source_r: array<u32>;
@@ -77,8 +78,13 @@ fn target_linear_rgb_at(x: u32, y: u32) -> vec3<f32> {
     );
     let threshold = params.transfer_parameters.z;
     if threshold >= 0.0 { converted_linear = select(converted_linear, vec3<f32>(0.0), converted_linear <= vec3<f32>(threshold)); }
-    return tone_map_light(converted_linear, params.target_luminance.xyz,
+    let mapped = tone_map_light(converted_linear, params.target_luminance.xyz,
         vec3<f32>(1.0), params.tone_mapping);
+    if params.tone_mapping.range.w == 5.0 || (params.tone_mapping.range.z > 0.0
+        && dot(converted_linear, params.target_luminance.xyz) < params.tone_mapping.range.z) {
+        return mapped;
+    }
+    return gamut_map_rgb(mapped, params.gamut_mapping);
 }
 
 fn target_intensity() -> f32 {
@@ -87,12 +93,17 @@ fn target_intensity() -> f32 {
 }
 
 fn target_rgb_at(x: u32, y: u32) -> vec3<f32> {
-    if params.identity_color_transform != 0u { return source_rgb_at(x, y); }
+    if identity_output_color() { return source_rgb_at(x, y); }
     let linear = target_linear_rgb_at(x, y);
     return display_from_linear(
         linear, params.target_transfer, params.transfer_parameters.y,
         target_intensity(), params.target_luminance,
     );
+}
+
+fn identity_output_color() -> bool {
+    return params.identity_color_transform != 0u
+        && (params.gamut_mapping.luminance.w < 0.0 || params.tone_mapping.range.w == 5.0);
 }
 
 fn rgb_at(x: u32, y: u32) -> vec3<f32> {
@@ -256,7 +267,7 @@ fn rgb_byte_at(x: u32, y: u32, component: u32, byte: u32) -> u32 {
         var word: u32;
         if component == 3u {
             word = source_alpha_word_at(x, y);
-        } else if params.identity_color_transform != 0u && params.alpha.x == 0u {
+        } else if identity_output_color() && params.alpha.x == 0u {
             // A float round trip may flush subnormals or change NaN/zero representations.
             // Preserve an unchanged F32 component as an integer word through packing.
             word = source_rgb_words_at(x, y)[component];

@@ -6,11 +6,13 @@ mod device;
 
 #[test]
 fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
-    admission(false);
-    admission(true);
+    admission(false, false);
+    admission(true, false);
+    admission(false, true);
+    admission(true, true);
 }
 
-fn admission(tone_mapping: bool) {
+fn admission(tone_mapping: bool, gamut_mapping: bool) {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
     let memory = backend.transient_memory_budget();
     let image_header = |bytes: &[u8]| {
@@ -115,6 +117,13 @@ fn admission(tone_mapping: bool) {
         } else {
             request
         };
+        let request = if gamut_mapping && !to_icc {
+            request
+                .with_gamut_mapping(jxl_gpu_protocol::GamutMapping::default())
+                .unwrap()
+        } else {
+            request
+        };
         let compositor = Compositor::new(
             backend.clone(),
             Extent2d::new(image.width, image.height),
@@ -147,7 +156,7 @@ fn admission(tone_mapping: bool) {
         );
         let source = compositor.completed_surface(buffer);
         let output_size = aligned(compositor.layout.logical_size).unwrap();
-        let transient = 288
+        let transient = 304
             + transform.memory.transient_bytes()
             + presentation.working.storage_bytes
             + if presentation.spots.is_some() {

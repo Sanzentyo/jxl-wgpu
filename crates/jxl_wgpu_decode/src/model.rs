@@ -10,6 +10,9 @@ use jxl_gpu_protocol::Extent2d;
 
 use crate::{Error, Result};
 
+#[cfg(test)]
+mod tests;
+
 /// A GPU decode profile negotiated before any frame is submitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DecodeProfile {
@@ -377,6 +380,7 @@ pub struct GpuOutputRequest {
     white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation,
     icc_rendering_intent: jxl_gpu_protocol::icc::IccRenderingIntent,
     tone_mapping: Option<jxl_gpu_protocol::LuminanceRange>,
+    gamut_mapping: Option<jxl_gpu_protocol::GamutMapping>,
     frame_surface: Option<crate::frame_surface::FrameSurfaceEncoding>,
     frame_stage: crate::frame_surface::FrameRenderStage,
     lf_extras: bool,
@@ -524,6 +528,7 @@ impl GpuOutputRequest {
             white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,
             icc_rendering_intent: jxl_gpu_protocol::icc::IccRenderingIntent::Relative,
             tone_mapping: None,
+            gamut_mapping: None,
             frame_surface: None,
             frame_stage: crate::frame_surface::FrameRenderStage::Complete,
             lf_extras: false,
@@ -629,6 +634,40 @@ impl GpuOutputRequest {
     pub const fn with_tone_mapping(mut self, target: jxl_gpu_protocol::LuminanceRange) -> Self {
         self.tone_mapping = Some(target);
         self
+    }
+
+    /// Map target-linear RGB into its unit cube at presentation. RGB, gray and YUV layouts
+    /// must declare target RGB chromaticities. ICC device output uses the selected profile
+    /// rendering intent instead; numeric samples have no presentation gamut.
+    pub fn with_gamut_mapping(mut self, mapping: jxl_gpu_protocol::GamutMapping) -> Result<Self> {
+        let ColorSpecification::Defined(target) = self.format.color_spec else {
+            return Err(Error::UnsupportedOutputFormat(
+                "gamut mapping requires enumerated RGB output chromaticities".into(),
+            ));
+        };
+        let space = target.space.rgb_space().ok_or_else(|| {
+            Error::UnsupportedOutputFormat(
+                "gamut mapping requires target RGB chromaticities".into(),
+            )
+        })?;
+        if self.mapping != GpuOutputMapping::Color {
+            return Err(Error::UnsupportedOutputFormat(
+                "numeric samples have no presentation gamut".into(),
+            ));
+        }
+        jxl_wgpu::GamutMappingParams::new(space, mapping)?;
+        self.gamut_mapping = Some(mapping);
+        Ok(self)
+    }
+
+    /// Effective presentation policy. Internal reference surfaces keep their original gamut.
+    #[must_use]
+    pub const fn gamut_mapping(&self) -> Option<jxl_gpu_protocol::GamutMapping> {
+        if self.frame_surface.is_some() {
+            None
+        } else {
+            self.gamut_mapping
+        }
     }
 
     /// Effective display range; internal reference surfaces and original-domain samples do not

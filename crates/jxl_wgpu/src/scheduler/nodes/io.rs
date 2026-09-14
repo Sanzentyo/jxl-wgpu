@@ -334,7 +334,8 @@ pub(in crate::scheduler) fn encode_image_save(
         },
         dispatch_width,
         request.white_point_adaptation,
-    )?;
+    )?
+    .with_gamut_mapping(request.gamut_mapping)?;
     let (buffer, pooled) = allocate_output_buffer(
         factory,
         "jxl-wgpu generic image output",

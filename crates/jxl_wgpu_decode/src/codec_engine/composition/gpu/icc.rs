@@ -268,6 +268,7 @@ impl Presentation {
                                 intensity.nits(),
                             ),
                         }?
+                        .with_gamut_mapping(request.gamut_mapping())?
                     }
                     FrameSurfaceEncoding::Encoded
                     | FrameSurfaceEncoding::Device(_)

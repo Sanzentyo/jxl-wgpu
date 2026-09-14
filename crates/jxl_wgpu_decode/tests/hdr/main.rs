@@ -3,6 +3,7 @@
 use jxl_test_support::fixtures::hdr as corpus;
 use jxl_test_support::oracles::hdr as oracle;
 mod frames;
+mod gamut_mapping;
 mod icc;
 mod independent;
 mod output;

@@ -266,6 +266,7 @@ impl Compositor {
         let native = crate::model::native_modular_format(request.format()).filter(|_| {
             request.uses_original_sample_domain()
                 || (tone_mapping.is_none()
+                    && request.gamut_mapping().is_none()
                     && original.rgb_encoding()
                         == Some(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709))
         });
@@ -487,6 +488,7 @@ impl Compositor {
                             intensity_target,
                         ),
                     }?
+                    .with_gamut_mapping(request.gamut_mapping())?
                     .with_alpha_conversion(alpha_conversion);
                     Ok(
                         if encoding

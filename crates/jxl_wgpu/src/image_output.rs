@@ -28,6 +28,7 @@ pub const IMAGE_OUTPUT_SHADER: &str = concat!(
     include_str!("../shaders/alpha_output.wgsl"),
     include_str!("../shaders/image_transfer.wgsl"),
     include_str!("../shaders/tone_mapping.wgsl"),
+    include_str!("../shaders/gamut_mapping.wgsl"),
     include_str!("../shaders/image_output.wgsl"),
 );
 
@@ -44,6 +45,7 @@ pub(crate) const RGB_TO_IMAGE_SHADER: &str = concat!(
     include_str!("../shaders/alpha_output.wgsl"),
     include_str!("../shaders/image_transfer.wgsl"),
     include_str!("../shaders/tone_mapping.wgsl"),
+    include_str!("../shaders/gamut_mapping.wgsl"),
     include_str!("../shaders/image_output.wgsl"),
     include_str!("../shaders/rgb_to_image.wgsl"),
 );
@@ -81,7 +83,7 @@ pub enum AlphaConversion {
     Premultiply = 2,
 }
 
-/// Fixed 288-byte uniform for the shared output shader.
+/// Fixed 304-byte uniform for the shared output shader.
 /// Construct it with [`Self::new`] to validate geometry, color, and packed addressing.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -126,6 +128,7 @@ pub struct ImageOutputParams {
     pub(crate) source_luminance: [f32; 4],
     pub(crate) target_luminance: [f32; 4],
     pub(crate) tone_mapping: crate::ToneMappingParams,
+    pub(crate) gamut_mapping: crate::GamutMappingParams,
 }
 impl ImageOutputParams {
     /// Pack three F32 codec components without assigning RGB or ICC meaning to their storage.
@@ -209,7 +212,7 @@ impl ImageOutputParams {
     ) -> Result<Self> {
         let prepared = prepare_image_output(layout)?;
         let color = image_color_transform(source.encoding, &layout.format, adaptation)?;
-        Self::lower(
+        let mut params = Self::lower(
             layout,
             ImageOutputGeometry {
                 extent: source.extent,
@@ -219,7 +222,26 @@ impl ImageOutputParams {
             dispatch_width,
             prepared,
             color,
-        )
+        )?;
+        let ColorSpecification::Defined(target) = layout.format.color_spec else {
+            unreachable!("image color transform validates enumerated output")
+        };
+        let space = target.space.rgb_space().ok_or_else(|| {
+            Error::InvalidPayload("image output requires target RGB chromaticities".into())
+        })?;
+        params.gamut_mapping = crate::GamutMappingParams::for_space(space)?;
+        Ok(params)
+    }
+
+    /// Map the already declared target-primary linear RGB after tone mapping and before its
+    /// transfer function. Protected tone-map samples retain their absolute light unchanged.
+    /// ICC/device and numeric parameter records have no linear RGB gamut and reject this option.
+    pub fn with_gamut_mapping(
+        mut self,
+        mapping: Option<jxl_gpu_protocol::GamutMapping>,
+    ) -> Result<Self> {
+        self.gamut_mapping = self.gamut_mapping.with_mapping(mapping)?;
+        Ok(self)
     }
 
     /// Convert display-relative RGB using an explicit unit-white intensity in nits.
@@ -274,7 +296,8 @@ impl ImageOutputParams {
             true,
         )?;
         params.tone_mapping = crate::ToneMappingParams::new(mapping)?;
-        if params.tone_mapping.range[3] != 1.0 || params.tone_mapping.knee[2] != 1.0 {
+        if !matches!(params.tone_mapping.range[3], 1.0 | 5.0) || params.tone_mapping.knee[2] != 1.0
+        {
             params.identity_color_transform = 0;
         }
         Ok(params)
@@ -377,6 +400,7 @@ impl ImageOutputParams {
             source_luminance: [0.0; 4],
             target_luminance: [0.0; 4],
             tone_mapping: crate::ToneMappingParams::default(),
+            gamut_mapping: crate::GamutMappingParams::default(),
         })
     }
 
@@ -714,7 +738,7 @@ fn to_shader_u32(value: u64) -> Result<u32> {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<ImageOutputParams>() == 288);
+    assert!(std::mem::size_of::<ImageOutputParams>() == 304);
     assert!(std::mem::align_of::<ImageOutputParams>() == 4);
     assert!(std::mem::offset_of!(ImageOutputParams, primaries_r) == 128);
     assert!(std::mem::offset_of!(ImageOutputParams, primaries_g) == 144);
@@ -724,4 +748,5 @@ const _: () = {
     assert!(std::mem::offset_of!(ImageOutputParams, source_luminance) == 208);
     assert!(std::mem::offset_of!(ImageOutputParams, target_luminance) == 224);
     assert!(std::mem::offset_of!(ImageOutputParams, tone_mapping) == 240);
+    assert!(std::mem::offset_of!(ImageOutputParams, gamut_mapping) == 288);
 };

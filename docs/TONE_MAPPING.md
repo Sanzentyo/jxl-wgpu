@@ -27,7 +27,9 @@ all three linear components by the luminance ratio retains their chromaticity. A
 or very small luminance (`<= 1e-6` nit), the base curve uses a neutral cap. RGB neutral is
 (1,1,1); ICC PCS neutral is D50 (0.9642,1,0.8249). PQ-space clipping precedes the inverse to
 avoid evaluating ST 2084 beyond its asymptote. F32 output retains chromatic components outside
-[0,1]; integer output quantizes and clips normally. Gamut mapping is a separate, unfinished policy.
+[0,1]; integer output quantizes and clips normally. Optional [RGB gamut mapping](GAMUT_MAPPING.md)
+follows this operation and gives priority to its protected light, including global protection
+when the threshold reaches either white.
 
 [ISO/IEC 18181-1:2024, E.3](https://previewnorm.com/iso/ISO%20IEC%2018181-1-2024%20PDF.pdf)
 requires luminance below `linear_below` to remain unchanged. Absolute thresholds are nits;
@@ -71,8 +73,8 @@ RGB packer for mapping, exactly once. ICC `lumi` tags do not select a physical d
 Production host code evaluates only metadata endpoints and coefficients. Pixel operations share
 `tone_mapping.wgsl` across image output and resident ICC. A 48-byte `ToneMappingParams` record
 contains source/target white, protected comparison bound, mode, PQ endpoints and knee coefficients.
-It occupies bytes 240–287 of the 288-byte image-output uniform. The separate codec-source uniform
-remains 160 bytes, for 448 bytes total. Resident ICC opcode 11 stores the same 48-byte payload with
+It occupies bytes 240–287 of the 304-byte image-output uniform. The separate codec-source uniform
+remains 160 bytes, for 464 bytes total. Resident ICC opcode 11 stores the same 48-byte payload with
 one 16-byte stage descriptor; its dispatch storage remains 320 bytes. No additional image buffer,
 GPU dispatch or readback is introduced by the mapping itself. An existing color conversion may
 still require its established intermediate image. Admission and cancellation charge and retain
@@ -101,6 +103,6 @@ are declared before GPU execution, never fitted from GPU differences.
 Full JPEG XL remains incomplete. Requested-profile tone-mapping pixel evidence currently covers
 identity PCS; existing profile/intent processing is independently tested, and admission tests also
 exercise tone programs with dynamic black detection and CMYK/15-channel output. Broader combined
-ICC target/intent pixel oracles, gamut mapping, automatic display policy, extreme numeric ranges,
+ICC target/intent pixel oracles, wider gamut/profile combinations, automatic display policy, extreme numeric ranges,
 HDR features/LF combinations, display textures and the remaining codec/conformance/encoder gates
 remain in the [full roadmap](FULL_JPEG_XL_ROADMAP.md).

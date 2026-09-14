@@ -43,6 +43,8 @@ mod resident_gaborish;
 mod resident_icc;
 mod tone_mapping;
 pub use tone_mapping::{TONE_MAPPING_SHADER, ToneMappingParams};
+mod gamut_mapping;
+pub use gamut_mapping::{GAMUT_MAPPING_SHADER, GamutMappingParams};
 mod resident_noise;
 mod resident_upsample;
 mod resident_vardct;

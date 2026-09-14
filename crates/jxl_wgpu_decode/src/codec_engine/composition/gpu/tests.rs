@@ -168,15 +168,25 @@ fn spot_metadata_admission_is_exact_retryable_and_completion_owned() {
         .unwrap();
     let image = &inventory.image_header;
     let memory = backend.transient_memory_budget();
-    for policy in [
+    for (policy, gamut) in [
         crate::SpotColorPolicy::Render,
         crate::SpotColorPolicy::Preserve,
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|policy| [false, true].map(|gamut| (policy, gamut)))
+    {
         let request = GpuOutputRequest::color(
             FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709).format(),
         )
         .unwrap()
         .with_spot_color_policy(policy);
+        let request = if gamut {
+            request
+                .with_gamut_mapping(jxl_gpu_protocol::GamutMapping::default())
+                .unwrap()
+        } else {
+            request
+        };
         let compositor = Compositor::new(
             backend.clone(),
             Extent2d::new(image.width, image.height),
@@ -197,7 +207,7 @@ fn spot_metadata_admission_is_exact_retryable_and_completion_owned() {
         );
         let source = compositor.completed_surface(buffer);
         let output_size = aligned(compositor.layout.logical_size).unwrap();
-        let transient = 288
+        let transient = 304
             + if policy == crate::SpotColorPolicy::Render {
                 5 * 32
             } else {

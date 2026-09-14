@@ -208,7 +208,7 @@ declarations, undefined primaries/specifications/transfers, sensor primaries, mu
 variant; an unspecified exponent cannot be constructed.
 
 The Rust/WGSL ABI gate parses the shader with Naga and reflects the complete uniform field order.
-Compile-time assertions independently fix `ImageOutputUniform` at 288 bytes and its three padded
+Compile-time assertions independently fix `ImageOutputUniform` at 304 bytes and its three padded
 matrix rows at offsets 128, 144, and 160. No test searches shader source text.
 
 The same-queue display gate then consumes stored BT.2020 PQ, BT.2020 SDR-OETF, Display-P3 HLG, and
@@ -256,7 +256,7 @@ and their bytes are identical under Scalar/32/64/128/256 lanes. Large-transform 
 accepts the frequency-CfL requirement implemented by the resident renderer, while unknown
 capability bits remain errors. A maximum-magnitude 256x256 fragment uses 6,967,356 bits in its
 217,730-word allocation; invalid lengths/counts are rejected. A 500 KiB storage-binding limit
-independently rejects the 524,288-byte matrix/order allocation before any job reservation.
+independently rejects the 524,304-byte matrix/order allocation before any job reservation.
 
 `vardct_encoder/tests/quantization.rs` checks the complete global-scale/LF syntax ranges and
 effective HF multipliers 1–256. Mixed and tiled solid-white images exercise both endpoints,
@@ -622,7 +622,7 @@ and explicit-sRGB `djxl` PFM is independently converted by the development-only 
 `jxl_gpu_formats::convert_rgb_f32` oracle after any required SDR transfer conversion.
 
 Every case runs whole-input blocking and fragmented-input async completion with a 256-byte entropy
-cap. Exact layout metadata, shared 448-byte output/source uniform accounting, four-byte-rounded
+cap. Exact layout metadata, shared 464-byte output/source uniform accounting, four-byte-rounded
 output leases, zero unused sample bits and plane gaps, equality between upload policies, and full
 budget release are required. Comparisons operate on stored sample codes rather than individual
 bytes, including 16-bit words and 10/12-bit alignment. On Apple M5/Metal (2026-09-07), the maximum
@@ -1706,7 +1706,7 @@ packing; NV12 and odd-width YUYV/UYVY use the shared scalar layout oracle, inclu
 final-luma alpha. Both compare within one stored code and check zero padding bits. Low-level output
 tests reject association conversion without an alpha
 binding before allocation, while existing ABI tests parse and validate the enlarged common
-288-byte uniform. Production still has no CPU image-domain fallback. Floating source samples remain
+304-byte uniform. Production still has no CPU image-domain fallback. Floating source samples remain
 a completion gate; the all-channel composition extension below adds integer extras and
 associated/resampled composition cross-products.
 
@@ -1883,8 +1883,8 @@ alpha scaling removed before comparison. Native outputs use one code of Modular 
 and checks high-depth padding. No production CPU codec or image readback was introduced.
 
 A GPU unit test independently isolates the packer: output admission succeeds with one byte less
-than the required uniform+ink metadata, then metadata admission fails with exactly 448 bytes for
-five inks or 288 bytes for Preserve. Repeating failure rolls back output reservations; releasing
+than the required uniform+ink metadata, then metadata admission fails with exactly 464 bytes for
+five inks or 304 bytes for Preserve. Repeating failure rolls back output reservations; releasing
 pressure allows retry. Dropping pending work retains all inputs and metadata until GPU completion,
 then only a caller-held output lease remains. `SpotColor` has compile-time 32-byte size, 16-byte
 alignment and byte-16 RGBA offset checks. Preserve allocates no dummy table.
@@ -2219,7 +2219,7 @@ model, preserving the following packet data. Public admission tests compare zero
 force a one-byte capacity shortfall, retry and abandon submitted work. XYB 257×17 adds 52,524
 bytes for the random planes and uniform. Unfiltered original Modular RGB and gray also need normalization
 and aligned render destinations; at the tested 256-byte storage-offset alignment their complete
-increase is 158,472 bytes. Original RGB VarDCT and 4:4:4/gray JPEG use the same 52,524-byte noise
+increase is 158,488 bytes. Original RGB VarDCT and 4:4:4/gray JPEG use the same 52,524-byte noise
 allocation as XYB. Subsampled JPEG needs two padded full-resolution chroma destinations plus two
 32-byte interpolation uniforms, for total increments of 104,812 bytes (4:2:2), 120,172 bytes
 (4:4:0), and 122,220 bytes (4:2:0). The zero model allocates none of those component destinations.
@@ -4040,7 +4040,7 @@ exact repeated retry, reuse without a second program reservation, and cancellati
 holds the output. Completion releases the source, intermediate, uniforms and program exactly once.
 The existing recursive LF oracle also covers non-color component surfaces with standard/custom
 Up8 weights, levels one through four, odd and one-pixel axes, poisoned input padding and exact
-admission. Component previews omit both color conversion and its 448-byte uniform reservation.
+admission. Component previews omit both color conversion and its 464-byte uniform reservation.
 The shared image-output source interface carries binary32 words. A separate actual-GPU test
 checks 64 combinations of all eight orientations, RGB/BGR/RGBA/BGRA and planar/interleaved
 packing against integer references containing signed zeros, both signs of subnormals and
@@ -4419,3 +4419,24 @@ immutable held progression, word equality and zero released budgets remain requi
 embedded RGB/Gray ICC and original/XYB sources add 32 outputs against independent/native linear
 references. ICC target/intent tone pixel coverage beyond identity PCS, gamut mapping, automatic
 display policy, extreme numeric ranges and the remaining full JPEG XL gates remain open.
+
+## Explicit RGB gamut checkpoint
+
+[The gamut contract](GAMUT_MAPPING.md) and [native generator](../crates/jxl_wgpu/test-data/gamut_mapping_generator/README.md)
+add 5,000 libjxl scalar records across BT.709/BT.2020/Display-P3 and five saturation preferences.
+Actual Apple M5 Metal runs check 45,000 color components in three workgroup widths against
+native and independent F64 intersections, with a predeclared `4e-6` linear allowance. They
+check exact in-cube primitive values, alpha and output guards. Negative-luminance black,
+extended values through ±1e30, subnormal signs and exact lower faces have separate tests.
+Generic RGB8/F32, NV12 and 12-bit I444 output verifies mapping before transfer/packing; F32
+encoded comparisons retain `5e-5`, and integer comparisons allow one code.
+
+All 56 unchanged HDR sources / 80 images run with and without tone mapping, three output
+transfers, both layouts and whole/bounded fragmented input: 1,920 presentations compare
+3,362,688 color components against native reconstruction followed by independent F64 interval
+conversion. Zero, relative, absolute and globally protected thresholds are covered. Eight
+embedded ICC/XYB/Gray/RGB sources add 64 outputs / 29,376 color components. Held progressive
+images remain immutable, final words agree, alpha words remain exact and budgets return to zero.
+Existing source/profile/reference files remain unchanged. The 304-byte image uniform / 464-byte
+codec conversion plan also undergo exact ICC/spot admission, retry and cancellation tests with
+the new policy selected. All broader profile/HDR/LF/numeric and full JPEG XL gates remain open.

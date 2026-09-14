@@ -79,8 +79,9 @@ and F64 transfer checks. HDR and ICC now connect through explicit image white, w
 rendering intents and native/independent references; see the
 [HDR/ICC corpus](crates/jxl_wgpu_decode/test-data/hdr_icc_generator/README.md).
 Explicit [tone mapping](docs/TONE_MAPPING.md) now uses image minimum luminance and protected
-absolute/relative thresholds for requested RGB or ICC output. Gamut mapping, broader display
-policies and full HDR conformance remain incomplete.
+absolute/relative thresholds for requested RGB or ICC output. Explicit [RGB gamut mapping](docs/GAMUT_MAPPING.md)
+now follows that curve, with native/F64 primitive references and 1,920 HDR presentations.
+Broader display/profile policies and full HDR conformance remain incomplete.
 
 The common backend now has a bounded [resident ICC color processor](docs/ICC_COLOR.md)
 with exact profile metadata, channel-specific curves and RGB/Gray conversion. Its independent

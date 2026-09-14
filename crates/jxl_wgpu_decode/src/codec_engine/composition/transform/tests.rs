@@ -79,7 +79,7 @@ fn original_icc_reconstruction_admits_exact_storage_retries_and_retains_cancelle
             &backend.device().limits(),
         )
         .unwrap();
-        let transient = 448
+        let transient = 464
             + completion_fence_bytes()
             + linear.storage_bytes
             + connection.memory.transient_bytes();

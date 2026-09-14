@@ -11,7 +11,7 @@ fn tone_map_light(
     if mode == 0u { return color; }
     let relative_y = dot(color, luminance);
     let nits = tone.range.x * relative_y;
-    if mode == 1u || (tone.range.z > 0.0 && relative_y < tone.range.z) {
+    if mode == 1u || mode == 5u || (tone.range.z > 0.0 && relative_y < tone.range.z) {
         return color * tone.knee.z;
     }
     if mode == 3u { return neutral; }

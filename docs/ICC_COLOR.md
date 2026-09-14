@@ -103,7 +103,7 @@ Requested color conversion uses a selected immutable program shared across physi
 upload is lazy, budgeted and retryable; each dispatch retains its uploaded program through GPU
 completion even if the image session is dropped. Intermediate color surfaces, unchanged extra
 planes, output words, the 320-byte ICC dispatch storage, optional four-byte validation word
-and the 96-byte numeric, 288-byte RGB/Gray or 320-byte device packing uniform are all accounted.
+and the 96-byte numeric, 304-byte RGB/Gray or 320-byte device packing uniform are all accounted.
 No frame readback or CPU pixel CMS is involved. `GpuOutputRequest::with_icc_rendering_intent`
 defaults to relative colorimetric; non-Bradford conversion and unsupported selected methods return errors.
 Exact same-profile packing does not select a CMS method and therefore does not require an
@@ -625,4 +625,4 @@ intensities. Same-profile output now selects a conversion when tone mapping is r
 complete CMYK output retains generated K separately from the original Black extra. Dynamic
 black detection, program caching, exact admission and cancellation keep their existing ownership
 contract. The 48-byte payload uses opcode 11; dispatch storage remains 320 bytes. The separate
-RGB output uniform is 288 bytes. See [the policy and scope of pixel evidence](TONE_MAPPING.md).
+RGB output uniform is 304 bytes. See [the policy and scope of pixel evidence](TONE_MAPPING.md).
