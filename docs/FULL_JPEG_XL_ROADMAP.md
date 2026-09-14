@@ -767,5 +767,23 @@ output agrees with final-only output. The independent oracle is a normal shared 
 module; no path inclusion or additional warning suppression is introduced. Existing source
 fixtures and profile bytes remain unchanged. See the [RGB-to-ICC recipe](../crates/jxl_wgpu_decode/test-data/rgb_icc_generator/README.md).
 This progresses `COLOR-01/02`, `IO-01`, `QA-03/06`; those rows and the full goal remain **Partial**.
-ICC spot rendering, complete CMYK/HDR plumbing, wider profile/method/range conformance and the
+Complete CMYK/HDR plumbing, wider profile/method/range conformance and the
 remaining codestream/container/encoder requirements are still required.
+
+ICC spot presentation checkpoint: declaration-order ink rendering now precedes the selected ICC
+connection in the actual original or linear source domain, after reference storage. A dedicated
+GPU copy retains the actual one/three color planes and independent extras, with offsets derived
+from their layouts. Its storage and ink table share exact admission and completion ownership
+with ICC packing; Preserve and numeric requests omit the stage. Same-profile output retains
+extended rendered values. Gray ICC connections consume their single device component.
+
+Thirty-two native streams cover ICC/enumerated RGB/Gray, both codecs, original/XYB and three-frame
+associated-alpha reference sequences. Independent equations and curve-conditioned intervals
+check 1,233,792 components in 3,456 final presentations; 6,912 updates are retained and reread.
+The native generator separately validates 86,904 CMM components and reproduces all 485 files.
+All nine numeric extras add 88,128 native comparisons and Render/Preserve byte equality.
+The native decoder's general-ICC XYB blending limitation is explicit: those four sequences use
+native uncoalesced linear reconstruction, Little CMS and independent composition equations.
+See the [recipe and precision contract](../crates/jxl_wgpu_decode/test-data/icc_spots_generator/README.md).
+`COLOR-01/02/03/04`, `IO-01`, `QA-03/06` and the full JPEG XL goal remain **Partial**; broader
+profile/range/render combinations, CMYK/HDR and all remaining roadmap gates remain required.

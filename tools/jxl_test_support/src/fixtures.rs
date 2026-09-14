@@ -2,6 +2,7 @@
 pub mod embedded_icc;
 pub mod frame_features;
 pub mod icc;
+pub mod icc_spots;
 pub mod jpeg_sampling;
 pub mod modular_passes;
 pub mod modular_ycbcr;

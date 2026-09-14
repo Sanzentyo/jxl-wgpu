@@ -700,8 +700,16 @@ matrix/TRC, LUT and MPE targets and all four intents: 9,120 presentations and 16
 comparisons, both F32 layouts, progressive/final-only equality, fragmented input, exact alpha
 and held-frame ownership. See the [reference and precision contract](test-data/rgb_icc_generator/README.md).
 
-Broader ICC XYB alpha/crop/reference conformance, spot-ink
-rendering, complete MPE ranges, CMYK image plumbing, other profile
+Spot inks now also render before ICC conversion, in the actual source domain after reference
+storage. Each presentation plan owns its ink offsets; Gray device and three-channel linear/RGB
+surfaces use their actual extra-plane layouts. A separate accounted copy preserves source and
+reference samples. Same-profile output retains extended values; other connections keep the
+ICC device-curve range contract. The [32-stream spot corpus](test-data/icc_spots_generator/README.md)
+checks 3,456 final images and 6,912 held progressive updates, all three alpha policies, both
+layouts, orientation and bounded fragmented input against independent color intervals.
+
+Broader ICC XYB alpha/crop/reference conformance,
+complete MPE ranges, CMYK image plumbing, other profile
 classes, HDR/gamut policies and standalone codec color admission remain open.
 Numeric and extra-channel bypasses keep their existing independent contracts.
 

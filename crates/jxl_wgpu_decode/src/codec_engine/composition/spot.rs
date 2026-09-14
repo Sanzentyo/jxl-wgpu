@@ -2,6 +2,9 @@
 
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_bitstream::{ExtraChannelInventory, ExtraChannelTypeInventory};
+use jxl_gpu_formats::ImageLayout;
+
+pub(super) mod render;
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -14,7 +17,11 @@ const _: () = assert!(std::mem::size_of::<SpotColor>() == 32);
 const _: () = assert!(std::mem::align_of::<SpotColor>() == 16);
 const _: () = assert!(std::mem::offset_of!(SpotColor, rgba) == 16);
 
-pub(super) fn spot_colors(extras: &[ExtraChannelInventory], plane_words: u32) -> Vec<SpotColor> {
+pub(super) fn spot_colors(
+    extras: &[ExtraChannelInventory],
+    planes: &[ImageLayout],
+) -> Vec<SpotColor> {
+    assert_eq!(extras.len(), planes.len());
     extras
         .iter()
         .enumerate()
@@ -29,7 +36,7 @@ pub(super) fn spot_colors(extras: &[ExtraChannelInventory], plane_words: u32) ->
                 return None;
             };
             Some(SpotColor {
-                source: [(3 + index as u32) * plane_words, 0, 0, 0],
+                source: [(planes[index].planes[0].offset / 4) as u32, 0, 0, 0],
                 rgba: [
                     red.to_f32(),
                     green.to_f32(),

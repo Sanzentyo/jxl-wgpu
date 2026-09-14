@@ -4136,3 +4136,33 @@ all three kernel variants; protocol tests check directional ordering and the lin
 Exact-budget tests include the enumerated transfer programs, rollback, reuse and cancellation.
 The [generator and precision contract](../crates/jxl_wgpu_decode/test-data/rgb_icc_generator/README.md)
 states the pairing, source provenance and remaining full JPEG XL requirements.
+
+## ICC spot presentation and reference ownership
+
+`crates/jxl_wgpu_decode/test-data/icc_spots` adds 32 native streams and 485 total files
+(4,039,732 bytes), reusing the embedded RGB/Gray profiles unchanged. Explicit manifest fields
+cross ICC/enumerated color, RGB/Gray, both codecs, original/XYB and still/three-frame animation.
+Nine independent integer/F32 extras include five ordered inks, non-leading associated/straight
+alpha and another alpha. Reference composition produces extended coverage and device values.
+
+The shared source-domain ink equation now also runs before ICC conversion. Source/reference
+planes remain unchanged, Gray ICC consumes its one device component, and direct XYB retains
+three linear components until the selected output connection. Inks use actual extra-plane
+offsets. The image-owned presentation plan accounts its copy and metadata through completion;
+Preserve and numeric output omit the stage. Same-profile F32 retains extended device values.
+
+The generator separates native reconstruction, independent F64 ink/composition equations,
+curve-conditioned primary bounds and 86,904 native CMM checks. Four ICC XYB sequences require
+native uncoalesced linear reconstruction plus independent CMS/composition because libjxl's
+coalesced blender cannot insert the general original ICC inverse. Every comparison identifies
+that provenance. Little CMS float calls apply the declared unit device boundary; neither this
+boundary nor a CMM difference widens the production interval. Two fresh generations reproduce
+all files exactly. See the [recipe](../crates/jxl_wgpu_decode/test-data/icc_spots_generator/README.md).
+
+The runtime color test checks 1,233,792 components across 3,456 final presentations and retains
+6,912 updates. Planar/interleaved, Apply/Keep, all three alpha policies, progressive/final-only,
+whole/43-byte input fragments and a 256-byte GPU window agree in canonical final words. All
+nine numeric extras add 88,128 native comparisons with byte-identical Render/Preserve output.
+Source-shaped memory tests include one-byte-short admission, rollback/retry, shared program
+reuse, reverse completion and cancellation. Old fixtures remain unchanged. Full profile/range,
+render combinations and every remaining JPEG XL conformance gate remain open.

@@ -6,6 +6,13 @@ use jxl_gpu_protocol::Extent2d;
 fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
     let memory = backend.transient_memory_budget();
+    let image_header = |bytes: &[u8]| {
+        jxl_gpu_bitstream::parse(bytes, Default::default())
+            .unwrap()
+            .codestream_inventory(Default::default())
+            .unwrap()
+            .image_header
+    };
     let matrix = jxl_test_support::fixtures::embedded_icc::cases()
         .filter(|case| !case.xyb && case.encoding == jxl_gpu_bitstream::FrameEncoding::Modular)
         .map(|case| case.bytes());
@@ -39,16 +46,52 @@ fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
     .unwrap();
     let mut dynamic = 0;
     let mut rgb_transfers = 0;
-    for (bytes, to_icc) in matrix
+    let mut spot_programs = 0;
+    let spots = jxl_test_support::fixtures::icc_spots::cases()
+        .into_iter()
+        .filter(|case| case.original && case.modular && !case.sequence)
+        .map(|case| (image_header(&case.bytes()), !case.icc))
+        .collect::<Vec<_>>();
+    let ink = spots[0]
+        .0
+        .extra_channels
+        .iter()
+        .find(|extra| {
+            matches!(
+                extra.channel_type,
+                jxl_gpu_bitstream::ExtraChannelTypeInventory::SpotColour { .. }
+            )
+        })
+        .unwrap();
+    // These compositor-only headers combine a real ink declaration with each dynamic
+    // black-validation profile, covering the map callback's ownership of spot resources.
+    let dynamic_spots = black
+        .iter()
+        .map(|bytes| {
+            let mut image = image_header(bytes);
+            image.extra_channels.push(ink.clone());
+            image.extra_channel_count += 1;
+            (image, false)
+        })
+        .collect::<Vec<_>>();
+    for (image, to_icc) in matrix
         .chain(black)
         .map(|bytes| (bytes, false))
         .chain(enumerated)
+        .map(|(bytes, to_icc)| (image_header(&bytes), to_icc))
+        .chain(spots)
+        .chain(dynamic_spots)
     {
-        let image = jxl_gpu_bitstream::parse(&bytes, Default::default())
-            .unwrap()
-            .codestream_inventory(Default::default())
-            .unwrap()
-            .image_header;
+        let ink_count = image
+            .extra_channels
+            .iter()
+            .filter(|extra| {
+                matches!(
+                    extra.channel_type,
+                    jxl_gpu_bitstream::ExtraChannelTypeInventory::SpotColour { .. }
+                )
+            })
+            .count() as u64;
         let request = GpuOutputRequest::color(
             if to_icc {
                 FrameSurfaceEncoding::Icc(target.clone())
@@ -77,6 +120,7 @@ fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
         rgb_transfers += usize::from(matches!(presentation.source_encoding,
             FrameSurfaceEncoding::Rgb(encoding) if encoding.transfer != jxl_gpu_protocol::TransferFunction::Linear));
         dynamic += usize::from(transform.memory.validation_bytes == 4);
+        spot_programs += usize::from(presentation.spots.is_some());
         assert!(super::super::super::lock(&transform.uploaded).is_none());
         assert_eq!(memory.snapshot().reserved_bytes, 0);
         let size = compositor.surface.storage_bytes;
@@ -91,8 +135,14 @@ fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
         );
         let source = compositor.completed_surface(buffer);
         let output_size = aligned(compositor.layout.logical_size).unwrap();
-        let transient =
-            208 + transform.memory.transient_bytes() + presentation.working.storage_bytes;
+        let transient = 208
+            + transform.memory.transient_bytes()
+            + presentation.working.storage_bytes
+            + if presentation.spots.is_some() {
+                size + ink_count * 32
+            } else {
+                0
+            };
         let program_bytes = transform.memory.program_bytes;
         for (available, requested) in [
             (output_size - 1, output_size),
@@ -153,6 +203,7 @@ fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
         drop(output);
         assert_eq!(memory.snapshot().reserved_bytes, 0);
     }
-    assert_eq!(dynamic, 4);
+    assert_eq!(dynamic, 8);
     assert!(rgb_transfers >= 10);
+    assert_eq!(spot_programs, 8);
 }

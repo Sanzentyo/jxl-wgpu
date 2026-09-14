@@ -1,0 +1,5 @@
+# Encoded images, ICC profiles, and little-endian numeric references.
+*.jxl binary
+*.icc binary
+*.f32 binary
+*.bounds binary

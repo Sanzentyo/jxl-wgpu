@@ -772,14 +772,23 @@ an enumerated RGB carrier or color-packing uniforms. RGB and ICC device domains 
 an inverse color operation returns its new layout with its buffer, including relocated extras
 when three codec components become one Gray plane.
 
-When Render applies to color with spot declarations, either packer also binds a readonly ink table
+When Render applies to color with spot declarations, raster packing binds a readonly ink table
 at binding 7. Each 32-byte, 16-byte-aligned `SpotColor` stores the absolute plane word offset at
 byte 0, three reserved words, and declared RGBA at byte 16. Declarations are visited in order;
 `mix = solidity * normalized_sample` is not clipped, and only RGB changes. Mixing follows reference
 storage and precedes target color conversion, association and chroma filtering. Numeric requests
 and Preserve compile a no-op presentation helper and allocate/bind no ink table. The complete table
 is checked against storage limits and charged with the output uniform for the submission lifetime.
-No additional image-sized spot buffer or readback is introduced.
+Raster packing fuses the ink equation without another image buffer. ICC presentation instead
+records `composition/spot/render.wgsl` before the selected ICC connection. Its one-pixel dispatch
+reads the all-channel source at binding 0, writes color to a private all-channel copy at binding 3,
+and reads the ink table at binding 7. Compile-time overrides carry the actual color-plane count,
+plane word stride, pixel count and dispatch row width; it allocates no uniform. Extra planes use
+checked GPU copies. The allocation is exactly the source `FrameSurfaceLayout::storage_bytes`
+plus 32 bytes per ink, charged to the presentation transient permit before buffer creation.
+The subsequent optional ICC destination allocation and its dispatch/validation resources keep
+their existing charges. All operations share one submission and completion owner. Preserve and
+numeric requests omit the copy and table; no image samples are read back in production.
 
 Each job reserves a native poll slot before submission, takes GPU access guards on every input,
 and retains source/reference/output leases, operation-table bytes and uniforms through completion

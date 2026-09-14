@@ -105,8 +105,11 @@ before output acceptance. Twenty more profiles add 954,720 resident GPU comparis
 also targets requested ICC profiles through both codecs, XYB/YCbCr reconstruction and reference
 composition. The 228-source [RGB-to-ICC corpus](crates/jxl_wgpu_decode/test-data/rgb_icc_generator/README.md)
 checks 9,120 presentations and 16,197,120 components with independent bounds, exact alpha,
-retained outputs and fragmented input. Broader ICC XYB conformance,
-spot rendering, CMYK image plumbing and full intent/HDR
+retained outputs and fragmented input. Spot presentation now also precedes ICC connections in
+the actual source color domain. A [32-stream corpus](crates/jxl_wgpu_decode/test-data/icc_spots_generator/README.md)
+covers both codecs, RGB/Gray, original/XYB and retained animations, with independent color
+intervals, numeric bypass and completion-owned ink metadata. Broader ICC XYB conformance,
+CMYK image plumbing and full intent/HDR
 policies remain incomplete.
 
 Creating an encoder or decoder requires a compatible `wgpu` backend. Unsupported codestream

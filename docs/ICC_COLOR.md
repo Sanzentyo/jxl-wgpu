@@ -9,9 +9,30 @@ also handles original and XYB ICC RGB/Gray color surfaces, including YCbCr recon
 original-domain references and composition, all four matrix/TRC intents and U8/F32 requested output.
 Requested RGB MPE output and embedded/requested RGB/Gray LUTs are also exercised through the public decoder.
 Enumerated SDR sources also target ICC through original/XYB/YCbCr reconstruction and composition.
-Broader ICC XYB conformance, spot rendering, other ICC methods
+Spot presentation runs before ICC connections in the actual source domain, after reference storage.
+Broader ICC XYB conformance, other ICC methods
 and HDR mapping remain open.
 This checkpoint does not change the full JPEG XL support claim.
+
+ICC spot presentation retains the existing
+[reference-stage ordering](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_cache.cc).
+Unreferenced XYB uses linear RGB; original and composed images use their tagged original domain.
+The [ink equation](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/render_pipeline/stage_spot.cc)
+applies each declaration in order, including signed or above-one coverage. A Gray ICC connection
+consumes its single first device component, matching native Gray CMS channel consumption.
+Linear/RGB sources retain all three colored components before a requested Gray conversion.
+The ink offsets come from the actual extra-plane layouts, including the different Gray/linear
+color-plane counts. Numeric requests keep the base samples and never render inks.
+
+The ICC presenter records the ink copy, optional color connection and final packing in one
+submission. Its private copy leaves saved references and independent extras unchanged. Its
+storage and 32-byte-per-ink metadata are admitted together with the existing ICC dispatch and
+packing resources, and remain owned through completion or cancellation. Preserve omits this
+copy and metadata. The [32-source recipe](../crates/jxl_wgpu_decode/test-data/icc_spots_generator/README.md)
+separates native reconstruction, independent spot/composition equations, ICC curve intervals
+and native CMM comparisons. Same-profile F32 output bypasses curves and preserves extended
+rendered values; CMM references for an actual connection apply the specified unit device range
+at the native float API boundary.
 
 YCbCr reconstruction carries the actual original device profile through the inverse codec matrix;
 it does not select an ICC transform or introduce an enumerated RGB carrier. The resulting surface

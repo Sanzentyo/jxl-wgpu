@@ -108,6 +108,7 @@ enum Packing {
     Raster {
         pipeline: wgpu::ComputePipeline,
         params: RasterPacking,
+        spots: Vec<SpotColor>,
     },
     Icc(Vec<icc::Presentation>),
 }
@@ -144,7 +145,6 @@ pub(super) struct Compositor {
     surface: FrameSurfaceLayout,
     blend: wgpu::ComputePipeline,
     packing: Packing,
-    spots: Vec<SpotColor>,
     pub(super) layout: ImageLayout,
     blend_dispatch: [u32; 2],
     output_dispatch: [u32; 2],
@@ -258,15 +258,6 @@ impl Compositor {
             )
             .into());
         }
-        let spots = if request.renders_spot_colors(extras) {
-            spot_colors(extras, (surface.color_plane_bytes / 4) as u32)
-        } else {
-            Vec::new()
-        };
-        if !spots.is_empty() {
-            validate_size(device, std::mem::size_of_val(spots.as_slice()) as u64)?;
-        }
-        let spot_source = spot_shader(!spots.is_empty());
         let native = crate::model::native_modular_format(request.format()).filter(|_| {
             request.uses_original_sample_domain()
                 || original.rgb_encoding() == Some(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709)
@@ -331,9 +322,6 @@ impl Compositor {
             ))
             && request.mapping() == crate::GpuOutputMapping::Color
         {
-            if !spots.is_empty() {
-                return Err(Error::UnsupportedOutputFormat("ICC spot-ink rendering is not yet connected; preserve spot channels to return the base color".into()));
-            }
             let mut presentation = |encoding: FrameSurfaceEncoding| -> Result<_> {
                 let source = FrameSurfaceLayout::with_encoding(
                     canvas,
@@ -346,8 +334,7 @@ impl Compositor {
                     &source,
                     request,
                     orientation,
-                    alpha_conversion,
-                    first_alpha.map(|(index, _)| index),
+                    extras,
                     &mut transforms,
                 )
             };
@@ -373,6 +360,15 @@ impl Compositor {
                     .collect::<Result<_>>()?,
             )
         } else {
+            let spots = if request.renders_spot_colors(extras) {
+                spot_colors(extras, &surface.extras)
+            } else {
+                Vec::new()
+            };
+            if !spots.is_empty() {
+                validate_size(device, std::mem::size_of_val(spots.as_slice()) as u64)?;
+            }
+            let spot_source = spot_shader(!spots.is_empty());
             let (packing, source) = if native.is_some() || scalar_float {
                 if let (Some(native), Some((_, extra))) = (native, selected)
                     && (native.channels != crate::ModularChannels::Gray
@@ -519,6 +515,7 @@ impl Compositor {
             Packing::Raster {
                 pipeline,
                 params: packing,
+                spots,
             }
         };
         let blend = pipeline(
@@ -537,7 +534,6 @@ impl Compositor {
             surface,
             blend,
             packing,
-            spots,
             layout,
             blend_dispatch,
             output_dispatch,
@@ -713,6 +709,7 @@ impl Compositor {
         let Packing::Raster {
             pipeline,
             params: packing,
+            spots,
         } = &self.packing
         else {
             let Packing::Icc(presentations) = &self.packing else {
@@ -766,7 +763,7 @@ impl Compositor {
                 pipeline,
                 params,
                 inputs: &[(0, &source.buffer)],
-                metadata: (!self.spots.is_empty()).then(|| (7, bytemuck::cast_slice(&self.spots))),
+                metadata: (!spots.is_empty()).then(|| (7, bytemuck::cast_slice(spots))),
                 output_binding,
                 uniform_binding,
                 size: aligned(self.layout.logical_size)?,

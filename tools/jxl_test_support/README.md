@@ -18,6 +18,11 @@ provides unbounded pre-OETF XYB stills; the codec's Gamma/DCI black floor makes 
 already encoded original image unsuitable for that reference. These helpers use ordinary module
 imports and stay outside production dependencies.
 
+`fixtures::icc_spots` reads a typed manifest for native ICC/enumerated RGB/Gray sources, both
+codecs and original/XYB stills or reference sequences. Behavior follows the manifest fields and
+is checked against the decoded inventory. Independent interval/CMM reference generation lives
+with the [spot corpus recipe](../../crates/jxl_wgpu_decode/test-data/icc_spots_generator/README.md).
+
 `native/icc` owns the shared C++ f64 ICC curve and CIE/Bradford reference equations used by the
 resident-ICC and embedded-JPEG-XL generators. Both compile with `-Itools/jxl_test_support/native`
 and include the named `icc` headers. Cargo and production decoding never compile or link this

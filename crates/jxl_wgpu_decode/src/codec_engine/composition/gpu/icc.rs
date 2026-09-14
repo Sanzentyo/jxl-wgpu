@@ -3,16 +3,18 @@
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
+use jxl_gpu_bitstream::{ExtraChannelInventory, ExtraChannelTypeInventory};
 use jxl_gpu_formats::{ColorSpecification, ImageLayout};
 use jxl_gpu_protocol::icc::IccTransform;
 use jxl_gpu_protocol::{OutputOrientation, RgbColorEncoding, RgbColorSpace, WhitePointAdaptation};
 use jxl_wgpu::{
-    AlphaConversion, GpuBufferLease, ImageOutputGeometry, ImageOutputParams, ImageOutputSource,
+    GpuBufferLease, ImageOutputGeometry, ImageOutputParams, ImageOutputSource,
     ResidentStorageBinding, WgpuBackend,
 };
 use wgpu::util::DeviceExt;
 
 use super::super::icc_transform::{ColorBinding, Transform, Transforms};
+use super::super::spot::render::Rendering;
 use super::super::submission::{
     GpuWork, IccWork, completion_fence_bytes, submit_icc_recorded, validate_size,
 };
@@ -27,6 +29,7 @@ mod tests;
 pub(super) struct Presentation {
     pub(super) source_encoding: FrameSurfaceEncoding,
     transform: Option<Arc<Transform>>,
+    spots: Option<Rendering>,
     working: FrameSurfaceLayout,
     output: ImageLayout,
     pipeline: wgpu::ComputePipeline,
@@ -40,16 +43,24 @@ impl Presentation {
         source: &FrameSurfaceLayout,
         request: &GpuOutputRequest,
         orientation: OutputOrientation,
-        alpha: AlphaConversion,
-        alpha_extra: Option<usize>,
+        extras: &[ExtraChannelInventory],
         transforms: &mut Transforms,
     ) -> Result<Self> {
         let device = backend.device();
         let source_encoding = FrameSurfaceEncoding::from_format(&source.color.format)
             .ok_or(Error::EngineContract("color presentation source layout"))?;
-        if alpha_extra.is_some_and(|index| index >= source.extras.len()) {
-            return Err(Error::EngineContract("color presentation alpha index"));
+        if extras.len() != source.extras.len() {
+            return Err(Error::EngineContract(
+                "color presentation extra-channel count",
+            ));
         }
+        let alpha_extra = extras.iter().position(|extra| {
+            matches!(extra.channel_type, ExtraChannelTypeInventory::Alpha { .. })
+        });
+        let spots = request
+            .renders_spot_colors(extras)
+            .then(|| Rendering::new(backend, source, extras))
+            .transpose()?;
         let output = ImageLayout::packed(
             orientation.map_extent(source.color.extent),
             request.format().clone(),
@@ -134,7 +145,7 @@ impl Presentation {
             )?,
             FrameSurfaceEncoding::Encoded => unreachable!("resolved presentation color"),
         }
-        .with_alpha_conversion(alpha);
+        .with_alpha_conversion(request.alpha_conversion(extras));
         let color_count = working.color.planes.len() as u32;
         let alpha_channel = alpha_extra.map_or(u32::MAX, |index| color_count + index as u32);
         let shader = format!(
@@ -164,6 +175,7 @@ impl Presentation {
         Ok(Self {
             source_encoding,
             transform,
+            spots,
             working,
             output,
             pipeline,
@@ -184,6 +196,7 @@ impl Presentation {
         let output_permit = backend.transient_memory_budget().try_reserve(output_size)?;
         let transient_bytes = std::mem::size_of::<ImageOutputParams>() as u64
             + completion_fence_bytes()
+            + self.spots.as_ref().map_or(0, Rendering::memory_bytes)
             + self.transform.as_ref().map_or(0, |transform| {
                 self.working.storage_bytes + transform.memory.transient_bytes()
             });
@@ -207,6 +220,14 @@ impl Presentation {
             output_permit,
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let rendered = self
+            .spots
+            .as_ref()
+            .map(|spots| spots.encode(device, &mut encoder, source))
+            .transpose()?;
+        let source_buffer = rendered
+            .as_ref()
+            .map_or(source.buffer.as_wgpu_buffer(), |rendered| &rendered.buffer);
         let mut converted = None;
         let mut icc_dispatch = None;
         if let (Some(transform), Some(program)) = (&self.transform, &program) {
@@ -228,7 +249,7 @@ impl Presentation {
                 &mut encoder,
                 program,
                 ColorBinding {
-                    storage: binding(source.buffer.as_wgpu_buffer(), source.layout.storage_bytes),
+                    storage: binding(source_buffer, source.layout.storage_bytes),
                     layout: &source.layout.color,
                 },
                 ColorBinding {
@@ -243,7 +264,7 @@ impl Presentation {
             )?;
             converted = Some(buffer);
         }
-        let input = converted.as_ref().unwrap_or(source.buffer.as_wgpu_buffer());
+        let input = converted.as_ref().unwrap_or(source_buffer);
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("JPEG XL ICC packing parameters"),
             contents: bytemuck::bytes_of(&self.params),
@@ -279,7 +300,7 @@ impl Presentation {
             output,
             vec![source.buffer.clone()],
             IccWork {
-                resources: (uniform, converted, program),
+                resources: (uniform, converted, rendered, program),
                 dispatch: icc_dispatch,
             },
             permit,

@@ -17,6 +17,7 @@ mod numeric;
 mod output;
 mod profile;
 mod references;
+mod spots;
 mod xyb;
 mod ycbcr;
 
