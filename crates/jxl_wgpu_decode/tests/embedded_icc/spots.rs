@@ -184,8 +184,14 @@ fn spots_precede_icc_connections_and_leave_references_extras_and_output_lifetime
     let mut components = 0;
     let mut presentations = 0;
     let mut updates = 0;
+    let mut invalid_references = 0;
     for case in cases {
         let data = case.bytes();
+        if !case.valid_reference_color {
+            super::xyb::reject_post_transform_reference(&backend, &data, &case.name);
+            invalid_references += 1;
+            continue;
+        }
         case.validate(&inventory(&data));
         let source =
             std::fs::read(corpus::directory().join(format!("{}.source.f32", case.name))).unwrap();
@@ -292,8 +298,9 @@ fn spots_precede_icc_connections_and_leave_references_extras_and_output_lifetime
             }
         }
     }
-    assert_eq!(components, 1_233_792);
-    assert_eq!(presentations, 3456);
+    assert_eq!(invalid_references, 4);
+    assert_eq!(components, 1_002_456);
+    assert_eq!(presentations, 2808);
     assert!(updates > presentations);
     eprintln!(
         "ICC spots: {presentations} final presentations, {updates} retained updates, {components} independent components"
@@ -307,7 +314,10 @@ fn numeric_spot_and_other_extra_samples_ignore_presentation_policy() {
     use jxl_wgpu_decode::NumericSampleMapping;
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
     let mut compared = 0;
-    for case in corpus::cases() {
+    for case in corpus::cases()
+        .into_iter()
+        .filter(|case| case.valid_reference_color)
+    {
         let data = case.bytes();
         let image = inventory(&data).image_header;
         let bytes =
@@ -357,6 +367,6 @@ fn numeric_spot_and_other_extra_samples_ignore_presentation_policy() {
             }
         }
     }
-    assert_eq!(compared, 88_128);
+    assert_eq!(compared, 71_604);
     eprintln!("ICC spot numeric bypass: {compared} native extra-channel comparisons");
 }

@@ -447,23 +447,14 @@ complete profile/range conformance and HDR/display integration remain open. Late
 cover LUT/MPE, intent and enumerated-RGB execution. All affected rows and completion gates
 remain **Partial**.
 
-ICC XYB checkpoint: inverse opsin reconstructs into linear D65 BT.709 independently of the
-original device profile. Direct presentations retain unbounded linear values. Post-transform
-references and frame composition execute a selected linear-to-original-ICC program first;
-Gray uses one real device plane and extras follow the actual color count. Reconstruction uses
-the source header intent, while requested presentation intent remains independent. The image
-plan selects only required domains, and both conversion stages share lazy, exactly admitted
-programs and completion-owned intermediate storage. LF prediction and patch producers retain
-explicit codec components instead of requiring an enumerated RGB carrier.
-Four native stills cover both codecs and RGB/Gray targets; four additive sequences verify
-original-domain blending and above-one values. Seven metadata substitutions cover LF/coefficient
-updates, custom weights and patched/nested LF producers in both codecs. 68 native/scalar/interval
-files are reproducible from the [published generator](../crates/jxl_wgpu_decode/test-data/embedded_icc_xyb_generator/README.md).
-Native XYB reconstruction precision is propagated through independent ICC inverse curves and
-composition, separately from native CMS precision. Wider alpha/blend/crop/reference combinations,
-ICC conversion after composition, numeric sequence bypasses, all ICC methods/intents and HDR
-policies still require conformance. This checkpoint leaves the full JPEG XL objective and every
-affected completion gate **Partial**.
+ICC XYB checkpoint (corrected by the September 14 reference-validity audit): inverse opsin
+reconstructs unbounded linear D65 BT.709, and requested output selects only the necessary ICC
+program. Four native stills and seven LF/patch substitutions retain their independent evidence.
+The four additive sequences formerly cited here are invalid reference inputs, as detailed in
+[the F.2 audit](ICC_COLOR.md#xyb-reference-validity); their old pixel calculations do not establish
+conformance. Shared GPU programs, exact admission, completion ownership and independent numeric
+selection retain their separate unit coverage. Wider legal combinations, full methods/intents,
+HDR and all other completion gates remain **Partial**.
 
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|
@@ -609,13 +600,11 @@ Modular LF restoration/resampling and staged global/LF-group extra channels in L
 now have independent conformance coverage. Remaining `FRAME-01/02`, `FRONT-01` and
 intermediate progressive-output gates still apply, including broader reconstruction color domains.
 
-ICC XYB now has 48 native alpha sequences covering RGB/Gray, both codecs, straight/associated
-F32 alpha, all five blend modes and separate implicit/explicit background-alpha selectors. Independent physical-layer ICC/blend equations and propagated
-precision bounds validate original-device composition, exact alpha, both output layouts and
-whole/fragmented input. An image-owned registry shares selected ICC programs across reconstruction
-and direct linear presentation, including exact-budget cancellation. These extend the existing
-partial color/frame/conformance gates; arbitrary alpha-policy/target/crop/reference combinations,
-complete ICC methods/intents and the remaining full JPEG XL requirements remain open.
+The 48 ICC XYB alpha sequences are now negative reference fixtures. Their earlier classification
+as positive composition evidence was incorrect; see [the reference-validity correction](ICC_COLOR.md#xyb-reference-validity).
+Independent physical-layer and blend calculations remain diagnostic records. The shared-program
+allocation/cancellation tests remain useful unit evidence, separate from codestream conformance.
+All legal colour/frame requirements and the full JPEG XL goal remain open.
 
 ### Structural refactoring gate
 
@@ -777,16 +766,12 @@ from their layouts. Its storage and ink table share exact admission and completi
 with ICC packing; Preserve and numeric requests omit the stage. Same-profile output retains
 extended rendered values. Gray ICC connections consume their single device component.
 
-Thirty-two native streams cover ICC/enumerated RGB/Gray, both codecs, original/XYB and three-frame
-associated-alpha reference sequences. Independent equations and curve-conditioned intervals
-check 1,233,792 components in 3,456 final presentations; 6,912 updates are retained and reread.
-The native generator separately validates 86,904 CMM components and reproduces all 485 files.
-All nine numeric extras add 88,128 native comparisons and Render/Preserve byte equality.
-The native decoder's general-ICC XYB blending limitation is explicit: those four sequences use
-native uncoalesced linear reconstruction, Little CMS and independent composition equations.
-See the [recipe and precision contract](../crates/jxl_wgpu_decode/test-data/icc_spots_generator/README.md).
-`COLOR-01/02/03/04`, `IO-01`, `QA-03/06` and the full JPEG XL goal remain **Partial**; broader
-profile/range/render combinations, CMYK/HDR and all remaining roadmap gates remain required.
+The spot corpus has 28 supported streams and four negative reference cases. Positive checks
+compare 1,002,456 colour components in 2,808 final presentations and 71,604 numeric extras,
+with independent intervals and retained output ownership. The four ICC XYB sequences were
+incorrectly described as conformance evidence; they now require early rejection. Their bytes
+and diagnostic calculations remain unchanged. See [the recipe](../crates/jxl_wgpu_decode/test-data/icc_spots_generator/README.md).
+`COLOR-01/02/03/04`, `IO-01`, `QA-03/06` and the full JPEG XL goal remain **Partial**.
 
 Original CMYK checkpoint: an explicit CMYK surface owns its profile and Black extra index while
 retaining three complemented CMY planes. ICC presentation borrows the independently composed
@@ -803,7 +788,7 @@ Native and F64 ICC oracles provide 132,192 components, checked 528,768 times in 
 presentations; scalar original components and retained memory ownership are checked separately.
 [Recipe and precision](../crates/jxl_wgpu_decode/test-data/cmyk_generator/README.md).
 `COLOR-01/02/03/04`, `IO-01`, `QA-03/06` and the full JPEG XL goal remain **Partial**. Requested CMYK
-layouts, XYB-to-original CMYK reconstruction, wider sampling/profile/range conformance, HDR and
+layouts, CMYK-suggested XYB output and numeric selection conformance, wider sampling/profile/range conformance, HDR and
 all remaining codestream/container/encoder gates still require work.
 
 ICC device output checkpoint: `ColorModel::IccDevice` and explicit `Channel::Device(index)` /
@@ -824,6 +809,15 @@ orientation, component permutations and unaligned pitches. Existing source/profi
 fixtures remain unchanged. See [the device output recipe](../crates/jxl_wgpu_decode/test-data/device_output_generator/README.md).
 
 This completes the requested CMYK layout gap described above. `COLOR-01/02/03/04`, `IO-01`,
-`QA-03/06` and the full JPEG XL goal remain **Partial**: XYB-to-original CMYK reconstruction,
+`QA-03/06` and the full JPEG XL goal remain **Partial**: CMYK-suggested XYB output and numeric selection conformance,
 uncommon device-space image conformance, broader profile/range/conditioning and sampling,
 HDR, container, encoder and the other roadmap gates still require work.
+
+Reference-colour validity checkpoint: the shared header parser and public frame planner now
+reject forbidden ICC XYB post-transform reference storage, with a typed slot error. All 56
+previously accepted invalid streams remain unchanged as negative fixtures. Whole input and
+1-/43-byte fragments reject before frame/section publication and release retained input. A
+192-case header matrix preserves legal pre-transform references, ordinary output, LF and preview
+behaviour. The corpus audit separates 56 negative inputs from 2,516 accepted inventories;
+acceptance alone is not a pixel-conformance claim. No completion gate closes at this checkpoint.
+[Specification basis and corrected evidence](ICC_COLOR.md#xyb-reference-validity).

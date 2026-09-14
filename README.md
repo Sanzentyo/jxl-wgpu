@@ -87,12 +87,10 @@ Same-profile output preserves device values without evaluating curves. Programs 
 selected image and accounted through GPU completion. ICC YCbCr has 146 source cases covering
 sampling, precision, restoration, resampling and both-codec composition; separate independently
 bounded references check linear/sRGB and other-profile output. ICC XYB keeps direct output in
-linear RGB and reconstructs original device values before references and blending. Four stills,
-four additive sequences and seven LF/patch substitutions check this boundary; see the
-[XYB references](crates/jxl_wgpu_decode/test-data/embedded_icc_xyb_generator/README.md).
-A further 48 alpha sequences cover all five blend modes, both associations and independently
-selected background alpha. Identical reconstruction/presentation connections share one accounted
-GPU program, including when cancellation outlives the image context.
+linear RGB and converts to the requested profile at presentation. Four stills and seven LF/patch
+substitutions check this boundary. The 52 formerly accepted ICC XYB reference sequences are now
+negative tests; see the [reference validity correction](docs/ICC_COLOR.md#xyb-reference-validity).
+Identical requested connections share one accounted GPU program, including after cancellation.
 An additional 3,744 ICC/linear connections check white-point and black-point intent policies
 against native and independent references. Public decoder tests cover all four intents on
 original/XYB RGB/Gray in 768 whole/fragmented planar/interleaved presentations.
@@ -109,11 +107,11 @@ also targets requested ICC profiles through both codecs, XYB/YCbCr reconstructio
 composition. The 228-source [RGB-to-ICC corpus](crates/jxl_wgpu_decode/test-data/rgb_icc_generator/README.md)
 checks 9,120 presentations and 16,197,120 components with independent bounds, exact alpha,
 retained outputs and fragmented input. Spot presentation now also precedes ICC connections in
-the actual source color domain. A [32-stream corpus](crates/jxl_wgpu_decode/test-data/icc_spots_generator/README.md)
-covers both codecs, RGB/Gray, original/XYB and retained animations, with independent color
-intervals, numeric bypass and completion-owned ink metadata. Broader ICC XYB conformance,
-XYB-to-original CMYK reconstruction and full intent/HDR
-policies remain incomplete.
+the actual source color domain. The [spot corpus](crates/jxl_wgpu_decode/test-data/icc_spots_generator/README.md)
+contains 28 supported streams and four explicitly invalid reference cases. Supported cases cover
+both codecs, RGB/Gray, original/XYB and original-domain animations, with independent intervals,
+numeric bypass and completion-owned ink metadata. Broader ICC XYB conformance, CMYK-suggested XYB
+output and numeric selection, and full intent/HDR policies remain incomplete.
 
 Creating an encoder or decoder requires a compatible `wgpu` backend. Unsupported codestream
 features or device limits return typed errors before a partial output becomes authoritative.

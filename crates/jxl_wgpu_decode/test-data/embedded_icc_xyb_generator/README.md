@@ -1,6 +1,14 @@
-# Embedded ICC XYB reconstruction and composition
+# Embedded ICC XYB output and invalid reference fixtures
 
-These offline programs require libjxl **0.12.0**, Little CMS **2.19**, a C++17 compiler,
+The `animation` and `alpha` outputs are **52 negative fixtures**. The
+[F.2 audit](../../../../docs/ICC_COLOR.md#xyb-reference-validity) corrected their earlier
+classification as conforming composition tests. The production decoder now rejects their
+post-transform references. All existing bytes and independent calculations are retained for
+diagnosis; the composition calculations below do not define conforming decoded pixels.
+Still output and the seven legal LF/patch substitutions remain positive tests.
+
+These offline programs require
+ libjxl **0.12.0**, Little CMS **2.19**, a C++17 compiler,
 and `pkg-config`. They are not production dependencies. From the repository root:
 
 ```sh
@@ -50,7 +58,7 @@ error cannot replace propagation from the linear input.
 
 `tests/embedded_icc/xyb` checks planar/interleaved output, real Gray/RGB plane counts,
 whole input and 43-byte fragments with 256-byte entropy windows, and retained frames after
-session destruction. Same-profile composition ignores unused presentation intents while
+session destruction. The retained diagnostic composition model ignores unused presentation intents while
 reconstruction uses the original profile's own intent. Private GPU tests verify exact
 output/intermediate/program admission, retry, cache reuse and completion-owned cancellation;
 direct XYB output does not select an unused unsupported original intent.
@@ -99,12 +107,11 @@ order; Replace and near-homogeneous Multiply cases need not. Eight composed outp
 one. The **624 files** include native/scalar physical layers, native/scalar composition and
 all lower/upper bounds. Neither GPU output nor an observed GPU error defines any reference.
 
-The public alpha test covers all 48 cases, both layouts, whole/fragmented input, exact alpha,
-association preservation and immutable held frames. Replace also changes the working color
+The public alpha test rejects all 48 cases through whole input and 1-/43-byte fragments before any frame is started. The previous diagnostic model changed the working color
 domain from original-device reference reconstruction to direct linear presentation. An
 image-owned selection registry shares identical ICC programs across these two uses; a byte
 budget test leaves no room for a duplicate program and verifies cancellation releases once.
 
-This checkpoint does not complete ICC XYB conformance. Broader alpha-policy/blend/crop/reference
+The old sequence calculations do not establish ICC XYB conformance. Broader legal alpha-policy/blend/crop/reference
 combinations, transformed ICC targets after composition, numeric sequence bypasses, full ICC
 methods/intents, and HDR/display policies remain part of the full JPEG XL goal.

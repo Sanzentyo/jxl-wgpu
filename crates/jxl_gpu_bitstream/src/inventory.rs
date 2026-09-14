@@ -19,6 +19,9 @@ use crate::{BitReader, Error as BitReaderError};
 
 mod image_header;
 
+#[cfg(test)]
+mod color_reference;
+
 const FLAG_USE_LF_FRAME: u64 = 0x20;
 const FLAG_SKIP_ADAPTIVE_LF_SMOOTHING: u64 = 0x80;
 const GROUP_DIM_LOG2_MINUS_ONE: u32 = 7;
@@ -581,6 +584,35 @@ pub struct FrameInventory {
 }
 
 impl FrameInventory {
+    /// Whether this frame retains a reference slot after decoding.
+    #[must_use]
+    pub const fn can_be_referenced(&self) -> bool {
+        !self.is_last
+            && !matches!(self.frame_type, FrameType::LowFrequency)
+            && (self.duration_ticks == 0 || self.save_as_reference != 0)
+    }
+
+    /// Validate the colour domain of a retained reference (ISO/IEC 18181-1:2024, F.2).
+    ///
+    /// XYB with an embedded ICC profile may retain codec components, but may not
+    /// require an ICC conversion before reference storage. Unreferenced output can
+    /// still be converted to any supported requested profile.
+    pub fn validate_color_reference(
+        &self,
+        image: &ImageHeaderInventory,
+    ) -> Result<(), InventoryError> {
+        validate_color_reference(
+            image.xyb_encoded,
+            matches!(
+                image.colour_encoding,
+                ColourEncodingInventory::IccProfile { .. }
+            ),
+            self.can_be_referenced(),
+            self.save_before_color_transform,
+            self.save_as_reference,
+        )
+    }
+
     /// Validate JPEG component sampling and its LF-smoothing constraint.
     ///
     /// Parsing checks this before the TOC. Callers that construct or modify the public
@@ -664,6 +696,8 @@ pub enum InventoryError {
     InvalidEnum { name: &'static str, value: u32 },
     #[error("invalid frame header: {0}")]
     InvalidFrame(&'static str),
+    #[error("XYB with an embedded ICC profile cannot save post-transform reference slot {slot}")]
+    XybIccReference { slot: u32 },
     #[error("preview dimensions {width}x{height} exceed the JPEG XL maximum of 4096x4096")]
     InvalidPreviewDimensions { width: u32, height: u32 },
     #[error("invalid JPEG sampling selectors {jpeg_upsampling:?} with do_YCbCr={do_ycbcr}")]
@@ -703,6 +737,7 @@ pub(crate) struct ImageContext {
     height: u32,
     preview_size: Option<(u32, u32)>,
     xyb_encoded: bool,
+    has_icc: bool,
     num_extra_channels: u32,
     extra_channel_shifts: Vec<u32>,
     have_animation: bool,
@@ -1224,6 +1259,7 @@ pub(crate) fn parse_image_header(
             height: image.size.height,
             preview_size,
             xyb_encoded: metadata.xyb_encoded,
+            has_icc: metadata.colour_encoding.want_icc(),
             num_extra_channels: extra_channel_count,
             extra_channel_shifts,
             have_animation: metadata.animation.is_some(),
@@ -1474,6 +1510,7 @@ pub(crate) struct FrameContext<'a> {
     width: u32,
     height: u32,
     xyb_encoded: bool,
+    has_icc: bool,
     num_extra_channels: u32,
     extra_channel_shifts: &'a [u32],
     have_animation: bool,
@@ -1486,6 +1523,7 @@ impl<'a> FrameContext<'a> {
             width: image.width,
             height: image.height,
             xyb_encoded: image.xyb_encoded,
+            has_icc: image.has_icc,
             num_extra_channels: image.num_extra_channels,
             extra_channel_shifts: &image.extra_channel_shifts,
             have_animation: image.have_animation,
@@ -1561,6 +1599,19 @@ fn validate_jpeg_sampling(
         && jpeg_upsampling != [jpeg_upsampling[0]; 3]
     {
         return Err(InventoryError::SubsampledAdaptiveLfSmoothing { jpeg_upsampling });
+    }
+    Ok(())
+}
+
+fn validate_color_reference(
+    xyb_encoded: bool,
+    has_icc: bool,
+    can_be_referenced: bool,
+    save_before_color_transform: bool,
+    slot: u32,
+) -> Result<(), InventoryError> {
+    if xyb_encoded && has_icc && can_be_referenced && !save_before_color_transform {
+        return Err(InventoryError::XybIccReference { slot });
     }
     Ok(())
 }
@@ -1780,6 +1831,15 @@ fn parse_frame_header(
         } else {
             frame_type == FrameType::LowFrequency
         };
+    // F.2 forbids an ICC-dependent post-transform reference. The flag has no
+    // reference semantics on a final or otherwise unretained presentation.
+    validate_color_reference(
+        context.xyb_encoded,
+        context.has_icc,
+        can_be_referenced,
+        save_before_color_transform,
+        save_as_reference,
+    )?;
     if frame_type == FrameType::ReferenceOnly && !save_before_color_transform && !full_frame {
         return Err(InventoryError::InvalidFrame(
             "post-transform reference frame cannot be cropped",
@@ -2379,6 +2439,7 @@ mod tests {
             height: 9,
             preview_size: Some((15, 27)),
             xyb_encoded: true,
+            has_icc: false,
             num_extra_channels: 0,
             extra_channel_shifts: Vec::new(),
             have_animation: false,
@@ -2446,6 +2507,7 @@ mod tests {
             height: 17,
             preview_size: None,
             xyb_encoded: false,
+            has_icc: false,
             num_extra_channels: 0,
             extra_channel_shifts: Vec::new(),
             have_animation: false,
@@ -2514,6 +2576,7 @@ mod tests {
             height: 9,
             preview_size: None,
             xyb_encoded: true,
+            has_icc: false,
             num_extra_channels: 4,
             extra_channel_shifts: vec![0, 1, 2, 3],
             have_animation: false,

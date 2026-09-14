@@ -4002,31 +4002,23 @@ equality, and unchanged reconstructed alpha words. No production CPU pixel conve
 
 ## ICC XYB reconstruction, reference color and alpha composition
 
-`embedded_icc_xyb` adds 68 native/scalar files for four stills and four two-frame additive
-sequences. Native physical-layer linear output and independent ICC equations keep XYB
-reconstruction precision separate from inverse-curve conditioning. Four direct linear stills
-also match jxl-oxide; seven metadata-only LF/patch substitutions preserve existing frame bytes,
-dependency IDs and immutable intermediate/final output. Original-device references are built
-before blending, while unused original CMS methods do not block direct linear output.
+Four ICC XYB stills retain independent native/jxl-oxide linear and F64 ICC-output comparisons.
+Seven metadata substitutions cover LF/coefficient previews, custom weights and patched/nested
+LF producers while retaining their existing frame bytes and independent source evidence.
 
-The `alpha` subdirectory adds 48 two-frame 17×9 codestreams and 576 F32LE references: RGB/Gray,
-Modular/VarDCT, straight/associated F32 alpha, all five frame blend modes, and eight extra Blend
-cases with explicit saved-alpha selection. Forty streams use an independent full-frame Replace
-for alpha, whose implicit source is transparent slot 0; the other eight select saved slot 1.
-Native header reads and Rust inventory checks verify this routing before scalar blending.
-Color Blend publishes combined coverage after the selected extra's own operation.
+The four additive and 48 alpha sequences previously listed here are negative fixtures.
+The [F.2 audit](ICC_COLOR.md#xyb-reference-validity) found prohibited post-transform ICC XYB
+reference storage in all 52. Their old physical layers, independent composition calculations
+and intervals are retained unchanged for diagnosis; these are not conforming decoded references.
+The public decoder rejects every stream through whole input and 1-/43-byte fragments before
+starting a frame, and releases retained input on failure. Constructed inventories cannot bypass
+the same frame-planning check. Ordinary requested ICC output remains covered separately.
 
-Native libjxl physical layers, Little CMS conversions and independent f64 ICC/coverage algebra
-supply references without GPU pixels. The original normalized XYB error propagates through
-ICC corner bounds and monotone blend operations with outward rounding. All 28 nontrivial
-Add/Blend/MultiplyAdd cases reject conversion after linear-domain blending; three Multiply
-cases also discriminate the order. Eight straight-alpha sums retain values above one.
-
-Both layouts, complete/43-byte fragmented input, 256-byte entropy windows, exact alpha and
-immutable held buffers are checked through the public decoder. A separate allocation test
-leaves no room for a duplicate reconstruction/presentation program and verifies cancellation
-retains and releases the shared reservation once. Full ICC conformance remains open; see the
-[generator and precision contract](../crates/jxl_wgpu_decode/test-data/embedded_icc_xyb_generator/README.md).
+The header test matrix covers 192 colour/reference combinations, all four slots, both codecs,
+regular/skip-progressive/reference-only frames, implicit post-transform storage, unused flags,
+LF storage, previews and the all-default final header. The full corpus audit inventories 2,572
+stored streams: 56 negative references and 2,516 accepted inventories. It does not assert pixel
+conformance for all accepted inventories. See the [recipe](../crates/jxl_wgpu_decode/test-data/embedded_icc_xyb_generator/README.md).
 
 ## Matrix/TRC rendering intents through resident and decoder APIs
 
@@ -4140,8 +4132,9 @@ states the pairing, source provenance and remaining full JPEG XL requirements.
 ## ICC spot presentation and reference ownership
 
 `crates/jxl_wgpu_decode/test-data/icc_spots` adds 32 native streams and 485 total files
-(4,039,732 bytes), reusing the embedded RGB/Gray profiles unchanged. Explicit manifest fields
-cross ICC/enumerated color, RGB/Gray, both codecs, original/XYB and still/three-frame animation.
+with 28 supported and four negative cases, reusing the embedded RGB/Gray profiles unchanged.
+Explicit manifest fields cross ICC/enumerated color, RGB/Gray, both codecs, original/XYB,
+still/three-frame animation, and reference-colour validity.
 Nine independent integer/F32 extras include five ordered inks, non-leading associated/straight
 alpha and another alpha. Reference composition produces extended coverage and device values.
 
@@ -4152,17 +4145,16 @@ offsets. The image-owned presentation plan accounts its copy and metadata throug
 Preserve and numeric output omit the stage. Same-profile F32 retains extended device values.
 
 The generator separates native reconstruction, independent F64 ink/composition equations,
-curve-conditioned primary bounds and 86,904 native CMM checks. Four ICC XYB sequences require
-native uncoalesced linear reconstruction plus independent CMS/composition because libjxl's
-coalesced blender cannot insert the general original ICC inverse. Every comparison identifies
-that provenance. Little CMS float calls apply the declared unit device boundary; neither this
-boundary nor a CMM difference widens the production interval. Two fresh generations reproduce
-all files exactly. See the [recipe](../crates/jxl_wgpu_decode/test-data/icc_spots_generator/README.md).
+curve-conditioned primary bounds and native CMM checks. The four ICC XYB reference sequences
+are invalid under F.2 and require rejection; their previous CMS/composition calculations remain
+diagnostic records. Valid cases preserve the existing independent intervals and native float
+boundary. All source/profile/reference bytes remain unchanged; the manifest now explicitly
+identifies negative cases. See the [recipe](../crates/jxl_wgpu_decode/test-data/icc_spots_generator/README.md).
 
-The runtime color test checks 1,233,792 components across 3,456 final presentations and retains
-6,912 updates. Planar/interleaved, Apply/Keep, all three alpha policies, progressive/final-only,
-whole/43-byte input fragments and a 256-byte GPU window agree in canonical final words. All
-nine numeric extras add 88,128 native comparisons with byte-identical Render/Preserve output.
+The runtime color test checks 1,002,456 components across 2,808 final presentations, retaining
+and rereading progressive updates. Planar/interleaved, Apply/Keep, all three alpha policies,
+progressive/final-only, whole/43-byte input fragments and a 256-byte GPU window agree in canonical
+final words. All nine numeric extras add 71,604 native comparisons with Render/Preserve equality.
 Source-shaped memory tests include one-byte-short admission, rollback/retry, shared program
 reuse, reverse completion and cancellation. Old fixtures remain unchanged. Full profile/range,
 render combinations and every remaining JPEG XL conformance gate remain open.

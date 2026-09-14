@@ -10,6 +10,8 @@ pub struct Case {
     pub modular: bool,
     pub original: bool,
     pub sequence: bool,
+    /// False marks a negative F.2 fixture with a forbidden XYB/ICC reference.
+    pub valid_reference_color: bool,
 }
 
 pub fn directory() -> std::path::PathBuf {
@@ -21,7 +23,7 @@ pub fn cases() -> Vec<Case> {
     let mut lines = manifest.lines();
     assert_eq!(
         lines.next(),
-        Some("name\ticc\tgray\tmodular\toriginal\tsequence")
+        Some("name\ticc\tgray\tmodular\toriginal\tsequence\tvalid_reference_color")
     );
     let boolean = |value| match value {
         "0" => false,
@@ -31,7 +33,7 @@ pub fn cases() -> Vec<Case> {
     lines
         .map(|line| {
             let fields: Vec<_> = line.split('\t').collect();
-            assert_eq!(fields.len(), 6);
+            assert_eq!(fields.len(), 7);
             Case {
                 name: fields[0].into(),
                 icc: boolean(fields[1]),
@@ -39,6 +41,7 @@ pub fn cases() -> Vec<Case> {
                 modular: boolean(fields[3]),
                 original: boolean(fields[4]),
                 sequence: boolean(fields[5]),
+                valid_reference_color: boolean(fields[6]),
             }
         })
         .collect()
@@ -50,6 +53,7 @@ impl Case {
     }
 
     pub fn validate(&self, inventory: &CodestreamInventory) {
+        assert!(self.valid_reference_color, "negative fixture was accepted");
         let image = &inventory.image_header;
         assert_eq!((image.width, image.height), (17, 9));
         assert_eq!(image.grayscale, self.gray);

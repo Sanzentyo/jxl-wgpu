@@ -667,19 +667,16 @@ interleaved linear/sRGB and other-profile output against independently propagate
 conversion preserves the actual reconstructed alpha words. See the
 [reference recipe](test-data/embedded_icc_ycbcr_generator/README.md).
 
-XYB reconstructs into linear D65 BT.709. Direct presentations keep that unbounded domain;
-post-transform references and composition first execute the original ICC's linear-to-device
-program. Its header intent is independent of the requested presentation intent. Source domains
-are selected from the frame plan, so an unused original CMS method does not block direct output.
-Reconstruction and presentation share exact program admission and completion ownership.
-LF prediction and features retain explicit codec components through their common color boundary.
-Four native stills, four additive reference sequences and seven LF/patch substitutions cover
-these paths; [reference generation and bounds](test-data/embedded_icc_xyb_generator/README.md)
-keep native reconstruction precision separate from ICC curve conditioning.
-Another 48 native sequences cover straight/associated F32 alpha, all five frame blend modes and
-implicit/explicit background-alpha references. Exact alpha and independent color intervals cover
-both output layouts and whole/fragmented input. A selection registry shares one GPU program
-across reconstruction and presentation, with exact-budget cancellation coverage.
+XYB reconstructs into linear D65 BT.709. Direct presentations keep that unbounded domain until
+requested profile conversion. LF prediction and features retain explicit codec components.
+Four native stills and seven LF/patch substitutions cover these paths; the
+[reference recipe](test-data/embedded_icc_xyb_generator/README.md) separates codec precision from
+ICC curve conditioning. Selected connections share exact admission and completion ownership.
+
+The four additive and 48 alpha sequences in that recipe are invalid reference inputs, as explained
+in the [F.2 audit](../../docs/ICC_COLOR.md#xyb-reference-validity). Contiguous and fragmented input
+now reject them before starting a frame or retaining section bytes. Constructed inventories receive
+the same check during frame planning. They are no longer counted as positive composition evidence.
 
 Legacy `mft1`/`mft2`/`mAB`/`mBA` source and requested-output programs share the ordered GPU
 interpreter. Twenty-four original RGB/Gray Modular/VarDCT streams cover XYZ/Lab PCS and all
@@ -704,9 +701,10 @@ Spot inks now also render before ICC conversion, in the actual source domain aft
 storage. Each presentation plan owns its ink offsets; Gray device and three-channel linear/RGB
 surfaces use their actual extra-plane layouts. A separate accounted copy preserves source and
 reference samples. Same-profile output retains extended values; other connections keep the
-ICC device-curve range contract. The [32-stream spot corpus](test-data/icc_spots_generator/README.md)
-checks 3,456 final images and 6,912 held progressive updates, all three alpha policies, both
-layouts, orientation and bounded fragmented input against independent color intervals.
+ICC device-curve range contract. The [spot corpus](test-data/icc_spots_generator/README.md)
+checks 2,808 final images from 28 supported streams, all three alpha policies, both layouts,
+orientation and bounded fragmented input against independent color intervals. Four further
+streams explicitly test invalid reference rejection; their former pixel references are diagnostic.
 
 `PixelFormat::icc_device(profile, sample, storage, alpha)` requests explicit ICC device components,
 including CMYK plus independent alpha and targets with up to fifteen components. U8/F32 and
@@ -715,9 +713,8 @@ physical packing fields; CMYK F32 values are unit ink amounts, with zero meaning
 Original CMYK retains its separately composed Black plane until this output boundary. Same-profile
 output bypasses CMS evaluation. See [device output semantics and evidence](../../docs/ICC_COLOR.md#profile-component-output).
 
-Broader ICC XYB alpha/crop/reference conformance,
-
-complete MPE ranges, XYB-to-original CMYK reconstruction, other profile
+Broader legal ICC XYB alpha/crop/reference conformance, complete MPE ranges,
+CMYK-suggested XYB output and numeric selection, other profile
 classes, HDR/gamut policies and standalone codec color admission remain open.
 Numeric and extra-channel bypasses keep their existing independent contracts.
 

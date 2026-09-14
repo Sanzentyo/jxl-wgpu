@@ -74,3 +74,9 @@ use the inventory. The single image-metadata walk checks the selector directly, 
 opaque extension parser and a second grammar walk. Empty unknown payloads are also
 rejected; frame/restoration payload lengths still obey the explicit extension-bit limit. Safe
 auxiliary container boxes continue through the transport event path independently.
+
+Retained reference colour is validated before the remaining frame header and TOC.
+`InventoryError::XybIccReference` identifies a prohibited reference slot. Public inventories expose
+`can_be_referenced` and `validate_color_reference` for callers that construct or edit fields.
+See the [reference-validity audit](../../docs/ICC_COLOR.md#xyb-reference-validity) for the constraint,
+negative corpus and preserved output/LF/preview cases.

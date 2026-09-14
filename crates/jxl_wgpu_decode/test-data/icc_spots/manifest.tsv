@@ -1,33 +1,33 @@
-name	icc	gray	modular	original	sequence
-enum_rgb_vardct_xyb_still	0	0	0	0	0
-enum_rgb_vardct_xyb_sequence	0	0	0	0	1
-enum_rgb_vardct_original_still	0	0	0	1	0
-enum_rgb_vardct_original_sequence	0	0	0	1	1
-enum_rgb_modular_xyb_still	0	0	1	0	0
-enum_rgb_modular_xyb_sequence	0	0	1	0	1
-enum_rgb_modular_original_still	0	0	1	1	0
-enum_rgb_modular_original_sequence	0	0	1	1	1
-enum_gray_vardct_xyb_still	0	1	0	0	0
-enum_gray_vardct_xyb_sequence	0	1	0	0	1
-enum_gray_vardct_original_still	0	1	0	1	0
-enum_gray_vardct_original_sequence	0	1	0	1	1
-enum_gray_modular_xyb_still	0	1	1	0	0
-enum_gray_modular_xyb_sequence	0	1	1	0	1
-enum_gray_modular_original_still	0	1	1	1	0
-enum_gray_modular_original_sequence	0	1	1	1	1
-icc_rgb_vardct_xyb_still	1	0	0	0	0
-icc_rgb_vardct_xyb_sequence	1	0	0	0	1
-icc_rgb_vardct_original_still	1	0	0	1	0
-icc_rgb_vardct_original_sequence	1	0	0	1	1
-icc_rgb_modular_xyb_still	1	0	1	0	0
-icc_rgb_modular_xyb_sequence	1	0	1	0	1
-icc_rgb_modular_original_still	1	0	1	1	0
-icc_rgb_modular_original_sequence	1	0	1	1	1
-icc_gray_vardct_xyb_still	1	1	0	0	0
-icc_gray_vardct_xyb_sequence	1	1	0	0	1
-icc_gray_vardct_original_still	1	1	0	1	0
-icc_gray_vardct_original_sequence	1	1	0	1	1
-icc_gray_modular_xyb_still	1	1	1	0	0
-icc_gray_modular_xyb_sequence	1	1	1	0	1
-icc_gray_modular_original_still	1	1	1	1	0
-icc_gray_modular_original_sequence	1	1	1	1	1
+name	icc	gray	modular	original	sequence	valid_reference_color
+enum_rgb_vardct_xyb_still	0	0	0	0	0	1
+enum_rgb_vardct_xyb_sequence	0	0	0	0	1	1
+enum_rgb_vardct_original_still	0	0	0	1	0	1
+enum_rgb_vardct_original_sequence	0	0	0	1	1	1
+enum_rgb_modular_xyb_still	0	0	1	0	0	1
+enum_rgb_modular_xyb_sequence	0	0	1	0	1	1
+enum_rgb_modular_original_still	0	0	1	1	0	1
+enum_rgb_modular_original_sequence	0	0	1	1	1	1
+enum_gray_vardct_xyb_still	0	1	0	0	0	1
+enum_gray_vardct_xyb_sequence	0	1	0	0	1	1
+enum_gray_vardct_original_still	0	1	0	1	0	1
+enum_gray_vardct_original_sequence	0	1	0	1	1	1
+enum_gray_modular_xyb_still	0	1	1	0	0	1
+enum_gray_modular_xyb_sequence	0	1	1	0	1	1
+enum_gray_modular_original_still	0	1	1	1	0	1
+enum_gray_modular_original_sequence	0	1	1	1	1	1
+icc_rgb_vardct_xyb_still	1	0	0	0	0	1
+icc_rgb_vardct_xyb_sequence	1	0	0	0	1	0
+icc_rgb_vardct_original_still	1	0	0	1	0	1
+icc_rgb_vardct_original_sequence	1	0	0	1	1	1
+icc_rgb_modular_xyb_still	1	0	1	0	0	1
+icc_rgb_modular_xyb_sequence	1	0	1	0	1	0
+icc_rgb_modular_original_still	1	0	1	1	0	1
+icc_rgb_modular_original_sequence	1	0	1	1	1	1
+icc_gray_vardct_xyb_still	1	1	0	0	0	1
+icc_gray_vardct_xyb_sequence	1	1	0	0	1	0
+icc_gray_vardct_original_still	1	1	0	1	0	1
+icc_gray_vardct_original_sequence	1	1	0	1	1	1
+icc_gray_modular_xyb_still	1	1	1	0	0	1
+icc_gray_modular_xyb_sequence	1	1	1	0	1	0
+icc_gray_modular_original_still	1	1	1	1	0	1
+icc_gray_modular_original_sequence	1	1	1	1	1	1

@@ -212,6 +212,9 @@ std::vector<float> Decode(const Case &test, const Bytes &encoded,
   // The native XYB blender cannot insert a general ICC inverse. Obtain
   // uncoalesced linear pixels, then independently convert and compose the
   // device samples.
+  // These four F.2-invalid reference streams retain their historical diagnostic
+  // calculations. The manifest marks them negative; their pixels are not
+  // decoder-conformance references.
   const bool compose = test.icc && !test.original && test.sequence;
   if (compose)
     Dec(JxlDecoderSetCoalescing(decoder, JXL_FALSE));
@@ -446,7 +449,8 @@ int main(int argc, char **argv) {
   const std::filesystem::path profiles(argv[1]), output(argv[2]);
   std::filesystem::create_directories(output);
   std::ofstream manifest(output / "manifest.tsv");
-  manifest << "name\ticc\tgray\tmodular\toriginal\tsequence\n";
+  manifest << "name\ticc\tgray\tmodular\toriginal\tsequence\tvalid_reference_"
+              "color\n";
   const std::array<Bytes, 2> profile_bytes{Read(profiles / "rgb.icc"),
                                            Read(profiles / "gray.icc")};
   const std::array<cmsHPROFILE, 2> native_profiles{
@@ -476,7 +480,8 @@ int main(int argc, char **argv) {
             References(output, test, native_profiles, source, linear, rendered,
                        validated);
             manifest << name << '\t' << icc << '\t' << gray << '\t' << modular
-                     << '\t' << original << '\t' << sequence << '\n';
+                     << '\t' << original << '\t' << sequence << '\t'
+                     << !(icc && !original && sequence) << '\n';
           }
   Require(manifest.good(), "manifest");
   for (auto profile : native_profiles)

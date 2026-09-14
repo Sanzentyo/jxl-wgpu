@@ -1,6 +1,14 @@
 # ICC spot presentation corpus
 
-`main.cpp` uses libjxl **0.12.0** and Little CMS **2.19** to generate 32 JPEG XL streams,
+The manifest explicitly marks **28 supported streams and four negative reference cases** with
+`valid_reference_color`. The four ICC XYB sequences were previously counted as conformance
+evidence, but the [F.2 audit](../../../../docs/ICC_COLOR.md#xyb-reference-validity) found forbidden
+reference storage. Their source bytes and old independent calculations remain diagnostic records;
+the decoder must reject them before starting a frame. Native encoder acceptance is insufficient
+to establish codestream validity.
+
+`main.cpp` uses
+ libjxl **0.12.0** and Little CMS **2.19** to generate 32 JPEG XL streams,
 native source planes and independent spot/color references. `reference.hpp` owns interval
 propagation; shared `icc/scalar.hpp` and `icc/linear.hpp` provide independent curve, matrix
 and CIE/Bradford equations. Production Rust/WGSL code does not generate reference pixels.
@@ -22,14 +30,14 @@ diff -qr "$spot_run_a" crates/jxl_wgpu_decode/test-data/icc_spots
 cargo test --locked -p jxl_wgpu_decode --test embedded_icc spots:: -- --nocapture --test-threads=1
 ```
 
-The two runs reproduce all **485 files / 4,039,732 bytes**. Profile inputs reuse the unchanged
+The two runs reproduce all **485 files**. Profile inputs reuse the unchanged
 embedded-ICC RGB per-channel gamma and Gray sampled profiles. No native encoder/decoder or CMS
 is linked into the production GPU decoder.
 
 ## Cases and files
 
 The TSV manifest explicitly declares ICC/enumerated, RGB/Gray, Modular/VarDCT, original/XYB,
-and still/sequence; the Cartesian product contains 32 cases. Rust checks those fields against
+still/sequence and reference validity; the Cartesian product contains 32 cases. Rust checks those fields against
 the actual inventory. Enumerated RGB is Display-P3/sRGB; enumerated Gray is D65/sRGB. The
 17×9 canvas has clockwise or counterclockwise orientation, and every color declaration is F32.
 Sequences have three presentations with durations 1/2/3, two saved reference versions, source-over
@@ -59,7 +67,7 @@ For original coding, the generator verifies that its default data profile is byt
 the requested original and reads those values directly. Native XYB blending cannot insert a
 general inverse ICC connection. For those four sequences, uncoalesced native linear frames
 enter Little CMS, then independent F64 source-over and ink equations construct the references.
-These four rendered sequences are not claimed as direct coalesced native decoder output.
+These four rendered sequences are diagnostic calculations for invalid streams, not decoded conformance references.
 
 ## Domain, precision and ownership
 
@@ -84,10 +92,10 @@ This handles steep/plateaued curves without a fixed output-code tolerance.
 The generator separately validates **86,904 native CMM components** against the shared
 method-specific native intervals. All native checks require finite values and the independently
 derived bounds; no mask skips a failing comparison. Production checks use their own curve and
-codec intervals. The runtime color test compares **1,233,792 components / 3,456 final images**
-and retains/rereads **6,912 updates**. Three alpha policies, planar/interleaved layouts, Apply/Keep,
+codec intervals. The runtime color test compares **1,002,456 components / 2,808 final images**
+and retains/rereads progressive and final updates. Three alpha policies, planar/interleaved layouts, Apply/Keep,
 whole input and 43-byte fragments with a 256-byte GPU window produce identical canonical final
-words. Alpha remains exact across all variants. Numeric extra tests add **88,128 native sample
+words. Alpha remains exact across all variants. Numeric extra tests add **71,604 native sample
 comparisons** and Render/Preserve equality.
 
 The private ICC spot stage adds one source-sized surface and 32 bytes per ink, with no uniform

@@ -9,6 +9,9 @@ use std::num::NonZeroU64;
 mod alpha;
 mod animation;
 mod progression;
+mod references;
+
+pub(super) use references::reject as reject_post_transform_reference;
 
 fn reference(case: corpus::Case, name: &str) -> Vec<u32> {
     let bytes = std::fs::read(

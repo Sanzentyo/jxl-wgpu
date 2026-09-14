@@ -50,6 +50,12 @@ pub struct FrameExecutionPlan {
 pub enum FramePlanError {
     #[error("frame execution requires at least one physical frame")]
     MissingFrame,
+    #[error("invalid header at physical frame {frame_index}: {source}")]
+    InvalidHeader {
+        frame_index: u32,
+        #[source]
+        source: jxl_gpu_bitstream::InventoryError,
+    },
     #[error("invalid frame sequence at physical frame {frame_index}: {reason}")]
     InvalidFrame {
         frame_index: u32,
@@ -119,6 +125,12 @@ impl FrameExecutionPlan {
         let mut ticks = 0_u64;
         let first_frame_index = inventory.frames[0].frame_index;
         for (index, frame) in inventory.frames.iter().enumerate() {
+            frame.validate_color_reference(image).map_err(|source| {
+                FramePlanError::InvalidHeader {
+                    frame_index: frame.frame_index,
+                    source,
+                }
+            })?;
             let invalid = |reason| FramePlanError::InvalidFrame {
                 frame_index: frame.frame_index,
                 reason,
@@ -211,9 +223,7 @@ impl FrameExecutionPlan {
                     || frame.y0 != 0
                     || frame.width != image.width
                     || frame.height != image.height);
-            let can_reference = !frame.is_last
-                && frame.frame_type != FrameType::LowFrequency
-                && (frame.duration_ticks == 0 || frame.save_as_reference != 0);
+            let can_reference = frame.can_be_referenced();
             nodes.push(FrameExecutionNode {
                 frame_index: frame.frame_index,
                 encoding: frame.encoding,

@@ -53,7 +53,7 @@ independent Black references, F32 extras, both codecs and YCbCr. Native reconstr
 independent F64/native ICC references check RGB/Gray presentation under four intents, spot
 Render/Preserve, both layouts, bounded input, held frames and memory release. Missing or ambiguous
 Black declarations remain typed unsupported profiles.
-XYB-to-original CMYK reconstruction, wider sampling/range/profile combinations and full JPEG XL
+CMYK-suggested XYB output and numeric selection conformance, wider sampling/range/profile combinations and full JPEG XL
 conformance remain open.
 
 YCbCr reconstruction carries the actual original device profile through the inverse codec matrix;
@@ -65,17 +65,11 @@ sampling, precision, filtering, resampling and retained compositions. Five sourc
 linear/sRGB and other-profile conversion with independent error propagation from each existing
 codec bound. [Generator and interval derivation](../crates/jxl_wgpu_decode/test-data/embedded_icc_ycbcr_generator/README.md).
 
-XYB reconstruction keeps direct presentations in unbounded linear D65 BT.709. References saved
-after the color transform and frame blends first enter the original ICC device domain. The
-original profile's header intent selects reconstruction; the requested intent selects presentation.
-Only required connections are selected and uploaded. Both stages use the same image-owned,
-budgeted ICC program abstraction, including intermediate storage retained through GPU completion.
-Gray reconstruction changes three linear planes into one device plane and keeps extra-channel
-offsets consistent. Four stills, four additive sequences and seven LF/patch substitutions cover
-this boundary. Forty-eight additional native sequences cover straight/associated F32 alpha and all five
-color blend modes against independent device-domain equations and propagated bounds. Identical
-selected connections share one image-owned GPU program across reconstruction and presentation,
-including mixed original/linear sequences and exact byte-budget cancellation. [XYB generator and precision](../crates/jxl_wgpu_decode/test-data/embedded_icc_xyb_generator/README.md).
+XYB reconstruction keeps direct presentations in unbounded linear D65 BT.709 until requested
+output conversion. Only required connections are selected and uploaded; intermediate storage
+and shared programs remain owned through GPU completion. Gray output changes three linear planes
+into one device plane while retaining independent extra offsets. Four stills and seven LF/patch
+substitutions cover this boundary. [XYB generator and precision](../crates/jxl_wgpu_decode/test-data/embedded_icc_xyb_generator/README.md).
 
 `ColorSpecification::Icc(IccProfile)` now carries the exact profile through owned pixel formats
 and layouts. The color specification is `Clone`, not `Copy`; clones share the original bytes and
@@ -112,6 +106,28 @@ No frame readback or CPU pixel CMS is involved. `GpuOutputRequest::with_icc_rend
 defaults to relative colorimetric; non-Bradford conversion and unsupported selected methods return errors.
 Exact same-profile packing does not select a CMS method and therefore does not require an
 executable matrix/TRC or inverse curve.
+
+## XYB reference validity
+
+ISO/IEC 18181-1:2024, F.2 excludes post-transform reference storage when both XYB and an
+embedded ICC profile are declared. Reference storage may keep codec components instead.
+The reference flag does not impose this constraint on a final or otherwise unretained output;
+requested ICC conversion, previews and LF storage remain available. See the
+[standard, F.2, page 39](https://previewnorm.com/iso/ISO%20IEC%2018181-1-2024%20PDF.pdf#page=43)
+and [ISO edition record](https://www.iso.org/standard/85066.html).
+
+The shared parser checks this immediately after reference selection, before the remaining frame
+header and TOC. `InventoryError::XybIccReference` identifies the slot. Public frame planning also
+validates constructed inventories. Both contiguous and incremental decoding use the same rule;
+failed incremental input releases retained bytes and cannot publish a frame.
+
+The September 14 audit found 56 such inputs among 2,572 stored codestreams: four additive,
+48 alpha and four spot sequences. Their bytes and old calculations remain unchanged as diagnostic
+records, and all 56 now require rejection. Earlier claims that these calculations established
+ICC XYB composition conformance were incorrect. Native encoder acceptance and independently
+computed pixels did not establish stream validity. The 28 remaining spot cases provide 2,808
+presentations, 1,002,456 color comparisons and 71,604 numeric extra comparisons. The broader
+full JPEG XL goal remains open, including legal CMYK-suggested XYB output and numeric selection.
 
 ## Profile component output
 
@@ -151,7 +167,7 @@ The standalone packer checks 1,152 guarded dispatches and 931,040 bytes, includi
 orientations, component permutations, varied plane pitches, missing alpha and alpha conversion.
 Exact-budget tests include fifteen-component targets, dynamic black preparation, same-profile
 CMYK, failed admission, retry, concurrent submissions and cancellation. These checks do not
-complete XYB-to-original CMYK reconstruction, uncommon device-space image conformance, HDR,
+complete CMYK-suggested XYB output and numeric selection conformance, uncommon device-space image conformance, HDR,
 full profile range/conditioning or the remaining full JPEG XL requirements.
 
 ## Model and supported scope
@@ -180,8 +196,8 @@ selected matrix/TRC method; LUT/MPE callers use the general selected program.
 Matrix/TRC covers RGB input/display and monochrome input/display/output classes with XYZ PCS.
 LUT/MPE supports input/display/output profiles, recognized device channel counts and XYZ/Lab PCS;
 this resident metadata support is broader than JPEG XL decoder admission, which still uses
-RGB/Gray and original CMYK source surfaces. Requested device outputs support up to fifteen color components. XYB-to-original CMYK
-reconstruction, other profile classes,
+RGB/Gray and original CMYK source surfaces. Requested device outputs support up to fifteen
+color components. CMYK-suggested XYB output and numeric selection conformance, other profile classes,
 full floating-point-range conformance and broader gamut/HDR policies remain open.
 
 Relative intent connects the profiles in media-relative PCS. Absolute intent uses fully adapted
