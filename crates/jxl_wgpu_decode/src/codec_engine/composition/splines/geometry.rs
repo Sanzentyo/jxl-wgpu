@@ -8,7 +8,7 @@ use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::{GpuBufferLease, MemoryPermit, SubmissionPollPermit, WgpuBackend};
 
 use super::super::entropy_program::DecodedProgram;
-use super::super::submission::{Completion, validate_size};
+use crate::gpu_submission::{Completion, validate_size};
 use crate::{Error, Result, SplineResource};
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

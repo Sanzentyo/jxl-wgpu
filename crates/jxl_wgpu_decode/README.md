@@ -10,7 +10,15 @@ transport events. The collector has explicit host retention/decompression limits
 ownership. Contiguous callers use `ParsedJxl::metadata`. Exif/XMP/JUMBF fields never override
 codestream orientation, dimensions, color or intensity. Seventeen decoder selections, including
 ICC/HDR, animation and preview, preserve 444 progressive/final GPU presentations exactly after
-metadata addition, replacement and removal. HDR gain-map interpretation is still unimplemented.
+metadata addition, replacement and removal.
+
+`GpuDecoder::decode_alternate` reconstructs an alternate still from `jhgm` using two ordinary GPU
+decodes and fused gain/color/output processing. The supported profile is a forward map with zero
+baseline HDR headroom, one still presentation per image and enumerated application/output color.
+Raw auxiliary values, bilinear resampling, primary orientation, image intensity and alpha retain
+explicit contracts. [Supported forms, limits and native references](../../docs/GAIN_MAP.md).
+Backward/HDR-baseline maps, animation, streaming gain output and full gain-map conformance remain
+open. Existing `open`/`stream` continue to select the baseline image.
 
 ## Executable profile
 

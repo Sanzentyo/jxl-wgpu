@@ -1346,7 +1346,7 @@ fn extra_channel_inventory(
     })
 }
 
-fn colour_encoding_inventory(encoding: &JxlColourEncoding) -> ColourEncodingInventory {
+pub(crate) fn colour_encoding_inventory(encoding: &JxlColourEncoding) -> ColourEncodingInventory {
     match encoding {
         JxlColourEncoding::Enum(enumerated) => ColourEncodingInventory::Enumerated {
             colour_space: colour_space_inventory(enumerated.colour_space),
@@ -1412,7 +1412,7 @@ const fn colour_space_inventory(colour_space: JxlColourSpace) -> ColourSpaceInve
     }
 }
 
-fn parse_embedded_icc(
+pub(crate) fn parse_embedded_icc(
     codestream: &[u8],
     header_bits: u64,
     limits: InventoryLimits,

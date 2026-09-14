@@ -10,7 +10,9 @@ Exif, XMP, JUMBF and unknown [container metadata](docs/CONTAINER_METADATA.md) no
 explicit retention, atomic replacement/removal and plain or bounded Brotli output. The metadata
 collector observes decoder transport events independently; image rendering follows codestream
 metadata. Native box/compression interoperability and 444 actual-GPU presentations cover this
-boundary. Frame indexes, JPEG reconstruction and HDR gain-map rendering remain incomplete.
+boundary. [HDR gain maps](docs/GAIN_MAP.md) now have bounded `jhgm` parsing/writing and GPU
+alternate-still reconstruction for forward maps with an SDR baseline and enumerated application
+color. Frame indexes, JPEG reconstruction and the remaining gain-map profiles remain incomplete.
 
 ## Crates
 

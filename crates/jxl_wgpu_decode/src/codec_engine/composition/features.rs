@@ -13,9 +13,9 @@ use jxl_wgpu::{
 
 use super::gpu::Surface;
 use super::splines;
-use super::submission::{GpuWork, completion_fence_bytes, submit_recorded};
 use crate::frame_resampling::FrameResampling;
 use crate::frame_surface::{FrameRenderStage, FrameSurfaceEncoding, FrameSurfaceLayout};
+use crate::gpu_submission::{GpuWork, completion_fence_bytes, submit_recorded};
 use crate::progressive_dc::{
     ProgressiveDcExtras, ProgressiveDcGpuError, ProgressiveDcOutput, ProgressiveDcXybPlanes,
 };

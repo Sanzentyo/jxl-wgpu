@@ -740,6 +740,15 @@ pub struct GpuFrameLease<F> {
 }
 
 impl<F> GpuFrameLease<F> {
+    pub(crate) fn replace_output<G>(self, output: G) -> GpuFrameLease<G> {
+        GpuFrameLease {
+            metadata: self.metadata,
+            output,
+            progression: self.progression,
+            _permit: self._permit,
+        }
+    }
+
     #[must_use]
     pub fn output(&self) -> &F {
         &self.output

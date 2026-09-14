@@ -33,13 +33,20 @@ pub(crate) fn original_encoding(image: &ImageHeaderInventory) -> Option<RgbColor
     if image.embedded_icc.is_some() {
         return None;
     }
+    enumerated_encoding(image.colour_encoding, image.grayscale)
+}
+
+pub(crate) fn enumerated_encoding(
+    encoding: ColourEncodingInventory,
+    grayscale: bool,
+) -> Option<RgbColorEncoding> {
     let ColourEncodingInventory::Enumerated {
         colour_space,
         white_point,
         primaries,
         transfer_function,
         rendering_intent,
-    } = image.colour_encoding
+    } = encoding
     else {
         return None;
     };
@@ -53,7 +60,7 @@ pub(crate) fn original_encoding(image: &ImageHeaderInventory) -> Option<RgbColor
     if white != Chromaticity::D65 && rendering_intent != RenderingIntentInventory::Relative {
         return None;
     }
-    let mut coordinates = match (colour_space, image.grayscale, primaries) {
+    let mut coordinates = match (colour_space, grayscale, primaries) {
         // Replicated luminance represents the declared white, not an assumed D65 gray.
         (ColourSpaceInventory::Grey, true, _) => RgbChromaticities::BT709,
         (ColourSpaceInventory::Rgb, false, PrimariesInventory::Srgb) => RgbChromaticities::BT709,

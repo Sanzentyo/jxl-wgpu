@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 mod acceleration;
+pub mod gain_map;
 mod inventory;
 mod inventory_stream;
 pub mod metadata;

@@ -11,11 +11,11 @@ use jxl_wgpu::{
     ResidentUpsampleKernel, ResidentUpsamplePipeline, WgpuBackend,
 };
 
-use super::submission::{GpuWork, completion_fence_bytes, submit_recorded, validate_size};
 use crate::color_output::{
     ColorOutputConfig, ColorOutputInputs, ColorOutputPacker, ColorOutputPlan, ColorOutputPlane,
     ColorOutputTransform, InverseOpsin,
 };
+use crate::gpu_submission::{GpuWork, completion_fence_bytes, submit_recorded, validate_size};
 use crate::progressive_dc::ProgressiveDcXybPlanes;
 use crate::{Error, GpuOutputRequest, Result};
 

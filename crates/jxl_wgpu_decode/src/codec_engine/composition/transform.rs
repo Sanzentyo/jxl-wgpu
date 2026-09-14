@@ -9,14 +9,14 @@ use jxl_wgpu::{GpuBufferLease, ResidentStorageBinding, WgpuBackend};
 
 use super::gpu::{Compositor, Surface};
 use super::icc_transform::ColorBinding;
-use super::submission::{
-    GpuWork, IccWork, completion_fence_bytes, submit_icc_recorded, submit_recorded,
-};
 use crate::color_output::{
     ColorOutputConfig, ColorOutputEncoding, ColorOutputInputs, ColorOutputPacker, ColorOutputPlan,
     ColorOutputPlane, ColorOutputTransform, InverseOpsin,
 };
 use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
+use crate::gpu_submission::{
+    GpuWork, IccWork, completion_fence_bytes, submit_icc_recorded, submit_recorded,
+};
 use crate::{Error, Result};
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

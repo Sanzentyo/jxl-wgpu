@@ -7,10 +7,10 @@ use jxl_wgpu::{ResidentStorageBinding, WgpuBackend};
 use wgpu::util::DeviceExt;
 
 use super::super::gpu::{Surface, dispatch, pipeline};
-use super::super::submission::validate_size;
 use super::{SpotColor, spot_colors};
 use crate::Result;
 use crate::frame_surface::FrameSurfaceLayout;
+use crate::gpu_submission::validate_size;
 
 #[derive(Debug)]
 pub(in crate::codec_engine::composition) struct Rendering {

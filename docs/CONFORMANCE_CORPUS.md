@@ -4461,3 +4461,28 @@ images remain immutable, final words agree, alpha words remain exact and budgets
 Existing source/profile/reference files remain unchanged. The 304-byte image uniform / 464-byte
 codec conversion plan also undergo exact ICC/spot admission, retry and cancellation tests with
 the new policy selected. All broader profile/HDR/LF/numeric and full JPEG XL gates remain open.
+
+## Alternate HDR gain-map checkpoint
+
+The [gain-map helper](../crates/jxl_wgpu_decode/test-data/gain_map_oracle/README.md) pins libjxl
+0.12.0 and libultrahdr 2.0.2. Its 64 streams combine four primary/auxiliary coding modes,
+Gray/RGB auxiliary images, BT.709/BT.2020 application primaries, four map geometries, all eight
+orientations and unassociated alpha. Native baseline, original gain, working-primary and gain
+result planes are saved as little-endian F32. The helper builds from pristine reference sources;
+production never links a CPU image codec.
+
+The actual-GPU tests check 128 Keep/Apply and plain/`brob` outputs (78,336 values) against independent
+F64 primary conversion, bilinear interpolation and exact-fraction gain math. Thirty-two further
+Display-P3 outputs add PQ/HLG/sRGB/linear transfers, BGRA, planar/interleaved U8/F32 and both alpha
+association policies (19,584 values). Gain reconstruction has a fixed `2e-4 * (1 + abs(reference))`
+bound and alpha `2e-7`; output intervals propagate it through HDR conversion with the existing
+packing allowance. Native gain math is checked separately at `3e-6 * (1 + abs(reference))` using
+saved native working pixels, keeping rounded native primary coefficients out of the GPU oracle.
+
+Sixty-four Rust bundle rewrites and 128 ISO metadata rewrites are consumed by native implementations
+with exact bytes/fractions. Four metadata tests cover all compact layouts, truncation, invalid
+fractions, padding and bounded ICC reconstruction. Additional tests check missing/duplicate boxes,
+unsupported profiles, metadata limits, portable shader/uniform layout, output/uniform admission
+failure, cancellation, retained outputs and released budgets. No pre-existing source/reference
+asset is modified. [The contract](GAIN_MAP.md) records the supported forward SDR-baseline profile
+and the remaining `CONT-07` / full JPEG XL requirements.

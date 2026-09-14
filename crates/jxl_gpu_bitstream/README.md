@@ -14,6 +14,12 @@ standard Brotli windows. Collections support atomic replacement/removal and cano
 writing, while individual boxes also feed the existing `jxlp` writer. Opaque contents never override
 codestream rendering fields. [API, ownership and executed evidence](../../docs/CONTAINER_METADATA.md).
 
+The `gain_map` module parses and emits version-zero `jhgm` bundles with exact ISO 21496-1
+rational metadata, optional serialized color/ICC metadata and a borrowed auxiliary codestream.
+Separate payload, codestream and transformed/decoded ICC bounds apply. It validates metadata
+without decoding image samples; alternate rendering belongs to `jxl_wgpu_decode`.
+[Gain-map contract and interoperability](../../docs/GAIN_MAP.md).
+
 `ContainerStreamScanner` is the non-accumulating transport path. It accepts owned `Arc<[u8]>`
 chunks at arbitrary byte boundaries and emits raw/`jxlc`/`jxlp` codestream slices in logical order.
 Except for the two-byte codestream signature reconstructed inline across arbitrary chunk

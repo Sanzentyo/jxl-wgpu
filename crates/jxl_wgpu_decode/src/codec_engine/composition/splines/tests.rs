@@ -300,7 +300,7 @@ fn geometry_tiles_and_ordered_raster_match_a_constant_straight_spline() {
         let uniforms = cache
             .record(backend.device(), &mut encoder, plane_bindings)
             .unwrap();
-        let work = super::super::submission::submit_recorded(
+        let work = crate::gpu_submission::submit_recorded(
             &backend,
             encoder,
             outputs,

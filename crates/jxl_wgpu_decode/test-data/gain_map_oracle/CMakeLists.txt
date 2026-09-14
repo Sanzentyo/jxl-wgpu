@@ -1,0 +1,37 @@
+cmake_minimum_required(VERSION 3.20)
+project(jxl_wgpu_gain_map_oracle LANGUAGES C CXX)
+
+set(JXL_SOURCE "" CACHE PATH "Pinned libjxl source checkout")
+set(UHDR_SOURCE "" CACHE PATH "Pinned libultrahdr source checkout")
+function(require_commit source expected)
+  execute_process(COMMAND git -C "${source}" rev-parse HEAD
+    OUTPUT_VARIABLE actual OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+  if(NOT actual STREQUAL expected)
+    message(FATAL_ERROR "Unexpected reference revision: ${actual}, expected ${expected}")
+  endif()
+endfunction()
+require_commit("${JXL_SOURCE}" "a7a9c787341cf703dede03c2009fa460cae5e5df")
+require_commit("${UHDR_SOURCE}" "6929c2b087e74120e6de52f361e77b06f07b1441")
+
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+foreach(feature TOOLS DEVTOOLS DOXYGEN MANPAGES BENCHMARK EXAMPLES JNI SJPEG OPENEXR SKCMS VIEWERS PLUGINS TCMALLOC)
+  set(JPEGXL_ENABLE_${feature} OFF CACHE BOOL "" FORCE)
+endforeach()
+set(JPEGXL_FORCE_SYSTEM_HWY ON CACHE BOOL "" FORCE)
+set(JPEGXL_FORCE_SYSTEM_BROTLI ON CACHE BOOL "" FORCE)
+set(JPEGXL_FORCE_SYSTEM_LCMS2 ON CACHE BOOL "" FORCE)
+add_subdirectory("${JXL_SOURCE}" libjxl EXCLUDE_FROM_ALL)
+set(UHDR_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(UHDR_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(UHDR_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+find_package(JPEG REQUIRED)
+add_subdirectory("${UHDR_SOURCE}" libultrahdr EXCLUDE_FROM_ALL)
+
+add_executable(gain_map_oracle main.cpp "${JXL_SOURCE}/lib/extras/gain_map.cc")
+target_compile_features(gain_map_oracle PRIVATE cxx_std_17)
+# Apply our warning policy to our oracle; the pinned reference source keeps its own policy.
+set_source_files_properties(main.cpp PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
+target_include_directories(gain_map_oracle SYSTEM PRIVATE
+  "${JXL_SOURCE}" "${UHDR_SOURCE}/lib/include")
+target_link_libraries(gain_map_oracle PRIVATE jxl-internal core JPEG::JPEG)

@@ -7,8 +7,8 @@ use bytemuck::Pod;
 use jxl_wgpu::{GpuBufferLease, MemoryPermit, WgpuBackend};
 use wgpu::util::DeviceExt;
 
-use super::submission::{Completion, validate_size};
 use crate::entropy_window::{EntropyStreamWindows, GroupStreamSegment};
+use crate::gpu_submission::{Completion, validate_size};
 use crate::{Error, GpuCodestream, Result};
 
 pub(super) const STATE_WORDS: u64 = 32;

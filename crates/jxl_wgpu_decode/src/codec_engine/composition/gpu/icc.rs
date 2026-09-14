@@ -15,11 +15,11 @@ use wgpu::util::DeviceExt;
 
 use super::super::icc_transform::{ColorBinding, Transform, Transforms};
 use super::super::spot::render::Rendering;
-use super::super::submission::{
-    GpuWork, IccWork, completion_fence_bytes, submit_icc_recorded, validate_size,
-};
 use super::{NativeParams, Surface, aligned, dispatch, pipeline};
 use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
+use crate::gpu_submission::{
+    GpuWork, IccWork, completion_fence_bytes, submit_icc_recorded, validate_size,
+};
 use crate::{Error, GpuOutputRequest, Result};
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

@@ -35,6 +35,8 @@ mod error;
 mod frame_plan;
 mod frame_resampling;
 mod frame_surface;
+pub mod gain_map;
+mod gpu_submission;
 mod image_color;
 mod image_selection;
 mod inflight;

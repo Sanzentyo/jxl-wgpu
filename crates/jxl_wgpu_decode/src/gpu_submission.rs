@@ -12,7 +12,7 @@ use wgpu::util::DeviceExt;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
 
-pub(super) struct Submission<'a> {
+pub(crate) struct Submission<'a> {
     pub pipeline: &'a wgpu::ComputePipeline,
     pub params: &'a [u8],
     pub inputs: &'a [(u32, &'a GpuBufferLease)],
@@ -23,7 +23,7 @@ pub(super) struct Submission<'a> {
     pub dispatch: [u32; 2],
 }
 
-pub(super) fn submit(backend: &WgpuBackend, request: Submission<'_>) -> Result<GpuWork> {
+pub(crate) fn submit(backend: &WgpuBackend, request: Submission<'_>) -> Result<GpuWork> {
     let Submission {
         pipeline,
         params,
@@ -129,7 +129,7 @@ pub(super) fn submit(backend: &WgpuBackend, request: Submission<'_>) -> Result<G
 }
 
 /// Completes a recorded render chain with the same accounted lifetime as frame composition.
-pub(super) fn submit_recorded<
+pub(crate) fn submit_recorded<
     R: wgpu::WasmNotSendSync + 'static,
     O: Clone + wgpu::WasmNotSendSync + 'static,
 >(
@@ -155,12 +155,12 @@ pub(super) fn submit_recorded<
     )
 }
 
-pub(super) struct IccWork<R> {
+pub(crate) struct IccWork<R> {
     pub resources: R,
     pub dispatch: Option<ResidentIccDispatch>,
 }
 
-pub(super) fn submit_icc_recorded<
+pub(crate) fn submit_icc_recorded<
     R: wgpu::WasmNotSendSync + 'static,
     O: Clone + wgpu::WasmNotSendSync + 'static,
 >(
@@ -214,7 +214,7 @@ pub(super) fn submit_icc_recorded<
         let done = Arc::clone(&completion);
         let retained = Arc::clone(&lifetime);
         encoder.on_submitted_work_done(move || {
-            drop(super::lock(&retained).take());
+            drop(lock(&retained).take());
             done.complete(Ok(()));
         });
     }
@@ -244,14 +244,14 @@ pub(super) fn submit_icc_recorded<
                 mapped.unmap();
                 outcome
             });
-            drop(super::lock(&retained).take());
+            drop(lock(&retained).take());
             done.finish(outcome);
         });
     }
     let failed = Arc::clone(&completion);
     poll.register(submission, move |error| {
         #[cfg(not(target_arch = "wasm32"))]
-        drop(super::lock(&lifetime).take());
+        drop(lock(&lifetime).take());
         failed.complete(Err(error));
     })?;
     Ok(GpuWork {
@@ -260,7 +260,7 @@ pub(super) fn submit_icc_recorded<
     })
 }
 
-pub(super) fn validate_size(device: &wgpu::Device, size: u64) -> Result<()> {
+pub(crate) fn validate_size(device: &wgpu::Device, size: u64) -> Result<()> {
     let limits = device.limits();
     let limit = u64::from(u32::MAX - 3)
         .min(limits.max_buffer_size)
@@ -288,12 +288,12 @@ struct WorkLifetime<R> {
     _completion_fence: wgpu::Buffer,
 }
 
-pub(super) const fn completion_fence_bytes() -> u64 {
+pub(crate) const fn completion_fence_bytes() -> u64 {
     if cfg!(target_arch = "wasm32") { 4 } else { 0 }
 }
 
 #[derive(Debug, Default)]
-pub(super) struct Completion {
+pub(crate) struct Completion {
     state: Mutex<CompletionState>,
     condition: Condvar,
 }
@@ -319,13 +319,13 @@ impl CompletionFailure {
 }
 
 impl Completion {
-    pub(super) fn complete(&self, result: std::result::Result<(), String>) {
+    pub(crate) fn complete(&self, result: std::result::Result<(), String>) {
         self.finish(result.map_err(CompletionFailure::Backend));
     }
 
     fn finish(&self, result: std::result::Result<(), CompletionFailure>) {
         let waker = {
-            let mut state = super::lock(&self.state);
+            let mut state = lock(&self.state);
             if state.result.is_some() {
                 return;
             }
@@ -337,8 +337,8 @@ impl Completion {
             waker.wake();
         }
     }
-    pub(super) fn poll(&self, context: &Context<'_>) -> Poll<Result<()>> {
-        let mut state = super::lock(&self.state);
+    pub(crate) fn poll(&self, context: &Context<'_>) -> Poll<Result<()>> {
+        let mut state = lock(&self.state);
         if let Some(result) = state.result.as_ref() {
             return Poll::Ready(result.clone().map_err(CompletionFailure::into_error));
         }
@@ -346,8 +346,8 @@ impl Completion {
         Poll::Pending
     }
     #[cfg(not(target_arch = "wasm32"))]
-    pub(super) fn wait(&self) -> Result<()> {
-        let mut state = super::lock(&self.state);
+    pub(crate) fn wait(&self) -> Result<()> {
+        let mut state = lock(&self.state);
         while state.result.is_none() {
             state = self
                 .condition
@@ -364,12 +364,12 @@ impl Completion {
 }
 
 #[derive(Debug)]
-pub(super) struct GpuWork<O = GpuBufferLease> {
+pub(crate) struct GpuWork<O = GpuBufferLease> {
     output: Option<O>,
     completion: Arc<Completion>,
 }
 impl<O> GpuWork<O> {
-    pub(super) fn poll(&mut self, context: &Context<'_>) -> Poll<Result<O>> {
+    pub(crate) fn poll(&mut self, context: &Context<'_>) -> Poll<Result<O>> {
         self.completion.poll(context).map(|result| {
             let output = self.output.take();
             result?;
@@ -379,7 +379,7 @@ impl<O> GpuWork<O> {
         })
     }
     #[cfg(not(target_arch = "wasm32"))]
-    pub(super) fn wait(mut self) -> Result<O> {
+    pub(crate) fn wait(mut self) -> Result<O> {
         self.completion.wait()?;
         self.output.take().ok_or(Error::EngineContract(
             "composition completion consumed twice",
@@ -388,9 +388,15 @@ impl<O> GpuWork<O> {
 }
 
 impl GpuWork {
-    pub(super) fn unvalidated(&self) -> Result<GpuBufferLease> {
+    pub(crate) fn unvalidated(&self) -> Result<GpuBufferLease> {
         self.output.clone().ok_or(Error::EngineContract(
             "composition completion consumed twice",
         ))
     }
+}
+
+fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    value
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

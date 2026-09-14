@@ -39,13 +39,12 @@ mod refinement_tests;
 mod spline_tests;
 mod splines;
 mod spot;
-mod submission;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod test_support;
 mod transform;
+use crate::gpu_submission::GpuWork;
 use gpu::{Compositor, Surface};
 use progression::LfPreview;
-use submission::GpuWork;
 
 /// Keep producer selection and sequence dispatch consistent about presentation-only conversion.
 pub(super) fn needs_surface(
@@ -72,6 +71,17 @@ pub(super) fn needs_surface(
         && crate::image_color::original_encoding(image)
             != Some(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709);
     let native = crate::model::native_modular_format(request.format());
+    // The direct Modular finalizer supports native integers and a narrow RGB F32 profile.
+    // Requested color outside that profile requires the shared presentation graph even when
+    // the source happens to be an ordinary eight-bit sRGB image.
+    let modular_output_conversion = !request.retains_frame_surface()
+        && request.mapping() == crate::GpuOutputMapping::Color
+        && native.is_none()
+        && !direct_float
+        && inventory
+            .frames
+            .iter()
+            .any(|frame| frame.encoding == jxl_gpu_bitstream::FrameEncoding::Modular);
     let direct_integer = native.is_some_and(|format| {
         image.bit_depth
             == (jxl_gpu_bitstream::SampleBitDepth::Integer {
@@ -113,6 +123,7 @@ pub(super) fn needs_surface(
             .iter()
             .any(|frame| frame.encoding == jxl_gpu_bitstream::FrameEncoding::VarDct);
     original_conversion
+        || modular_output_conversion
         || request.tone_mapping_target().is_some()
         || request.gamut_mapping().is_some()
         || (request.mapping() == crate::GpuOutputMapping::Color

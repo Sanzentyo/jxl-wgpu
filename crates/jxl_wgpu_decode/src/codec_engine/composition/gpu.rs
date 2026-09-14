@@ -14,8 +14,8 @@ use jxl_wgpu::{
 
 use super::blend::{BlendParams, blend_channels, intersection};
 use super::spot::{SpotColor, shader as spot_shader, spot_colors};
-use super::submission::{GpuWork, Submission, submit, validate_size};
 use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
+use crate::gpu_submission::{GpuWork, Submission, submit, validate_size};
 use crate::{Error, GpuOutputRequest, Result};
 
 mod icc;

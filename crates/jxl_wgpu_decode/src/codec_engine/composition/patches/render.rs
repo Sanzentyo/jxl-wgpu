@@ -4,9 +4,9 @@ use jxl_wgpu::{GpuBufferLease, WgpuBackend};
 use wgpu::util::DeviceExt;
 
 use super::super::gpu::{Surface, dispatch, pipeline};
-use super::super::submission::{GpuWork, completion_fence_bytes, submit_recorded, validate_size};
 use super::Dictionary;
 use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
+use crate::gpu_submission::{GpuWork, completion_fence_bytes, submit_recorded, validate_size};
 use crate::progressive_dc::{
     ProgressiveDcExtras, ProgressiveDcGpuError, ProgressiveDcOutput, ProgressiveDcXybPlanes,
 };

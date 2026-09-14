@@ -171,6 +171,12 @@ impl FrontendIncomplete {
 #[derive(Debug, Error)]
 pub enum Error {
     #[error(transparent)]
+    ContainerMetadata(#[from] jxl_gpu_bitstream::metadata::MetadataError),
+    #[error(transparent)]
+    GainMapMetadata(#[from] jxl_gpu_bitstream::gain_map::GainMapError),
+    #[error(transparent)]
+    GainMap(#[from] crate::gain_map::GainMapDecodeError),
+    #[error(transparent)]
     ImageSelection(#[from] crate::ImageSelectionError),
     #[error("Modular stream {stream_index} selects a missing global MA tree")]
     MissingGlobalMaTree { stream_index: u32 },
