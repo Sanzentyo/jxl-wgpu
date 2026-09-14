@@ -395,7 +395,7 @@ colorants and independent identity/gamma/sampled/parametric curves. GPU executio
 XYZ matrix/TRC semantics, inverse plateaus/gaps, checked plane bindings and explicit program/80-byte
 dispatch allocation. The 100-pair corpus checks 176,120 components against independent f64
 equations and retains native Little CMS references with documented precision/boundary differences.
-See [the contract and evidence](ICC_MATRIX_TRC.md). All affected feature rows remain **Partial**:
+See [the contract and evidence](ICC_COLOR.md). All affected feature rows remain **Partial**:
 embedded-ICC decoder admission, original/XYB/reference integration, requested ICC outputs, exact
 numeric bypass, LUT/MPE/Lab/CMYK, other intents and HDR/unbounded policies are not completed here.
 
@@ -677,7 +677,7 @@ The existing 80-byte program header stores offsets in the matrix rows' fourth la
 additional allocation or CPU pixel work. All 2,704 profile pairs and 1,040 linear connections
 have native/independent references. Public decoding adds 192 original/XYB connections and 768
 presentations, preserving codec precision, alpha, transport and completion ownership.
-All 1,015 earlier reference files remain unchanged. See [the ICC contract](ICC_MATRIX_TRC.md).
+All 1,015 earlier reference files remain unchanged. See [the ICC contract](ICC_COLOR.md).
 `COLOR-01/02`, `IO-01`, `QA-03/06` and the full JPEG XL goal remain **Partial**; LUT/MPE/Lab/CMYK,
 other profile policies, gamut/HDR mapping and the remaining conformance requirements are open.
 
@@ -691,3 +691,14 @@ other profile policies, gamut/HDR mapping and the remaining conformance requirem
 
 The ISO text and official conformance material remain normative. The public libjxl sources above
 are implementation and audit references, not permission to substitute its CPU codec in production.
+
+ICC MPE execution checkpoint: selected floating-point processing elements now use one ordered
+GPU stage program shared with matrix/TRC and linear RGB connections. `matf`, segmented `cvst`,
+`clut`, `bACS`/`eACS`, physical Lab/XYZ conversion, all four tag selections and mixed absolute-PCS
+connections are implemented. Metadata bounds and whole-element sharing precede allocation;
+exact identity elimination and bit-ordered breakpoint selection preserve subnormal branch
+ownership. The native/f64 MPE corpus adds 135,864 resident components and 22,032 original-decoder
+components, with 192 requested-output presentations. See [ICC color processing](ICC_COLOR.md).
+`COLOR-01/02`, `IO-01`, `QA-03/06` and the full goal remain **Partial**: legacy LUT methods,
+complete CMYK image plumbing, arbitrary float-range MPE conditioning/overflow, hybrid-profile
+CMM policy conformance, remaining embedded MPE/XYB coverage and HDR/display mapping remain open.

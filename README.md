@@ -70,7 +70,7 @@ See the [original color corpus](crates/jxl_wgpu_decode/test-data/original_color_
 for the original OETF and XYB calibration contracts. ICC, complete rendering intents and HDR
 luminance mapping remain incomplete.
 
-The common backend now has a bounded [resident ICC matrix/TRC converter](docs/ICC_MATRIX_TRC.md)
+The common backend now has a bounded [resident ICC color processor](docs/ICC_COLOR.md)
 with exact profile metadata, channel-specific curves and RGB/Gray conversion. Its independent
 358,530-component corpus includes 100 profile pairs and 100 connections to unbounded linear RGB.
 Pixel formats retain owned ICC profiles, and inventories share the reconstructed profile bytes.
@@ -93,7 +93,10 @@ GPU program, including when cancellation outlives the image context.
 An additional 3,744 ICC/linear connections check white-point and black-point intent policies
 against native and independent references. Public decoder tests cover all four intents on
 original/XYB RGB/Gray in 768 whole/fragmented planar/interleaved presentations.
-Broader ICC XYB conformance, enumerated sources targeting ICC, spot rendering, LUT/CMYK and full
+An ordered GPU interpreter also executes floating-point MPE matrices, segmented curves, CLUTs
+and Lab PCS connections. Its native/scalar corpus checks 135,864 resident components and 192
+original RGB/Gray decoder presentations through both codecs.
+Broader ICC XYB conformance, enumerated sources targeting ICC, spot rendering, legacy LUT/CMYK and full
 intent/HDR policies remain incomplete.
 
 Creating an encoder or decoder requires a compatible `wgpu` backend. Unsupported codestream

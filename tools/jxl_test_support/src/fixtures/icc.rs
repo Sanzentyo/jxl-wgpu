@@ -1,6 +1,25 @@
 //! Structurally complete ICC methods for testing transform selection independently of pixels.
 use jxl_gpu_protocol::icc::{IccDirection, IccProfile, IccRenderingIntent, IccSignature};
 
+/// A selected, structurally complete matrix containing an invalid IEEE infinity.
+/// Unused directional methods must remain uninterpreted; selecting this one must fail.
+pub fn with_nonfinite_matrix_mpe(
+    profile: &IccProfile,
+    direction: IccDirection,
+    intent: IccRenderingIntent,
+) -> IccProfile {
+    let profile = with_matrix_mpe(profile, direction, intent);
+    let mut signature = match direction {
+        IccDirection::DeviceToPcs => *b"D2B0",
+        IccDirection::PcsToDevice => *b"B2D0",
+    };
+    signature[3] += intent as u8;
+    let start = profile.tag(IccSignature(signature)).unwrap().offset as usize + 24 + 12;
+    let mut bytes = profile.bytes().to_vec();
+    bytes[start..start + 4].copy_from_slice(&f32::INFINITY.to_be_bytes());
+    IccProfile::parse(bytes.into(), Default::default()).unwrap()
+}
+
 /// Adds an intent-specific MPE with one matrix element. Matrix/TRC execution must
 /// select this higher-priority method instead of silently using the original TRCs.
 pub fn with_matrix_mpe(

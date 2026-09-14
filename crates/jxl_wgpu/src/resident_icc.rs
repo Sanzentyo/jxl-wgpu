@@ -1,4 +1,4 @@
-//! ICC matrix/TRC execution on resident planar F32 channels.
+//! Ordered ICC processing on resident planar F32 channels.
 //!
 //! Device values follow the ICC unit-domain/range rules. PCS matrix intermediates remain
 //! unclipped. Alpha and extra planes are not included in the supplied color channel views.
@@ -9,14 +9,14 @@
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_protocol::{
     Extent2d,
-    icc::{IccCurve, IccCurveKind, IccInverseDirection, IccTransform, IccTransformEndpoint},
+    icc::{IccCurve, IccCurveKind, IccInverseDirection, IccTransform},
 };
 use wgpu::util::DeviceExt;
 
 use crate::{KernelVariant, ResidentStorageBinding};
 
 mod program;
-use program::lower_program;
+use program::{lower_program, program_size};
 
 /// Scalar offsets relative to a storage binding; row padding is left untouched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,7 +30,7 @@ pub struct ResidentIccInputs<'a> {
     pub input: ResidentStorageBinding<'a>,
     pub output: ResidentStorageBinding<'a>,
     pub extent: Extent2d,
-    /// One plane for gray profiles, three for RGB. Every source value must be finite.
+    /// One plane per selected device channel. Every source value must be finite.
     pub input_planes: &'a [ResidentIccPlane],
     pub output_planes: &'a [ResidentIccPlane],
 }
@@ -46,28 +46,19 @@ impl ResidentIccMemoryPlan {
     /// descriptor/table. A program is reusable across arbitrary frame extents and row pitches.
     pub fn new(transform: &IccTransform, limits: &wgpu::Limits) -> Result<Self, ResidentIccError> {
         validate_capabilities(limits)?;
-        let curves = unique_curves(transform);
-        let mut bytes = std::mem::size_of::<ProgramHeader>() as u64;
-        for curve in curves {
-            let samples = match curve.kind() {
-                IccCurveKind::Sampled(v) => v.len() as u64,
-                _ => 0,
-            };
-            bytes = bytes
-                .checked_add(48 + samples * 4)
-                .ok_or(ResidentIccError::Addressing)?;
+        let max_channels = transform.program().max_channels();
+        if max_channels > MAX_CHANNELS {
+            return Err(ResidentIccError::Limit {
+                resource: "processing channels",
+                required: max_channels as u64,
+                available: MAX_CHANNELS as u64,
+            });
         }
         let limit = limits
             .max_buffer_size
             .min(limits.max_storage_buffer_binding_size)
             .min(u64::from(u32::MAX));
-        if bytes > limit {
-            return Err(ResidentIccError::Limit {
-                resource: "program bytes",
-                required: bytes,
-                available: limit,
-            });
-        }
+        let bytes = program_size(transform, limit)?;
         Ok(Self {
             program_bytes: bytes,
             dispatch_uniform_bytes: std::mem::size_of::<DispatchParams>() as u64,
@@ -125,7 +116,7 @@ pub enum ResidentIccError {
         required: u64,
         available: u64,
     },
-    #[error("ICC matrix/curve metadata cannot be represented by finite GPU F32 values")]
+    #[error("ICC processing metadata cannot be represented by finite GPU F32 values")]
     Precision,
     #[error("ICC buffer addressing exceeds checked WGSL u32 arithmetic")]
     Addressing,
@@ -169,7 +160,7 @@ impl ResidentIccPipeline {
         let (x, y) = variant.workgroup_size();
         let module = device.create_shader_module(wgpu::include_wgsl!("../shaders/icc.wgsl"));
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("jxl-wgpu ICC matrix/TRC"),
+            label: Some("jxl-wgpu ICC processing"),
             layout: None,
             module: &module,
             entry_point: Some("main"),
@@ -182,7 +173,7 @@ impl ResidentIccPipeline {
         Ok(Self { pipeline, variant })
     }
 
-    /// Validates all views and records one dispatch. The returned 80-byte uniform is part of
+    /// Validates all views and records one dispatch. The returned uniform is part of
     /// the caller's admitted transient allocation and must remain owned through completion.
     pub fn encode(
         &self,
@@ -240,7 +231,7 @@ impl ResidentIccPipeline {
             ],
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("jxl-wgpu ICC matrix/TRC"),
+            label: Some("jxl-wgpu ICC processing"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
@@ -253,27 +244,21 @@ impl ResidentIccPipeline {
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct ProgramHeader {
-    matrix: [[f32; 4]; 3],
-    source_curves: [u32; 4],
-    target_curves: [u32; 4],
-}
-
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Pod, Zeroable)]
 struct CurveParams {
     selectors: [u32; 4],
     parameters: [[f32; 4]; 2],
 }
 
+const MAX_CHANNELS: usize = 16;
+
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct DispatchParams {
     extent_channels: [u32; 4],
-    input_offsets: [u32; 4],
-    input_strides: [u32; 4],
-    output_offsets: [u32; 4],
-    output_strides: [u32; 4],
+    input_offsets: [u32; MAX_CHANNELS],
+    input_strides: [u32; MAX_CHANNELS],
+    output_offsets: [u32; MAX_CHANNELS],
+    output_strides: [u32; MAX_CHANNELS],
 }
 
 fn validate_capabilities(limits: &wgpu::Limits) -> Result<(), ResidentIccError> {
@@ -296,7 +281,7 @@ fn validate_capabilities(limits: &wgpu::Limits) -> Result<(), ResidentIccError> 
         ),
         (
             "uniform binding bytes",
-            80,
+            std::mem::size_of::<DispatchParams>() as u64,
             limits.max_uniform_buffer_binding_size,
         ),
     ] {
@@ -309,21 +294,6 @@ fn validate_capabilities(limits: &wgpu::Limits) -> Result<(), ResidentIccError> 
         }
     }
     Ok(())
-}
-
-fn unique_curves(transform: &IccTransform) -> Vec<&IccCurve> {
-    let mut curves = Vec::new();
-    for curve in transform
-        .source()
-        .curves()
-        .iter()
-        .chain(transform.target().curves())
-    {
-        if !curves.contains(&curve) {
-            curves.push(curve);
-        }
-    }
-    curves
 }
 
 fn validate_inputs(
@@ -418,14 +388,11 @@ fn plane_end(plane: ResidentIccPlane, extent: Extent2d) -> Result<u64, ResidentI
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<ProgramHeader>() == 80);
-    assert!(std::mem::offset_of!(ProgramHeader, source_curves) == 48);
-    assert!(std::mem::offset_of!(ProgramHeader, target_curves) == 64);
     assert!(std::mem::size_of::<CurveParams>() == 48);
     assert!(std::mem::offset_of!(CurveParams, parameters) == 16);
-    assert!(std::mem::size_of::<DispatchParams>() == 80);
+    assert!(std::mem::size_of::<DispatchParams>() == 272);
     assert!(std::mem::offset_of!(DispatchParams, input_offsets) == 16);
-    assert!(std::mem::offset_of!(DispatchParams, output_strides) == 64);
+    assert!(std::mem::offset_of!(DispatchParams, output_strides) == 208);
 };
 
 #[cfg(test)]

@@ -1,11 +1,11 @@
-# Resident ICC matrix/TRC conversion
+# Resident ICC color processing
 
-The metadata and resident GPU execution layers support RGB matrix/TRC and XYZ gray profiles.
+The metadata and resident GPU execution layers support RGB/Gray matrix/TRC and floating-point MPE programs with XYZ or Lab PCS.
 JPEG XL decoding now admits embedded ICC for unfiltered original Modular numeric samples and
 independent extra-channel output in the supported single-frame paths through both codecs. Codec
 reconstruction and LF configuration are independent of color conversion. The common decoder now
 also handles original and XYB ICC RGB/Gray color surfaces, including YCbCr reconstruction,
-original-domain references and composition, all four matrix/TRC intents and U8/F32 requested output.
+original-domain references and composition, all four matrix/TRC intents and U8/F32 requested output. Requested RGB MPE output is also exercised through the public decoder.
 Broader ICC XYB conformance, enumerated-source-to-ICC conversion, spot rendering, other ICC methods
 and HDR mapping remain open.
 This checkpoint does not change the full JPEG XL support claim.
@@ -59,7 +59,7 @@ when an actual profile conversion is requested.
 Requested color conversion uses a selected immutable program shared across physical frames. Program
 upload is lazy, budgeted and retryable; each dispatch retains its uploaded program through GPU
 completion even if the image session is dropped. Intermediate color surfaces, unchanged extra
-planes, output words, the 80-byte ICC uniform and 208-byte packing uniform are all accounted.
+planes, output words, the 272-byte ICC uniform and 208-byte packing uniform are all accounted.
 No frame readback or CPU pixel CMS is involved. `GpuOutputRequest::with_icc_rendering_intent`
 defaults to relative colorimetric; non-Bradford conversion and unsupported selected methods return errors.
 Exact same-profile packing does not select a CMS method and therefore does not require an
@@ -80,12 +80,19 @@ Default bounds are 16 MiB per profile, 4,096 tags and 1,048,576 samples per sele
 curve inverses. No source pixels are passed to this crate. A fixed number of metadata endpoint
 evaluations checks the mathematical domain of parametric curves and monotonicity for inversion.
 
-`IccProfile::matrix_trc` selects a direction and explicit intent. Higher-priority DToB/BToD or
-AToB/BToA tags produce a typed unsupported error, including the perceptual-LUT fallback when the
-requested LUT is absent. They are never silently discarded in favour of colorants/TRCs.
-All four rendering intents execute for matrix/TRC connections. RGB input/display and
-monochrome input/display/output classes with XYZ PCS are supported. Lab, CMYK, other profile
-classes, LUT/MPE execution and broader gamut/HDR policies remain open.
+`IccProfile::select` selects a direction and explicit intent and returns an `IccProfileProgram`.
+Its `IccProgram` is a checked sequence of typed stages with explicit input/output channel counts.
+DToB/BToD MPE tags take priority. Unknown processing-element signatures discard that MPE method
+according to ICC.1 section 10.16.1; malformed supported elements return an error. Selected legacy
+AToB/BToA LUTs still return an unsupported-method error, including the intent-zero fallback when
+the requested LUT is absent. `matrix_trc` remains restricted metadata inspection of a selected
+matrix/TRC method. It cannot represent an MPE method.
+
+Matrix/TRC covers RGB input/display and monochrome input/display/output classes with XYZ PCS.
+MPE supports input/display/output profiles, recognized device channel counts and XYZ/Lab PCS;
+this resident metadata support is broader than JPEG XL decoder admission, which still uses
+RGB/Gray image color surfaces. Legacy LUTs, complete CMYK image plumbing, other profile classes,
+full floating-point-range conformance and broader gamut/HDR policies remain open.
 
 Relative intent connects the profiles in media-relative PCS. Absolute intent uses fully adapted
 media-white scaling, `source_white / target_white`, between the original PCS matrices. V2 display
@@ -99,8 +106,7 @@ This is a declared matrix-shaper CMM policy, not a substitute for profile-suppli
 Black is obtained by evaluating at most three curve endpoints and the profile's colorant matrix.
 The CMM darker-colorant policy clips Lab L* to 0–50, resets L* above 95 to zero, and retains a*/b*.
 The policy uses decimal PCS D50 `(0.9642, 1, 0.8249)`; encoded colorants and RGB connection geometry
-remain unchanged. No CPU image pixels are evaluated. The resulting affine offset is transformed
-into the target's linear coordinates and occupies the existing matrix rows' fourth F32 lanes.
+remain unchanged. No CPU image pixels are evaluated. Connection matrices and offsets compose in host f64 before upload.
 
 Matrix columns retain the exact signed fixed-point values, represented losslessly in host f64.
 Media white and chromatic adaptation retain their original signed integer records. ICC colorants
@@ -126,8 +132,7 @@ and 1,000,003 irregular samples, subnormal/near-zero coordinates and exact endpo
 ## Linear RGB connections
 
 `IccTransform::to_linear_rgb` and `from_linear_rgb` connect the selected profile to a declared
-`RgbColorSpace`. The endpoint model distinguishes a profile's one/three device channels and
-curves from three unbounded linear RGB components. Relative colorimetric intent uses Bradford
+`RgbColorSpace`. The endpoint model distinguishes a selected profile program from three unbounded linear RGB components. Relative colorimetric intent uses Bradford
 between the RGB reference white and ICC's exact encoded PCS D50. Colorants are connected directly
 in f64; no synthetic quantized profile or approximation by recognized primaries is introduced.
 All intents treat this linear endpoint as an ideal, fully adapted v4 endpoint with PCS D50 white
@@ -146,8 +151,8 @@ ICC curve contract. This does not extend arbitrary ICC device curves to unbounde
 ## GPU contract
 
 `ResidentIccMemoryPlan::new` checks capability and program bounds before allocation.
-`ResidentIccProgram::new` uploads immutable, deduplicated curve metadata once.
-`ResidentIccPipeline::encode` records conversion between one or three planar F32 color channels
+`ResidentIccProgram::new` uploads immutable stage metadata, shared curves and shared CLUTs once.
+`ResidentIccPipeline::encode` records conversion between up to sixteen planar F32 color channels
 in distinct resident storage buffers. Offsets are scalar indices relative to their binding;
 each plane has its own row stride. Alignment, usage, extents, channel counts, storage capacity,
 non-overlapping output ranges, u32 addressing and workgroup counts are checked before dispatch.
@@ -159,11 +164,57 @@ image buffers. Recorded work can be abandoned; the same program can be reused ac
 pitches and later submissions. Queue/session integration must keep the existing memory permits
 until the last submitted consumer completes.
 
-Inputs must be finite. ICC device-domain and curve-range values are clamped to [0,1]; matrix
-intermediates preserve signed XYZ-derived values before inverse-curve domain clipping. This is an
-explicit bounded ICC contract, separate from the existing unbounded enumerated SDR conversion.
-No HDR or unbounded ICC behaviour is claimed. Matrix lowering and pixel arithmetic use F32.
-A legal parametric power that exceeds finite F32 evaluation returns `ResidentIccError::Precision`.
+Inputs must be finite. Legacy ICC device curves clamp their domain and range to [0,1]. MPE
+formulas and matrices do not impose that clipping; a CLUT clamps only its input coordinates.
+All pixel arithmetic and uploaded coefficients use F32. The backend checks finite matrix lowering
+and the existing legacy parametric-power bound. Full-range overflow/conditioning coverage for
+arbitrary MPE formulas remains a conformance gate, not an established HDR guarantee.
+
+## Floating-point multi-process elements
+
+The ordered stage representation replaces the fixed source-curves/matrix/target-curves ABI.
+Matrix/TRC, profile-to-profile and linear RGB connections use this same interpreter. Adjacent
+unclipped affine operations combine in host f64; exact identity matrices disappear, preserving
+subnormal inputs before a discontinuous curve. Curve breakpoints use ordered IEEE bit keys so
+GPU subnormal flushing cannot choose the wrong segment at zero. Positive and negative zero
+compare equal, and the first segment containing a repeated breakpoint owns that input.
+
+The MPE parser covers `matf`, `cvst` with all three formula forms and sampled segments, `clut`,
+and the required `bACS`/`eACS` pass-through elements. It checks position-table ranges, alignment,
+zero padding, whole-element sharing, execution order, channel continuity, finite stored numbers,
+curve domains, sample counts and table products before payload allocation. Sampled segments
+reconstruct their implicit initial metadata value from the preceding segment. No CPU image
+samples or pixel CMS are used. Shared curve/element ranges retain shared immutable storage.
+
+Default MPE limits are 4,096 processing elements, sixteen processing channels, 4,096 segments
+per curve and 4,194,304 CLUT component values, in addition to the profile/tag/sample limits above.
+The channel limit is a configurable metadata resource policy; it is not a normative limit on
+all MPE matrices. The current resident backend separately admits at most sixteen live channels.
+One-/two-dimensional CLUTs use linear/bilinear interpolation. Higher dimensions use tetrahedral
+interpolation on the last three axes and linear interpolation on the preceding axes, matching
+the native comparison policy. Float CLUT outputs and formula outputs retain signed and above-one values.
+
+Physical Lab/XYZ stages connect differing PCS declarations. DToB3/BToD3 already use absolute
+PCS: their media white is not applied again. Mixed absolute/relative endpoints apply only the
+remaining conversion. Selected MPE perceptual/saturation methods use the v4 PCS reference black
+(0.00336, 0.0034731, 0.0028646); unused TRC tags do not alter this selected-method policy. This
+is explicit CMM policy, not a claim of parity with every CMM's heuristics for hybrid profiles.
+
+The `mpe` corpus contains nine processing profiles and an identity connection profile. All
+72 directional/intent connections have 135,864 independent f64 and Little CMS 2.19 components.
+It covers all formula forms, sampled segments, repeated breakpoints, signed zeros/subnormals,
+reversed physical storage, anisotropic 1–5D CLUTs, Lab PCS and fifteen intermediate channels.
+Native Little CMS rejects a sixteen-channel intermediate; that native limit is not used as
+an ICC format limit. Per-stage uncertainty includes affine coefficient magnitudes, curve branch
+bounds, CLUT gradients and the operands before Lab cancellation; no output tolerance is fitted
+to GPU results. All original matrix/TRC acceptance intervals remain unchanged.
+
+Another 48 native/scalar connections consume the existing original RGB/Gray Modular/VarDCT
+reference pixels and three MPE targets. Source uncertainty stays zero for original Modular and
+2e-5 for original VarDCT. Their 22,032 components are checked through 192 decoder presentations
+covering planar/interleaved output and whole/fragmented input, with exact alpha, held-output
+rereads and final budget release. Native CMM fixed-PCS uncertainty is propagated separately;
+it never enlarges the primary GPU interval. The complete MPE corpus contains 132 files.
 
 ## Evidence and precision
 
@@ -200,7 +251,7 @@ component is excluded from the primary GPU assertion.
 Additional GPU tests cover both monotone directions, exact plateau endpoint rules, all parametric
 inverse branches, clipped plateaus/gaps, metadata reuse after abandoned commands, Scalar/Lanes32/
 Tile16x16 dispatches, multiple extents/pitches, exact program limits and invalid bindings.
-The shader is Naga-validated without optional capabilities and its 80-byte uniform is checked
+The shader is Naga-validated without optional capabilities and its 272-byte uniform is checked
 against the parsed WGSL layout.
 
 The `linear` subcorpus adds 100 connections between the ten original profiles and five linear
@@ -246,10 +297,10 @@ bounds are propagated through all source-box corners: original Modular is exact,
 uses 2e-5, and native XYB uses `(1 + abs(linear)) / 1024`. Tests check 768 presentations across both
 layouts and whole/fragmented input, unchanged alpha, held outputs and final budget release. The
 independent intervals also distinguish each non-relative intent from relative in applicable cases.
-Selected MPE rejection and unused-original-method bypass tests retain their original protection.
+Selected nonfinite MPE rejection and unused-original-method bypass tests retain their original protection.
 
 The normative references are [ICC.1:2022](https://www.color.org/specification/ICC.1-2022-05.pdf),
-sections 7, 8.10, 10.6, 10.18 and Annex F. The observed native boundaries follow Little CMS 2.19
+sections 7, 8.10, 10.6, 10.16, 10.18 and Annex F. The observed native boundaries follow Little CMS 2.19
 [`cmsgamma.c`](https://github.com/mm2/Little-CMS/blob/lcms2.19/src/cmsgamma.c), cases 3 and -2.
 The declared matrix-shaper CMM connection policy is independently checked against Little CMS 2.19
 [`cmscnvrt.c`](https://github.com/mm2/Little-CMS/blob/lcms2.19/src/cmscnvrt.c),

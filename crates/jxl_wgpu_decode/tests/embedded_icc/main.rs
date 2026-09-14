@@ -11,9 +11,11 @@ use std::num::NonZeroU64;
 
 mod color;
 mod intents;
+mod mpe;
 mod numeric;
 mod output;
 mod profile;
+mod references;
 mod xyb;
 mod ycbcr;
 
@@ -125,11 +127,9 @@ fn native_icc_declarations_and_scalar_alpha_survive_both_codecs() {
 }
 
 #[test]
-fn icc_color_conversion_selects_the_requested_mpe_before_allocating() {
+fn icc_color_conversion_rejects_nonfinite_selected_mpe_before_allocating() {
     use jxl_gpu_formats::{ColorSpecification, PixelFormat, RgbChannelOrder};
-    use jxl_gpu_protocol::icc::{
-        IccDirection, IccError, IccProfile, IccRenderingIntent, IccSignature,
-    };
+    use jxl_gpu_protocol::icc::{IccDirection, IccError, IccProfile, IccRenderingIntent};
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
     let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     for case in corpus::cases().filter(|case| !case.xyb) {
@@ -141,7 +141,7 @@ fn icc_color_conversion_selects_the_requested_mpe_before_allocating() {
             IccRenderingIntent::Saturation,
             IccRenderingIntent::Absolute,
         ] {
-            let target = jxl_test_support::fixtures::icc::with_matrix_mpe(
+            let target = jxl_test_support::fixtures::icc::with_nonfinite_matrix_mpe(
                 &original,
                 IccDirection::PcsToDevice,
                 intent,
@@ -157,8 +157,10 @@ fn icc_color_conversion_selects_the_requested_mpe_before_allocating() {
                 .with_icc_rendering_intent(intent);
             assert!(matches!(
                 decoder.open(&data, request),
-                Err(jxl_wgpu_decode::Error::Icc(IccError::TransformTag { tag }))
-                    if tag == IccSignature([b'B', b'2', b'D', b'0' + intent as u8])
+                Err(jxl_wgpu_decode::Error::Icc(IccError::Invalid {
+                    field: "non-finite float",
+                    ..
+                }))
             ));
             assert_eq!(
                 backend.transient_memory_budget().snapshot().reserved_bytes,

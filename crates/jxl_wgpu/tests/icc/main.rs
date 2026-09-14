@@ -20,6 +20,7 @@ mod analytic;
 mod connection;
 mod intents;
 mod metadata;
+mod mpe;
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -179,7 +180,7 @@ fn run(
     let plan = ResidentIccMemoryPlan::new(transform, &backend.device().limits()).unwrap();
     let program = ResidentIccProgram::new(backend.device(), transform).unwrap();
     assert_eq!(program.memory_plan(), plan);
-    assert_eq!(plan.dispatch_uniform_bytes, 80);
+    assert_eq!(plan.dispatch_uniform_bytes, 272);
     run_program(backend, pipeline, &program, extent, input, padding)
 }
 

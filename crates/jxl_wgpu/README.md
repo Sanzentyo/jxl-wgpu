@@ -16,13 +16,13 @@ operations, layouts, precision contracts, and device limits return typed errors 
 is authoritative.
 
 `ResidentIccProgram` and `ResidentIccPipeline` execute all four RGB/Gray ICC matrix/TRC intents
-on resident planar F32 channels, including absolute media white and v4 perceptual/saturation
+and floating-point MPE stage programs on resident planar F32 channels, including absolute media white and v4 perceptual/saturation
 black compensation. A checked profile retains exact colorants,
-independent curves and original ICC bytes; LUT precedence is never silently bypassed. The
+independent curves and original ICC bytes. MPE matrices, segmented curves, CLUTs and Lab/XYZ PCS\nconversions share one interpreter; unknown MPE elements follow the specified fallback, while\nmalformed supported methods and selected legacy LUTs return typed errors. The
 same program connects profiles to unbounded linear RGB using shared f64 CIE/Bradford metadata
 before one F32 lowering; signed and above-one linear values remain intact. Owned ICC pixel
 formats and Gray/alpha storage describe these domains independently of execution admission. The
-[ICC execution contract](../../docs/ICC_MATRIX_TRC.md) documents unit-domain semantics, memory
+[ICC execution contract](../../docs/ICC_COLOR.md) documents unit-domain semantics, memory
 ownership, native/scalar evidence and remaining decoder integration.
 
 `ImageOutputParams::for_icc_device` packs values already in the exact target ICC profile. It

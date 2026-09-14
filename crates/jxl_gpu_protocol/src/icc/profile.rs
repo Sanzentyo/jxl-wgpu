@@ -28,7 +28,7 @@ pub struct IccProfile {
     bytes: Arc<[u8]>,
     header: IccHeader,
     tags: Arc<[IccTag]>,
-    max_curve_samples: u32,
+    limits: IccLimits,
 }
 
 // A resource policy does not change the profile's color meaning or identity.
@@ -155,7 +155,7 @@ impl IccProfile {
             bytes,
             header,
             tags: tags.into(),
-            max_curve_samples: limits.max_curve_samples,
+            limits,
         })
     }
 
@@ -197,10 +197,15 @@ impl IccProfile {
     }
 
     pub(super) const fn max_curve_samples(&self) -> u32 {
-        self.max_curve_samples
+        self.limits.max_curve_samples
+    }
+
+    pub(super) const fn limits(&self) -> IccLimits {
+        self.limits
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct Reader<'a>(pub(super) &'a [u8]);
 
 impl<'a> Reader<'a> {
@@ -230,6 +235,14 @@ impl<'a> Reader<'a> {
 
     pub(super) fn i32(&self, offset: u64) -> Result<i32, IccError> {
         self.u32(offset).map(|v| v as i32)
+    }
+
+    pub(super) fn f32(&self, offset: u64) -> Result<f32, IccError> {
+        let value = f32::from_bits(self.u32(offset)?);
+        if !value.is_finite() {
+            return invalid("non-finite float", offset);
+        }
+        Ok(value)
     }
 
     pub(super) fn u16(&self, offset: u64) -> Result<u16, IccError> {

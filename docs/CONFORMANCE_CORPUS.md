@@ -3868,7 +3868,7 @@ against an independent f64 product, including near-zero and endpoint samples.
 175,851 native components also meet their independently propagated native precision bounds.
 56 zero-base offset and 213 negative-inverse components retain documented Little CMS boundary
 differences; every component still passes the narrower independent GPU assertion. No native
-reference is altered to match GPU output. See [ICC_MATRIX_TRC.md](ICC_MATRIX_TRC.md) and the
+reference is altered to match GPU output. See [ICC_COLOR.md](ICC_COLOR.md) and the
 [generator](../crates/jxl_wgpu/test-data/icc_generator/README.md) for equations and reproduction.
 This corpus validates the resident converter, not embedded-ICC JPEG XL decoder admission,
 original-domain composition, LUT/MPE/Lab/CMYK or full intent/HDR behaviour.
@@ -3894,7 +3894,7 @@ ICC device-space rejection before layout creation. Enumerated packers reject une
 
 This stage prepares decoder integration. Embedded ICC color admission, original/XYB/reference execution,
 requested ICC packing/display, and per-image program/budget ownership are still incomplete.
-See [ICC_MATRIX_TRC.md](ICC_MATRIX_TRC.md) for the execution contract and
+See [ICC_COLOR.md](ICC_COLOR.md) for the execution contract and
 [the generator](../crates/jxl_wgpu/test-data/icc_generator/README.md) for reproducibility.
 
 ## Embedded ICC numeric samples and independent extra channels

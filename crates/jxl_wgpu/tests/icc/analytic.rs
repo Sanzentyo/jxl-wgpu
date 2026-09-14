@@ -144,7 +144,7 @@ fn uploaded_profile_program_reuses_metadata_across_extents_pitches_and_abandoned
         (program.input_channels(), program.output_channels()),
         (1, 1)
     );
-    assert_eq!(program.memory_plan().program_bytes, 184); // 80 header + 48 parametric + 48 sampled + 8 samples.
+    assert_eq!(program.memory_plan().program_bytes, 160); // Gray: 16 header + 32 curve stages + 8 curve references + 104 shared curve data; identity matrix is elided.
     let extent = Extent2d::new(2, 1);
     let source = Storage::new(&backend, extent, 1, Some(&[0.25, 0.5]), 4);
     let target = Storage::new(&backend, extent, 1, None, 8);

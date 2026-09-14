@@ -1,20 +1,26 @@
-//! Bounded ICC metadata and backend-neutral matrix/TRC transforms.
+//! Bounded ICC metadata and backend-neutral processing programs.
 //!
 //! Profiles keep their original bytes, signed fixed-point colorants, and independent channel
 //! curves. This module never reads image samples. GPU backends lower the resulting transform
-//! once and execute the curves and matrix on resident pixels.
+//! once and execute its ordered stages on resident pixels.
 //!
-//! The initial execution model covers ICC v2/v4 RGB matrix and XYZ monochrome profiles with
-//! media-relative colorimetric intent. LUT, Lab, absolute/perceptual/saturation policies and
-//! other device spaces return structured unsupported errors, without substituting a profile.
+//! Matrix/TRC and floating-point multi-process elements support all four rendering intents.
+//! Unimplemented legacy LUT methods return structured errors. Unknown MPE element types
+//! follow the ICC fallback rule; malformed supported elements never substitute another method.
 
 mod curve;
+mod mpe;
 mod profile;
+mod program;
 mod transform;
 
 pub use curve::{IccCurve, IccCurveKind, IccInverseDirection};
 pub use profile::{IccHeader, IccProfile, IccTag};
-pub use transform::{IccMatrixTrc, IccTransform, IccTransformEndpoint};
+pub use program::{
+    IccAffine, IccClut, IccCurveSegment, IccCurveSegmentKind, IccProgram, IccSegmentedCurve,
+    IccStage,
+};
+pub use transform::{IccMatrixTrc, IccProfileProgram, IccTransform, IccTransformEndpoint};
 
 /// An ICC four-byte signature, preserved even for unknown tags and profile classes.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -56,6 +62,11 @@ pub struct IccLimits {
     pub max_tags: u32,
     /// Maximum entries in each selected sampled curve; parameterized curves need no table.
     pub max_curve_samples: u32,
+    pub max_processing_elements: u32,
+    /// A resource policy, including intermediate MPE channels; not a format-wide limit.
+    pub max_processing_channels: u16,
+    pub max_curve_segments: u16,
+    pub max_clut_values: u32,
 }
 
 impl Default for IccLimits {
@@ -64,6 +75,10 @@ impl Default for IccLimits {
             max_profile_bytes: 16 << 20,
             max_tags: 4096,
             max_curve_samples: 1 << 20,
+            max_processing_elements: 4096,
+            max_processing_channels: 16,
+            max_curve_segments: 4096,
+            max_clut_values: 4 << 20,
         }
     }
 }
@@ -102,12 +117,12 @@ pub enum IccError {
         tag: IccSignature,
         kind: IccSignature,
     },
-    #[error("ICC {field} {signature} is unsupported for matrix/TRC execution")]
+    #[error("ICC {field} {signature} is unsupported")]
     Unsupported {
         field: &'static str,
         signature: IccSignature,
     },
-    #[error("ICC transform selects {tag}; its execution is not implemented")]
+    #[error("ICC selected method {tag} is not supported by this operation")]
     TransformTag { tag: IccSignature },
     #[error("ICC tag {tag} has invalid curve parameters")]
     CurveParameters { tag: IccSignature },

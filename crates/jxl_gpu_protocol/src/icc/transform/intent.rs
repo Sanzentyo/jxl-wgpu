@@ -56,6 +56,11 @@ fn media_white(endpoint: &IccTransformEndpoint) -> [f64; 3] {
         // The virtual endpoint is an already adapted, ideal v4 display in PCS D50.
         IccTransformEndpoint::LinearRgb(_) => D50,
         IccTransformEndpoint::Profile(profile)
+            if profile.tag.is_some_and(|tag| tag.0[3] == b'3') =>
+        {
+            D50
+        }
+        IccTransformEndpoint::Profile(profile)
             if profile.header.version >> 24 == 2
                 && profile.header.class == IccSignature(*b"mntr") =>
         {
@@ -70,7 +75,12 @@ fn media_white(endpoint: &IccTransformEndpoint) -> [f64; 3] {
 fn black(endpoint: &IccTransformEndpoint) -> [f64; 3] {
     match endpoint {
         IccTransformEndpoint::LinearRgb(_) => [0.0; 3],
-        IccTransformEndpoint::Profile(profile) => profile_black(profile),
+        IccTransformEndpoint::Profile(profile) => match &profile.matrix_trc {
+            Some(matrix) => profile_black(matrix),
+            // Selected v4 MPE perceptual/saturation methods use the PCS reference black.
+            // Unused matrix-shaper tags do not change the selected method's meaning.
+            None => [0.00336, 0.0034731, 0.0028646],
+        },
     }
 }
 

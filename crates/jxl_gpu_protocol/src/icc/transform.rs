@@ -1,8 +1,8 @@
-use crate::color::matrix::{IDENTITY, multiply};
 use crate::{Chromaticity, ColorMatrix, RgbColorSpace, WhitePointAdaptation};
 
 use super::{
-    IccCurve, IccDirection, IccError, IccHeader, IccProfile, IccRenderingIntent, IccSignature,
+    IccAffine, IccCurve, IccDirection, IccError, IccHeader, IccProfile, IccProgram,
+    IccRenderingIntent, IccSignature, IccStage,
 };
 
 mod intent;
@@ -39,42 +39,21 @@ impl IccMatrixTrc {
 }
 
 impl IccProfile {
-    /// Selects a matrix/TRC transform without bypassing a higher-priority LUT. Unimplemented
-    /// DToB/BToD elements currently return an explicit error instead of silently using a
-    /// lower-priority profile method. This conservative policy can expand with MPE support.
+    /// Inspect a selected matrix/TRC method. MPE and legacy LUT methods cannot be
+    /// represented by this descriptor; use `select` for general profile execution.
     pub fn matrix_trc(
         &self,
         direction: IccDirection,
         intent: IccRenderingIntent,
     ) -> Result<IccMatrixTrc, IccError> {
+        let selected = self.select(direction, intent)?;
+        selected.matrix_trc.ok_or_else(|| IccError::TransformTag {
+            tag: selected.tag.expect("non-matrix method"),
+        })
+    }
+
+    fn parse_matrix_trc(&self, direction: IccDirection) -> Result<IccMatrixTrc, IccError> {
         let header = self.header();
-        if !matches!(&header.class.0, b"scnr" | b"mntr" | b"prtr") {
-            return Err(IccError::Unsupported {
-                field: "profile class",
-                signature: header.class,
-            });
-        }
-        let suffix = b'0' + intent as u8;
-        let mpe = match direction {
-            IccDirection::DeviceToPcs => IccSignature([b'D', b'2', b'B', suffix]),
-            IccDirection::PcsToDevice => IccSignature([b'B', b'2', b'D', suffix]),
-        };
-        let base = match direction {
-            IccDirection::DeviceToPcs => *b"A2B0",
-            IccDirection::PcsToDevice => *b"B2A0",
-        };
-        let mut selected = base;
-        selected[3] = b'0'
-            + if intent == IccRenderingIntent::Absolute {
-                1
-            } else {
-                intent as u8
-            };
-        for tag in [mpe, IccSignature(selected), IccSignature(base)] {
-            if self.tag(tag).is_some() {
-                return Err(IccError::TransformTag { tag });
-            }
-        }
         if header.pcs != IccSignature(*b"XYZ ") {
             return Err(IccError::Unsupported {
                 field: "PCS",
@@ -156,11 +135,192 @@ impl IccProfile {
     }
 }
 
-/// A selected ICC profile endpoint or an unbounded linear RGB connection. Linear RGB has
-/// three channels and no ICC device-domain clipping or fixed-point profile approximation.
+/// One selected directional method, expressed in physical PCS XYZ at its connection end.
+/// Original profile metadata stays available; unused TRC/LUT methods are never interpreted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IccProfileProgram {
+    header: IccHeader,
+    tag: Option<IccSignature>,
+    program: IccProgram,
+    matrix_trc: Option<IccMatrixTrc>,
+    media_white: [i32; 3],
+    device_channels: usize,
+}
+
+impl IccProfileProgram {
+    #[must_use]
+    pub const fn header(&self) -> &IccHeader {
+        &self.header
+    }
+    #[must_use]
+    pub const fn tag(&self) -> Option<IccSignature> {
+        self.tag
+    }
+    #[must_use]
+    pub const fn program(&self) -> &IccProgram {
+        &self.program
+    }
+    #[must_use]
+    pub const fn matrix_trc(&self) -> Option<&IccMatrixTrc> {
+        self.matrix_trc.as_ref()
+    }
+    #[must_use]
+    pub const fn channels(&self) -> usize {
+        self.device_channels
+    }
+}
+
+impl IccProfile {
+    /// Select the requested DToB/BToD method, then its legacy LUT, then the intent-zero
+    /// legacy LUT, then matrix/TRC. Unknown MPE element types discard that method as
+    /// required by ICC.1 §10.16.1. Broken supported elements remain an error.
+    pub fn select(
+        &self,
+        direction: IccDirection,
+        intent: IccRenderingIntent,
+    ) -> Result<IccProfileProgram, IccError> {
+        let header = *self.header();
+        if !matches!(&header.class.0, b"scnr" | b"mntr" | b"prtr") {
+            return Err(IccError::Unsupported {
+                field: "profile class",
+                signature: header.class,
+            });
+        }
+        if !matches!(&header.pcs.0, b"XYZ " | b"Lab ") {
+            return Err(IccError::Unsupported {
+                field: "PCS",
+                signature: header.pcs,
+            });
+        }
+        let device_channels = device_channels(header.device_space)?;
+        let (inputs, outputs, mut mpe, base) = match direction {
+            IccDirection::DeviceToPcs => (device_channels, 3, *b"D2B0", *b"A2B0"),
+            IccDirection::PcsToDevice => (3, device_channels, *b"B2D0", *b"B2A0"),
+        };
+        mpe[3] += intent as u8;
+        let mpe = IccSignature(mpe);
+        if self.tag(mpe).is_some() {
+            if header.version < 0x0430_0000 {
+                return Err(IccError::Invalid {
+                    field: "MPE requires v4.3",
+                    offset: 8,
+                });
+            }
+            if let Some(program) = super::mpe::parse(self, mpe, inputs, outputs)? {
+                let mut stages = program.stages().to_vec();
+                if header.pcs == IccSignature(*b"Lab ") {
+                    match direction {
+                        IccDirection::DeviceToPcs => stages.push(IccStage::LabToXyz),
+                        IccDirection::PcsToDevice => stages.insert(0, IccStage::XyzToLab),
+                    }
+                }
+                let media_white = validated_white(self)?;
+                return Ok(IccProfileProgram {
+                    header,
+                    tag: Some(mpe),
+                    program: IccProgram::new(inputs, outputs, stages)?,
+                    matrix_trc: None,
+                    media_white,
+                    device_channels,
+                });
+            }
+        }
+        let mut requested = base;
+        requested[3] += if intent == IccRenderingIntent::Absolute {
+            1
+        } else {
+            intent as u8
+        };
+        for tag in [IccSignature(requested), IccSignature(base)] {
+            if self.tag(tag).is_some() {
+                return Err(IccError::TransformTag { tag });
+            }
+        }
+        let matrix_trc = self.parse_matrix_trc(direction)?;
+        let curves = IccStage::Curves {
+            curves: matrix_trc.curves.clone().into(),
+            inverse: direction == IccDirection::PcsToDevice,
+        };
+        let stages = match direction {
+            IccDirection::DeviceToPcs => vec![
+                curves,
+                IccStage::Matrix(IccAffine::new(
+                    device_channels,
+                    matrix_trc
+                        .matrix
+                        .iter()
+                        .flat_map(|row| row[..device_channels].iter().copied())
+                        .collect(),
+                    vec![0.0; 3],
+                    false,
+                )?),
+            ],
+            IccDirection::PcsToDevice => {
+                let matrix = if device_channels == 1 {
+                    vec![0.0, 1.0, 0.0]
+                } else {
+                    inverse(matrix_trc.matrix)?.into_iter().flatten().collect()
+                };
+                vec![
+                    IccStage::Matrix(IccAffine::new(
+                        3,
+                        matrix,
+                        vec![0.0; device_channels],
+                        false,
+                    )?),
+                    curves,
+                ]
+            }
+        };
+        Ok(IccProfileProgram {
+            header,
+            tag: None,
+            program: IccProgram::new(inputs, outputs, stages)?,
+            media_white: matrix_trc.media_white,
+            matrix_trc: Some(matrix_trc),
+            device_channels,
+        })
+    }
+}
+
+fn validated_white(profile: &IccProfile) -> Result<[i32; 3], IccError> {
+    let white = xyz_tag(profile, *b"wtpt")?;
+    if white.iter().any(|v| *v <= 0) {
+        return Err(IccError::Invalid {
+            field: "media white point",
+            offset: u64::from(
+                profile
+                    .tag(IccSignature(*b"wtpt"))
+                    .expect("read white tag")
+                    .offset,
+            ),
+        });
+    }
+    Ok(white)
+}
+
+fn device_channels(signature: IccSignature) -> Result<usize, IccError> {
+    Ok(match &signature.0 {
+        b"GRAY" => 1,
+        b"CMYK" => 4,
+        b"RGB " | b"XYZ " | b"Lab " | b"Luv " | b"YCbr" | b"Yxy " | b"HSV " | b"HLS " | b"CMY " => {
+            3
+        }
+        [n @ b'2'..=b'9', b'C', b'L', b'R'] => usize::from(n - b'0'),
+        [n @ b'A'..=b'F', b'C', b'L', b'R'] => usize::from(n - b'A' + 10),
+        _ => {
+            return Err(IccError::Unsupported {
+                field: "device space",
+                signature,
+            });
+        }
+    })
+}
+
+/// A selected directional profile or an unbounded linear RGB connection.
 #[derive(Clone, Debug, PartialEq)]
 pub enum IccTransformEndpoint {
-    Profile(IccMatrixTrc),
+    Profile(Box<IccProfileProgram>),
     LinearRgb(RgbColorSpace),
 }
 
@@ -168,40 +328,53 @@ impl IccTransformEndpoint {
     #[must_use]
     pub fn channels(&self) -> usize {
         match self {
-            Self::Profile(profile) => profile.curves.len(),
+            Self::Profile(p) => p.channels(),
             Self::LinearRgb(_) => 3,
         }
     }
-
-    /// Selected device curves; a linear RGB connection has no curve descriptors.
     #[must_use]
-    pub fn curves(&self) -> &[IccCurve] {
+    pub fn profile(&self) -> Option<&IccProfileProgram> {
         match self {
-            Self::Profile(profile) => &profile.curves,
-            Self::LinearRgb(_) => &[],
+            Self::Profile(p) => Some(p),
+            Self::LinearRgb(_) => None,
         }
     }
 
-    #[must_use]
-    pub const fn profile(&self) -> Option<&IccMatrixTrc> {
+    fn stages(&self, direction: IccDirection) -> Result<Vec<IccStage>, IccError> {
         match self {
-            Self::Profile(profile) => Some(profile),
-            Self::LinearRgb(_) => None,
+            Self::Profile(p) => Ok(p.program.stages().to_vec()),
+            Self::LinearRgb(space) => {
+                let matrix = match direction {
+                    IccDirection::DeviceToPcs => ColorMatrix::rgb_to_xyz(
+                        *space,
+                        Chromaticity::ICC_D50,
+                        WhitePointAdaptation::Bradford,
+                    )?,
+                    IccDirection::PcsToDevice => ColorMatrix::xyz_to_rgb(
+                        Chromaticity::ICC_D50,
+                        *space,
+                        WhitePointAdaptation::Bradford,
+                    )?,
+                };
+                Ok(vec![IccStage::Matrix(IccAffine::new(
+                    3,
+                    matrix.rows().iter().flatten().copied().collect(),
+                    vec![0.0; 3],
+                    false,
+                )?)])
+            }
         }
     }
 }
 
-/// ICC colorimetric program. Device endpoints follow their profile's bounded curve rules;
-/// linear RGB endpoints preserve signed values and values above one. Alpha and extra channels
-/// are outside this transform. Matrix/TRC profiles support all four intents: relative PCS,
-/// fully adapted absolute media white, and perceptual/saturation black compensation for v4
-/// targets. Linear RGB is an ideal adapted v4 endpoint with zero black; its geometry uses Bradford.
+/// Ordered ICC program. Alpha and extra channels are outside this transform. Matrix/TRC
+/// profiles use relative PCS, fully adapted absolute white, or v4 black compensation.
+/// MPE stages preserve unbounded values except for their explicitly bounded CLUT inputs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct IccTransform {
     source: IccTransformEndpoint,
     target: IccTransformEndpoint,
-    matrix: [[f64; 3]; 3],
-    offset: [f64; 3],
+    program: IccProgram,
 }
 
 impl IccTransform {
@@ -211,28 +384,22 @@ impl IccTransform {
         intent: IccRenderingIntent,
     ) -> Result<Self, IccError> {
         Self::connect(
-            IccTransformEndpoint::Profile(source.matrix_trc(IccDirection::DeviceToPcs, intent)?),
-            IccTransformEndpoint::Profile(target.matrix_trc(IccDirection::PcsToDevice, intent)?),
+            IccTransformEndpoint::Profile(source.select(IccDirection::DeviceToPcs, intent)?.into()),
+            IccTransformEndpoint::Profile(target.select(IccDirection::PcsToDevice, intent)?.into()),
             intent,
         )
     }
-
-    /// Convert a profile's device channels to unbounded linear RGB. Source colorants and
-    /// independent curves retain their exact ICC values; no synthetic profile is serialized.
     pub fn to_linear_rgb(
         source: &IccProfile,
         target: RgbColorSpace,
         intent: IccRenderingIntent,
     ) -> Result<Self, IccError> {
         Self::connect(
-            IccTransformEndpoint::Profile(source.matrix_trc(IccDirection::DeviceToPcs, intent)?),
+            IccTransformEndpoint::Profile(source.select(IccDirection::DeviceToPcs, intent)?.into()),
             IccTransformEndpoint::LinearRgb(target),
             intent,
         )
     }
-
-    /// Convert unbounded linear RGB to a profile's device channels. Inputs are not clamped
-    /// before the PCS matrix; only the selected ICC inverse curve applies device bounds.
     pub fn from_linear_rgb(
         source: RgbColorSpace,
         target: &IccProfile,
@@ -240,7 +407,7 @@ impl IccTransform {
     ) -> Result<Self, IccError> {
         Self::connect(
             IccTransformEndpoint::LinearRgb(source),
-            IccTransformEndpoint::Profile(target.matrix_trc(IccDirection::PcsToDevice, intent)?),
+            IccTransformEndpoint::Profile(target.select(IccDirection::PcsToDevice, intent)?.into()),
             intent,
         )
     }
@@ -250,64 +417,47 @@ impl IccTransform {
         target: IccTransformEndpoint,
         intent: IccRenderingIntent,
     ) -> Result<Self, IccError> {
-        let source_matrix = match &source {
-            IccTransformEndpoint::Profile(profile) => profile.matrix,
-            IccTransformEndpoint::LinearRgb(space) => *ColorMatrix::rgb_to_xyz(
-                *space,
-                Chromaticity::ICC_D50,
-                WhitePointAdaptation::Bradford,
-            )?
-            .rows(),
-        };
-        let target_inverse = match &target {
-            IccTransformEndpoint::Profile(profile) if profile.curves.len() == 1 => {
-                // Gray selects PCS Y after the selected intent's PCS connection.
-                [[0.0, 1.0, 0.0], [0.0; 3], [0.0; 3]]
-            }
-            IccTransformEndpoint::Profile(profile) => inverse(profile.matrix)?,
-            IccTransformEndpoint::LinearRgb(space) => *ColorMatrix::xyz_to_rgb(
-                Chromaticity::ICC_D50,
-                *space,
-                WhitePointAdaptation::Bradford,
-            )?
-            .rows(),
-        };
         let connection = intent::Connection::new(&source, &target, intent);
-        let matrix = if connection.is_identity()
-            && matches!((&source, &target),
-            (IccTransformEndpoint::Profile(s), IccTransformEndpoint::Profile(t))
-                if s.matrix == t.matrix && s.curves.len() == t.curves.len())
-        {
-            // Exact cancellation also retains the specified endpoint of sampled plateaus.
-            IDENTITY
+        let mut first = source.stages(IccDirection::DeviceToPcs)?;
+        let mut last = target.stages(IccDirection::PcsToDevice)?;
+        let same_geometry = source
+            .profile()
+            .and_then(IccProfileProgram::matrix_trc)
+            .zip(target.profile().and_then(IccProfileProgram::matrix_trc))
+            .is_some_and(|(s, t)| s.matrix == t.matrix && s.curves.len() == t.curves.len());
+        let mut stages = Vec::new();
+        if connection.is_identity() && same_geometry {
+            // Exact cancellation retains the specified endpoint of sampled plateaus.
+            first.pop();
+            last.remove(0);
+            stages.extend(first);
+            stages.extend(last);
         } else {
-            multiply(
-                target_inverse,
-                std::array::from_fn(|r| source_matrix[r].map(|v| v * connection.scale[r])),
-            )
-        };
-        let offset = target_inverse.map(|row| {
-            row.into_iter()
-                .zip(connection.offset)
-                .map(|(a, b)| a * b)
-                .sum()
-        });
-        if matrix
-            .iter()
-            .flatten()
-            .chain(&offset)
-            .any(|v| !v.is_finite())
-        {
-            return Err(IccError::Matrix);
+            let connection = IccStage::Matrix(IccAffine::new(
+                3,
+                (0..9)
+                    .map(|i| {
+                        if i / 3 == i % 3 {
+                            connection.scale[i / 3]
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect(),
+                connection.offset.to_vec(),
+                false,
+            )?);
+            for stage in first.into_iter().chain([connection]).chain(last) {
+                super::program::append(&mut stages, stage)?;
+            }
         }
+        let program = IccProgram::new(source.channels(), target.channels(), stages)?;
         Ok(Self {
             source,
             target,
-            matrix,
-            offset,
+            program,
         })
     }
-
     #[must_use]
     pub const fn source(&self) -> &IccTransformEndpoint {
         &self.source
@@ -317,14 +467,8 @@ impl IccTransform {
         &self.target
     }
     #[must_use]
-    pub const fn matrix(&self) -> &[[f64; 3]; 3] {
-        &self.matrix
-    }
-
-    /// Linear target-channel offset, applied after the matrix and before inverse curves.
-    #[must_use]
-    pub const fn offset(&self) -> &[f64; 3] {
-        &self.offset
+    pub const fn program(&self) -> &IccProgram {
+        &self.program
     }
 }
 

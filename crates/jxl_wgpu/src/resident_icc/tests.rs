@@ -33,7 +33,7 @@ fn profile_binding_capabilities_fail_before_pipeline_creation() {
         ),
         (
             wgpu::Limits {
-                max_uniform_buffer_binding_size: 79,
+                max_uniform_buffer_binding_size: 271,
                 ..Default::default()
             },
             "uniform binding bytes",
@@ -68,6 +68,6 @@ fn icc_shader_and_dispatch_abi_are_webgpu_portable() {
             .iter()
             .map(|member| member.offset)
             .collect::<Vec<_>>(),
-        vec![0, 16, 32, 48, 64]
+        vec![0, 16, 80, 144, 208]
     );
 }

@@ -1310,31 +1310,30 @@ uses libjxl's ICC-calibrated sRGB primary coordinates; its direct sRGB and Gray 
 existing inverse-matrix interpretation. This precision distinction is explicit producer metadata,
 while the generic BT.709 color space retains the standard CIE coordinates.
 
-## Resident ICC matrix/TRC records
+## Resident ICC processing records
 
-The reusable ICC metadata buffer contains an 80-byte header (three F32 affine matrix rows, source and
-target curve offsets) and one 48-byte record per distinct curve. Each matrix row's fourth word
-stores its F32 offset; the shader adds it after the three-component dot product. Media-white
-scaling and black compensation are combined in f64 before this single lowering. The header,
-bindings and byte accounting do not grow. Each sampled curve appends its
-exact u16 entries as u32 words; offsets are checked u32 word indices. Sample coordinates use an
-exact u32 significand product split into two words before fractional-weight conversion, so large
-tables do not lose their interpolation position to an F32 multiplication. Parametric records preserve
-all seven declared parameters on lowering. The 80-byte dispatch uniform contains extent/channel
-counts, relative input offsets/strides and output offsets/strides at 16-byte intervals.
+The reusable ICC storage buffer is an array of u32 words. A 16-byte header carries the stage
+count, followed by one 16-byte record per stage: opcode, input count, output count and payload
+word offset. Payloads contain checked variable-size matrices/offsets, curve-reference arrays,
+CLUT grids/strides and float samples, or segmented-curve records. Legacy curve descriptors remain
+48 bytes and store every original parameter; their u16 tables occupy u32 words. Sample positions
+retain the exact F32 significand product before fractional-weight conversion. Shared curve/CLUT
+payloads have one physical allocation, independent of their number of uses.
 
-The fourth word of each source/target curve-offset vector (byte offsets 60 and 76) selects the
-endpoint: zero uses ICC curve offsets, one uses unbounded linear RGB without curve descriptors or
-unit clipping. Channel counts remain in the dispatch uniform; a linear endpoint always has three.
-The 80-byte header/dispatch and 48-byte curve ABI sizes are unchanged. Exact ICC/PCS/RGB matrices
-are combined in host f64 metadata before F32 program lowering; no image buffer is read on the host.
+The 272-byte, 16-byte-aligned dispatch uniform stores extent/channel counts at byte 0 and four
+sixteen-entry u32 plane arrays at bytes 16, 80, 144 and 208: input offsets, input strides, output
+offsets and output strides. WGSL uses arrays of four vec4 values to preserve portable uniform
+alignment. Its layout is checked against Naga. The backend limits live channel count to sixteen;
+metadata limits are separate from this device execution policy.
 
-`ResidentIccMemoryPlan` reports exact program bytes and per-dispatch uniform bytes before upload;
-the caller owns admission and completion lifetime. Three storage bindings and one uniform are
-checked against device limits. Color input/output use distinct buffers and checked planar ranges;
-row/inter-plane padding and non-color channels are outside the dispatched writes. No image-sized
-temporary or host pixel conversion is used. See [ICC_MATRIX_TRC.md](ICC_MATRIX_TRC.md) for the
-bounded unit-domain contract and incomplete decoder/session integration.
+`ResidentIccMemoryPlan` walks the same layout as upload, checking program size before allocating
+or traversing large sample payloads. The caller admits exact program and dispatch bytes and
+retains them through completion. Three storage bindings and one uniform are checked against
+device limits. Color input/output use distinct buffers and checked planar ranges; padding,
+alpha and extra planes remain outside writes. There is no per-stage image allocation or CPU
+pixel conversion. Affine metadata connects in f64, while non-identity stage execution uses F32.
+Exact identity matrices are omitted, preserving subnormals before discontinuous curves. See
+[ICC_COLOR.md](ICC_COLOR.md) for clipping, precision, selection and ownership contracts.
 
 ## Original ICC frame and presentation ownership
 
@@ -1370,7 +1369,7 @@ needs a profile transform, it selects one host program and uploads it on its fir
 The program buffer has its own exact `MemoryPermit`, shared by an image-owned cache and each
 submitted dispatch. Failed initial admission leaves the cache empty; later frames reuse the same
 program reservation. A conversion reserves a separate full target-color/extra intermediate,
-the 80-byte ICC dispatch uniform, the 208-byte output-packing uniform and the browser completion
+the 272-byte ICC dispatch uniform, the 208-byte output-packing uniform and the browser completion
 fence. Packed output has its own lease. Completion owns all input/intermediate/uniform/program
 handles, even if pending work and the image session are dropped.
 

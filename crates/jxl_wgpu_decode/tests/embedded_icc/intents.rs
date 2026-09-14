@@ -1,30 +1,10 @@
-use super::{color, corpus, output};
+use super::{color, corpus, output, references};
 use jxl_gpu_formats::{ColorSpecification, PixelFormat, RgbChannelOrder};
 use jxl_gpu_protocol::icc::{IccProfile, IccRenderingIntent};
 use jxl_wgpu::WgpuBackend;
 use jxl_wgpu_decode::{AlphaOutputPolicy, GpuOutputRequest};
 use std::num::NonZeroU64;
 use std::path::Path;
-
-fn references(directory: &Path, name: &str) -> Vec<[f32; 6]> {
-    let bytes = std::fs::read(directory.join(format!("decoder/{name}.reference"))).unwrap();
-    let (records, tail) = bytes.as_chunks::<28>();
-    assert!(tail.is_empty());
-    records
-        .iter()
-        .map(|record| {
-            let values = std::array::from_fn(|c| {
-                f32::from_le_bytes(record[c * 4..c * 4 + 4].try_into().unwrap())
-            });
-            let [native, exact, lower, upper, native_lower, native_upper] = values;
-            assert!(values.iter().all(|v| v.is_finite()));
-            assert!(lower <= exact && exact <= upper);
-            assert!(native_lower <= native && native <= native_upper);
-            assert_eq!(u32::from_le_bytes(record[24..].try_into().unwrap()), 0);
-            values
-        })
-        .collect()
-}
 
 #[test]
 fn requested_icc_intents_convert_original_and_xyb_pixels_with_white_and_black_adjustments() {
@@ -61,7 +41,7 @@ fn requested_icc_intents_convert_original_and_xyb_pixels_with_white_and_black_ad
             let gray = target.starts_with("gray_");
             let colors = if gray { 1 } else { 3 };
             let prefix = format!("{}_to_{target}", case.name());
-            let relative = references(&directory, &format!("{prefix}_1"));
+            let relative = references::read(&directory, &format!("{prefix}_1"));
             for intent in [
                 IccRenderingIntent::Perceptual,
                 IccRenderingIntent::Relative,
@@ -69,7 +49,7 @@ fn requested_icc_intents_convert_original_and_xyb_pixels_with_white_and_black_ad
                 IccRenderingIntent::Absolute,
             ] {
                 let name = format!("{prefix}_{}", intent as u32);
-                let reference = references(&directory, &name);
+                let reference = references::read(&directory, &name);
                 assert_eq!(reference.len(), 153 * colors);
                 distinct_from_relative[intent as usize] += reference
                     .iter()

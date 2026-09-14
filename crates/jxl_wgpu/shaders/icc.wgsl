@@ -1,12 +1,21 @@
+const FORWARD_CURVES: u32 = 0u;
+const INVERSE_CURVES: u32 = 1u;
+const AFFINE: u32 = 2u;
+const CLUT: u32 = 3u;
+const SEGMENTED_CURVES: u32 = 4u;
+const LAB_TO_XYZ: u32 = 5u;
+const XYZ_TO_LAB: u32 = 6u;
+const CLAMPED_AFFINE: u32 = 7u;
+
 override wg_x: u32 = 16u;
 override wg_y: u32 = 16u;
 
 struct Params {
     extent_channels: vec4<u32>,
-    input_offsets: vec4<u32>,
-    input_strides: vec4<u32>,
-    output_offsets: vec4<u32>,
-    output_strides: vec4<u32>,
+    input_offsets: array<vec4<u32>, 4>,
+    input_strides: array<vec4<u32>, 4>,
+    output_offsets: array<vec4<u32>, 4>,
+    output_strides: array<vec4<u32>, 4>,
 }
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
@@ -161,20 +170,181 @@ fn inverse_curve(base: u32, value: f32) -> f32 {
     return upper_x;
 }
 
+// MPE formulas are not bounded ICC device TRCs. Integer powers retain negative bases.
+fn real_power(x: f32, g: f32) -> f32 {
+    if g == 0.0 { return 1.0; }
+    if g == 1.0 { return x; }
+    if x == 0.0 && g > 0.0 { return 0.0; }
+    if x < 0.0 {
+        let odd = g - 2.0 * floor(g * 0.5) != 0.0;
+        return select(1.0, -1.0, odd) * pow(-x, g);
+    }
+    return pow(x, g);
+}
+
+fn float_order(value: f32) -> u32 {
+    let bits = bitcast<u32>(value);
+    if (bits & 0x7fffffffu) == 0u { return 0x80000000u; }
+    return select(bits | 0x80000000u, ~bits, (bits & 0x80000000u) != 0u);
+}
+
+fn segmented_curve(base: u32, x: f32) -> f32 {
+    let count = program[base];
+    var low = 0u;
+    var high = count - 1u;
+    // First containing segment owns a breakpoint, including repeated breakpoints.
+    while low < high {
+        let mid = low + (high - low) / 2u;
+        // Numeric F32 comparisons may flush subnormals on portable GPUs. A curve
+        // can jump at zero, so losing the original side of the breakpoint is not safe.
+        if float_order(x) <= float_order(bitcast<f32>(program[base + 1u + mid * 10u])) { high = mid; }
+        else { low = mid + 1u; }
+    }
+    let record = base + 1u + low * 10u;
+    let mode = program[record + 2u];
+    if mode == 3u {
+        let lower = bitcast<f32>(program[record + 1u]);
+        let upper = bitcast<f32>(program[record]);
+        let count = program[record + 3u];
+        let samples = program[record + 9u];
+        let t = clamp((x - lower) / (upper - lower), 0.0, 1.0);
+        if t == 0.0 { return bitcast<f32>(program[samples]); }
+        if t == 1.0 { return bitcast<f32>(program[samples + count - 1u]); }
+        let position = sample_position(t, count - 1u);
+        return mix(bitcast<f32>(program[samples + position.left]), bitcast<f32>(program[samples + position.left + 1u]), position.weight);
+    }
+    let p0 = bitcast<f32>(program[record + 4u]);
+    let p1 = bitcast<f32>(program[record + 5u]);
+    let p2 = bitcast<f32>(program[record + 6u]);
+    let p3 = bitcast<f32>(program[record + 7u]);
+    let p4 = bitcast<f32>(program[record + 8u]);
+    if mode == 0u { return real_power(p1 * x + p2, p0) + p3; }
+    if mode == 1u { return p1 * log2(p2 * real_power(x, p0) + p3) / log2(10.0) + p4; }
+    return p0 * real_power(p1, p2 * x + p3) + p4;
+}
+
+fn clut_value(base: u32, dimensions: u32, channel: u32, values: ptr<function, array<f32, 16>>) -> f32 {
+    var weights: array<f32, 16>;
+    var strides: array<u32, 16>;
+    var origin = base + dimensions * 2u + channel;
+    for (var axis = 0u; axis < dimensions; axis++) {
+        let grid = program[base + axis * 2u];
+        let stride = program[base + axis * 2u + 1u];
+        let value = clamp((*values)[axis], 0.0, 1.0);
+        var position = SamplePosition(0u, 0.0);
+        if value == 1.0 { position = SamplePosition(grid - 2u, 1.0); }
+        else if value > 0.0 { position = sample_position(value, grid - 1u); }
+        weights[axis] = position.weight;
+        strides[axis] = stride;
+        origin += position.left * stride;
+    }
+    // One/two dimensions use linear/bilinear interpolation. Higher dimensions use
+    // tetrahedra on the last three axes and linear interpolation on preceding axes.
+    let tail = min(dimensions, 3u);
+    let leading = dimensions - tail;
+    var order = array<u32, 3>(leading, leading + 1u, leading + 2u);
+    if tail == 3u {
+        for (var i = 1u; i < 3u; i++) {
+            var j = i;
+            while j > 0u && weights[order[j]] > weights[order[j - 1u]] {
+                let swap = order[j]; order[j] = order[j - 1u]; order[j - 1u] = swap;
+                j--;
+            }
+        }
+    }
+    var result = 0.0;
+    for (var corner = 0u; corner < (1u << leading); corner++) {
+        var index = origin;
+        var weight = 1.0;
+        for (var axis = 0u; axis < leading; axis++) {
+            let upper = (corner & (1u << axis)) != 0u;
+            if upper { index += strides[axis]; }
+            weight *= select(1.0 - weights[axis], weights[axis], upper);
+        }
+        var value = 0.0;
+        if tail == 3u {
+            let a = bitcast<f32>(program[index]);
+            index += strides[order[0]];
+            let b = bitcast<f32>(program[index]);
+            index += strides[order[1]];
+            let c = bitcast<f32>(program[index]);
+            index += strides[order[2]];
+            let d = bitcast<f32>(program[index]);
+            value = a + weights[order[0]] * (b - a) + weights[order[1]] * (c - b) + weights[order[2]] * (d - c);
+        } else {
+            for (var point = 0u; point < (1u << tail); point++) {
+                var address = index;
+                var factor = 1.0;
+                for (var axis = 0u; axis < tail; axis++) {
+                    let upper = (point & (1u << axis)) != 0u;
+                    if upper { address += strides[axis]; }
+                    factor *= select(1.0 - weights[axis], weights[axis], upper);
+                }
+                value += factor * bitcast<f32>(program[address]);
+            }
+        }
+        result += weight * value;
+    }
+    return result;
+}
+
+fn lab_f(t: f32) -> f32 {
+    if t > 216.0 / 24389.0 { return pow(t, 1.0 / 3.0); }
+    return ((24389.0 / 27.0) * t + 16.0) / 116.0;
+}
+fn lab_inverse(t: f32) -> f32 {
+    if t > 6.0 / 29.0 { return t * t * t; }
+    return (116.0 * t - 16.0) * (27.0 / 24389.0);
+}
+
 @compute @workgroup_size(wg_x, wg_y, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= params.extent_channels.x || id.y >= params.extent_channels.y { return; }
-    var linear = vec3<f32>(0.0);
-    for (var channel = 0u; channel < params.extent_channels.z; channel++) {
-        let value = input[params.input_offsets[channel] + id.y * params.input_strides[channel] + id.x];
-        if program[15u] != 0u { linear[channel] = value; }
-        else { linear[channel] = forward_curve(program[12u + channel], value); }
+    var values: array<f32, 16>;
+    for (var c = 0u; c < params.extent_channels.z; c++) {
+        values[c] = input[params.input_offsets[c / 4u][c % 4u] + id.y * params.input_strides[c / 4u][c % 4u] + id.x];
     }
-    for (var channel = 0u; channel < params.extent_channels.w; channel++) {
-        let base = channel * 4u;
-        let row = vec3<f32>(bitcast<f32>(program[base]), bitcast<f32>(program[base + 1u]), bitcast<f32>(program[base + 2u]));
-        var value = dot(row, linear) + bitcast<f32>(program[base + 3u]);
-        if program[19u] == 0u { value = inverse_curve(program[16u + channel], value); }
-        output[params.output_offsets[channel] + id.y * params.output_strides[channel] + id.x] = value;
+    for (var stage = 0u; stage < program[0]; stage++) {
+        let record = 4u + stage * 4u;
+        let opcode = program[record];
+        let p = program[record + 1u];
+        let q = program[record + 2u];
+        let base = program[record + 3u];
+        var next: array<f32, 16>;
+        for (var c = 0u; c < q; c++) {
+            if opcode == FORWARD_CURVES { next[c] = forward_curve(program[base + c], values[c]); }
+            else if opcode == INVERSE_CURVES { next[c] = inverse_curve(program[base + c], values[c]); }
+            else if opcode == AFFINE || opcode == CLAMPED_AFFINE {
+                let row = base + c * (p + 1u);
+                var value = 0.0;
+                if p == 3u {
+                    value = dot(vec3<f32>(bitcast<f32>(program[row]), bitcast<f32>(program[row + 1u]), bitcast<f32>(program[row + 2u])), vec3<f32>(values[0], values[1], values[2]));
+                } else {
+                    for (var i = 0u; i < p; i++) { value += bitcast<f32>(program[row + i]) * values[i]; }
+                }
+                value += bitcast<f32>(program[row + p]);
+                if opcode == CLAMPED_AFFINE { value = clamp(value, 0.0, 1.0); }
+                next[c] = value;
+            }
+            else if opcode == CLUT { next[c] = clut_value(base, p, c, &values); }
+            else if opcode == SEGMENTED_CURVES { next[c] = segmented_curve(program[base + c], values[c]); }
+        }
+        if opcode == LAB_TO_XYZ {
+            let fy = (values[0] + 16.0) / 116.0;
+            next[0] = 0.9642 * lab_inverse(fy + values[1] / 500.0);
+            next[1] = lab_inverse(fy);
+            next[2] = 0.8249 * lab_inverse(fy - values[2] / 200.0);
+        } else if opcode == XYZ_TO_LAB {
+            let fx = lab_f(values[0] / 0.9642);
+            let fy = lab_f(values[1]);
+            let fz = lab_f(values[2] / 0.8249);
+            next[0] = 116.0 * fy - 16.0;
+            next[1] = 500.0 * (fx - fy);
+            next[2] = 200.0 * (fy - fz);
+        }
+        values = next;
+    }
+    for (var c = 0u; c < params.extent_channels.w; c++) {
+        output[params.output_offsets[c / 4u][c % 4u] + id.y * params.output_strides[c / 4u][c % 4u] + id.x] = values[c];
     }
 }

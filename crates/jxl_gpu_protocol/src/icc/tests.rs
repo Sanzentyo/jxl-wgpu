@@ -1,5 +1,52 @@
 use super::*;
 
+mod mpe;
+
+fn affine(transform: &IccTransform) -> &IccAffine {
+    let matrices = transform
+        .program()
+        .stages()
+        .iter()
+        .filter_map(|stage| match stage {
+            IccStage::Matrix(matrix) => Some(matrix),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matrices.len(), 1);
+    matrices[0]
+}
+fn matrix(transform: &IccTransform) -> [[f64; 3]; 3] {
+    if !transform
+        .program()
+        .stages()
+        .iter()
+        .any(|s| matches!(s, IccStage::Matrix(_)))
+    {
+        return crate::color::matrix::IDENTITY;
+    }
+    let matrix = affine(transform);
+    std::array::from_fn(|r| {
+        std::array::from_fn(|c| {
+            if r < matrix.offset().len() && c < matrix.input_channels() {
+                matrix.matrix()[r * matrix.input_channels() + c]
+            } else {
+                0.0
+            }
+        })
+    })
+}
+fn offset(transform: &IccTransform) -> [f64; 3] {
+    if !transform
+        .program()
+        .stages()
+        .iter()
+        .any(|s| matches!(s, IccStage::Matrix(_)))
+    {
+        return [0.0; 3];
+    }
+    std::array::from_fn(|c| affine(transform).offset().get(c).copied().unwrap_or(0.0))
+}
+
 fn put32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
 }
@@ -82,7 +129,7 @@ fn exact_colorants_independent_curves_and_original_bytes_survive_selection() {
     assert_eq!(selected.media_white(), [0xf6d6, 65536, 0xd32d]);
     assert_eq!(selected.chromatic_adaptation(), None);
     let transform = IccTransform::new(&profile, &profile, IccRenderingIntent::Relative).unwrap();
-    for (r, row) in transform.matrix().iter().enumerate() {
+    for (r, row) in matrix(&transform).iter().enumerate() {
         for (c, value) in row.iter().enumerate() {
             assert_eq!(*value, f64::from(r == c));
         }
@@ -100,7 +147,14 @@ fn tag_priority_is_directional_and_never_silently_discards_a_lut() {
         (*b"B2D1", IccDirection::PcsToDevice),
     ] {
         let mut tags = rgb_tags();
-        tags.push((signature, element(b"mAB ", &[])));
+        tags.push((
+            signature,
+            if signature[0] == b'D' || signature[2] == b'D' {
+                mpe::identity_mpe(3)
+            } else {
+                element(b"mAB ", &[])
+            },
+        ));
         let profile = parse(profile_bytes(&tags)).unwrap();
         assert_eq!(
             profile.matrix_trc(direction, IccRenderingIntent::Relative),
@@ -125,8 +179,8 @@ fn tag_priority_is_directional_and_never_silently_discards_a_lut() {
         IccRenderingIntent::Saturation,
     ] {
         let transform = IccTransform::new(&profile, &profile, intent).unwrap();
-        assert_eq!(transform.matrix(), &crate::color::matrix::IDENTITY);
-        assert_eq!(transform.offset(), &[0.0; 3]);
+        assert_eq!(matrix(&transform), crate::color::matrix::IDENTITY);
+        assert_eq!(offset(&transform), [0.0; 3]);
     }
 }
 
@@ -264,7 +318,7 @@ fn gray_uses_pcs_y_and_chad_is_preserved_without_double_adaptation() {
     let gray = parse(bytes).unwrap();
     let transform = IccTransform::new(&rgb, &gray, IccRenderingIntent::Relative).unwrap();
     assert_eq!(
-        transform.matrix()[0],
+        matrix(&transform)[0],
         [10000.0 / 65536.0, 50000.0 / 65536.0, 5536.0 / 65536.0]
     );
     assert_eq!(
@@ -272,14 +326,22 @@ fn gray_uses_pcs_y_and_chad_is_preserved_without_double_adaptation() {
             .source()
             .profile()
             .unwrap()
+            .matrix_trc()
+            .unwrap()
             .chromatic_adaptation()
             .unwrap()[1],
         4096
     );
-    assert_eq!(transform.target().curves().len(), 1);
+    assert_eq!(transform.target().channels(), 1);
     let reverse = IccTransform::new(&gray, &rgb, IccRenderingIntent::Relative).unwrap();
     assert_eq!(
-        reverse.source().profile().unwrap().matrix()[0][0],
+        reverse
+            .source()
+            .profile()
+            .unwrap()
+            .matrix_trc()
+            .unwrap()
+            .matrix()[0][0],
         f64::from(0xf6d6) / 65536.0
     );
 }
@@ -291,7 +353,7 @@ fn a_singular_input_matrix_is_usable_forward_but_has_no_inverse() {
     tags[1].1 = element(b"XYZ ", &[0, 0, 0]);
     let source = parse(profile_bytes(&tags)).unwrap();
     let transform = IccTransform::new(&source, &target, IccRenderingIntent::Relative).unwrap();
-    assert!(transform.matrix().iter().all(|row| row[0] == 0.0));
+    assert!(matrix(&transform).iter().all(|row| row[0] == 0.0));
     assert_eq!(
         IccTransform::new(&target, &source, IccRenderingIntent::Relative),
         Err(IccError::Matrix)
@@ -320,10 +382,8 @@ fn linear_connections_honor_directional_tag_priority_intent_and_geometry() {
     for (tag, forward) in [
         (*b"A2B0", true),
         (*b"A2B1", true),
-        (*b"D2B1", true),
         (*b"B2A0", false),
         (*b"B2A1", false),
-        (*b"B2D1", false),
     ] {
         let mut tags = rgb_tags();
         tags.push((tag, element(b"mAB ", &[])));
@@ -355,14 +415,14 @@ fn linear_connections_honor_directional_tag_priority_intent_and_geometry() {
     ] {
         let to = IccTransform::to_linear_rgb(&profile, RgbColorSpace::Bt709, intent).unwrap();
         let from = IccTransform::from_linear_rgb(RgbColorSpace::Bt709, &profile, intent).unwrap();
-        let product = crate::color::matrix::multiply(*from.matrix(), *to.matrix());
+        let product = crate::color::matrix::multiply(matrix(&from), matrix(&to));
         for (r, row) in product.into_iter().enumerate() {
             for (c, value) in row.into_iter().enumerate() {
                 assert!((value - f64::from(r == c)).abs() < 1e-12);
             }
         }
-        assert_eq!(to.offset(), &[0.0; 3]);
-        assert_eq!(from.offset(), &[0.0; 3]);
+        assert_eq!(offset(&to), [0.0; 3]);
+        assert_eq!(offset(&from), [0.0; 3]);
     }
     assert_eq!(
         IccTransform::to_linear_rgb(
@@ -410,7 +470,7 @@ fn every_intent_selects_its_mpe_then_its_lut_then_the_default_lut() {
             if lut != base {
                 tags.push((lut, element(b"mAB ", &[])));
             }
-            tags.push((mpe, element(b"mpet", &[])));
+            tags.push((mpe, self::mpe::identity_mpe(3)));
             for expected in [mpe, lut, base] {
                 if !tags.iter().any(|(signature, _)| *signature == expected) {
                     continue;

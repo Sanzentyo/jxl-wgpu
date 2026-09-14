@@ -8,7 +8,7 @@ compensation. Float native output is clipped to the declared unit output range.
 `tools/jxl_test_support/native/icc/scalar.hpp` independently evaluates the ICC.1:2022 matrix/TRC equations in f64, using Little CMS
 only to read the profile's exact colorant/curve metadata. It uses pivoted elimination and
 analytical roots or exhaustive sampled-segment search. Production Rust/WGSL code is not called.
-See [the execution contract](../../../../docs/ICC_MATRIX_TRC.md) for scope, precision intervals
+See [the execution contract](../../../../docs/ICC_COLOR.md) for scope, precision intervals
 and the two documented Little CMS boundary differences.
 
 The deterministic corpus lives in `../icc`:
@@ -96,3 +96,36 @@ an analytical root in floating point must not discard it in favour of a distant 
 All 223 original files and all 792 earlier embedded/YCbCr/XYB/alpha files reproduce unchanged
 under their respective documented compiler options. In particular, retain the original generator's
 compiler contraction setting: `linear/input.f32le` itself contains multiply/subtract probes.
+
+## Floating-point MPE programs
+
+`mpe.cpp` independently constructs ICC.1:2022 processing elements, including reversed physical
+storage and repeated curve breakpoints, and evaluates their mathematical stages in C++ f64.
+Little CMS 2.19 reopens each exact profile and executes every native connection with
+`NOOPTIMIZE | NOCACHE`. No production parser, GPU shader or GPU output participates in generation.
+
+```sh
+c++ -std=c++17 -Wall -Wextra -Werror -ffp-contract=off \
+  -Itools/jxl_test_support/native \
+  crates/jxl_wgpu/test-data/icc_generator/mpe.cpp \
+  $(pkg-config --cflags --libs lcms2) -o .git/icc-regenerate/mpe
+.git/icc-regenerate/mpe crates/jxl_wgpu_decode/test-data/embedded_icc \
+  .git/icc-regenerate/mpe-corpus
+diff -rq crates/jxl_wgpu/test-data/icc/mpe .git/icc-regenerate/mpe-corpus
+```
+
+The new output directory contains 132 files: ten profiles, one 629-pixel RGB input, a manifest,
+72 native/scalar directional/intent references and 48 decoder references. Records retain the
+same seven-field layout; all native semantics masks are zero. The nine processing profiles cover
+matrices, all three MPE formula forms, implicit sampled endpoints, repeated breakpoints,
+1–5D anisotropic CLUTs, Lab PCS and fifteen intermediate channels. Both signs of zero and
+subnormal boundary probes are retained. A sixteen-channel native intermediate is outside
+Little CMS 2.19's admitted range, independently of the resident backend's sixteen-channel limit.
+
+Primary intervals propagate F32 arithmetic from each stage: affine magnitudes and input bounds,
+curve branch endpoints, CLUT gradients, and Lab operands before cancellation. Large extended-Lab
+values therefore have magnitude-dependent absolute errors. Decoder source bounds remain zero
+for original Modular and 2e-5 for original VarDCT. The separate native CMM interval includes
+`3/65535 * (1 + abs(PCS))` before MPE evaluation for its fixed-PCS/white/curve uncertainty; this
+never widens a primary GPU interval. [The execution contract](../../../../docs/ICC_COLOR.md)
+defines the supported scope and remaining conformance gates.

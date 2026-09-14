@@ -40,7 +40,7 @@ fn every_matrix_intent_preserves_white_black_and_parametric_curve_boundaries() {
                 let transform = IccTransform::new(source_profile, target_profile, intent).unwrap();
                 assert_eq!(transform.source().channels(), source.channels);
                 assert_eq!(transform.target().channels(), target.channels);
-                nonzero_offsets += usize::from(transform.offset().iter().any(|v| *v != 0.0));
+                nonzero_offsets += usize::from(transform.program().stages().iter().any(|stage| matches!(stage, jxl_gpu_protocol::icc::IccStage::Matrix(matrix) if matrix.offset().iter().any(|v| *v != 0.0))));
                 let actual = run(
                     &backend,
                     &pipeline,

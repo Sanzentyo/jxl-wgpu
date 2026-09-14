@@ -226,9 +226,7 @@ fn original_reconstruction_and_linear_presentation_share_one_program_admission()
 
 #[test]
 fn direct_xyb_never_selects_an_unused_original_profile_intent() {
-    use jxl_gpu_protocol::icc::{
-        IccDirection, IccError, IccProfile, IccRenderingIntent, IccSignature,
-    };
+    use jxl_gpu_protocol::icc::{IccDirection, IccError, IccProfile, IccRenderingIntent};
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
     for case in jxl_test_support::fixtures::embedded_icc::cases().filter(|case| case.xyb) {
         let data = case.bytes();
@@ -245,7 +243,7 @@ fn direct_xyb_never_selects_an_unused_original_profile_intent() {
             let mut profile = case.profile();
             profile[64..68].copy_from_slice(&code.to_be_bytes());
             let profile = IccProfile::parse(profile.into(), Default::default()).unwrap();
-            let profile = jxl_test_support::fixtures::icc::with_matrix_mpe(
+            let profile = jxl_test_support::fixtures::icc::with_nonfinite_matrix_mpe(
                 &profile,
                 IccDirection::PcsToDevice,
                 intent,
@@ -277,10 +275,19 @@ fn direct_xyb_never_selects_an_unused_original_profile_intent() {
             .wait()
             .unwrap();
             drop(compositor.pack(&reconstructed).unwrap().wait().unwrap());
-            assert!(
-                matches!(Compositor::new(backend.clone(), extent, &image, &request, ColorUsage::ORIGINAL),
-                Err(Error::Icc(IccError::TransformTag { tag })) if tag == IccSignature([b'B', b'2', b'D', b'0' + code as u8]))
-            );
+            assert!(matches!(
+                Compositor::new(
+                    backend.clone(),
+                    extent,
+                    &image,
+                    &request,
+                    ColorUsage::ORIGINAL
+                ),
+                Err(Error::Icc(IccError::Invalid {
+                    field: "non-finite float",
+                    ..
+                }))
+            ));
             drop(reconstructed);
             drop(source);
             drop(compositor);

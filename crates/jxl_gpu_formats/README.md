@@ -33,7 +33,7 @@ RGB. A single-channel layout is classified as interleaved; with alpha, both inte
 storage are distinct. Gray is color-bearing and never enters the numeric classifier. Storage
 classification is separate from execution capability: stock decoder admission and enumerated
 packing/display still require the remaining ICC/gray integration described in
-[ICC_MATRIX_TRC.md](../../docs/ICC_MATRIX_TRC.md).
+[ICC_COLOR.md](../../docs/ICC_COLOR.md).
 
 ## Portable storage boundary
 
