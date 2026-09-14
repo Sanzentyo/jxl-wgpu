@@ -702,3 +702,13 @@ components, with 192 requested-output presentations. See [ICC color processing](
 `COLOR-01/02`, `IO-01`, `QA-03/06` and the full goal remain **Partial**: legacy LUT methods,
 complete CMYK image plumbing, arbitrary float-range MPE conditioning/overflow, hybrid-profile
 CMM policy conformance, remaining embedded MPE/XYB coverage and HDR/display mapping remain open.
+
+MPE curve range checkpoint: the GPU retains separate significands and exponents across curve
+intermediates, avoiding overflow in powers, exponential multipliers and sampled interval widths.
+Logarithmic increments and differences retain their contribution before a large outer scale;
+computed subnormal inputs survive normalization. Stored subnormals are rejected, empty sampled
+segments retain the next segment's implicit endpoint, and logarithmic metadata endpoints avoid
+overflowing powers. Thirteen independent scalar profiles cover 10,959 components across F32 extrema
+and boundaries (65,754 GPU checks across directions/variants). Earlier native/scalar references
+are unchanged. The feature rows remain **Partial**: entire-segment formula validation, arbitrary
+conditioning and full-range matrix/CLUT/Lab arithmetic still require further work.

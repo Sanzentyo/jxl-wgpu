@@ -289,6 +289,80 @@ void Decoder(const std::vector<Case>& cases, const fs::path& base, const fs::pat
     cmsCloseProfile(source);
   }
 }
+
+// Full-range scalar probes are separate from the native corpus. Little CMS 2.19
+// substitutes +/-1e22 for unbounded segment endpoints (cmstypes.c), so it cannot
+// supply a full-F32-range oracle. These equations use host f64 log1p/sqrt/exp2;
+// they share neither the production scaled arithmetic nor a pixel evaluator.
+void ScalarRange(const fs::path& out) {
+  fs::create_directories(out);
+  const double inf = std::numeric_limits<double>::infinity();
+  const double largest = std::numeric_limits<float>::max(), smallest = std::numeric_limits<float>::min();
+  struct Probe { const char* name; Curve curve; std::function<Value(double)> expected; };
+  auto bounded = [](double value, double magnitude = 0) {
+    return Value{value, 16 * epsilon * (1 + std::max(std::abs(value), magnitude))};
+  };
+  const std::vector<Probe> probes{
+    {"identity", {{inf,0,{1,1,0,0}}}, [](double x) { return Value{x,0}; }},
+    {"half", {{inf,0,{1,.5,0,0}}}, [](double x) { return Value{x/2,static_cast<double>(std::numeric_limits<float>::denorm_min())/2}; }},
+    {"log_square", {{inf,1,{2,1,1,1,0}}}, [=](double x) { return bounded(std::log1p(x*x) / std::log(10.0)); }},
+    {"log_small_increment", {{inf,1,{2,0x1p100,1,1,0}}}, [=](double x) { return bounded(0x1p100 * std::log1p(x*x) / std::log(10.0)); }},
+    {"log_huge_power", {{inf,1,{largest,smallest,1,1,0}}}, [=](double x) {
+      if (x == 0) return bounded(0);
+      const double exponent = largest * std::log(std::abs(x));
+      const double logarithm = std::max(0.0, exponent) + std::log1p(std::exp(-std::abs(exponent)));
+      return bounded(smallest * logarithm / std::log(10.0));
+    }},
+    {"log_difference", {{-1,0,{1,0,0,.25}}, {0,1,{1,0x1p100,1,1,0}}, {std::nextafter(1.f,0.f),1,{1,0x1p100,-1,1,0}}, {inf,0,{1,0,0,.5}}}, [=](double x) {
+      return bounded(x <= -1 ? .25 : x > std::nextafter(1.f,0.f) ? .5 : 0x1p100 * std::log1p(-std::abs(x)) / std::log(10.0));
+    }},
+    {"log_zero_scale", {{inf,1,{2,0,1,1,.5}}}, [=](double) { return bounded(.5); }},
+    {"root_large_product", {{0,0,{1,0,0,0}}, {inf,0,{.5,largest,0,0}}}, [=](double x) { return bounded(x <= 0 ? 0 : std::sqrt(largest * x)); }},
+    {"exponential", {{-1,0,{1,0,0,.25}}, {1,2,{smallest,2,1,140,0}}, {inf,0,{1,0,0,.5}}}, [=](double x) { return bounded(x <= -1 ? .25 : x <= 1 ? std::exp2(14+x) : .5); }},
+    {"exponential_zero_scale", {{inf,2,{0,2,largest,largest,.125}}}, [=](double) { return bounded(.125); }},
+    {"sampled_wide", {{-largest,0,{1,0,0,-largest/2}}, {largest,3,{largest/2}}, {inf,0,{1,0,0,largest/2}}}, [=](double x) { return bounded(x/2, largest); }},
+    {"sampled_narrow", {{-smallest,0,{1,0,0,-.5}}, {smallest,3,{.5}}, {inf,0,{1,0,0,.5}}}, [=](double x) { return bounded(std::clamp(x / (2*smallest), -.5, .5)); }},
+    {"sampled_empty", {{0,0,{1,0,0,.25}}, {0,3,{7,8}}, {1,3,{9}}, {inf,0,{1,0,0,9}}}, [=](double x) { return bounded(x <= 0 ? .25 : x <= 1 ? 8+x : 9); }},
+  };
+  std::vector<float> values{0,-0.0f,std::numeric_limits<float>::denorm_min(),-std::numeric_limits<float>::denorm_min(),
+    std::nextafter(static_cast<float>(smallest),0.0f),static_cast<float>(smallest),-static_cast<float>(smallest),
+    static_cast<float>(largest),-static_cast<float>(largest)};
+  for (unsigned word = 2; word <= 17; ++word) {
+    const float value = std::ldexp(static_cast<float>(word),-149);
+    values.push_back(value); values.push_back(-value);
+  }
+  for (int exponent = -126; exponent <= 127; exponent += 5) {
+    const float x = std::ldexp(.75f,exponent);
+    for (float v : {x,-x,std::nextafter(x,0.0f),std::nextafter(x,std::numeric_limits<float>::infinity())}) values.push_back(v);
+  }
+  for (float x : {-2.f,-1.f,-.5f,0.f,.5f,1.f,2.f,3.f,1e-30f,1e-20f,1e-10f,1e-5f}) {
+    values.push_back(std::nextafter(x,-std::numeric_limits<float>::infinity()));
+    values.push_back(x); values.push_back(std::nextafter(x,std::numeric_limits<float>::infinity()));
+  }
+  Bytes input;
+  for (size_t pixel = 0; pixel < values.size(); ++pixel) for (size_t c = 0; c < 3; ++c) LE(input,Bits(values[(pixel + c*17) % values.size()]));
+  Save(out / "input.f32le",input);
+  std::ofstream manifest(out / "manifest.json");
+  manifest << "{\"width\":" << values.size() << ",\"height\":1,\"profiles\":[";
+  for (size_t i = 0; i < probes.size(); ++i) {
+    const auto& p = probes[i];
+    const Case c{p.name,false,{Curves({p.curve,p.curve,p.curve})}};
+    Save(out / (std::string(p.name) + ".icc"),Profile(c,true));
+    manifest << (i ? "," : "") << "{\"name\":\"" << p.name << "\",\"channels\":3}";
+    Bytes reference;
+    for (size_t pixel = 0; pixel < values.size(); ++pixel) for (size_t channel = 0; channel < 3; ++channel) {
+      const auto value = p.expected(values[(pixel + channel*17) % values.size()]);
+      Check(std::isfinite(value.x) && std::abs(value.x) <= largest && std::isfinite(value.radius),"finite range reference");
+      for (double v : {value.x,value.radius}) {
+        uint64_t word; std::memcpy(&word,&v,8); for (unsigned b = 0; b < 8; ++b) reference.push_back(static_cast<uint8_t>(word >> (b*8)));
+      }
+    }
+    Save(out / (std::string(p.name) + ".reference"),reference);
+  }
+  manifest << "]}\n"; Check(bool(manifest),"write range manifest");
+  std::cout << "independent full-range MPE components: " << probes.size()*values.size()*3 << '\n';
+}
+
 int main(int argc, char** argv) try {
   Check(argc == 3 && !fs::exists(argv[2]), "usage: mpe EMBEDDED_ICC_DIRECTORY NEW_OUTPUT_DIRECTORY"); Check(cmsGetEncodedCMMversion() == 2190, "requires Little CMS 2.19");
   const fs::path out(argv[2]); fs::create_directories(out);
@@ -339,5 +413,6 @@ int main(int argc, char** argv) try {
   }
   manifest << "]}\n"; Check(bool(manifest), "write manifest"); cmsCloseProfile(identity_profile);
   Decoder(cases, argv[1], out / "decoder");
+  ScalarRange(out / "range");
   std::cout << "independent and native MPE components: " << components << '\n';
 } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

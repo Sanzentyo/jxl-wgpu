@@ -1,6 +1,71 @@
 use super::*;
 
 #[test]
+fn full_range_mpe_curves_keep_finite_results_across_large_intermediates() {
+    let Some(backend) = backend() else {
+        return;
+    };
+    let manifest: Manifest = serde_json::from_slice(
+        &std::fs::read(directory().join("mpe/range/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest.profiles.len(), 13);
+    let input = floats("mpe/range/input.f32le");
+    let extent = Extent2d::new(manifest.width, manifest.height);
+    let identity = profile("mpe/identity");
+    let mut components = 0;
+    for variant in [
+        KernelVariant::Scalar,
+        KernelVariant::Lanes32,
+        KernelVariant::Tile16x16,
+    ] {
+        let pipeline = ResidentIccPipeline::with_variant(backend.device(), variant).unwrap();
+        for record in &manifest.profiles {
+            let selected = profile(&format!("mpe/range/{}", record.name));
+            let bytes =
+                std::fs::read(directory().join(format!("mpe/range/{}.reference", record.name)))
+                    .unwrap();
+            let (references, rest) = bytes.as_chunks::<16>();
+            assert!(rest.is_empty());
+            assert_eq!(references.len(), input.len());
+            for reverse in [false, true] {
+                let (source, target) = if reverse {
+                    (&identity, &selected)
+                } else {
+                    (&selected, &identity)
+                };
+                let transform =
+                    IccTransform::new(source, target, IccRenderingIntent::Relative).unwrap();
+                let actual = run(&backend, &pipeline, &transform, extent, &input, 13);
+                for (i, (&value, reference)) in actual.iter().zip(references).enumerate() {
+                    let expected = f64::from_le_bytes(reference[..8].try_into().unwrap());
+                    let radius = f64::from_le_bytes(reference[8..].try_into().unwrap());
+                    assert!(expected.is_finite() && radius.is_finite() && radius >= 0.0);
+                    if record.name == "half" && value != 0.0 {
+                        assert_eq!(
+                            value.to_bits(),
+                            (expected as f32).to_bits(),
+                            "round-to-even subnormal {i}"
+                        );
+                    }
+                    assert!(
+                        value.is_finite() && (f64::from(value) - expected).abs() <= radius,
+                        "{} {variant:?} reverse={reverse}, sample {i}, input {}: GPU {value}, expected {expected} +/- {radius}",
+                        record.name,
+                        input[i]
+                    );
+                    components += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(components, input.len() * 13 * 6);
+    eprintln!(
+        "MPE full-range {components} checked components across both directions and all kernel variants"
+    );
+}
+
+#[test]
 fn native_mpe_programs_match_ordered_scalar_references_in_both_directions() {
     let Some(backend) = backend() else {
         return;

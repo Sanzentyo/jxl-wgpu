@@ -92,8 +92,8 @@ fn parse(data: Reader<'_>, limits: IccLimits) -> Result<IccSegmentedCurve, IccEr
                 }
             }
             b"samf" => {
-                if index == 0 || index + 1 == usize::from(count) || lower == upper {
-                    return invalid("unbounded or zero-width sampled segment", cursor);
+                if index == 0 || index + 1 == usize::from(count) {
+                    return invalid("unbounded sampled segment", cursor);
                 }
                 let count = data.u32(cursor + 8)?;
                 if count == 0 {
@@ -229,7 +229,7 @@ fn endpoint(segment: &IccCurveSegment, x: f32) -> f32 {
             (f64::from(*a) * x + f64::from(*b)).powf(f64::from(*gamma)) + f64::from(*c)
         }
         IccCurveSegmentKind::Logarithmic { gamma, a, b, c, d } => {
-            f64::from(*a) * (f64::from(*b) * x.powf(f64::from(*gamma)) + f64::from(*c)).log10()
+            f64::from(*a) * logarithm(x, f64::from(*gamma), f64::from(*b), f64::from(*c))
                 + f64::from(*d)
         }
         IccCurveSegmentKind::Exponential { a, b, c, d, e } => {
@@ -239,4 +239,38 @@ fn endpoint(segment: &IccCurveSegment, x: f32) -> f32 {
             f64::from(*samples.last().expect("nonempty preceding segment"))
         }
     }) as f32
+}
+
+// Metadata endpoints can have a finite logarithm even when their power exceeds f64.
+// log1p also retains a small argument increment before the profile's outer scale.
+fn logarithm(x: f64, gamma: f64, b: f64, c: f64) -> f64 {
+    if b == 0.0 || (x == 0.0 && gamma > 0.0) {
+        return c.log10();
+    }
+    let power = if gamma == 0.0 {
+        0.0
+    } else {
+        gamma * x.abs().ln()
+    };
+    let term = b.abs().ln() + power;
+    if c == 0.0 {
+        return term / std::f64::consts::LN_10;
+    }
+    let constant = c.abs().ln();
+    let relative = (b.abs() - c.abs()) / c.abs();
+    let coefficient_log = if relative.abs() <= 0.5 {
+        relative.ln_1p()
+    } else {
+        (b.abs() / c.abs()).ln()
+    };
+    let delta = power + coefficient_log;
+    let negative_term = (b < 0.0) != (x < 0.0 && gamma % 2.0 != 0.0);
+    let correction = if negative_term == (c < 0.0) {
+        (-delta.abs()).exp().ln_1p()
+    } else if delta.abs() < 0.5 {
+        (-(-delta.abs()).exp_m1()).ln()
+    } else {
+        (-(-delta.abs()).exp()).ln_1p()
+    };
+    (constant + delta.max(0.0) + correction) / std::f64::consts::LN_10
 }

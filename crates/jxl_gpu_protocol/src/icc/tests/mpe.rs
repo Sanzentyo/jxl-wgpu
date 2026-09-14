@@ -188,6 +188,121 @@ fn shared_segmented_curves_reconstruct_the_implicit_sample_without_clipping() {
 }
 
 #[test]
+fn empty_sampled_segments_keep_their_stored_endpoint_for_the_next_segment() {
+    let mut curve = element(b"curf", &[4 << 16, 0, 0, 1_f32.to_bits()]);
+    curve.extend(formula(0, &[1.0, 1.0, 0.0, 0.25]));
+    curve.extend(element(b"samf", &[2, 7_f32.to_bits(), 8_f32.to_bits()]));
+    curve.extend(element(b"samf", &[1, 9_f32.to_bits()]));
+    curve.extend(formula(0, &[1.0, 1.0, 0.0, 0.0]));
+    let cvst = container(b"cvst", 3, 3, &[curve], &[0, 0, 0]);
+    let selected = select(container(b"mpet", 3, 3, &[cvst], &[0])).unwrap();
+    let IccStage::SegmentedCurves(curves) = &selected.program().stages()[0] else {
+        panic!()
+    };
+    for (index, expected) in [(1, &[0.25, 7.0, 8.0][..]), (2, &[8.0, 9.0][..])] {
+        let IccCurveSegmentKind::Samples(samples) = &curves[0].segments()[index].kind else {
+            panic!()
+        };
+        assert_eq!(&**samples, expected);
+    }
+}
+
+#[test]
+fn logarithmic_metadata_endpoints_do_not_materialize_an_overflowing_power() {
+    let mut curve = element(b"curf", &[3 << 16, 2_f32.to_bits(), 3_f32.to_bits()]);
+    curve.extend(formula(1, &[65536.0, 1.0, 1.0, 1.0, 0.0]));
+    curve.extend(element(b"samf", &[1, 1_f32.to_bits()]));
+    curve.extend(formula(0, &[1.0, 1.0, 0.0, 0.0]));
+    let cvst = container(b"cvst", 3, 3, &[curve], &[0, 0, 0]);
+    let selected = select(container(b"mpet", 3, 3, &[cvst], &[0])).unwrap();
+    let IccStage::SegmentedCurves(curves) = &selected.program().stages()[0] else {
+        panic!()
+    };
+    let IccCurveSegmentKind::Samples(samples) = &curves[0].segments()[1].kind else {
+        panic!()
+    };
+    assert_eq!(samples[0], (65536.0 * std::f64::consts::LOG10_2) as f32);
+}
+
+#[test]
+fn logarithmic_sample_endpoints_retain_small_differences_before_large_scales() {
+    for breakpoint in [f32::MIN_POSITIVE, 0.5] {
+        let mut curve = element(
+            b"curf",
+            &[4 << 16, 0, breakpoint.to_bits(), 1_f32.to_bits()],
+        );
+        curve.extend(formula(0, &[1.0, 0.0, 0.0, 0.0]));
+        curve.extend(formula(1, &[1.0, f32::MAX, -1.0, 1.0, 0.0]));
+        curve.extend(element(b"samf", &[1, 1_f32.to_bits()]));
+        curve.extend(formula(0, &[1.0, 0.0, 0.0, 1.0]));
+        let cvst = container(b"cvst", 3, 3, &[curve], &[0, 0, 0]);
+        let selected = select(container(b"mpet", 3, 3, &[cvst], &[0])).unwrap();
+        let IccStage::SegmentedCurves(curves) = &selected.program().stages()[0] else {
+            panic!()
+        };
+        let IccCurveSegmentKind::Samples(samples) = &curves[0].segments()[2].kind else {
+            panic!()
+        };
+        let expected =
+            f64::from(f32::MAX) * (-f64::from(breakpoint)).ln_1p() / std::f64::consts::LN_10;
+        assert_eq!(samples[0], expected as f32);
+    }
+}
+
+#[test]
+fn stored_mpe_floats_exclude_subnormals_but_allow_signed_zero_and_normal_extremes() {
+    for value in [
+        0.0,
+        -0.0,
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        f32::MAX,
+        -f32::MAX,
+        f32::from_bits(1),
+        -f32::from_bits(1),
+        f32::MIN_POSITIVE.next_down(),
+        -f32::MIN_POSITIVE.next_down(),
+    ] {
+        let mut matrix = matrix_element(3, 3);
+        put32(&mut matrix, 12, value.to_bits());
+        let mut curve = element(b"curf", &[1 << 16]);
+        curve.extend(formula(0, &[1.0, 0.0, value, 0.0]));
+        let curves = container(b"cvst", 3, 3, &[curve], &[0, 0, 0]);
+        let mut clut = header(b"clut", 3, 3);
+        clut.extend([2; 3]);
+        clut.resize(28 + 8 * 3 * 4, 0);
+        put32(&mut clut, 28, value.to_bits());
+        for stage in [matrix, curves, clut] {
+            let result = select(container(b"mpet", 3, 3, &[stage], &[0]));
+            if value.is_subnormal() {
+                assert!(matches!(
+                    result,
+                    Err(IccError::Invalid {
+                        field: "subnormal stored float",
+                        ..
+                    })
+                ));
+            } else {
+                assert!(result.is_ok(), "stored {value}: {result:?}");
+            }
+        }
+    }
+    for offset in [12, 60] {
+        // A breakpoint and an explicitly stored sample.
+        let mut curve = segmented();
+        put32(&mut curve, offset, f32::from_bits(1).to_bits());
+        let cvst = container(b"cvst", 3, 3, &[curve], &[0, 0, 0]);
+        assert!(matches!(
+            select(container(b"mpet", 3, 3, &[cvst], &[0])),
+            Err(IccError::Invalid {
+                field: "subnormal stored float",
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
 fn clut_dimensions_payloads_and_sampled_curves_are_bounded_and_validated() {
     let mut clut = header(b"clut", 3, 3);
     clut.extend([255; 16]);

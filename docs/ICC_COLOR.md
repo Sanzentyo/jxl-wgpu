@@ -166,7 +166,7 @@ until the last submitted consumer completes.
 
 Inputs must be finite. Legacy ICC device curves clamp their domain and range to [0,1]. MPE
 formulas and matrices do not impose that clipping; a CLUT clamps only its input coordinates.
-All pixel arithmetic and uploaded coefficients use F32. The backend checks finite matrix lowering
+Pixel arithmetic retains F32 significand precision, and uploaded coefficients use F32. The backend checks finite matrix lowering
 and the existing legacy parametric-power bound. Full-range overflow/conditioning coverage for
 arbitrary MPE formulas remains a conformance gate, not an established HDR guarantee.
 
@@ -181,10 +181,22 @@ compare equal, and the first segment containing a repeated breakpoint owns that 
 
 The MPE parser covers `matf`, `cvst` with all three formula forms and sampled segments, `clut`,
 and the required `bACS`/`eACS` pass-through elements. It checks position-table ranges, alignment,
-zero padding, whole-element sharing, execution order, channel continuity, finite stored numbers,
+zero padding, whole-element sharing, execution order, channel continuity, valid stored numbers,
 curve domains, sample counts and table products before payload allocation. Sampled segments
 reconstruct their implicit initial metadata value from the preceding segment. No CPU image
 samples or pixel CMS are used. Shared curve/element ranges retain shared immutable storage.
+Stored `float32Number` values reject subnormals as well as infinities/NaNs (ICC.1 section 4.3);
+computed subnormals remain valid inputs to the resident interpreter. An empty sampled segment
+is never selected, but retains its final stored sample for the following segment's implicit
+endpoint. Logarithmic metadata endpoints do not materialize a potentially overflowing power.
+
+MPE curves keep an F32 significand and separate integer exponent for intermediate arithmetic.
+This avoids overflow in affine power bases, exponential multipliers and sampled interval widths.
+Logarithmic curves combine signed terms in the logarithmic domain; small `log1p` increments
+are retained before the outer scale. Near unity, a bounded atanh series avoids subtracting
+rounded logarithms; the complementary exponential also uses a bounded series near cancellation.
+Final conversion rounds subnormals with integer bits, and zero formula scales
+avoid evaluating irrelevant powers. Curve evaluation remains entirely on the GPU.
 
 Default MPE limits are 4,096 processing elements, sixteen processing channels, 4,096 segments
 per curve and 4,194,304 CLUT component values, in addition to the profile/tag/sample limits above.
@@ -214,7 +226,19 @@ reference pixels and three MPE targets. Source uncertainty stays zero for origin
 2e-5 for original VarDCT. Their 22,032 components are checked through 192 decoder presentations
 covering planar/interleaved output and whole/fragmented input, with exact alpha, held-output
 rereads and final budget release. Native CMM fixed-PCS uncertainty is propagated separately;
-it never enlarges the primary GPU interval. The complete MPE corpus contains 132 files.
+it never enlarges the primary GPU interval. This native/scalar portion contains 132 files.
+
+A separate 28-file `range` corpus adds thirteen profiles and 10,959 independent scalar components,
+checked 65,754 times across both directions and all kernel variants. It includes full F32
+extrema, computed subnormals, large intermediate powers/products, logarithmic cancellation and
+small increments with large outer scales, zero scales, wide/narrow sampled intervals and empty
+sampled segments. Identity values and rounded halves are exact; other intervals are derived
+before GPU execution with explicit cancellation conditioning. Little CMS's finite substitutes
+for infinite segment endpoints prevent using it as a full-range oracle. See the
+[range equations and bounds](../crates/jxl_wgpu/test-data/icc_generator/README.md).
+This improves execution of representable results; it does not prove that every admitted formula
+has a finite result across its entire segment. Complete formula-range validation, arbitrary
+ill-conditioning, and full-range matrix/CLUT/Lab arithmetic remain open.
 
 ## Evidence and precision
 

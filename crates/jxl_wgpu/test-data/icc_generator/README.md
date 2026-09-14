@@ -114,7 +114,7 @@ c++ -std=c++17 -Wall -Wextra -Werror -ffp-contract=off \
 diff -rq crates/jxl_wgpu/test-data/icc/mpe .git/icc-regenerate/mpe-corpus
 ```
 
-The new output directory contains 132 files: ten profiles, one 629-pixel RGB input, a manifest,
+The native/scalar portion contains 132 files: ten profiles, one 629-pixel RGB input, a manifest,
 72 native/scalar directional/intent references and 48 decoder references. Records retain the
 same seven-field layout; all native semantics masks are zero. The nine processing profiles cover
 matrices, all three MPE formula forms, implicit sampled endpoints, repeated breakpoints,
@@ -129,3 +129,24 @@ for original Modular and 2e-5 for original VarDCT. The separate native CMM inter
 `3/65535 * (1 + abs(PCS))` before MPE evaluation for its fixed-PCS/white/curve uncertainty; this
 never widens a primary GPU interval. [The execution contract](../../../../docs/ICC_COLOR.md)
 defines the supported scope and remaining conformance gates.
+
+The `range` subdirectory adds 28 files (160 total): thirteen processing profiles, a 281-pixel
+RGB input, a manifest and thirteen independent scalar references. Each reference record stores
+two little-endian f64 values: the mathematical result and its absolute error radius. These
+probes deliberately exceed Little CMS 2.19's `-1e22`/`+1e22` substitutes for unbounded curve
+endpoints in [`cmstypes.c`](https://github.com/mm2/Little-CMS/blob/lcms2.19/src/cmstypes.c).
+They have no native-CMM comparison claim; the earlier 132 files and their native assertions
+remain unchanged. The scalar equations use f64 `log1p`, `sqrt` and `exp2`, independently of
+the production GPU's separated significand/exponent arithmetic.
+
+The 10,959 scalar components cover signed zero, computed subnormals, normal exponent bins,
+both finite extrema, large powers/products, logarithm increments/differences with large outer
+scales, zero scales, sampled domains spanning both extrema or only the minimum normals, and
+empty sampled segments. Identity has zero radius; halving allows half the minimum subnormal
+and separately checks rounding to even. Other radii are
+`16 * 4e-7 * (1 + max(abs(result), conditioning_magnitude))`, a fixed F32 arithmetic budget
+for these equations, including transcendental lowering and interpolation. The wide sampled curve uses
+`MAX_F32` as its conditioning magnitude, accounting for cancellation of large endpoint values;
+it does not promise small relative output error near the midpoint. All radii are calculated
+before GPU execution. Tests require finite results in both directions and all three kernel
+variants, checking 65,754 components and the existing buffer guards.

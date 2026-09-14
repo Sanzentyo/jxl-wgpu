@@ -170,16 +170,182 @@ fn inverse_curve(base: u32, value: f32) -> f32 {
     return upper_x;
 }
 
-// MPE formulas are not bounded ICC device TRCs. Integer powers retain negative bases.
-fn real_power(x: f32, g: f32) -> f32 {
-    if g == 0.0 { return 1.0; }
-    if g == 1.0 { return x; }
-    if x == 0.0 && g > 0.0 { return 0.0; }
-    if x < 0.0 {
-        let odd = g - 2.0 * floor(g * 0.5) != 0.0;
-        return select(1.0, -1.0, odd) * pow(-x, g);
+// MPE intermediates can exceed F32 even when the final result is representable.
+// Keep F32 significand precision with a separate exponent until the element output.
+// Bit normalization also preserves computed subnormals on GPUs that flush arithmetic.
+struct ScaledFloat { significand: f32, exponent: i32 }
+
+fn scaled(value: f32) -> ScaledFloat {
+    let bits = bitcast<u32>(value);
+    let magnitude = bits & 0x7fffffffu;
+    if magnitude == 0u { return ScaledFloat(value, 0); }
+    let encoded_exponent = magnitude >> 23u;
+    var fraction = magnitude & 0x7fffffu;
+    var exponent = i32(encoded_exponent) - 127;
+    if encoded_exponent == 0u {
+        let shift = countLeadingZeros(fraction) - 8u;
+        fraction = (fraction << shift) & 0x7fffffu;
+        exponent = -126 - i32(shift);
     }
-    return pow(x, g);
+    return ScaledFloat(bitcast<f32>((bits & 0x80000000u) | 0x3f800000u | fraction), exponent);
+}
+
+fn scaled_add(a: ScaledFloat, b: ScaledFloat) -> ScaledFloat {
+    if a.significand == 0.0 { return b; }
+    if b.significand == 0.0 { return a; }
+    var larger = a;
+    var smaller = b;
+    if a.exponent < b.exponent { larger = b; smaller = a; }
+    let distance = larger.exponent - smaller.exponent;
+    if distance > 25 { return larger; }
+    let factor = bitcast<f32>(u32(127 - distance) << 23u);
+    var result = scaled(larger.significand + smaller.significand * factor);
+    result.exponent += larger.exponent;
+    return result;
+}
+
+fn scaled_multiply(a: ScaledFloat, b: ScaledFloat) -> ScaledFloat {
+    var result = scaled(a.significand * b.significand);
+    result.exponent += a.exponent + b.exponent;
+    return result;
+}
+
+fn scaled_divide(a: ScaledFloat, b: ScaledFloat) -> ScaledFloat {
+    var result = scaled(a.significand / b.significand);
+    result.exponent += a.exponent - b.exponent;
+    return result;
+}
+
+fn scaled_value(value: ScaledFloat) -> f32 {
+    let bits = bitcast<u32>(value.significand);
+    let sign = bits & 0x80000000u;
+    if value.significand == 0.0 { return bitcast<f32>(sign); }
+    if value.exponent > 127 { return bitcast<f32>(sign | 0x7f800000u); }
+    if value.exponent >= -126 {
+        return bitcast<f32>(sign | (u32(value.exponent + 127) << 23u) | (bits & 0x7fffffu));
+    }
+    if value.exponent < -150 { return bitcast<f32>(sign); }
+    let shift = u32(-126 - value.exponent);
+    let significand = (bits & 0x7fffffu) | 0x800000u;
+    var rounded = significand >> shift;
+    let remainder = significand & ((1u << shift) - 1u);
+    let half = 1u << (shift - 1u);
+    if remainder > half || (remainder == half && (rounded & 1u) != 0u) { rounded++; }
+    return bitcast<f32>(sign | rounded);
+}
+
+fn log2_near_ratio(z: f32) -> f32 {
+    // log((1+z)/(1-z)) = 2*atanh(z). For |z| <= 1/3 the omitted
+    // base-2 terms are below 1.5e-11; the small numerator never cancels a rounded log.
+    let square = z * z;
+    var series = 1.0 / 19.0;
+    for (var denominator = 17; denominator >= 1; denominator -= 2) {
+        series = 1.0 / f32(denominator) + square * series;
+    }
+    return (2.0 / log(2.0)) * z * series;
+}
+
+fn scaled_log2(value: ScaledFloat) -> f32 {
+    if value.exponent == -1 || value.exponent == 0 {
+        let x = abs(value.significand) * select(1.0, 0.5, value.exponent == -1);
+        return log2_near_ratio((x - 1.0) / (x + 1.0));
+    }
+    return f32(value.exponent) + log2(abs(value.significand));
+}
+
+fn scaled_log_ratio(a: ScaledFloat, b: ScaledFloat) -> f32 {
+    let numerator = ScaledFloat(abs(a.significand), a.exponent);
+    let denominator = ScaledFloat(abs(b.significand), b.exponent);
+    let ratio = scaled_divide(numerator, denominator);
+    if ratio.exponent == -1 || ratio.exponent == 0 {
+        let difference = scaled_add(numerator, ScaledFloat(-denominator.significand, denominator.exponent));
+        let sum = scaled_add(numerator, denominator);
+        return log2_near_ratio(scaled_value(scaled_divide(difference, sum)));
+    }
+    return scaled_log2(ratio);
+}
+
+fn scaled_exp2(value: ScaledFloat) -> ScaledFloat {
+    // No finite F32 multiplier or offset can rescue a power beyond these bounds.
+    // Logarithmic curves never materialize their power and do not use this cutoff.
+    if value.significand != 0.0 && value.exponent >= 10 {
+        if value.significand < 0.0 { return scaled(0.0); }
+        return ScaledFloat(1.0, 4096);
+    }
+    let exponent = scaled_value(value);
+    let whole = floor(exponent);
+    var result = scaled(exp2(exponent - whole));
+    result.exponent += i32(whole);
+    return result;
+}
+
+fn scaled_power(base: ScaledFloat, gamma: ScaledFloat) -> ScaledFloat {
+    if gamma.significand == 0.0 { return scaled(1.0); }
+    if gamma.significand == 1.0 && gamma.exponent == 0 { return base; }
+    if base.significand == 0.0 { return scaled(0.0); }
+    let integral_log = scaled_multiply(gamma, scaled(f32(base.exponent)));
+    var result: ScaledFloat;
+    if base.exponent == -1 || base.exponent == 0 {
+        result = scaled_exp2(scaled_multiply(gamma, scaled(scaled_log2(base))));
+    } else if integral_log.significand == 0.0 || integral_log.exponent < 10 {
+        // Separate the integral exponent before adding the fractional logarithm.
+        // Rounding log2(MAX_F32^2) to 256 would otherwise make its square root infinite.
+        let integral = scaled_value(integral_log);
+        let whole = floor(integral);
+        let fractional = scaled_multiply(gamma, scaled(log2(abs(base.significand))));
+        result = scaled_exp2(scaled_add(scaled(integral - whole), fractional));
+        result.exponent += i32(whole);
+    } else {
+        result = scaled_exp2(scaled_multiply(gamma, scaled(scaled_log2(base))));
+    }
+    if base.significand < 0.0 {
+        let g = scaled_value(gamma);
+        if g - 2.0 * floor(g * 0.5) != 0.0 { result.significand = -result.significand; }
+    }
+    return result;
+}
+
+fn logarithmic_argument(x: f32, gamma: f32, b: f32, c: f32) -> ScaledFloat {
+    let sx = scaled(x);
+    if b == 0.0 || (sx.significand == 0.0 && gamma > 0.0) {
+        return scaled(scaled_log2(scaled(c)));
+    }
+    var power_log = scaled(0.0);
+    if gamma != 0.0 { power_log = scaled_multiply(scaled(gamma), scaled(scaled_log2(sx))); }
+    if c == 0.0 { return scaled_add(scaled(scaled_log2(scaled(b))), power_log); }
+    let constant_log = scaled(scaled_log2(scaled(c)));
+    let delta = scaled_add(power_log, scaled(scaled_log_ratio(scaled(b), scaled(c))));
+    var larger = scaled_add(constant_log, delta);
+    if delta.significand < 0.0 { larger = constant_log; }
+    let absolute_delta = ScaledFloat(abs(delta.significand), delta.exponent);
+    let odd = gamma - 2.0 * floor(gamma * 0.5) != 0.0;
+    let negative_term = (b < 0.0) != (sx.significand < 0.0 && odd);
+    let same_sign = negative_term == (c < 0.0);
+    if absolute_delta.significand != 0.0 && (absolute_delta.exponent > 2 || (absolute_delta.exponent == 2 && absolute_delta.significand > 1.25)) {
+        // A small log1p term may become significant after multiplication by a large a.
+        // Preserve it in scaled form; forming 1 + ratio would round it away.
+        let ratio = scaled_exp2(ScaledFloat(-absolute_delta.significand, absolute_delta.exponent));
+        let t = scaled_value(ratio);
+        let sign = select(-1.0, 1.0, same_sign);
+        let series = 1.0 + t * (-sign * 0.5 + t * (1.0 / 3.0 + t * (-sign * 0.25 + t / 5.0)));
+        let correction = scaled_multiply(ratio, scaled(sign * series / log(2.0)));
+        return scaled_add(larger, correction);
+    }
+    let distance = scaled_value(absolute_delta);
+    if same_sign {
+        return scaled_add(larger, scaled(log2(1.0 + exp2(-distance))));
+    }
+    // log(1-exp(-u)) must not lose a small, positive difference to rounding at 1.
+    // The fourth-degree series has remainder below 1.4e-9 for 0 <= u <= 1/16.
+    let u = distance * log(2.0);
+    var correction = 0.0;
+    if u < 0.0625 {
+        let ratio = 1.0 + u * (-0.5 + u * (1.0 / 6.0 + u * (-1.0 / 24.0 + u / 120.0)));
+        correction = scaled_log2(absolute_delta) + log2(log(2.0)) + log2(ratio);
+    } else {
+        correction = log2(1.0 - exp2(-distance));
+    }
+    return scaled_add(larger, scaled(correction));
 }
 
 fn float_order(value: f32) -> u32 {
@@ -207,20 +373,34 @@ fn segmented_curve(base: u32, x: f32) -> f32 {
         let upper = bitcast<f32>(program[record]);
         let count = program[record + 3u];
         let samples = program[record + 9u];
-        let t = clamp((x - lower) / (upper - lower), 0.0, 1.0);
+        let numerator = scaled_add(scaled(x), scaled(-lower));
+        let denominator = scaled_add(scaled(upper), scaled(-lower));
+        let t = clamp(scaled_value(scaled_divide(numerator, denominator)), 0.0, 1.0);
         if t == 0.0 { return bitcast<f32>(program[samples]); }
         if t == 1.0 { return bitcast<f32>(program[samples + count - 1u]); }
         let position = sample_position(t, count - 1u);
-        return mix(bitcast<f32>(program[samples + position.left]), bitcast<f32>(program[samples + position.left + 1u]), position.weight);
+        let a = scaled(bitcast<f32>(program[samples + position.left]));
+        let b = scaled(bitcast<f32>(program[samples + position.left + 1u]));
+        return scaled_value(scaled_add(scaled_multiply(a, scaled(1.0 - position.weight)), scaled_multiply(b, scaled(position.weight))));
     }
     let p0 = bitcast<f32>(program[record + 4u]);
     let p1 = bitcast<f32>(program[record + 5u]);
     let p2 = bitcast<f32>(program[record + 6u]);
     let p3 = bitcast<f32>(program[record + 7u]);
     let p4 = bitcast<f32>(program[record + 8u]);
-    if mode == 0u { return real_power(p1 * x + p2, p0) + p3; }
-    if mode == 1u { return p1 * log2(p2 * real_power(x, p0) + p3) / log2(10.0) + p4; }
-    return p0 * real_power(p1, p2 * x + p3) + p4;
+    if mode == 0u {
+        let base_value = scaled_add(scaled_multiply(scaled(p1), scaled(x)), scaled(p2));
+        return scaled_value(scaled_add(scaled_power(base_value, scaled(p0)), scaled(p3)));
+    }
+    if mode == 1u {
+        if p1 == 0.0 { return p4; }
+        let logarithm = logarithmic_argument(x, p0, p2, p3);
+        let scale = scaled_multiply(scaled(p1), scaled(1.0 / log2(10.0)));
+        return scaled_value(scaled_add(scaled_multiply(scale, logarithm), scaled(p4)));
+    }
+    if p0 == 0.0 { return p4; }
+    let exponent = scaled_add(scaled_multiply(scaled(p2), scaled(x)), scaled(p3));
+    return scaled_value(scaled_add(scaled_multiply(scaled(p0), scaled_power(scaled(p1), exponent)), scaled(p4)));
 }
 
 fn clut_value(base: u32, dimensions: u32, channel: u32, values: ptr<function, array<f32, 16>>) -> f32 {

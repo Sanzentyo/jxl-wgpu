@@ -242,6 +242,10 @@ impl<'a> Reader<'a> {
         if !value.is_finite() {
             return invalid("non-finite float", offset);
         }
+        // ICC.1 section 4.3 excludes subnormals from stored float32Number values.
+        if value.is_subnormal() {
+            return invalid("subnormal stored float", offset);
+        }
         Ok(value)
     }
 
