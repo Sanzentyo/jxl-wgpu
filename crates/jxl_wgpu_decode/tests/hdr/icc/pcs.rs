@@ -32,7 +32,7 @@ fn hdr_original_and_composed_sources_reach_relative_icc_pcs_with_image_luminance
                     .unwrap()
                     .with_alpha_output_policy(AlphaOutputPolicy::Preserve)
                     .with_icc_rendering_intent(IccRenderingIntent::Relative);
-                let actual = frames(&backend, &case.bytes(), request, planar, 4, bounded);
+                let actual = frames::read(&backend, &case.bytes(), request, planar, 4, bounded);
                 assert_eq!(actual.len(), case.frame_count());
                 for (frame, actual) in actual.iter().enumerate() {
                     assert_eq!(actual.len(), case.frame_words());

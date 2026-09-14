@@ -31,6 +31,46 @@ pub fn directory() -> std::path::PathBuf {
 }
 
 impl Case {
+    /// Native unreferenced XYB reconstruction or the independent original-ICC scalar reference,
+    /// expanded to RGBA. Values use the fixture's unchanged image intensity.
+    pub fn linear_reference(self) -> Vec<f32> {
+        let bytes = if self.xyb {
+            std::fs::read(
+                directory()
+                    .parent()
+                    .unwrap()
+                    .join("embedded_icc_xyb")
+                    .join(format!("{}.linear.native.f32le", self.name())),
+            )
+            .unwrap()
+        } else {
+            crate::offline::unhex(
+                &std::fs::read_to_string(
+                    directory().join(format!("{}.linear.scalar.f32.hex", self.name())),
+                )
+                .unwrap(),
+            )
+        };
+        let values: Vec<_> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| f32::from_le_bytes(*v))
+            .collect();
+        let rgba = if self.xyb && self.gray {
+            values
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|p| [p[0], p[0], p[0], p[1]])
+                .collect()
+        } else {
+            values
+        };
+        assert_eq!(rgba.len(), 17 * 9 * 4);
+        rgba
+    }
+
     fn color_name(self) -> &'static str {
         if self.gray { "gray" } else { "rgb" }
     }

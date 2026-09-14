@@ -9,6 +9,7 @@ const CLAMPED_AFFINE: u32 = 7u;
 const MULTILINEAR_CLUT: u32 = 8u;
 const BLACK_POINT_CONNECTION: u32 = 9u;
 const RGB_TRANSFER: u32 = 10u;
+const TONE_MAPPING: u32 = 11u;
 
 override wg_x: u32 = 16u;
 override wg_y: u32 = 16u;
@@ -652,6 +653,19 @@ fn process_program(start: u32, input_values: array<f32, 16>) -> array<f32, 16> {
             var converted: vec3<f32>;
             if program[base + 2u] != 0u { converted = display_to_linear(rgb, transfer, gamma, intensity, luminance); }
             else { converted = display_from_linear(rgb, transfer, gamma, intensity, luminance); }
+            next[0] = converted.x;
+            next[1] = converted.y;
+            next[2] = converted.z;
+        } else if opcode == TONE_MAPPING {
+            var tone: ToneMappingParams;
+            tone.range = vec4<f32>(bitcast<f32>(program[base]), bitcast<f32>(program[base + 1u]),
+                bitcast<f32>(program[base + 2u]), bitcast<f32>(program[base + 3u]));
+            tone.curve = vec4<f32>(bitcast<f32>(program[base + 4u]), bitcast<f32>(program[base + 5u]),
+                bitcast<f32>(program[base + 6u]), bitcast<f32>(program[base + 7u]));
+            tone.knee = vec4<f32>(bitcast<f32>(program[base + 8u]), bitcast<f32>(program[base + 9u]),
+                bitcast<f32>(program[base + 10u]), bitcast<f32>(program[base + 11u]));
+            let converted = tone_map_light(vec3<f32>(values[0], values[1], values[2]),
+                vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.9642, 1.0, 0.8249), tone);
             next[0] = converted.x;
             next[1] = converted.y;
             next[2] = converted.z;

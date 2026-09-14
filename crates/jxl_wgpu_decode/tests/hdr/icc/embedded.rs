@@ -18,42 +18,10 @@ fn embedded_rgb_gray_icc_and_xyb_output_hdr_against_independent_linear_reference
                 .intensity_target
                 .to_f32(),
         );
-        let bytes = if case.xyb {
-            std::fs::read(
-                embedded::directory()
-                    .parent()
-                    .unwrap()
-                    .join("embedded_icc_xyb")
-                    .join(format!("{}.linear.native.f32le", case.name())),
-            )
-            .unwrap()
-        } else {
-            jxl_test_support::offline::unhex(
-                &std::fs::read_to_string(
-                    embedded::directory().join(format!("{}.linear.scalar.f32.hex", case.name())),
-                )
-                .unwrap(),
-            )
-        };
-        let values: Vec<_> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|word| f32::from_le_bytes(*word))
-            .collect();
-        let rgba: Vec<_> = if case.xyb && case.gray {
-            values
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .flat_map(|p| [p[0], p[0], p[0], p[1]])
-                .collect()
-        } else {
-            values
-        };
-        assert_eq!(rgba.len(), 17 * 9 * 4);
+        let rgba = case.linear_reference();
         for nits in [100, 255, 1000, 4000] {
-            let data = corpus::intensity::replace(&data, nits);
+            use jxl_test_support::fixtures::tone_mapping::{Metadata, replace};
+            let data = replace(&data, Metadata::intensity(nits));
             let independent = jxl_oxide::JxlImage::read_with_defaults(data.as_slice()).unwrap();
             assert_eq!(
                 independent
@@ -85,7 +53,7 @@ fn embedded_rgb_gray_icc_and_xyb_output_hdr_against_independent_linear_reference
                             let request = GpuOutputRequest::color(format.clone())
                                 .unwrap()
                                 .with_alpha_output_policy(AlphaOutputPolicy::Preserve);
-                            let actual = frames(&backend, &data, request, planar, 4, bounded);
+                            let actual = frames::read(&backend, &data, request, planar, 4, bounded);
                             assert_eq!(actual.len(), 1);
                             for (p, pixel) in actual[0].as_chunks::<4>().0.iter().enumerate() {
                                 let original =

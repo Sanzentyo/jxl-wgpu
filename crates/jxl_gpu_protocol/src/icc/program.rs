@@ -88,6 +88,8 @@ pub enum IccStage {
         intensity: Option<crate::DisplayIntensity>,
         to_linear: bool,
     },
+    /// Map PCS Y luminance after rendering-intent connection and before target device curves.
+    ToneMapping(crate::ToneMapping),
     /// CIE Lab in physical units (L*, a*, b*) to PCS XYZ, without unit-range clipping.
     LabToXyz,
     XyzToLab,
@@ -106,6 +108,7 @@ impl IccStage {
             Self::LabToXyz
             | Self::XyzToLab
             | Self::BlackPointConnection(_)
+            | Self::ToneMapping(_)
             | Self::RgbTransfer { .. } => 3,
         }
     }

@@ -103,7 +103,7 @@ Requested color conversion uses a selected immutable program shared across physi
 upload is lazy, budgeted and retryable; each dispatch retains its uploaded program through GPU
 completion even if the image session is dropped. Intermediate color surfaces, unchanged extra
 planes, output words, the 320-byte ICC dispatch storage, optional four-byte validation word
-and the 96-byte numeric, 240-byte RGB/Gray or 320-byte device packing uniform are all accounted.
+and the 96-byte numeric, 288-byte RGB/Gray or 320-byte device packing uniform are all accounted.
 No frame readback or CPU pixel CMS is involved. `GpuOutputRequest::with_icc_rendering_intent`
 defaults to relative colorimetric; non-Bradford conversion and unsupported selected methods return errors.
 Exact same-profile packing does not select a CMS method and therefore does not require an
@@ -616,3 +616,13 @@ The declared matrix-shaper CMM connection policy is independently checked agains
 [`cmscnvrt.c`](https://github.com/mm2/Little-CMS/blob/lcms2.19/src/cmscnvrt.c),
 [`cmssamp.c`](https://github.com/mm2/Little-CMS/blob/lcms2.19/src/cmssamp.c) and
 [`cmsio1.c`](https://github.com/mm2/Little-CMS/blob/lcms2.19/src/cmsio1.c).
+
+## Requested tone mapping
+
+`IccTransform::with_tone_mapping` adds one shared GPU luminance stage after the selected PCS intent
+connection and before target device curves. RGB endpoints acquire the explicit source/target
+intensities. Same-profile output now selects a conversion when tone mapping is requested;
+complete CMYK output retains generated K separately from the original Black extra. Dynamic
+black detection, program caching, exact admission and cancellation keep their existing ownership
+contract. The 48-byte payload uses opcode 11; dispatch storage remains 320 bytes. The separate
+RGB output uniform is 288 bytes. See [the policy and scope of pixel evidence](TONE_MAPPING.md).

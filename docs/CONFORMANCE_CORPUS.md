@@ -208,7 +208,7 @@ declarations, undefined primaries/specifications/transfers, sensor primaries, mu
 variant; an unspecified exponent cannot be constructed.
 
 The Rust/WGSL ABI gate parses the shader with Naga and reflects the complete uniform field order.
-Compile-time assertions independently fix `ImageOutputUniform` at 240 bytes and its three padded
+Compile-time assertions independently fix `ImageOutputUniform` at 288 bytes and its three padded
 matrix rows at offsets 128, 144, and 160. No test searches shader source text.
 
 The same-queue display gate then consumes stored BT.2020 PQ, BT.2020 SDR-OETF, Display-P3 HLG, and
@@ -622,7 +622,7 @@ and explicit-sRGB `djxl` PFM is independently converted by the development-only 
 `jxl_gpu_formats::convert_rgb_f32` oracle after any required SDR transfer conversion.
 
 Every case runs whole-input blocking and fragmented-input async completion with a 256-byte entropy
-cap. Exact layout metadata, shared 400-byte output/source uniform accounting, four-byte-rounded
+cap. Exact layout metadata, shared 448-byte output/source uniform accounting, four-byte-rounded
 output leases, zero unused sample bits and plane gaps, equality between upload policies, and full
 budget release are required. Comparisons operate on stored sample codes rather than individual
 bytes, including 16-bit words and 10/12-bit alignment. On Apple M5/Metal (2026-09-07), the maximum
@@ -1706,7 +1706,7 @@ packing; NV12 and odd-width YUYV/UYVY use the shared scalar layout oracle, inclu
 final-luma alpha. Both compare within one stored code and check zero padding bits. Low-level output
 tests reject association conversion without an alpha
 binding before allocation, while existing ABI tests parse and validate the enlarged common
-240-byte uniform. Production still has no CPU image-domain fallback. Floating source samples remain
+288-byte uniform. Production still has no CPU image-domain fallback. Floating source samples remain
 a completion gate; the all-channel composition extension below adds integer extras and
 associated/resampled composition cross-products.
 
@@ -1883,8 +1883,8 @@ alpha scaling removed before comparison. Native outputs use one code of Modular 
 and checks high-depth padding. No production CPU codec or image readback was introduced.
 
 A GPU unit test independently isolates the packer: output admission succeeds with one byte less
-than the required uniform+ink metadata, then metadata admission fails with exactly 400 bytes for
-five inks or 240 bytes for Preserve. Repeating failure rolls back output reservations; releasing
+than the required uniform+ink metadata, then metadata admission fails with exactly 448 bytes for
+five inks or 288 bytes for Preserve. Repeating failure rolls back output reservations; releasing
 pressure allows retry. Dropping pending work retains all inputs and metadata until GPU completion,
 then only a caller-held output lease remains. `SpotColor` has compile-time 32-byte size, 16-byte
 alignment and byte-16 RGBA offset checks. Preserve allocates no dummy table.
@@ -2219,7 +2219,7 @@ model, preserving the following packet data. Public admission tests compare zero
 force a one-byte capacity shortfall, retry and abandon submitted work. XYB 257×17 adds 52,524
 bytes for the random planes and uniform. Unfiltered original Modular RGB and gray also need normalization
 and aligned render destinations; at the tested 256-byte storage-offset alignment their complete
-increase is 158,424 bytes. Original RGB VarDCT and 4:4:4/gray JPEG use the same 52,524-byte noise
+increase is 158,472 bytes. Original RGB VarDCT and 4:4:4/gray JPEG use the same 52,524-byte noise
 allocation as XYB. Subsampled JPEG needs two padded full-resolution chroma destinations plus two
 32-byte interpolation uniforms, for total increments of 104,812 bytes (4:2:2), 120,172 bytes
 (4:4:0), and 122,220 bytes (4:2:0). The zero model allocates none of those component destinations.
@@ -4040,7 +4040,7 @@ exact repeated retry, reuse without a second program reservation, and cancellati
 holds the output. Completion releases the source, intermediate, uniforms and program exactly once.
 The existing recursive LF oracle also covers non-color component surfaces with standard/custom
 Up8 weights, levels one through four, odd and one-pixel axes, poisoned input padding and exact
-admission. Component previews omit both color conversion and its 400-byte uniform reservation.
+admission. Component previews omit both color conversion and its 448-byte uniform reservation.
 The shared image-output source interface carries binary32 words. A separate actual-GPU test
 checks 64 combinations of all eight orientations, RGB/BGR/RGBA/BGRA and planar/interleaved
 packing against integer references containing signed zeros, both signs of subnormals and
@@ -4403,3 +4403,19 @@ The new transfer payload adds no image pass or per-transfer image, and the curre
 dispatch ABI is unchanged. Exact program sharing/admission, completion and cancellation remain
 regression requirements. Wider HDR/CMYK/feature/LF combinations, ICC `lumi` display policy,
 tone/gamut mapping, full numeric range and full JPEG XL conformance remain open.
+
+## Explicit luminance mapping checkpoint
+
+[The tone-mapping contract](TONE_MAPPING.md) records the explicit BT.2408 policy, JPEG XL protected
+thresholds and degenerate-range conventions. The pinned native primitive generates 4,986 XYZ
+samples across 18 ranges; Scalar/Lanes32/Tile16x16 check 44,874 components against both native and
+independent Bernstein/F64 equations. Dense protected ramps retain their light and monotonic
+highlight shoulders, including adjacent F32 threshold values and thresholds below source black.
+
+The unchanged 56 HDR streams receive only header edits for minimum light and absolute/relative
+thresholds. Their 80 images produce 960 tone-mapped outputs and 1,681,344 checked color components
+through P3 PQ/HLG and identity PCS, both layouts and whole/fragmented bounded input. Exact alpha,
+immutable held progression, word equality and zero released budgets remain required. Eight
+embedded RGB/Gray ICC and original/XYB sources add 32 outputs against independent/native linear
+references. ICC target/intent tone pixel coverage beyond identity PCS, gamut mapping, automatic
+display policy, extreme numeric ranges and the remaining full JPEG XL gates remain open.

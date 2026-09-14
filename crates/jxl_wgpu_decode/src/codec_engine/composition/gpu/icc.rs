@@ -37,6 +37,7 @@ pub(super) enum Output<'a> {
 pub(super) struct ImageMetadata<'a> {
     pub(super) orientation: OutputOrientation,
     pub(super) intensity: jxl_gpu_protocol::DisplayIntensity,
+    pub(super) tone_mapping: Option<jxl_gpu_protocol::ToneMapping>,
     pub(super) extras: &'a [ExtraChannelInventory],
 }
 
@@ -66,6 +67,7 @@ impl Presentation {
         let ImageMetadata {
             orientation,
             intensity,
+            tone_mapping,
             extras,
         } = image;
         let (request, numeric) = match output {
@@ -120,12 +122,12 @@ impl Presentation {
                 | FrameSurfaceEncoding::Cmyk { profile, .. },
                 ColorSpecification::Icc(target),
             ) => (
-                if target == profile {
+                if target == profile && tone_mapping.is_none() {
                     source_encoding.clone()
                 } else {
                     target_encoding(target)
                 },
-                if target == profile {
+                if target == profile && tone_mapping.is_none() {
                     None
                 } else {
                     Some(IccTransform::new(profile, target, intent)?)
@@ -159,6 +161,18 @@ impl Presentation {
                         .into(),
                 ));
             }
+        };
+        // Profile intent connection precedes luminance mapping in D50 PCS. Enumerated output
+        // instead maps in the final RGB packer, after its selected profile conversion.
+        let selected = if matches!(target, ColorSpecification::Icc(_)) {
+            selected
+                .map(|selected| match tone_mapping {
+                    Some(mapping) => selected.with_tone_mapping(mapping),
+                    None => Ok(selected),
+                })
+                .transpose()?
+        } else {
+            selected
         };
         if numeric.is_none()
             && selected.is_some()
@@ -232,18 +246,28 @@ impl Presentation {
                         dispatch[0] * 64,
                     )?,
                     FrameSurfaceEncoding::Rgb(encoding) => {
-                        ImageOutputParams::new_with_intensity_target(
-                            &output,
-                            ImageOutputSource {
-                                extent: geometry.extent,
-                                orientation,
-                                strides: geometry.strides,
-                                encoding: *encoding,
-                            },
-                            dispatch[0] * 64,
-                            request.white_point_adaptation(),
-                            intensity.nits(),
-                        )?
+                        let source = ImageOutputSource {
+                            extent: geometry.extent,
+                            orientation,
+                            strides: geometry.strides,
+                            encoding: *encoding,
+                        };
+                        match tone_mapping {
+                            Some(mapping) => ImageOutputParams::new_with_tone_mapping(
+                                &output,
+                                source,
+                                dispatch[0] * 64,
+                                request.white_point_adaptation(),
+                                mapping,
+                            ),
+                            None => ImageOutputParams::new_with_intensity_target(
+                                &output,
+                                source,
+                                dispatch[0] * 64,
+                                request.white_point_adaptation(),
+                                intensity.nits(),
+                            ),
+                        }?
                     }
                     FrameSurfaceEncoding::Encoded
                     | FrameSurfaceEncoding::Device(_)

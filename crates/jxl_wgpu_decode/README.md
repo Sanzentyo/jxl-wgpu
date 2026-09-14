@@ -757,7 +757,7 @@ nits. PQ uses the absolute 10000-nit scale; HLG applies the forward/inverse disp
 the source/target RGB luminance coefficients. The same context reaches original reference storage,
 blending, numeric original reconstruction and requested output. Same-encoding F32 output avoids
 an EOTF/OETF round trip. `ColorOutputConfig` rejects invalid intensity or an inconsistent XYB
-inverse before submission. The shared output uniform is 240 bytes; composed native packing is
+inverse before submission. The shared output uniform is 288 bytes; composed native packing is
 96 bytes. GPU memory remains explicitly accounted.
 
 The [HDR generator](test-data/hdr_generator/README.md) documents 56 streams/80 presentations,
@@ -778,7 +778,8 @@ components in 1,280 presentations across both layouts and input modes. Eight emb
 ICC sources, including both codecs and XYB, also produce 512 PQ/HLG outputs at four intensities;
 only their tone-mapping headers change, with compressed ICC and frame bytes retained exactly.
 Held progressive images, alpha, complete memory release and direct resident transfer checks
-remain covered. Physical display adaptation, ICC `lumi` policy, tone/gamut mapping, broader
+remain covered. Explicit requested tone mapping is described below. Automatic display adaptation,
+ICC `lumi` policy, gamut mapping, broader
 HDR/CMYK/feature/LF combinations and full-range conformance remain open.
 
 ### Frame execution and animation
@@ -1053,7 +1054,7 @@ executor above; the low-level standalone VarDCT entry point remains an uncropped
 All image orientations 1–8 are normalized before target chroma subsampling and packing. `ColorOutputConfig` explicitly
 separates the unrotated `extent` and typed `orientation`; `output_extent()` includes transposition.
 Coefficient grids, restoration, component/frame upsampling, and progressive-DC dependencies stay
-in codestream coordinates. The shared 240-byte output uniform carries geometry and orientation,
+in codestream coordinates. The shared 288-byte output uniform carries geometry and orientation,
 while a 160-byte source uniform describes XYB/JPEG reconstruction and independent alpha. No intermediate RGB image or
 additional submission is needed. Odd 257×17 three-pass fixtures cover
 every orientation; the packer also checks both one-pixel axes and zero tail padding.
@@ -1339,8 +1340,8 @@ The codec source fragment reconstructs unclipped linear RGB from XYB, or origina
 JPEG components, inside the render backend's shared word-owned output shader. Chroma sampling
 therefore follows orientation and full-precision reconstruction before one final quantization.
 `ColorOutputInputs` takes an explicit checked `ImageLayout`; output planning uses its exact logical
-byte length and four-byte storage rounding. Separate 240-byte output and 160-byte source uniforms
-cost 400 bytes in total and are checked individually against binding limits. Padded rows, unaligned
+byte length and four-byte storage rounding. Separate 288-byte output and 160-byte source uniforms
+cost 448 bytes in total and are checked individually against binding limits. Padded rows, unaligned
 plane starts, last-row tails, opaque alpha, and unused sample/storage bits have actual-GPU coverage.
 Thirty integer layout/transfer cases match both float CPU oracles within one code at 8–12 bits and at most
 three codes at 16 bits on Apple M5. Dedicated Display-P3 and BT.2020 cases match requested `djxl`
@@ -1681,3 +1682,13 @@ the polling/future API. There is no Tokio or async-std dependency.
 The WGSL storage/uniform ABI and F64 output words are explicitly little-endian. Because the
 `repr(C)` + `bytemuck::Pod` host structs use native endian, non-little-endian targets are rejected
 at compile time rather than silently corrupting transport values.
+
+## Requested display luminance
+
+`GpuOutputRequest::with_tone_mapping(jxl_gpu_protocol::LuminanceRange)` opts color presentation
+into BT.2408 luminance mapping. Image intensity/minimum light and protected absolute/relative
+thresholds resolve against the requested display white. Frame references and numeric samples
+retain their original domain; mapped output follows composition and spot rendering. RGB and ICC
+share the GPU curve, preserve alpha words and use distinct source/target HDR transfer intensities.
+See [the complete policy, edge cases and evidence](../../docs/TONE_MAPPING.md). Gamut mapping,
+automatic display policy and broader HDR conformance remain open.

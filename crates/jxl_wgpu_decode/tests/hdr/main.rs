@@ -2,10 +2,12 @@
 
 use jxl_test_support::fixtures::hdr as corpus;
 use jxl_test_support::oracles::hdr as oracle;
+mod frames;
 mod icc;
 mod independent;
 mod output;
 mod reference;
+mod tone_mapping;
 mod transfer;
 
 use jxl_test_support::gpu::planes;

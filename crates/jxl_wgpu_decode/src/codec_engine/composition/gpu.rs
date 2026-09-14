@@ -166,6 +166,7 @@ impl Compositor {
         let intensity_target = image.tone_mapping.intensity_target.to_f32();
         let intensity = jxl_gpu_protocol::DisplayIntensity::new(intensity_target)
             .ok_or(crate::color_output::ColorOutputError::InvalidIntensityTarget)?;
+        let tone_mapping = crate::tone_mapping::for_image(image, request)?;
         let orientation = OutputOrientation::from_exif_value(image.orientation).ok_or(
             Error::InvalidImageOrientation {
                 value: image.orientation,
@@ -264,7 +265,9 @@ impl Compositor {
         }
         let native = crate::model::native_modular_format(request.format()).filter(|_| {
             request.uses_original_sample_domain()
-                || original.rgb_encoding() == Some(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709)
+                || (tone_mapping.is_none()
+                    && original.rgb_encoding()
+                        == Some(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709))
         });
         let source_depth = selected.map_or(sample_bit_depth, |(_, extra)| extra.bit_depth);
         let source_float = matches!(source_depth, SampleBitDepth::Float { .. });
@@ -342,6 +345,7 @@ impl Compositor {
                     icc::ImageMetadata {
                         orientation,
                         intensity,
+                        tone_mapping,
                         extras,
                     },
                     &mut transforms,
@@ -459,20 +463,30 @@ impl Compositor {
                     .rgb_encoding()
                     .ok_or(Error::EngineContract("enumerated packing requires RGB"))?;
                 let params = |encoding: FrameSurfaceEncoding| -> Result<ImageOutputParams> {
-                    let params = ImageOutputParams::new_with_intensity_target(
-                        &layout,
-                        ImageOutputSource {
-                            extent: canvas,
-                            orientation,
-                            strides: [canvas.width; 3],
-                            encoding: encoding
-                                .rgb_encoding()
-                                .ok_or(Error::EngineContract("packing requires RGB"))?,
-                        },
-                        output_dispatch[0] * 64,
-                        request.white_point_adaptation(),
-                        intensity_target,
-                    )?
+                    let source = ImageOutputSource {
+                        extent: canvas,
+                        orientation,
+                        strides: [canvas.width; 3],
+                        encoding: encoding
+                            .rgb_encoding()
+                            .ok_or(Error::EngineContract("packing requires RGB"))?,
+                    };
+                    let params = match tone_mapping {
+                        Some(mapping) => ImageOutputParams::new_with_tone_mapping(
+                            &layout,
+                            source,
+                            output_dispatch[0] * 64,
+                            request.white_point_adaptation(),
+                            mapping,
+                        ),
+                        None => ImageOutputParams::new_with_intensity_target(
+                            &layout,
+                            source,
+                            output_dispatch[0] * 64,
+                            request.white_point_adaptation(),
+                            intensity_target,
+                        ),
+                    }?
                     .with_alpha_conversion(alpha_conversion);
                     Ok(
                         if encoding
@@ -555,6 +569,7 @@ impl Compositor {
                                 icc::ImageMetadata {
                                     orientation,
                                     intensity,
+                                    tone_mapping,
                                     extras,
                                 },
                                 &mut transforms,

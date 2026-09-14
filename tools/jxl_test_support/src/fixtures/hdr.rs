@@ -7,8 +7,6 @@ use jxl_gpu_formats::{
 };
 use std::path::PathBuf;
 
-pub mod intensity;
-
 pub struct Case {
     pub name: String,
     pub width: usize,

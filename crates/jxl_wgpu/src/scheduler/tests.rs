@@ -89,7 +89,7 @@ fn uniform_abi_sizes_are_explicit_and_naturally_aligned() {
         ("TransferUniform", size_of::<TransferUniform>(), 64),
         ("PremultiplyUniform", size_of::<PremultiplyUniform>(), 32),
         ("SaveUniform", size_of::<SaveUniform>(), 32),
-        ("ImageOutputUniform", size_of::<ImageOutputUniform>(), 240),
+        ("ImageOutputUniform", size_of::<ImageOutputUniform>(), 288),
     ];
     for (name, actual, expected) in sizes {
         assert_eq!(actual, expected, "Rust/WGSL ABI size drift for {name}");
@@ -666,6 +666,11 @@ fn uniform_rust_word_order_matches_wgsl_field_order() {
         transfer_parameters: [49, 50, 51, 52].map(f32::from_bits),
         source_luminance: [53, 54, 55, 56].map(f32::from_bits),
         target_luminance: [57, 58, 59, 60].map(f32::from_bits),
+        tone_mapping: crate::ToneMappingParams {
+            range: [61, 62, 63, 64].map(f32::from_bits),
+            curve: [65, 66, 67, 68].map(f32::from_bits),
+            knee: [69, 70, 71, 72].map(f32::from_bits),
+        },
     });
     assert_wgsl_fields(
         crate::image_output::RGB_TO_IMAGE_SHADER,
@@ -710,6 +715,7 @@ fn uniform_rust_word_order_matches_wgsl_field_order() {
             "transfer_parameters",
             "source_luminance",
             "target_luminance",
+            "tone_mapping",
         ],
     );
 }

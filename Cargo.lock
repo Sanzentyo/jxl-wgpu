@@ -913,7 +913,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "jxl",
- "jxl-bitstream 1.1.0",
+ "jxl-bitstream",
  "jxl-coding",
  "jxl_gpu_bitstream",
  "jxl_gpu_formats",

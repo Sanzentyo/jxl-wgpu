@@ -397,6 +397,7 @@ impl IccTransformEndpoint {
 pub struct IccTransform {
     source: IccTransformEndpoint,
     target: IccTransformEndpoint,
+    intent: IccRenderingIntent,
     program: IccProgram,
 }
 
@@ -515,6 +516,28 @@ impl IccTransform {
         target: IccTransformEndpoint,
         intent: IccRenderingIntent,
     ) -> Result<Self, IccError> {
+        Self::connect_mapped(source, target, intent, None)
+    }
+
+    /// Apply BT.2408 to connected PCS luminance before target device curves. RGB endpoints
+    /// receive the mapping's explicit source/target white intensities. Profile black detection
+    /// and rendering-intent connection happen before this presentation-only luminance operation.
+    pub fn with_tone_mapping(mut self, mapping: crate::ToneMapping) -> Result<Self, IccError> {
+        if let IccTransformEndpoint::Rgb { intensity, .. } = &mut self.source {
+            *intensity = Some(mapping.source().white());
+        }
+        if let IccTransformEndpoint::Rgb { intensity, .. } = &mut self.target {
+            *intensity = Some(mapping.target().white());
+        }
+        Self::connect_mapped(self.source, self.target, self.intent, Some(mapping))
+    }
+
+    fn connect_mapped(
+        source: IccTransformEndpoint,
+        target: IccTransformEndpoint,
+        intent: IccRenderingIntent,
+        mapping: Option<crate::ToneMapping>,
+    ) -> Result<Self, IccError> {
         let connection = intent::Connection::new(&source, &target, intent);
         let mut first = source.stages(IccDirection::DeviceToPcs)?;
         let mut last = target.stages(IccDirection::PcsToDevice)?;
@@ -524,7 +547,7 @@ impl IccTransform {
             .zip(target.profile().and_then(IccProfileProgram::matrix_trc))
             .is_some_and(|(s, t)| s.matrix == t.matrix && s.curves.len() == t.curves.len());
         let mut stages = Vec::new();
-        if connection.is_identity() && same_geometry {
+        if mapping.is_none() && connection.is_identity() && same_geometry {
             // Exact cancellation retains the specified endpoint of sampled plateaus.
             first.pop();
             last.remove(0);
@@ -532,7 +555,12 @@ impl IccTransform {
             stages.extend(last);
         } else {
             let connection = connection.into_stage()?;
-            for stage in first.into_iter().chain([connection]).chain(last) {
+            for stage in first
+                .into_iter()
+                .chain([connection])
+                .chain(mapping.map(IccStage::ToneMapping))
+                .chain(last)
+            {
                 super::program::append(&mut stages, stage)?;
             }
         }
@@ -540,6 +568,7 @@ impl IccTransform {
         Ok(Self {
             source,
             target,
+            intent,
             program,
         })
     }

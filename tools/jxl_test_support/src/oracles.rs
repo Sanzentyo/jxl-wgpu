@@ -6,3 +6,4 @@ pub mod hdr;
 pub mod lf;
 pub mod patches;
 pub mod progressive;
+pub mod tone_mapping;

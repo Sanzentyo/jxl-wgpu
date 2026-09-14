@@ -4,6 +4,11 @@ use jxl_gpu_formats::{ColorSample, ColorStorage, PixelFormat};
 
 #[test]
 fn device_output_admits_exact_bytes_retries_and_retains_cancelled_resources() {
+    admission(false);
+    admission(true);
+}
+
+fn admission(tone_mapping: bool) {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = jxl_gpu_protocol::icc::IccProfile::parse(
@@ -43,6 +48,11 @@ fn device_output_admits_exact_bytes_retries_and_retains_cancelled_resources() {
         let request = GpuOutputRequest::color(format)
             .unwrap()
             .with_icc_rendering_intent(jxl_gpu_protocol::icc::IccRenderingIntent::Perceptual);
+        let request = if tone_mapping {
+            request.with_tone_mapping(jxl_gpu_protocol::LuminanceRange::new(0.0, 80.0).unwrap())
+        } else {
+            request
+        };
         let compositor = Compositor::new(
             backend.clone(),
             Extent2d::new(image.width, image.height),
@@ -57,14 +67,21 @@ fn device_output_admits_exact_bytes_retries_and_retains_cancelled_resources() {
         assert_eq!(presentations.len(), 1);
         let presentation = &presentations[0];
         assert_eq!(presentation.params.len(), 320);
-        assert_eq!(presentation.transform.is_none(), same);
-        if same {
+        assert_eq!(presentation.transform.is_none(), same && !tone_mapping);
+        if same && !tone_mapping {
             assert_eq!(
                 presentation.working.storage_bytes,
                 compositor.surface.storage_bytes
             );
         } else {
-            assert_eq!(presentation.working.color.planes.len(), 15);
+            assert_eq!(
+                presentation.working.color.planes.len(),
+                if same { 4 } else { 15 }
+            );
+            assert!(matches!(
+                presentation.working_encoding,
+                FrameSurfaceEncoding::Device(_)
+            ));
         }
         prepared += usize::from(
             presentation

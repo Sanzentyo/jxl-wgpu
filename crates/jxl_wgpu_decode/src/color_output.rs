@@ -448,7 +448,7 @@ fn validate_storage_bindings(limits: &wgpu::Limits) -> Result<(), ColorOutputErr
 /// Uniform allocation that must remain live through command submission.
 #[derive(Debug)]
 pub struct ColorOutputScratch {
-    /// The shared 240-byte color/layout parameter buffer.
+    /// The shared 288-byte color/layout parameter buffer.
     pub uniform: wgpu::Buffer,
     /// The 160-byte inverse-opsin/JPEG and alpha source parameter buffer.
     pub source_uniform: wgpu::Buffer,
@@ -459,6 +459,8 @@ pub struct ColorOutputScratch {
 /// Typed validation errors for GPU-resident reconstructed color output.
 #[derive(Debug, thiserror::Error)]
 pub enum ColorOutputError {
+    #[error("invalid image tone-mapping luminance metadata")]
+    InvalidToneMapping,
     #[error("reconstructed output needs five storage bindings, device permits {available}")]
     StorageBindingCount { available: u32 },
     #[error("reconstructed alpha has invalid sample precision {depth:?}")]
@@ -561,7 +563,7 @@ pub enum ColorOutputError {
         required: u64,
         available: u64,
     },
-    /// The 240-byte uniform exceeds an unusual device limit.
+    /// The 288-byte uniform exceeds an unusual device limit.
     #[error(
         "reconstructed color uniform needs {required} bytes, uniform binding limit is {available}"
     )]
@@ -1118,9 +1120,9 @@ mod tests {
         let memory = ColorOutputMemoryPlan::new(&rgb_layout(5, 3)).unwrap();
         assert_eq!(memory.logical_output_bytes, 45);
         assert_eq!(memory.output_storage_bytes, 48);
-        assert_eq!(memory.uniform_bytes, 400);
-        assert_eq!(memory.transient_bytes, 400);
-        assert_eq!(memory.total_bytes, 448);
+        assert_eq!(memory.uniform_bytes, 448);
+        assert_eq!(memory.transient_bytes, 448);
+        assert_eq!(memory.total_bytes, 496);
 
         let plan = ColorOutputPlan::for_limits(&rgb_layout(5, 3), &generous_limits()).unwrap();
         assert_eq!(plan.output_words, 12);
@@ -1443,7 +1445,7 @@ mod tests {
                         scratch.plan.memory.output_storage_bytes,
                         layout.logical_size.div_ceil(4) * 4
                     );
-                    assert_eq!(scratch.uniform.size(), 240);
+                    assert_eq!(scratch.uniform.size(), 288);
                     assert_eq!(scratch.source_uniform.size(), 160);
                     encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, 128);
                     let submission = queue.submit([encoder.finish()]);

@@ -41,6 +41,7 @@ struct Params {
     transfer_parameters: vec4<f32>, // source gamma, target gamma, black floor, display nits (zero = generic)
     source_luminance: vec4<f32>,
     target_luminance: vec4<f32>,
+    tone_mapping: ToneMappingParams,
 };
 
 @group(0) @binding(0) var<storage, read> source_r: array<u32>;
@@ -69,14 +70,20 @@ fn target_linear_rgb_at(x: u32, y: u32) -> vec3<f32> {
         source, params.source_transfer, params.transfer_parameters.x,
         params.transfer_parameters.w, params.source_luminance,
     );
-    let converted_linear = vec3<f32>(
+    var converted_linear = vec3<f32>(
         dot(params.primaries_r.xyz, source_linear),
         dot(params.primaries_g.xyz, source_linear),
         dot(params.primaries_b.xyz, source_linear),
     );
     let threshold = params.transfer_parameters.z;
-    if threshold >= 0.0 { return select(converted_linear, vec3<f32>(0.0), converted_linear <= vec3<f32>(threshold)); }
-    return converted_linear;
+    if threshold >= 0.0 { converted_linear = select(converted_linear, vec3<f32>(0.0), converted_linear <= vec3<f32>(threshold)); }
+    return tone_map_light(converted_linear, params.target_luminance.xyz,
+        vec3<f32>(1.0), params.tone_mapping);
+}
+
+fn target_intensity() -> f32 {
+    if params.tone_mapping.range.w != 0.0 { return params.tone_mapping.range.y; }
+    return params.transfer_parameters.w;
 }
 
 fn target_rgb_at(x: u32, y: u32) -> vec3<f32> {
@@ -84,7 +91,7 @@ fn target_rgb_at(x: u32, y: u32) -> vec3<f32> {
     let linear = target_linear_rgb_at(x, y);
     return display_from_linear(
         linear, params.target_transfer, params.transfer_parameters.y,
-        params.transfer_parameters.w, params.target_luminance,
+        target_intensity(), params.target_luminance,
     );
 }
 
@@ -128,7 +135,7 @@ fn yuv_at(x: u32, y: u32) -> vec3<f32> {
     var linear = target_linear_rgb_at(x, y);
     var encoded = display_from_linear(
         linear, params.target_transfer, params.transfer_parameters.y,
-        params.transfer_parameters.w, params.target_luminance,
+        target_intensity(), params.target_luminance,
     );
     if params.alpha.x != 0u {
         encoded *= output_alpha_multiplier_at(x, y);
@@ -136,7 +143,7 @@ fn yuv_at(x: u32, y: u32) -> vec3<f32> {
         forward_luminance.w = 1.0 / (1.0 + forward_luminance.w) - 1.0;
         linear = display_to_linear(
             encoded, params.target_transfer, params.transfer_parameters.y,
-            params.transfer_parameters.w, forward_luminance,
+            target_intensity(), forward_luminance,
         );
     }
     let coefficient = coefficients();
@@ -146,7 +153,7 @@ fn yuv_at(x: u32, y: u32) -> vec3<f32> {
     let y_encoded = display_from_linear(
         vec3<f32>(kr * linear.r + kg * linear.g + kb * linear.b),
         params.target_transfer, params.transfer_parameters.y,
-        params.transfer_parameters.w, params.target_luminance,
+        target_intensity(), params.target_luminance,
     ).x;
     let cb_divisor = select(1.9404, 1.5816, encoded.b > y_encoded);
     let cr_divisor = select(1.7184, 0.9936, encoded.r > y_encoded);

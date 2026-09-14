@@ -376,6 +376,7 @@ pub struct GpuOutputRequest {
     alpha: AlphaOutputPolicy,
     white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation,
     icc_rendering_intent: jxl_gpu_protocol::icc::IccRenderingIntent,
+    tone_mapping: Option<jxl_gpu_protocol::LuminanceRange>,
     frame_surface: Option<crate::frame_surface::FrameSurfaceEncoding>,
     frame_stage: crate::frame_surface::FrameRenderStage,
     lf_extras: bool,
@@ -522,6 +523,7 @@ impl GpuOutputRequest {
             alpha: AlphaOutputPolicy::default(),
             white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,
             icc_rendering_intent: jxl_gpu_protocol::icc::IccRenderingIntent::Relative,
+            tone_mapping: None,
             frame_surface: None,
             frame_stage: crate::frame_surface::FrameRenderStage::Complete,
             lf_extras: false,
@@ -618,6 +620,26 @@ impl GpuOutputRequest {
     #[must_use]
     pub const fn icc_rendering_intent(&self) -> jxl_gpu_protocol::icc::IccRenderingIntent {
         self.icc_rendering_intent
+    }
+
+    /// Map image luminance to an explicit display range during color presentation. The image
+    /// header supplies source luminance and its protected linear-light threshold. Numeric and
+    /// native output without an explicit color specification retain their original samples.
+    #[must_use]
+    pub const fn with_tone_mapping(mut self, target: jxl_gpu_protocol::LuminanceRange) -> Self {
+        self.tone_mapping = Some(target);
+        self
+    }
+
+    /// Effective display range; internal reference surfaces and original-domain samples do not
+    /// apply presentation tone mapping.
+    #[must_use]
+    pub fn tone_mapping_target(&self) -> Option<jxl_gpu_protocol::LuminanceRange> {
+        if self.frame_surface.is_some() || self.uses_original_sample_domain() {
+            None
+        } else {
+            self.tone_mapping
+        }
     }
 
     /// Create a reference-frame request from its explicit sample domain, independently of

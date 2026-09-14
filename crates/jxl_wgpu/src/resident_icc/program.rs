@@ -20,6 +20,7 @@ enum Opcode {
     MultilinearClut = 8,
     BlackPointConnection = 9,
     RgbTransfer = 10,
+    ToneMapping = 11,
 }
 
 pub(super) fn program_size(transform: &IccTransform, limit: u64) -> Result<u64, ResidentIccError> {
@@ -274,6 +275,16 @@ impl<'a> Encoder<'a> {
                         self.sink.word(payload + 4 + c as u32, value.to_bits());
                     }
                     (Opcode::RgbTransfer, payload)
+                }
+                IccStage::ToneMapping(mapping) => {
+                    let params = crate::ToneMappingParams::new(*mapping)
+                        .map_err(|_| ResidentIccError::Precision)?;
+                    let words = bytemuck::cast_slice::<_, u32>(std::slice::from_ref(&params));
+                    let payload = self.sink.allocate(words.len())?;
+                    for (index, &word) in words.iter().enumerate() {
+                        self.sink.word(payload + index as u32, word);
+                    }
+                    (Opcode::ToneMapping, payload)
                 }
                 IccStage::LabToXyz => (Opcode::LabToXyz, 0),
                 IccStage::XyzToLab => (Opcode::XyzToLab, 0),

@@ -21,6 +21,8 @@ pub use color::{
     RgbChromaticities, WhitePointAdaptation,
 };
 pub mod icc;
+mod tone_mapping;
+pub use tone_mapping::{LuminanceRange, ToneMapping};
 mod vardct;
 
 /// Stable identifier for a logical image plane in a [`RenderPlan`].

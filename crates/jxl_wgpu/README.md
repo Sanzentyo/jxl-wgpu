@@ -181,13 +181,16 @@ subsampling footprint; cosited output uses the top-left luma position. Numeric r
 matrix, range, and siting are never inferred from an ambiguous descriptor.
 
 The render graph and VarDCT decoder share `ImageOutputParams`, `ImageOutputSource`, and
-`IMAGE_OUTPUT_SHADER`. The fixed 240-byte uniform validates target layout, source coordinates,
+`IMAGE_OUTPUT_SHADER`. The fixed 288-byte uniform validates target layout, source coordinates,
 color conversion, and WGSL addressing. The record at byte 192 carries both gamma exponents,
 an optional target-linear black threshold and display intensity. Source and target luminance/OOTF
 vectors occupy bytes 208 and 224. `new_with_intensity_target` defines the nits represented by unit
 linear RGB: PQ scales absolute light, and HLG applies the display OOTF with each encoding's own
 luminance coefficients. `new` retains generic absolute-normalized PQ / scene-linear HLG behavior.
-Neither constructor changes the display peak or tone/gamut maps. `with_alpha_conversion` selects an explicit
+`new_with_tone_mapping` adds an explicit source/target luminance range and protected threshold.
+Its shared 48-byte record begins at byte 240; mapping uses target-linear RGB before the target
+OETF, with separate source/target HLG intensities. The original constructors retain their existing
+semantics. See [the luminance policy](../../docs/TONE_MAPPING.md). `with_alpha_conversion` selects an explicit
 association adjustment after color conversion and before quantization or chroma subsampling.
 The common `ALPHA_OUTPUT_SHADER` uses the JPEG XL finite `2^-26` alpha floor; it never transforms
 the alpha component through an RGB transfer. Producers supply `source_rgb_words_at` and

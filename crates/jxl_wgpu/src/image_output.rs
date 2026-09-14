@@ -27,6 +27,7 @@ pub const IMAGE_OUTPUT_SHADER: &str = concat!(
     include_str!("../shaders/image_orientation.wgsl"),
     include_str!("../shaders/alpha_output.wgsl"),
     include_str!("../shaders/image_transfer.wgsl"),
+    include_str!("../shaders/tone_mapping.wgsl"),
     include_str!("../shaders/image_output.wgsl"),
 );
 
@@ -42,6 +43,7 @@ pub(crate) const RGB_TO_IMAGE_SHADER: &str = concat!(
     include_str!("../shaders/image_orientation.wgsl"),
     include_str!("../shaders/alpha_output.wgsl"),
     include_str!("../shaders/image_transfer.wgsl"),
+    include_str!("../shaders/tone_mapping.wgsl"),
     include_str!("../shaders/image_output.wgsl"),
     include_str!("../shaders/rgb_to_image.wgsl"),
 );
@@ -79,7 +81,7 @@ pub enum AlphaConversion {
     Premultiply = 2,
 }
 
-/// Fixed 240-byte uniform for the shared output shader.
+/// Fixed 288-byte uniform for the shared output shader.
 /// Construct it with [`Self::new`] to validate geometry, color, and packed addressing.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -123,6 +125,7 @@ pub struct ImageOutputParams {
     pub(crate) transfer_parameters: [f32; 4],
     pub(crate) source_luminance: [f32; 4],
     pub(crate) target_luminance: [f32; 4],
+    pub(crate) tone_mapping: crate::ToneMappingParams,
 }
 impl ImageOutputParams {
     /// Pack three F32 codec components without assigning RGB or ICC meaning to their storage.
@@ -246,6 +249,37 @@ impl ImageOutputParams {
         Ok(params)
     }
 
+    /// Map explicit source luminance to a display range in target-linear RGB before its OETF.
+    /// The same word-owned dispatch performs conversion, mapping, association and quantization.
+    pub fn new_with_tone_mapping(
+        layout: &ImageLayout,
+        source: ImageOutputSource,
+        dispatch_width: u32,
+        adaptation: WhitePointAdaptation,
+        mapping: jxl_gpu_protocol::ToneMapping,
+    ) -> Result<Self> {
+        let mut params = Self::new_with_intensity_target(
+            layout,
+            source,
+            dispatch_width,
+            adaptation,
+            mapping.source().white().nits(),
+        )?;
+        let ColorSpecification::Defined(target) = layout.format.color_spec else {
+            unreachable!("validated enumerated color target")
+        };
+        params.target_luminance = display_luminance(
+            target.space.rgb_space().expect("validated RGB geometry"),
+            mapping.target().white().nits(),
+            true,
+        )?;
+        params.tone_mapping = crate::ToneMappingParams::new(mapping)?;
+        if params.tone_mapping.range[3] != 1.0 || params.tone_mapping.knee[2] != 1.0 {
+            params.identity_color_transform = 0;
+        }
+        Ok(params)
+    }
+
     /// Pack RGB or gray device values already in the exact target ICC profile. This performs
     /// no curve or matrix evaluation, preserving F32 device samples when alpha is preserved.
     /// A gray source supplies its one color word in `source_rgb_words_at(...).x`; alpha is separate.
@@ -342,6 +376,7 @@ impl ImageOutputParams {
             transfer_parameters: [color.source_gamma, color.target_gamma, -1.0, 0.0],
             source_luminance: [0.0; 4],
             target_luminance: [0.0; 4],
+            tone_mapping: crate::ToneMappingParams::default(),
         })
     }
 
@@ -679,7 +714,7 @@ fn to_shader_u32(value: u64) -> Result<u32> {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<ImageOutputParams>() == 240);
+    assert!(std::mem::size_of::<ImageOutputParams>() == 288);
     assert!(std::mem::align_of::<ImageOutputParams>() == 4);
     assert!(std::mem::offset_of!(ImageOutputParams, primaries_r) == 128);
     assert!(std::mem::offset_of!(ImageOutputParams, primaries_g) == 144);
@@ -688,4 +723,5 @@ const _: () = {
     assert!(std::mem::offset_of!(ImageOutputParams, transfer_parameters) == 192);
     assert!(std::mem::offset_of!(ImageOutputParams, source_luminance) == 208);
     assert!(std::mem::offset_of!(ImageOutputParams, target_luminance) == 224);
+    assert!(std::mem::offset_of!(ImageOutputParams, tone_mapping) == 240);
 };

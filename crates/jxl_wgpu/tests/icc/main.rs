@@ -28,6 +28,7 @@ mod metadata;
 mod mpe;
 mod rgb;
 mod samples;
+mod tone_mapping;
 
 #[derive(Deserialize)]
 struct Manifest {

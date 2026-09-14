@@ -2,7 +2,7 @@
 use super::color;
 use jxl_gpu_formats::{ColorSpace, TransferFunction};
 
-fn luminance(space: ColorSpace) -> [f64; 3] {
+pub fn luminance(space: ColorSpace) -> [f64; 3] {
     match space {
         ColorSpace::Bt709 => [0.212639005871510, 0.715168678767756, 0.072192315360734],
         ColorSpace::Bt2020 => [0.262700212011267, 0.677998071518871, 0.059301716469862],

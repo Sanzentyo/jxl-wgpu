@@ -113,6 +113,7 @@ pub(super) fn needs_surface(
             .iter()
             .any(|frame| frame.encoding == jxl_gpu_bitstream::FrameEncoding::VarDct);
     original_conversion
+        || request.tone_mapping_target().is_some()
         || (request.mapping() == crate::GpuOutputMapping::Color
             && matches!(request.format().color_spec, ColorSpecification::Icc(_)))
         || modular_rendering

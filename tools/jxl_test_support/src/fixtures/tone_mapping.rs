@@ -1,4 +1,4 @@
-//! Replace only image intensity, retaining compressed ICC and every physical frame byte.
+//! Replace only the tone-mapping header, retaining ICC and every physical frame byte.
 use jxl_bitstream::{Bitstream, U};
 use jxl_gpu_bitstream::{BitReader, BitWriter, CodestreamInventory};
 use jxl_image::{
@@ -25,13 +25,37 @@ fn copy(writer: &mut BitWriter, data: &[u8], start: u64, end: u64) {
     }
 }
 
-/// The fixture intensity must be a positive integer exactly representable as normal binary16.
-pub fn replace(data: &[u8], nits: u16) -> Vec<u8> {
-    assert!(nits > 0);
-    let bits = f32::from(nits).to_bits();
-    let exponent = ((bits >> 23) & 255) - 127 + 15;
-    assert!((1..31).contains(&exponent) && bits & 0x1fff == 0);
-    let half = (exponent << 10) | ((bits >> 13) & 0x3ff);
+#[derive(Clone, Copy, Debug)]
+pub struct Metadata {
+    pub intensity_target: f32,
+    pub min_nits: f32,
+    pub relative_to_max_display: bool,
+    pub linear_below: f32,
+}
+
+impl Metadata {
+    pub const fn intensity(nits: u16) -> Self {
+        Self {
+            intensity_target: nits as f32,
+            min_nits: 0.0,
+            relative_to_max_display: false,
+            linear_below: 0.0,
+        }
+    }
+}
+
+/// Every fixture value must be exactly representable as finite nonnegative binary16.
+pub fn replace(data: &[u8], metadata: Metadata) -> Vec<u8> {
+    fn half(value: f32) -> u16 {
+        (0..0x7c00)
+            .find(|bits| {
+                jxl_gpu_bitstream::FiniteF16::from_bits(*bits)
+                    .unwrap()
+                    .to_f32()
+                    == value
+            })
+            .expect("exact nonnegative binary16 fixture metadata")
+    }
     let file = jxl_gpu_bitstream::parse(data, Default::default()).unwrap();
     let data = file.codestream();
     let original = inventory(data);
@@ -69,9 +93,6 @@ pub fn replace(data: &[u8], nits: u16) -> Vec<u8> {
         ToneMapping::parse(&mut reader, ()).unwrap();
     }
     let tone_end = reader.num_read_bits() as u64;
-    assert_eq!(image.tone_mapping.min_nits.to_f32(), 0.0);
-    assert!(!image.tone_mapping.relative_to_max_display);
-    assert_eq!(image.tone_mapping.linear_below.to_f32(), 0.0);
     let mut writer = BitWriter::new();
     copy(&mut writer, data, 0, extra_flag);
     writer.write_bits(1, 1).unwrap();
@@ -82,8 +103,18 @@ pub fn replace(data: &[u8], nits: u16) -> Vec<u8> {
     }
     copy(&mut writer, data, representation, tone_start);
     writer.write_bits(0, 1).unwrap(); // Explicit tone mapping.
-    writer.write_bits(u64::from(half), 16).unwrap();
-    writer.write_bits(0, 33).unwrap(); // Zero min_nits and linear_below; absolute threshold.
+    writer
+        .write_bits(u64::from(half(metadata.intensity_target)), 16)
+        .unwrap();
+    writer
+        .write_bits(u64::from(half(metadata.min_nits)), 16)
+        .unwrap();
+    writer
+        .write_bits(u64::from(metadata.relative_to_max_display), 1)
+        .unwrap();
+    writer
+        .write_bits(u64::from(half(metadata.linear_below)), 16)
+        .unwrap();
     copy(&mut writer, data, tone_end, image.bit_range.end().unwrap());
     if let Some(icc) = &image.embedded_icc {
         copy(
@@ -104,8 +135,37 @@ pub fn replace(data: &[u8], nits: u16) -> Vec<u8> {
     );
     assert_eq!(
         changed.image_header.tone_mapping.intensity_target.to_f32(),
-        f32::from(nits)
+        metadata.intensity_target
     );
+    assert_eq!(
+        changed.image_header.tone_mapping.min_nits.to_f32(),
+        metadata.min_nits
+    );
+    assert_eq!(
+        changed.image_header.tone_mapping.relative_to_max_display,
+        metadata.relative_to_max_display
+    );
+    assert_eq!(
+        changed.image_header.tone_mapping.linear_below.to_f32(),
+        metadata.linear_below
+    );
+    // Initialize the independent header/ICC reader only. Frame entropy is intentionally outside
+    // a metadata edit's contract; some native sequence fixtures exceed that decoder's MA support.
+    let mut reader = jxl_oxide::JxlImage::builder().build_uninit();
+    reader
+        .feed_bytes(&encoded[..changed.frames[0].header_bits.offset as usize / 8])
+        .unwrap();
+    let jxl_oxide::InitializeResult::Initialized(independent) = reader.try_init().unwrap() else {
+        panic!("complete rewritten image header")
+    };
+    let independent = &independent.image_header().metadata.tone_mapping;
+    assert_eq!(independent.intensity_target, metadata.intensity_target);
+    assert_eq!(independent.min_nits, metadata.min_nits);
+    assert_eq!(
+        independent.relative_to_max_display,
+        metadata.relative_to_max_display
+    );
+    assert_eq!(independent.linear_below, metadata.linear_below);
     let mut normalized = changed.image_header;
     normalized.bit_range = image.bit_range;
     normalized.tone_mapping = image.tone_mapping;

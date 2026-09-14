@@ -41,6 +41,8 @@ mod resident_chroma_upsample;
 mod resident_epf;
 mod resident_gaborish;
 mod resident_icc;
+mod tone_mapping;
+pub use tone_mapping::{TONE_MAPPING_SHADER, ToneMappingParams};
 mod resident_noise;
 mod resident_upsample;
 mod resident_vardct;

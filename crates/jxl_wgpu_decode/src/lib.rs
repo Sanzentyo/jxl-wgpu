@@ -61,6 +61,7 @@ mod profile;
 mod progressive_dc;
 mod restoration;
 mod session;
+mod tone_mapping;
 mod vardct_artifact;
 mod vardct_engine;
 mod vardct_epf;

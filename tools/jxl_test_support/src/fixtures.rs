@@ -16,3 +16,4 @@ pub mod preview;
 pub mod progressive_layers;
 pub mod resampling;
 pub mod splines;
+pub mod tone_mapping;

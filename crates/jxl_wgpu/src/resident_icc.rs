@@ -18,6 +18,7 @@ use crate::{KernelVariant, ResidentStorageBinding};
 
 const ICC_SHADER: &str = concat!(
     include_str!("../shaders/image_transfer.wgsl"),
+    include_str!("../shaders/tone_mapping.wgsl"),
     "\n",
     include_str!("../shaders/icc.wgsl"),
 );

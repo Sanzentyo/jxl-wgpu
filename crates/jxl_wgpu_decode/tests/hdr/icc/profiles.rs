@@ -67,7 +67,7 @@ fn hdr_rgb_xyb_stills_and_sequences_match_native_and_scalar_icc_profiles() {
         )
         .unwrap();
         targets.insert(case.target.clone());
-        let original = frames(
+        let original = frames::read(
             &backend,
             &data,
             GpuOutputRequest::color(source.format(source.transfer, source.space))
@@ -109,7 +109,7 @@ fn hdr_rgb_xyb_stills_and_sequences_match_native_and_scalar_icc_profiles() {
                         .with_icc_rendering_intent(intent)
                         .with_alpha_output_policy(AlphaOutputPolicy::Preserve);
                     let actual =
-                        frames(&backend, &data, request, planar, case.channels + 1, bounded);
+                        frames::read(&backend, &data, request, planar, case.channels + 1, bounded);
                     assert_eq!(actual.len(), case.frames);
                     presentations += actual.len();
                     for (frame, pixels) in actual.iter().enumerate() {

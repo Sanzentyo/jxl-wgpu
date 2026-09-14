@@ -3,6 +3,7 @@ use super::*;
 mod lut;
 mod mpe;
 mod rgb;
+mod tone_mapping;
 
 fn affine(transform: &IccTransform) -> &IccAffine {
     let matrices = transform

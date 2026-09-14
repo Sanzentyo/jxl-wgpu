@@ -79,7 +79,7 @@ fn original_icc_reconstruction_admits_exact_storage_retries_and_retains_cancelle
             &backend.device().limits(),
         )
         .unwrap();
-        let transient = 400
+        let transient = 448
             + completion_fence_bytes()
             + linear.storage_bytes
             + connection.memory.transient_bytes();
@@ -151,7 +151,8 @@ fn original_reconstruction_and_linear_presentation_share_one_program_admission()
         .filter(|case| case.xyb)
         .flat_map(|case| [100, 255, 1000, 4000].map(|nits| (case, nits)))
     {
-        let data = jxl_test_support::fixtures::hdr::intensity::replace(&case.bytes(), nits);
+        use jxl_test_support::fixtures::tone_mapping::{Metadata, replace};
+        let data = replace(&case.bytes(), Metadata::intensity(nits));
         let inventory = jxl_gpu_bitstream::parse(&data, Default::default())
             .unwrap()
             .codestream_inventory(Default::default())
