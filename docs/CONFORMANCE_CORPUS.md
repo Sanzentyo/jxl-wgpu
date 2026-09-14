@@ -23,6 +23,27 @@ The checked-in inventory includes 1x1, tiny (2x2), odd (17x13, 19x11), square (6
 1x16384), 255/256/257 group boundaries, HD 1280x720 (Gray8 and RGB8), FHD 1920x1080 (RGBA8), UHD 4K
 3840x2160 (RGB10), UHD 8K 7680x4320 (Gray8), and UHD 16K 15360x8640 (Gray8).
 
+## Opaque metadata and compression
+
+The normal `jxl_gpu_bitstream::metadata::tests` tree covers selected Exif/XMP/JUMBF/unknown
+retention, atomic editing, independent encoded/decoded/aggregate bounds and poisoned collector
+release. Every split and byte-drip input covers compact, extended and size-zero metadata boxes
+interleaved with ordered/v1 out-of-order fragments. Original compressed payloads remain exact;
+decompression rejects truncation, trailing/concatenated streams, forbidden types and nonstandard
+Brotli extensions. The tests retain no caller `Arc` allocation in the metadata collector.
+
+Google Brotli 1.2.0 verifies 180 compression/decompression pairs across all quality/window hints.
+The [raw libjxl oracle](../crates/jxl_gpu_bitstream/test-data/metadata_oracle/README.md) verifies
+six exact plain/compressed box payloads without `djxl`'s Exif normalization. Existing source and
+reference fixtures remain unchanged. Native tools were required for the recorded run.
+
+The decoder's `container_metadata` test covers seventeen source/selection cases: Modular,
+VarDCT, mixed animation, main/preview, eight ICC sources and four PQ/HLG sources. Apply/Keep,
+plain/compressed/edited metadata and whole/bounded input produce 444 immutable presentations
+and 1,357,296 equal F32 words. Timing, progression, alpha, retained bytes and released budgets
+also match. These are exact invariance checks against existing GPU paths, not new codec precision
+or JUMBF-document conformance claims. [Policy and bounds](CONTAINER_METADATA.md).
+
 ## Incremental transport matrix
 
 `jxl_gpu_bitstream::stream` tests raw codestreams and compact `jxlc`/`jxlp` containers at every

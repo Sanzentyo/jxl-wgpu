@@ -6,10 +6,16 @@ This is an independent Cargo workspace. Production codec execution requires a co
 Published `jxl` and the reference `djxl` tool are development-only interoperability oracles and are
 not production dependencies or fallback paths.
 
+Exif, XMP, JUMBF and unknown [container metadata](docs/CONTAINER_METADATA.md) now support
+explicit retention, atomic replacement/removal and plain or bounded Brotli output. The metadata
+collector observes decoder transport events independently; image rendering follows codestream
+metadata. Native box/compression interoperability and 444 actual-GPU presentations cover this
+boundary. Frame indexes, JPEG reconstruction and HDR gain-map rendering remain incomplete.
+
 ## Crates
 
 - `jxl_gpu_bitstream`: bounded raw/container parsing, non-accumulating incremental transport
-  events, bit IO, and deterministic `jxlc`/`jxlp` assembly shared by encode and decode.
+  events, opaque metadata/Brotli, bit IO, and deterministic `jxlc`/`jxlp` assembly shared by encode and decode.
 - `jxl_gpu_protocol`: backend-neutral render plans, decoded-group packets, and the canonical
   `RenderBackend`/`FrameSession` contracts.
 - `jxl_gpu_formats`: checked pitch-linear image layouts and CPU reference conversion, including

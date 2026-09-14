@@ -6,6 +6,14 @@ Bounded JPEG XL transport and codestream inventory for GPU codec front ends.
 `jxlp` fragment sequences. Raw and single-`jxlc` codestreams remain borrowed; only fragmented
 streams are joined.
 
+The public `metadata` module retains Exif, XMP, JUMBF and unknown auxiliary payloads by explicit
+selection. `MetadataCollector` consumes borrowed transport events without retaining their source
+allocations; `ParsedJxl::metadata` serves contiguous input. Original compressed payloads stay exact
+until explicit `decode`/`decode_all`; independent limits cover retention, expansion, ratio and
+standard Brotli windows. Collections support atomic replacement/removal and canonical `jxlc`
+writing, while individual boxes also feed the existing `jxlp` writer. Opaque contents never override
+codestream rendering fields. [API, ownership and executed evidence](../../docs/CONTAINER_METADATA.md).
+
 `ContainerStreamScanner` is the non-accumulating transport path. It accepts owned `Arc<[u8]>`
 chunks at arbitrary byte boundaries and emits raw/`jxlc`/`jxlp` codestream slices in logical order.
 Except for the two-byte codestream signature reconstructed inline across arbitrary chunk

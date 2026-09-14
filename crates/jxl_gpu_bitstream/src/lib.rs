@@ -15,6 +15,7 @@ use thiserror::Error;
 mod acceleration;
 mod inventory;
 mod inventory_stream;
+pub mod metadata;
 mod stream;
 
 #[cfg(test)]

@@ -11,6 +11,13 @@ other driver-private allocations cannot be measured portably and are not include
 
 ## ABI rules
 
+Opaque container metadata has separate host ownership in
+[`MetadataCollector` / `Metadata`](CONTAINER_METADATA.md). Selected encoded bytes and box count
+are bounded independently of input spans and GPU allocations; decompression additionally bounds
+decoded bytes, aggregate output, expansion ratio and standard Brotli windows. No GPU uniform,
+binding, dispatch or image allocation changes for metadata retention or editing. Collector failure
+or drop releases copied metadata without extending the lifetime of caller chunks or GPU images.
+
 - Every Rust value copied into a uniform or structured storage buffer is `#[repr(C)]`, derives
   `bytemuck::Pod` and `Zeroable`, and has compile-time size/alignment assertions plus a field-order
   test. Uploads use `bytemuck::bytes_of` or `cast_slice`; fixed readback records use

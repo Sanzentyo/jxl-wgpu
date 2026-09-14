@@ -9,6 +9,12 @@ The complete encoder backlog, dependencies, and acceptance gates are tracked in
 [`FULL_JPEG_XL_ROADMAP.md`](../../docs/FULL_JPEG_XL_ROADMAP.md). This README describes only the
 currently executable profiles.
 
+GPU-produced codestreams can be wrapped with Exif/XMP/JUMBF or other opaque payloads using
+`jxl_gpu_bitstream::metadata::Metadata::write_container`. `MetadataBox::new` supports plain or
+Brotli-compressed metadata with explicit size, ratio and window limits; `as_container_box` also
+feeds `FragmentedContainerWriter`. Existing payloads can be preserved or replaced independently
+of image encoding. [Metadata API and native interoperability](../../docs/CONTAINER_METADATA.md).
+
 ## Lossless Modular profile
 
 - Extents are `1..2^30` on each axis, further bounded by the selected WebGPU device's storage

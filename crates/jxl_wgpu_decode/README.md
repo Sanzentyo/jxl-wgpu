@@ -4,6 +4,14 @@ GPU-required JPEG XL decode orchestration. Production execution uses the stock W
 no dependency on the published `jxl` decoder. The complete-format backlog and acceptance gates are
 tracked in [`FULL_JPEG_XL_ROADMAP.md`](../../docs/FULL_JPEG_XL_ROADMAP.md).
 
+Opaque [container metadata](../../docs/CONTAINER_METADATA.md) can be retained with
+`jxl_gpu_bitstream::metadata::MetadataCollector` alongside `GpuDecodeStream`, using the same borrowed
+transport events. The collector has explicit host retention/decompression limits and independent
+ownership. Contiguous callers use `ParsedJxl::metadata`. Exif/XMP/JUMBF fields never override
+codestream orientation, dimensions, color or intensity. Seventeen decoder selections, including
+ICC/HDR, animation and preview, preserve 444 progressive/final GPU presentations exactly after
+metadata addition, replacement and removal. HDR gain-map interpretation is still unimplemented.
+
 ## Executable profile
 
 `GpuDecoder::wgpu` supports independent full-canvas Replace animations and layered stills, including
