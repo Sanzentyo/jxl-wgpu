@@ -89,7 +89,9 @@ impl Presentation {
         if matches!(output.format.color_spec, ColorSpecification::Defined(color)
             if matches!(color.transfer, jxl_gpu_formats::TransferFunction::Pq | jxl_gpu_formats::TransferFunction::Hlg))
         {
-            return Err(crate::color_output::ColorOutputError::HdrLuminanceMappingRequired.into());
+            return Err(
+                crate::color_output::ColorOutputError::HdrIccLuminanceMappingRequired.into(),
+            );
         }
         let device_output = output.format.model == jxl_gpu_formats::ColorModel::IccDevice;
         let target_encoding = |profile: &jxl_gpu_protocol::icc::IccProfile| {

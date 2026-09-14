@@ -111,6 +111,7 @@ impl LfPreview {
             "LF presentation has no inverse opsin metadata",
         ))?;
         let config = ColorOutputConfig {
+            intensity_target: inverse_opsin.intensity_target,
             linear_black_threshold: original_encoding.and_then(|original| {
                 crate::image_color::reconstruction_black_threshold(
                     original,
@@ -184,6 +185,7 @@ impl LfPreview {
             PreviewOutput::Components
         } else {
             let config = ColorOutputConfig {
+                intensity_target: self.inverse_opsin.intensity_target,
                 linear_black_threshold: self.original_encoding.and_then(|original| {
                     crate::image_color::reconstruction_black_threshold(
                         original,

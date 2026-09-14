@@ -223,7 +223,7 @@ fn numeric_icc_device_reconstruction_admits_complete_channels_and_owned_scratch(
         };
         assert_eq!(presentations.len(), 1);
         let presentation = &presentations[0];
-        assert_eq!(presentation.params.len(), 80);
+        assert_eq!(presentation.params.len(), 96);
         assert_eq!(presentation.bindings, [1, 2]);
         let FrameSurfaceEncoding::Device(profile) = &presentation.working_encoding else {
             panic!("complete reconstructed device");

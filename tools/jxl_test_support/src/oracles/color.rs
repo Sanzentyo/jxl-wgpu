@@ -26,9 +26,17 @@ pub fn linear_original_still(case: &corpus::Case) -> Vec<[f64; 4]> {
         .collect()
 }
 
-pub fn xyb_original_linear(mut rgb: [f64; 3], case: &corpus::Case) -> [f64; 3] {
+pub fn xyb_original_linear(rgb: [f64; 3], case: &corpus::Case) -> [f64; 3] {
+    xyb_original_linear_for_profile(rgb, case.profile.space(), case.profile.grayscale)
+}
+
+pub fn xyb_original_linear_for_profile(
+    mut rgb: [f64; 3],
+    target: ColorSpace,
+    grayscale: bool,
+) -> [f64; 3] {
     use jxl_gpu_protocol::{Chromaticity as Xy, RgbChromaticities};
-    let space = if case.profile.grayscale || case.profile.space() == ColorSpace::Bt709 {
+    let space = if grayscale || target == ColorSpace::Bt709 {
         ColorSpace::Bt709
     } else {
         // libjxl v0.12.0 ColorEncoding::GetPrimaries(kSRGB), used by OutputEncodingInfo
@@ -40,10 +48,10 @@ pub fn xyb_original_linear(mut rgb: [f64; 3], case: &corpus::Case) -> [f64; 3] {
             white: Xy::D65,
         })
     };
-    if case.profile.grayscale {
+    if grayscale {
         rgb = [(0..3).map(|c| rgb[c] * [0.2126, 0.7152, 0.0722][c]).sum(); 3];
     }
-    matrix(space, case.profile.space()).map(|row| (0..3).map(|c| row[c] * rgb[c]).sum())
+    matrix(space, target).map(|row| (0..3).map(|c| row[c] * rgb[c]).sum())
 }
 
 pub fn to_linear(value: f64, transfer: TransferFunction) -> f64 {

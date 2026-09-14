@@ -184,7 +184,7 @@ fn recursive_lf_rendering_clips_odd_grids_and_accounts_levels_one_through_four()
                 }
                 let bytes = |w: u32, h: u32| u64::from(w) * u64::from(h) * 4;
                 let total = renderer.output_storage_bytes
-                    + if components { 0 } else { 368 }
+                    + if components { 0 } else { 400 }
                     + renderer.kernel.weight_bytes()
                     + u64::from(level) * 3 * ResidentUpsamplePipeline::UNIFORM_BYTES
                     + (0..level)

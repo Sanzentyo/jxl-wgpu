@@ -530,18 +530,6 @@ fn composed_source(
 ) -> Result<(SequenceSource, Arc<Compositor>)> {
     validate(inventory, plan)?;
     let image = &inventory.image_header;
-    if inventory
-        .frames
-        .iter()
-        .any(|frame| frame.encoding == jxl_gpu_bitstream::FrameEncoding::VarDct)
-        && matches!(request.format().color_spec, jxl_gpu_formats::ColorSpecification::Defined(color)
-                if matches!(color.transfer, jxl_gpu_formats::TransferFunction::Pq | jxl_gpu_formats::TransferFunction::Hlg))
-    {
-        return Err(crate::VarDctDecodeError::Output(
-            crate::color_output::ColorOutputError::HdrLuminanceMappingRequired,
-        )
-        .into());
-    }
     let usage = if !image.xyb_encoded {
         gpu::ColorUsage::ORIGINAL
     } else {

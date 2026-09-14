@@ -101,7 +101,7 @@ Requested color conversion uses a selected immutable program shared across physi
 upload is lazy, budgeted and retryable; each dispatch retains its uploaded program through GPU
 completion even if the image session is dropped. Intermediate color surfaces, unchanged extra
 planes, output words, the 320-byte ICC dispatch storage, optional four-byte validation word
-and the 80-byte numeric, 208-byte RGB/Gray or 320-byte device packing uniform are all accounted.
+and the 96-byte numeric, 240-byte RGB/Gray or 320-byte device packing uniform are all accounted.
 No frame readback or CPU pixel CMS is involved. `GpuOutputRequest::with_icc_rendering_intent`
 defaults to relative colorimetric; non-Bradford conversion and unsupported selected methods return errors.
 Exact same-profile packing does not select a CMS method and therefore does not require an
@@ -191,7 +191,7 @@ at index 0 or 2. Native linear reconstruction, 88,128 independent/native ICC ref
 352,512 GPU device comparisons and 66,096 numeric comparisons separate generated K from stored
 Black. Both F32 layouts, bounded transport, retained outputs and exact alpha/extra words are covered.
 RGB/Gray numeric output and patched LF alpha/depth substitutions cover the shared boundary.
-Private tests include exact 80-byte numeric packing admission and the complete device-plus-extra
+Private tests include exact 96-byte numeric packing admission and the complete device-plus-extra
 working allocation, retry and completion-owned cancellation.
 
 Independent frame sequences retain the caller's requested frame window. Each physical producer

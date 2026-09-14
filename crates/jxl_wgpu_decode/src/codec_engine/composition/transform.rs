@@ -134,6 +134,7 @@ pub(super) fn convert(
         stride: source.extent().width,
     });
     let config = ColorOutputConfig {
+        intensity_target: image.tone_mapping.intensity_target.to_f32(),
         linear_black_threshold: if image.xyb_encoded {
             original.rgb_encoding().and_then(|original| {
                 crate::image_color::reconstruction_black_threshold(

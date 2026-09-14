@@ -3,8 +3,9 @@ struct Params {
     extent: vec4<u32>, // output width/height, source width/height
     format: vec4<u32>, // channels, valid bits, bytes per sample, row bytes
     output: vec4<u32>, // logical bytes, dispatch width, orientation, alpha conversion
-    color: vec4<u32>, // original transfer selector, gamma bits, color channels, reserved
+    color: vec4<u32>, // original transfer selector, gamma bits, color channels, intensity bits
     source: vec4<u32>, // plane stride, first alpha plane, selected scalar plane, flags (F32, linear RGB, complement)
+    luminance: vec4<f32>, // original RGB luminance coefficients, inverse HLG OOTF exponent
 };
 @group(0) @binding(0) var<storage, read> source: array<u32>;
 @group(0) @binding(1) var<storage, read_write> destination: array<u32>;
@@ -18,8 +19,8 @@ fn original_rgb_words(input: vec3<u32>) -> vec3<u32> {
     if params.color.x == 6u || params.color.x == 7u {
         rgb = select(rgb, vec3<f32>(0.0), rgb <= vec3<f32>(1e-5));
     }
-    return bitcast<vec3<u32>>(vec3<f32>(transfer_from_linear(rgb.r, params.color.x, bitcast<f32>(params.color.y)),
-        transfer_from_linear(rgb.g, params.color.x, bitcast<f32>(params.color.y)), transfer_from_linear(rgb.b, params.color.x, bitcast<f32>(params.color.y))));
+    return bitcast<vec3<u32>>(display_from_linear(rgb, params.color.x,
+        bitcast<f32>(params.color.y), bitcast<f32>(params.color.w), params.luminance));
 }
 
 fn output_byte(offset: u32) -> u32 {

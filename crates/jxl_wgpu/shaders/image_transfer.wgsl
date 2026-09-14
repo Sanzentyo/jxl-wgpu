@@ -83,3 +83,53 @@ fn transfer_from_linear(value: f32, transfer: u32, gamma: f32) -> f32 {
     }
     return select(encoded, -encoded, value < 0.0);
 }
+// Display-relative RGB uses unit white at the declared intensity target. Generic
+// callers pass zero nits to retain absolute-normalized PQ / scene-linear HLG.
+fn display_ootf(rgb: vec3<f32>, luminance: vec4<f32>) -> vec3<f32> {
+    let exponent = luminance.w;
+    if abs(exponent) <= 0.01 { return rgb; }
+    let y = dot(rgb, luminance.xyz);
+    var ratio: f32;
+    if y > 0.0 {
+        ratio = min(pow(y, exponent), 1e9);
+    } else {
+        // XYB ringing can produce nonpositive luminance. Preserve libjxl's
+        // reconstruction extension (base/fast_math-inl.h::FastLog2f) with
+        // explicit wrapping integer range reduction; never pow a negative base.
+        let bits = bitcast<i32>(y);
+        let shift = (bits - 0x3f2aaaab) >> 23u;
+        let mantissa = bitcast<f32>(bits - (shift << 23u));
+        ratio = min(exp2((log2(mantissa) + f32(shift)) * exponent), 1e9);
+    }
+    return rgb * ratio;
+}
+
+fn display_to_linear(
+    rgb: vec3<f32>, transfer: u32, gamma: f32, intensity: f32, luminance: vec4<f32>,
+) -> vec3<f32> {
+    var linear = vec3<f32>(
+        transfer_to_linear(rgb.r, transfer, gamma),
+        transfer_to_linear(rgb.g, transfer, gamma),
+        transfer_to_linear(rgb.b, transfer, gamma),
+    );
+    if intensity > 0.0 {
+        if transfer == 3u { linear *= 10000.0 / intensity; }
+        if transfer == 4u { linear = display_ootf(linear, luminance); }
+    }
+    return linear;
+}
+
+fn display_from_linear(
+    rgb: vec3<f32>, transfer: u32, gamma: f32, intensity: f32, luminance: vec4<f32>,
+) -> vec3<f32> {
+    var linear = rgb;
+    if intensity > 0.0 {
+        if transfer == 3u { linear *= intensity / 10000.0; }
+        if transfer == 4u { linear = display_ootf(linear, luminance); }
+    }
+    return vec3<f32>(
+        transfer_from_linear(linear.r, transfer, gamma),
+        transfer_from_linear(linear.g, transfer, gamma),
+        transfer_from_linear(linear.b, transfer, gamma),
+    );
+}

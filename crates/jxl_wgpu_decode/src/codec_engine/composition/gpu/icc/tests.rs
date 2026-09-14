@@ -137,7 +137,7 @@ fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
         );
         let source = compositor.completed_surface(buffer);
         let output_size = aligned(compositor.layout.logical_size).unwrap();
-        let transient = 208
+        let transient = 240
             + transform.memory.transient_bytes()
             + presentation.working.storage_bytes
             + if presentation.spots.is_some() {

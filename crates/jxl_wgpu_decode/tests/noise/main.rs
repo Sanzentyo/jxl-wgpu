@@ -143,7 +143,7 @@ fn noise_scratch_is_admitted_before_submission_and_released_on_retry_and_cancell
                     257 * 17 * 12
                         + (257_u64 * 17 * 4).div_ceil(alignment) * alignment * 3
                         + 80
-                        + 208
+                        + 240
                         + 160
                 } else {
                     0

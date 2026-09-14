@@ -144,6 +144,7 @@ impl ModularReconstructionConfig {
             (Some(transform), threshold)
         };
         Ok(ModularColorConfig {
+            intensity_target: image.tone_mapping.intensity_target.to_f32(),
             reconstruction: self,
             transform,
             linear_black_threshold,
@@ -153,6 +154,7 @@ impl ModularReconstructionConfig {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ModularColorConfig {
+    intensity_target: f32,
     reconstruction: ModularReconstructionConfig,
     /// Absent when reconstruction ends at codec components with no color interpretation.
     transform: Option<ColorOutputTransform>,
@@ -198,6 +200,7 @@ impl ColorPlan {
             return invalid("Modular color reconstruction requires equal color grids");
         }
         let output_config = config.transform.map(|transform| ColorOutputConfig {
+            intensity_target: config.intensity_target,
             linear_black_threshold: config.linear_black_threshold,
             white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,
             extent,
@@ -960,6 +963,7 @@ mod tests {
             inverse_sigma: -1.171_572_9,
         };
         let config = ModularColorConfig {
+            intensity_target: 255.0,
             reconstruction,
             transform: Some(ColorOutputTransform::Rgb(RgbColorEncoding::SRGB_BT709)),
             linear_black_threshold: None,
@@ -977,7 +981,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.storage_bytes, 6 * 19 * 9 * 4 + 3 * 37 * 17 * 4);
-        assert_eq!(plan.uniform_bytes, 80 + 80 + 2 * 80 + 3 * 48 + 208 + 160);
+        assert_eq!(plan.uniform_bytes, 80 + 80 + 2 * 80 + 3 * 48 + 240 + 160);
         assert_eq!(
             plan.layout
                 .planes

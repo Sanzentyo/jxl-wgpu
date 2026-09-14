@@ -197,7 +197,7 @@ fn spot_metadata_admission_is_exact_retryable_and_completion_owned() {
         );
         let source = compositor.completed_surface(buffer);
         let output_size = aligned(compositor.layout.logical_size).unwrap();
-        let transient = 208
+        let transient = 240
             + if policy == crate::SpotColorPolicy::Render {
                 5 * 32
             } else {

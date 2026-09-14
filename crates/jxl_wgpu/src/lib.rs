@@ -72,7 +72,7 @@ pub use forward_vardct::{
 pub use image_output::{
     ALPHA_OUTPUT_SHADER, AlphaConversion, IMAGE_ORIENTATION_SHADER, IMAGE_OUTPUT_SHADER,
     IMAGE_TRANSFER_SHADER, ImageOutputGeometry, ImageOutputParams, ImageOutputSource,
-    rgb_color_matrix,
+    display_luminance, rgb_color_matrix,
 };
 pub use jxl_gpu_formats::{
     ByteOrder, Channel, ChromaLocation, ChromaLocation2d, ChromaOrder, ChromaSubsampling,

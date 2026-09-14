@@ -81,6 +81,8 @@ pub(crate) fn original_encoding(image: &ImageHeaderInventory) -> Option<RgbColor
         TransferFunctionInventory::Linear => TransferFunction::Linear,
         TransferFunctionInventory::Srgb => TransferFunction::Srgb,
         TransferFunctionInventory::Bt709 => TransferFunction::Bt709,
+        TransferFunctionInventory::Pq => TransferFunction::Pq,
+        TransferFunctionInventory::Hlg => TransferFunction::Hlg,
         TransferFunctionInventory::Dci => TransferFunction::Dci,
         TransferFunctionInventory::Gamma {
             scaled_gamma,
@@ -113,7 +115,7 @@ pub(crate) fn require_original_encoding(
     original_encoding(image).ok_or_else(|| {
         crate::UnsupportedProfile::new(
             crate::UnsupportedCodestreamFeature::ColorEncoding,
-            "image color requires a nonsingular enumerated RGB/gray SDR profile; non-D65 whites currently require relative intent",
+            "image color requires a nonsingular enumerated RGB/gray profile; non-D65 whites currently require relative intent",
         )
     })
 }
@@ -252,6 +254,8 @@ mod tests {
                 (TransferFunctionInventory::Linear, TransferFunction::Linear),
                 (TransferFunctionInventory::Srgb, TransferFunction::Srgb),
                 (TransferFunctionInventory::Bt709, TransferFunction::Bt709),
+                (TransferFunctionInventory::Pq, TransferFunction::Pq),
+                (TransferFunctionInventory::Hlg, TransferFunction::Hlg),
             ] {
                 for gray in [false, true] {
                     image.grayscale = gray;
@@ -304,8 +308,6 @@ mod tests {
         *white_point = WhitePointInventory::Custom(ChromaticityInventory { x: 0, y: 0 });
         unsupported.push(image);
         for tf in [
-            TransferFunctionInventory::Pq,
-            TransferFunctionInventory::Hlg,
             TransferFunctionInventory::Unknown,
             TransferFunctionInventory::Gamma {
                 scaled_gamma: 0,

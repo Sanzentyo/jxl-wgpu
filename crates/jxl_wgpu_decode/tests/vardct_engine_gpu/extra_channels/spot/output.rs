@@ -148,7 +148,7 @@ fn spot_presentation_precedes_native_quantization_and_target_chroma_subsampling(
 }
 
 #[test]
-fn spot_policy_never_tints_selected_numeric_planes_and_hdr_remains_explicit() {
+fn spot_policy_never_tints_selected_numeric_planes_and_hdr_output_is_finite() {
     let Ok(backend) = pollster::block_on(WgpuBackend::request_default(Default::default())) else {
         return;
     };
@@ -184,7 +184,6 @@ fn spot_policy_never_tints_selected_numeric_planes_and_hdr_remains_explicit() {
             }
         }
         if name.starts_with("vardct") {
-            let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
             for transfer in [TransferFunction::Pq, TransferFunction::Hlg] {
                 let ColorSpecification::Defined(mut color) = vardct_rgb8_format().color_spec else {
                     unreachable!()
@@ -196,8 +195,16 @@ fn spot_policy_never_tints_selected_numeric_planes_and_hdr_remains_explicit() {
                     ColorSpecification::Defined(color),
                 ))
                 .unwrap();
-                assert!(matches!(decoder.open(&data, request), Err(DecodeError::VarDct(VarDctDecodeError::Output(
-                    jxl_wgpu_decode::color_output::ColorOutputError::HdrLuminanceMappingRequired)))));
+                let rendered = associated::decode(&backend, &data, request.clone(), false);
+                let bounded = associated::decode(&backend, &data, request, true);
+                assert_eq!(rendered, bounded, "{name}: bounded HDR output");
+                assert!(rendered.iter().all(|(_, bytes)| {
+                    bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|word| f32::from_le_bytes(*word).is_finite())
+                }));
             }
             assert_eq!(
                 backend.transient_memory_budget().snapshot().reserved_bytes,

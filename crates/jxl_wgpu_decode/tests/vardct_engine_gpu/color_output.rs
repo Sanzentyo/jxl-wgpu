@@ -305,7 +305,7 @@ fn check_formats(
                     memory.output_lease_bytes,
                     expected.layout.logical_size.div_ceil(4) * 4
                 );
-                assert_eq!(memory.output_uniform_bytes, 208 + 160);
+                assert_eq!(memory.output_uniform_bytes, 240 + 160);
             }
             let frame = if cap == 256 {
                 pollster::block_on(session.next_frame_async())

@@ -79,7 +79,7 @@ pub enum AlphaConversion {
     Premultiply = 2,
 }
 
-/// Fixed 208-byte uniform for the shared output shader.
+/// Fixed 240-byte uniform for the shared output shader.
 /// Construct it with [`Self::new`] to validate geometry, color, and packed addressing.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -121,6 +121,8 @@ pub struct ImageOutputParams {
     pub(crate) primaries_b: [f32; 4],
     pub(crate) alpha: [u32; 4],
     pub(crate) transfer_parameters: [f32; 4],
+    pub(crate) source_luminance: [f32; 4],
+    pub(crate) target_luminance: [f32; 4],
 }
 impl ImageOutputParams {
     /// Pack three F32 codec components without assigning RGB or ICC meaning to their storage.
@@ -217,6 +219,33 @@ impl ImageOutputParams {
         )
     }
 
+    /// Convert display-relative RGB using an explicit unit-white intensity in nits.
+    /// PQ is absolute light; HLG includes the display OOTF using each encoding's own
+    /// luminance coefficients. SDR and linear values remain relative to this intensity.
+    /// This conversion does not tone-map, change the display peak, or clip RGB.
+    pub fn new_with_intensity_target(
+        layout: &ImageLayout,
+        source: ImageOutputSource,
+        dispatch_width: u32,
+        adaptation: WhitePointAdaptation,
+        intensity_target: f32,
+    ) -> Result<Self> {
+        let mut params = Self::new(layout, source, dispatch_width, adaptation)?;
+        let ColorSpecification::Defined(target) = layout.format.color_spec else {
+            return Err(Error::InvalidPayload(
+                "display luminance requires enumerated RGB".into(),
+            ));
+        };
+        let target_space = target.space.rgb_space().ok_or_else(|| {
+            Error::InvalidPayload("display luminance requires target chromaticities".into())
+        })?;
+        params.source_luminance =
+            display_luminance(source.encoding.space, intensity_target, false)?;
+        params.target_luminance = display_luminance(target_space, intensity_target, true)?;
+        params.transfer_parameters[3] = intensity_target;
+        Ok(params)
+    }
+
     /// Pack RGB or gray device values already in the exact target ICC profile. This performs
     /// no curve or matrix evaluation, preserving F32 device samples when alpha is preserved.
     /// A gray source supplies its one color word in `source_rgb_words_at(...).x`; alpha is separate.
@@ -311,6 +340,8 @@ impl ImageOutputParams {
             primaries_b: color.primaries[2],
             alpha: [0; 4],
             transfer_parameters: [color.source_gamma, color.target_gamma, -1.0, 0.0],
+            source_luminance: [0.0; 4],
+            target_luminance: [0.0; 4],
         })
     }
 
@@ -636,7 +667,9 @@ pub(crate) fn image_color_transform(
     })
 }
 
+mod luminance;
 mod matrix;
+pub use luminance::display_luminance;
 use matrix::IDENTITY as IDENTITY_3;
 pub use matrix::rgb_color_matrix;
 
@@ -646,11 +679,13 @@ fn to_shader_u32(value: u64) -> Result<u32> {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<ImageOutputParams>() == 208);
+    assert!(std::mem::size_of::<ImageOutputParams>() == 240);
     assert!(std::mem::align_of::<ImageOutputParams>() == 4);
     assert!(std::mem::offset_of!(ImageOutputParams, primaries_r) == 128);
     assert!(std::mem::offset_of!(ImageOutputParams, primaries_g) == 144);
     assert!(std::mem::offset_of!(ImageOutputParams, primaries_b) == 160);
     assert!(std::mem::offset_of!(ImageOutputParams, alpha) == 176);
     assert!(std::mem::offset_of!(ImageOutputParams, transfer_parameters) == 192);
+    assert!(std::mem::offset_of!(ImageOutputParams, source_luminance) == 208);
+    assert!(std::mem::offset_of!(ImageOutputParams, target_luminance) == 224);
 };

@@ -218,6 +218,11 @@ pub(super) fn prepare_presentation(
             },
         };
         let config = ColorOutputConfig {
+            intensity_target: inventory
+                .image_header
+                .tone_mapping
+                .intensity_target
+                .to_f32(),
             linear_black_threshold: if inventory.image_header.xyb_encoded {
                 crate::image_color::reconstruction_black_threshold(
                     original,

@@ -87,12 +87,14 @@ struct NativeParams {
     output: [u32; 4],
     color: [u32; 4],
     source: [u32; 4],
+    luminance: [f32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<NativeParams>() == 80);
+const _: () = assert!(std::mem::size_of::<NativeParams>() == 96);
 const _: () = assert!(std::mem::align_of::<NativeParams>() == 16);
 const _: () = assert!(std::mem::offset_of!(NativeParams, color) == 48);
 const _: () = assert!(std::mem::offset_of!(NativeParams, source) == 64);
+const _: () = assert!(std::mem::offset_of!(NativeParams, luminance) == 80);
 
 #[derive(Debug)]
 enum RasterPacking {
@@ -161,6 +163,19 @@ impl Compositor {
         let grayscale = image.grayscale;
         let sample_bit_depth = image.bit_depth;
         let original = crate::image_color::original_domain(image)?;
+        let intensity_target = image.tone_mapping.intensity_target.to_f32();
+        if matches!(
+            original.rgb_encoding().map(|encoding| encoding.transfer),
+            Some(jxl_gpu_protocol::TransferFunction::Pq | jxl_gpu_protocol::TransferFunction::Hlg)
+        ) && matches!(
+            request.format().color_spec,
+            jxl_gpu_formats::ColorSpecification::Icc(_)
+        ) && request.mapping() == crate::GpuOutputMapping::Color
+        {
+            return Err(
+                crate::color_output::ColorOutputError::HdrIccLuminanceMappingRequired.into(),
+            );
+        }
         let orientation = OutputOrientation::from_exif_value(image.orientation).ok_or(
             Error::InvalidImageOrientation {
                 value: image.orientation,
@@ -415,9 +430,11 @@ impl Compositor {
                                 None | Some(jxl_gpu_protocol::TransferFunction::Linear) => 0,
                                 Some(jxl_gpu_protocol::TransferFunction::Srgb) => 1,
                                 Some(jxl_gpu_protocol::TransferFunction::Bt709) => 2,
+                                Some(jxl_gpu_protocol::TransferFunction::Pq) => 3,
+                                Some(jxl_gpu_protocol::TransferFunction::Hlg) => 4,
+                                Some(jxl_gpu_protocol::TransferFunction::Bt2020) => 5,
                                 Some(jxl_gpu_protocol::TransferFunction::Gamma(_)) => 6,
                                 Some(jxl_gpu_protocol::TransferFunction::Dci) => 7,
-                                _ => unreachable!("validated original transfer"),
                             },
                             match original.rgb_encoding().map(|encoding| encoding.transfer) {
                                 Some(jxl_gpu_protocol::TransferFunction::Gamma(exponent)) => {
@@ -426,7 +443,7 @@ impl Compositor {
                                 _ => 1.0f32.to_bits(),
                             },
                             color_count,
-                            0,
+                            intensity_target.to_bits(),
                         ],
                         source: [
                             (surface.color_plane_bytes / 4) as u32,
@@ -434,6 +451,9 @@ impl Compositor {
                             selected.map_or(color_channel.unwrap_or(0), |(index, _)| index),
                             u32::from(scalar_float),
                         ],
+                        luminance: original.rgb_encoding().map_or(Ok([0.0; 4]), |encoding| {
+                            jxl_wgpu::display_luminance(encoding.space, intensity_target, true)
+                        })?,
                     }),
                     native_shader(spot_source),
                 )
@@ -445,7 +465,7 @@ impl Compositor {
                     .rgb_encoding()
                     .ok_or(Error::EngineContract("enumerated packing requires RGB"))?;
                 let params = |encoding: FrameSurfaceEncoding| -> Result<ImageOutputParams> {
-                    let params = ImageOutputParams::new(
+                    let params = ImageOutputParams::new_with_intensity_target(
                         &layout,
                         ImageOutputSource {
                             extent: canvas,
@@ -457,6 +477,7 @@ impl Compositor {
                         },
                         output_dispatch[0] * 64,
                         request.white_point_adaptation(),
+                        intensity_target,
                     )?
                     .with_alpha_conversion(alpha_conversion);
                     Ok(

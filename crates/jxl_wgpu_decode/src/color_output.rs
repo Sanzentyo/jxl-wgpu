@@ -5,7 +5,7 @@
 //! up to three zero padding bytes after the logical image payload.
 
 use bytemuck::{Pod, Zeroable};
-use jxl_gpu_formats::{ColorSpecification, ImageLayout, TransferFunction};
+use jxl_gpu_formats::ImageLayout;
 use jxl_gpu_protocol::{Extent2d, OutputOrientation, RgbColorEncoding, XybParams};
 use jxl_wgpu::{ImageOutputParams, ImageOutputSource, KernelVariant, ResidentStorageBinding};
 use wgpu::util::DeviceExt;
@@ -167,6 +167,8 @@ impl InverseOpsin {
 /// Host-known geometry and source color transform for one packed output.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ColorOutputConfig {
+    /// Nits represented by unit linear RGB. Must equal the XYB inverse's intensity target.
+    pub intensity_target: f32,
     /// Logical image extent after resampling, before orientation.
     pub extent: Extent2d,
     /// Maps input coordinates into the display-oriented packed output.
@@ -198,12 +200,16 @@ impl ColorOutputConfig {
         strides: [u32; 3],
         dispatch_width: u32,
     ) -> Result<ImageOutputParams, ColorOutputError> {
-        if matches!(layout.format.color_spec, ColorSpecification::Defined(color) if matches!(color.transfer, TransferFunction::Pq | TransferFunction::Hlg))
+        if !self.intensity_target.is_finite() || self.intensity_target <= 0.0 {
+            return Err(ColorOutputError::InvalidIntensityTarget);
+        }
+        if let ColorOutputTransform::Xyb(inverse) = self.transform
+            && inverse.intensity_target != self.intensity_target
         {
-            return Err(ColorOutputError::HdrLuminanceMappingRequired);
+            return Err(ColorOutputError::InvalidIntensityTarget);
         }
         let params = match self.transform.encoding() {
-            ColorOutputEncoding::Rgb(encoding) => ImageOutputParams::new(
+            ColorOutputEncoding::Rgb(encoding) => ImageOutputParams::new_with_intensity_target(
                 layout,
                 ImageOutputSource {
                     extent: self.extent,
@@ -213,6 +219,7 @@ impl ColorOutputConfig {
                 },
                 dispatch_width,
                 self.white_point_adaptation,
+                self.intensity_target,
             )?,
             ColorOutputEncoding::Icc(profile) => ImageOutputParams::for_icc_device(
                 layout,
@@ -441,7 +448,7 @@ fn validate_storage_bindings(limits: &wgpu::Limits) -> Result<(), ColorOutputErr
 /// Uniform allocation that must remain live through command submission.
 #[derive(Debug)]
 pub struct ColorOutputScratch {
-    /// The shared 208-byte color/layout parameter buffer.
+    /// The shared 240-byte color/layout parameter buffer.
     pub uniform: wgpu::Buffer,
     /// The 160-byte inverse-opsin/JPEG and alpha source parameter buffer.
     pub source_uniform: wgpu::Buffer,
@@ -463,9 +470,9 @@ pub enum ColorOutputError {
     /// The common output contract rejected color or layout metadata.
     #[error(transparent)]
     ImageOutput(#[from] jxl_wgpu::Error),
-    /// Relative SDR values cannot be relabeled as absolute PQ or scene-linear HLG.
-    #[error("reconstructed HDR output requires an explicit luminance mapping")]
-    HdrLuminanceMappingRequired,
+    /// The ICC connection does not yet carry the image's display-luminance context.
+    #[error("HDR conversion through an ICC profile requires an explicit luminance mapping")]
+    HdrIccLuminanceMappingRequired,
     /// Checked size arithmetic overflowed.
     #[error("reconstructed color output arithmetic overflow while computing {field}")]
     ArithmeticOverflow { field: &'static str },
@@ -557,7 +564,7 @@ pub enum ColorOutputError {
         required: u64,
         available: u64,
     },
-    /// The 208-byte uniform exceeds an unusual device limit.
+    /// The 240-byte uniform exceeds an unusual device limit.
     #[error(
         "reconstructed color uniform needs {required} bytes, uniform binding limit is {available}"
     )]
@@ -1040,6 +1047,7 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jxl_gpu_formats::{ColorSpecification, TransferFunction};
 
     fn rgb_layout(width: u32, height: u32) -> ImageLayout {
         ImageLayout::packed(
@@ -1113,9 +1121,9 @@ mod tests {
         let memory = ColorOutputMemoryPlan::new(&rgb_layout(5, 3)).unwrap();
         assert_eq!(memory.logical_output_bytes, 45);
         assert_eq!(memory.output_storage_bytes, 48);
-        assert_eq!(memory.uniform_bytes, 368);
-        assert_eq!(memory.transient_bytes, 368);
-        assert_eq!(memory.total_bytes, 416);
+        assert_eq!(memory.uniform_bytes, 400);
+        assert_eq!(memory.transient_bytes, 400);
+        assert_eq!(memory.total_bytes, 448);
 
         let plan = ColorOutputPlan::for_limits(&rgb_layout(5, 3), &generous_limits()).unwrap();
         assert_eq!(plan.output_words, 12);
@@ -1190,8 +1198,9 @@ mod tests {
     }
 
     #[test]
-    fn output_contract_rejects_inconsistent_layout_and_unmapped_hdr() {
+    fn output_contract_validates_layout_and_display_intensity() {
         let config = ColorOutputConfig {
+            intensity_target: 255.0,
             white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,
             linear_black_threshold: None,
             extent: Extent2d::new(5, 3),
@@ -1221,10 +1230,17 @@ mod tests {
                 unreachable!()
             };
             color.transfer = transfer;
-            assert!(matches!(
-                config.validate_layout(&hdr),
-                Err(ColorOutputError::HdrLuminanceMappingRequired)
-            ));
+            config.validate_layout(&hdr).unwrap();
+            for intensity_target in [0.0, -1.0, f32::NAN, f32::INFINITY, 1000.0] {
+                let invalid = ColorOutputConfig {
+                    intensity_target,
+                    ..config.clone()
+                };
+                assert!(matches!(
+                    invalid.validate_layout(&hdr),
+                    Err(ColorOutputError::InvalidIntensityTarget)
+                ));
+            }
         }
         let mut limited_rgb = layout;
         let ColorSpecification::Defined(ref mut color) = limited_rgb.format.color_spec else {
@@ -1390,6 +1406,7 @@ mod tests {
                         output: binding(&output),
                         layout: &layout,
                         config: &ColorOutputConfig {
+                            intensity_target: 255.0,
                             linear_black_threshold: None,
                             white_point_adaptation:
                                 jxl_gpu_protocol::WhitePointAdaptation::Bradford,
@@ -1429,7 +1446,7 @@ mod tests {
                         scratch.plan.memory.output_storage_bytes,
                         layout.logical_size.div_ceil(4) * 4
                     );
-                    assert_eq!(scratch.uniform.size(), 208);
+                    assert_eq!(scratch.uniform.size(), 240);
                     assert_eq!(scratch.source_uniform.size(), 160);
                     encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, 128);
                     let submission = queue.submit([encoder.finish()]);
