@@ -1,5 +1,6 @@
 use super::*;
 
+mod lut;
 mod mpe;
 
 fn affine(transform: &IccTransform) -> &IccAffine {
@@ -152,7 +153,7 @@ fn tag_priority_is_directional_and_never_silently_discards_a_lut() {
             if signature[0] == b'D' || signature[2] == b'D' {
                 mpe::identity_mpe(3)
             } else {
-                element(b"mAB ", &[])
+                lut::identity_lut(direction)
             },
         ));
         let profile = parse(profile_bytes(&tags)).unwrap();
@@ -386,7 +387,12 @@ fn linear_connections_honor_directional_tag_priority_intent_and_geometry() {
         (*b"B2A1", false),
     ] {
         let mut tags = rgb_tags();
-        tags.push((tag, element(b"mAB ", &[])));
+        let direction = if forward {
+            IccDirection::DeviceToPcs
+        } else {
+            IccDirection::PcsToDevice
+        };
+        tags.push((tag, lut::identity_lut(direction)));
         let profile = parse(profile_bytes(&tags)).unwrap();
         let to = IccTransform::to_linear_rgb(
             &profile,
@@ -398,14 +404,14 @@ fn linear_connections_honor_directional_tag_priority_intent_and_geometry() {
             &profile,
             IccRenderingIntent::Relative,
         );
-        let (rejected, accepted) = if forward { (to, from) } else { (from, to) };
+        assert!(to.is_ok() && from.is_ok());
         assert_eq!(
-            rejected,
-            Err(IccError::TransformTag {
-                tag: IccSignature(tag)
-            })
+            profile
+                .select(direction, IccRenderingIntent::Relative)
+                .unwrap()
+                .tag(),
+            Some(IccSignature(tag))
         );
-        assert!(accepted.is_ok());
     }
     let profile = parse(profile_bytes(&rgb_tags())).unwrap();
     for intent in [
@@ -466,9 +472,9 @@ fn every_intent_selects_its_mpe_then_its_lut_then_the_default_lut() {
                 intent as u8
             };
             let mut tags = rgb_tags();
-            tags.push((base, element(b"mAB ", &[])));
+            tags.push((base, self::lut::identity_lut(direction)));
             if lut != base {
-                tags.push((lut, element(b"mAB ", &[])));
+                tags.push((lut, self::lut::identity_lut(direction)));
             }
             tags.push((mpe, self::mpe::identity_mpe(3)));
             for expected in [mpe, lut, base] {

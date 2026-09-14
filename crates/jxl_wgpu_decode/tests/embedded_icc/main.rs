@@ -11,6 +11,7 @@ use std::num::NonZeroU64;
 
 mod color;
 mod intents;
+mod lut;
 mod mpe;
 mod numeric;
 mod output;

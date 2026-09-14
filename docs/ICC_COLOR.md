@@ -1,11 +1,13 @@
 # Resident ICC color processing
 
-The metadata and resident GPU execution layers support RGB/Gray matrix/TRC and floating-point MPE programs with XYZ or Lab PCS.
+The metadata and resident GPU execution layers support RGB/Gray matrix/TRC, integer LUT methods
+and floating-point MPE programs with XYZ or Lab PCS.
 JPEG XL decoding now admits embedded ICC for unfiltered original Modular numeric samples and
 independent extra-channel output in the supported single-frame paths through both codecs. Codec
 reconstruction and LF configuration are independent of color conversion. The common decoder now
 also handles original and XYB ICC RGB/Gray color surfaces, including YCbCr reconstruction,
-original-domain references and composition, all four matrix/TRC intents and U8/F32 requested output. Requested RGB MPE output is also exercised through the public decoder.
+original-domain references and composition, all four matrix/TRC intents and U8/F32 requested output.
+Requested RGB MPE output and embedded/requested RGB/Gray LUTs are also exercised through the public decoder.
 Broader ICC XYB conformance, enumerated-source-to-ICC conversion, spot rendering, other ICC methods
 and HDR mapping remain open.
 This checkpoint does not change the full JPEG XL support claim.
@@ -83,15 +85,15 @@ evaluations checks the mathematical domain of parametric curves and monotonicity
 `IccProfile::select` selects a direction and explicit intent and returns an `IccProfileProgram`.
 Its `IccProgram` is a checked sequence of typed stages with explicit input/output channel counts.
 DToB/BToD MPE tags take priority. Unknown processing-element signatures discard that MPE method
-according to ICC.1 section 10.16.1; malformed supported elements return an error. Selected legacy
-AToB/BToA LUTs still return an unsupported-method error, including the intent-zero fallback when
-the requested LUT is absent. `matrix_trc` remains restricted metadata inspection of a selected
-matrix/TRC method. It cannot represent an MPE method.
+according to ICC.1 section 10.16.1; malformed supported elements return an error. Legacy AToB/BToA
+selection uses the requested intent, then intent zero if absent. Absolute uses the relative LUT
+and the PCS media-white connection. `matrix_trc` remains restricted metadata inspection of a
+selected matrix/TRC method; LUT/MPE callers use the general selected program.
 
 Matrix/TRC covers RGB input/display and monochrome input/display/output classes with XYZ PCS.
-MPE supports input/display/output profiles, recognized device channel counts and XYZ/Lab PCS;
+LUT/MPE supports input/display/output profiles, recognized device channel counts and XYZ/Lab PCS;
 this resident metadata support is broader than JPEG XL decoder admission, which still uses
-RGB/Gray image color surfaces. Legacy LUTs, complete CMYK image plumbing, other profile classes,
+RGB/Gray image color surfaces. V2 LUT black-point connections, complete CMYK image plumbing, other profile classes,
 full floating-point-range conformance and broader gamut/HDR policies remain open.
 
 Relative intent connects the profiles in media-relative PCS. Absolute intent uses fully adapted
@@ -103,7 +105,7 @@ black to target black: `scale = (D50 - target_black) / (D50 - source_black)` and
 `offset = target_black - scale * source_black`. V2 targets do not enable this automatic compensation.
 This is a declared matrix-shaper CMM policy, not a substitute for profile-supplied gamut mapping.
 
-Black is obtained by evaluating at most three curve endpoints and the profile's colorant matrix.
+Matrix/TRC black is obtained by evaluating at most three curve endpoints and the profile's colorant matrix.
 The CMM darker-colorant policy clips Lab L* to 0–50, resets L* above 95 to zero, and retains a*/b*.
 The policy uses decimal PCS D50 `(0.9642, 1, 0.8249)`; encoded colorants and RGB connection geometry
 remain unchanged. No CPU image pixels are evaluated. Connection matrices and offsets compose in host f64 before upload.
@@ -171,6 +173,59 @@ affine bases where needed. The backend checks finite matrix lowering
 and the existing legacy parametric-power bound. Full-range overflow/conditioning coverage for
 arbitrary MPE formulas remains a conformance gate, not an established HDR guarantee.
 
+## Integer LUT methods
+
+`mft1`/`mft2` profiles execute their matrix, input curves, CLUT and output curves in order.
+`mAB`/`mBA` use named offsets and directional A/CLUT/M/matrix/B stages, including all four
+permitted combinations. Embedded curves reuse the validated unit-domain curve representation;
+sampled payloads shared by complete or suffix curve sets retain one allocation. Physical ordering
+is independent of execution order. Unsupported selected types, invalid combinations, overlap,
+truncation, reserved bytes and resource excess return errors before GPU execution. No malformed
+selected method falls back to another tag.
+
+The table formats accept v2/v4; A/B formats require v4. `mft1` has 256 entries per input/output
+curve; `mft2` has 2–4,096. CLUTs have at least two grid points per dimension and use 8-/16-bit
+samples. Counts and byte ranges are checked before payload allocation, using the same channel,
+sample and CLUT resource limits as MPE. The table matrix must be identity unless its input is
+PCSXYZ. A device-space `XYZ ` signature does not make input device data PCS.
+
+Explicit stages convert normalized LUT samples to physical PCS. XYZ uses `65535/32768`;
+`mft1` XYZ is implementation-defined and follows this same Little CMS convention. General
+Lab uses L* 0–100 and a*/b* −128–127. `mft2` retains the legacy Lab encoding even in v4:
+L*=100 at `0xff00`, neutral a*/b* at `0x8000`, with valid a*/b* values up to 127.99609375.
+The physical PCS connection preserves that range; L* is clipped to 0–100. Normalization, matrix
+and curve clipping boundaries remain explicit and cannot be removed by affine composition.
+
+Interpolation is a typed property of the CLUT. Legacy Lab-indexed output LUTs use multilinear
+interpolation; other LUTs use the existing tetrahedral/leading-axis-linear policy. This follows
+Little CMS 2.19's legacy LUT selection without changing floating MPE interpolation. GPU payload
+addresses, shared storage and the 272-byte dispatch uniform retain the existing checked layout.
+
+The v4 selected-method black policy also applies to LUTs. V2 LUTs can execute colorimetric
+connections and output connections where no automatic source-black detection is required.
+Perceptual/saturation conversion from a v2 LUT to a v4 or virtual linear endpoint returns
+`IccError::LutBlackPoint`: the v4 reference black is not a substitute for executing the v2
+black-detection program. GPU execution of that metadata program remains required.
+
+The `lut` corpus contains 436 files for 41 profiles and 202,436 independently evaluated/native
+components, checked 607,308 times on all three GPU kernels. It covers RGB, Gray, CMYK, 2/5/15
+channels, XYZ/Lab, table precision, every A/B combination, shared offsets, curve branches and all
+implemented directional/intent connections. V2 black-point rejection is explicitly asserted.
+Another 145 files contain 24 libjxl original-color streams and 96 LUT-to-LUT references.
+Their 29,376 components are checked through 384 public decoder presentations (117,504 GPU
+components), with whole/fragmented input, planar/interleaved output, exact alpha, held-image
+rereads and final memory release. Lossless source words are exact; VarDCT source uncertainty
+remains 2e-5 and is propagated through every LUT stage.
+
+Primary intervals use independent f64 curve equations, branch extrema, matrix magnitudes,
+CLUT gradients and Lab corner bounds. Native intervals separately account for integer
+interpolation and the CMM's unclipped matrices/analytical curves. Native mask bit 5 marks
+propagated departures from the unit-domain model, including the native offset curve's
+zero-clamped branch threshold. Every record retains the native value, and every component
+checks both its primary GPU interval and its separately derived native interval; no mask skips
+an assertion. Neither intervals nor profile choices are fitted to GPU output. See the
+[generator and reproducibility instructions](../crates/jxl_wgpu/test-data/icc_generator/README.md).
+
 ## Floating-point multi-process elements
 
 The ordered stage representation replaces the fixed source-curves/matrix/target-curves ABI.
@@ -219,7 +274,7 @@ the native comparison policy. Float CLUT outputs and formula outputs retain sign
 
 Physical Lab/XYZ stages connect differing PCS declarations. DToB3/BToD3 already use absolute
 PCS: their media white is not applied again. Mixed absolute/relative endpoints apply only the
-remaining conversion. Selected MPE perceptual/saturation methods use the v4 PCS reference black
+remaining conversion. Selected v4 LUT/MPE perceptual/saturation methods use the PCS reference black
 (0.00336, 0.0034731, 0.0028646); unused TRC tags do not alter this selected-method policy. This
 is explicit CMM policy, not a claim of parity with every CMM's heuristics for hybrid profiles.
 

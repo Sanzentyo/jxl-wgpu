@@ -4051,3 +4051,32 @@ forward re-evaluation residual previously selected x=1 over a clipped plateau's 
 all 1,015 pre-existing resident/embedded/YCbCr/XYB/alpha files byte-identical and leaves all GPU
 precision bounds unchanged. Matrix/TRC intents do not complete LUT/MPE/Lab/CMYK, gamut mapping,
 HDR luminance or the full JPEG XL conformance gates.
+
+## Legacy ICC LUT methods through resident and decoder APIs
+
+`crates/jxl_wgpu/test-data/icc/lut` adds 436 resident files for 41 profiles: `mft1`, `mft2`,
+`mAB` and `mBA`, v2/v4, XYZ/Lab PCS, and Gray/RGB/CMYK/2CLR/5CLR/FCLR device spaces.
+The 202,436 independent f64/native components produce 607,308 GPU comparisons through both
+directions and all three kernel variants. Coverage includes all four A/B stage combinations,
+8-/16-bit tables, complete/suffix curve sharing, reordered physical storage, explicit clipping,
+both interpolation policies and distinct intent curves. Parser tests reject invalid offsets,
+overlap, counts, padding, truncation, direction, matrix domains and resource excess before GPU work.
+
+The `decoder` subdirectory adds 145 files: 24 libjxl 0.12.0 original RGB/Gray streams through
+Modular/VarDCT, native original samples, 96 LUT-to-LUT references and a manifest. Exact source ICC
+bytes, coding mode and alpha words are checked. All four intents run through both output layouts
+and whole/fragmented input with bounded entropy windows: 384 presentations and 117,504 compared
+color components. Completed frames remain readable after session release; dropping them returns
+the shared byte budget. Perceptual and saturation intervals distinguish their curves from relative;
+equal source/target media whites make absolute and relative equal in this corpus.
+
+Primary intervals propagate curve branches, matrix magnitudes, CLUT gradients and Lab corner
+bounds independently of production Rust/WGSL. Native Little CMS 2.19 values have separate bounds
+for quantized interpolation and unclipped matrix/analytical-curve extensions. Mask bit 5 records
+those extensions; every component still checks both intervals. Native/GPU pixels never set the
+primary tolerance. Both generators reproduce all 581 files byte-for-byte, and every earlier
+reference remains unchanged. See the [generator and precision contract](../crates/jxl_wgpu/test-data/icc_generator/README.md#legacy-integer-lut-programs).
+
+V2 source-LUT perceptual/saturation connections to v4 or virtual linear RGB explicitly return
+`IccError::LutBlackPoint` until GPU source-black detection exists. CMYK image admission, other
+profile classes, broader MPE/XYB/HDR policies and full JPEG XL conformance remain open.

@@ -1,4 +1,4 @@
-use super::{IccMatrixTrc, IccRenderingIntent, IccSignature, IccTransformEndpoint};
+use super::{IccError, IccMatrixTrc, IccRenderingIntent, IccSignature, IccTransformEndpoint};
 
 // Decimal PCS D50 used by the ICC CMM connection policy. Profile matrices retain their
 // original fixed-point encoding; neither their colorants nor their CHAD is rewritten.
@@ -14,14 +14,14 @@ impl Connection {
         source: &IccTransformEndpoint,
         target: &IccTransformEndpoint,
         intent: IccRenderingIntent,
-    ) -> Self {
+    ) -> Result<Self, IccError> {
         if intent == IccRenderingIntent::Absolute {
             let source = media_white(source);
             let target = media_white(target);
-            return Self {
+            return Ok(Self {
                 scale: std::array::from_fn(|c| source[c] / target[c]),
                 offset: [0.0; 3],
-            };
+            });
         }
         let compensate = matches!(
             intent,
@@ -30,20 +30,20 @@ impl Connection {
             .profile()
             .is_none_or(|profile| profile.header.version >> 24 == 4);
         if compensate {
-            let source = black(source);
-            let target = black(target);
+            let source = black(source)?;
+            let target = black(target)?;
             if source != target {
                 let scale = std::array::from_fn(|c| (D50[c] - target[c]) / (D50[c] - source[c]));
-                return Self {
+                return Ok(Self {
                     scale,
                     offset: std::array::from_fn(|c| target[c] - scale[c] * source[c]),
-                };
+                });
             }
         }
-        Self {
+        Ok(Self {
             scale: [1.0; 3],
             offset: [0.0; 3],
-        }
+        })
     }
 
     pub(super) fn is_identity(&self) -> bool {
@@ -72,16 +72,23 @@ fn media_white(endpoint: &IccTransformEndpoint) -> [f64; 3] {
     }
 }
 
-fn black(endpoint: &IccTransformEndpoint) -> [f64; 3] {
-    match endpoint {
+fn black(endpoint: &IccTransformEndpoint) -> Result<[f64; 3], IccError> {
+    Ok(match endpoint {
         IccTransformEndpoint::LinearRgb(_) => [0.0; 3],
         IccTransformEndpoint::Profile(profile) => match &profile.matrix_trc {
             Some(matrix) => profile_black(matrix),
-            // Selected v4 MPE perceptual/saturation methods use the PCS reference black.
+            // Selected v4 LUT/MPE perceptual/saturation methods use the PCS reference black.
             // Unused matrix-shaper tags do not change the selected method's meaning.
-            None => [0.00336, 0.0034731, 0.0028646],
+            None if profile.header.version >> 24 == 4 => [0.00336, 0.0034731, 0.0028646],
+            None => {
+                // A v2 LUT has no declared v4 reference black. Deriving its black requires
+                // executing the selected LUT; do not substitute a v4 value or add CPU CMS.
+                return Err(IccError::LutBlackPoint {
+                    tag: profile.tag.expect("selected LUT method"),
+                });
+            }
         },
-    }
+    })
 }
 
 fn profile_black(profile: &IccMatrixTrc) -> [f64; 3] {

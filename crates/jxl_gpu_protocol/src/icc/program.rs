@@ -197,6 +197,17 @@ pub struct IccClut {
     pub(super) grid: Arc<[u8]>,
     pub(super) output_channels: usize,
     pub(super) values: Arc<[f32]>,
+    pub(super) interpolation: IccClutInterpolation,
+}
+
+/// CMM interpolation policy, independent of the table's stored component precision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IccClutInterpolation {
+    /// Linear/bilinear for one/two dimensions; tetrahedral in the last three axes
+    /// with multilinear interpolation in any preceding axes.
+    Tetrahedral,
+    /// Multilinear in every dimension, including legacy Lab-indexed output LUTs.
+    Multilinear,
 }
 
 impl IccClut {
@@ -213,6 +224,11 @@ impl IccClut {
     #[must_use]
     pub fn values(&self) -> &[f32] {
         &self.values
+    }
+
+    #[must_use]
+    pub const fn interpolation(&self) -> IccClutInterpolation {
+        self.interpolation
     }
 }
 

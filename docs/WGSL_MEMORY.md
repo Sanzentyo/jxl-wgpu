@@ -1320,6 +1320,14 @@ CLUT grids/strides and float samples, or segmented-curve records. Legacy curve d
 retain the exact F32 significand product before fractional-weight conversion. Shared curve/CLUT
 payloads have one physical allocation, independent of their number of uses.
 
+CLUT opcode 3 selects tetrahedral interpolation on the final three axes and linear interpolation
+on earlier axes; opcode 8 selects multilinear interpolation on every axis. Both use the same
+grid/stride/sample payload, so a shared table needs no duplicate storage for different policies.
+Integer LUT samples lower to the existing F32 CLUT payload; embedded sampled curves retain u16
+precision in u32 words. A/B curve sets may share complete curves or suffixes after metadata
+preflight proves their physical spans. Clipped matrix boundaries use opcode 7 and cannot fuse
+with neighboring affine stages. These additions use the existing dispatch uniform and bindings.
+
 The 272-byte, 16-byte-aligned dispatch uniform stores extent/channel counts at byte 0 and four
 sixteen-entry u32 plane arrays at bytes 16, 80, 144 and 208: input offsets, input strides, output
 offsets and output strides. WGSL uses arrays of four vec4 values to preserve portable uniform

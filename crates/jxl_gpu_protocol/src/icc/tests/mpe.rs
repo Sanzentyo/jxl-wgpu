@@ -79,10 +79,13 @@ fn unknown_mpe_elements_fall_back_but_known_broken_elements_do_not() {
     assert!(selected.matrix_trc().is_some());
     let mut tags = rgb_tags();
     tags.push((*b"D2B1", container(b"mpet", 3, 3, &[unknown], &[0])));
-    tags.push((*b"A2B1", element(b"mAB ", &[])));
-    assert!(
-        matches!(parse(profile_bytes(&tags)).unwrap().select(IccDirection::DeviceToPcs, IccRenderingIntent::Relative), Err(IccError::TransformTag { tag: IccSignature(signature) }) if signature == *b"A2B1")
-    );
+    tags.push((*b"A2B1", lut::identity_lut(IccDirection::DeviceToPcs)));
+    let selected = parse(profile_bytes(&tags))
+        .unwrap()
+        .select(IccDirection::DeviceToPcs, IccRenderingIntent::Relative)
+        .unwrap();
+    assert_eq!(selected.tag(), Some(IccSignature(*b"A2B1")));
+    assert!(selected.matrix_trc().is_none());
     for bits in [
         f32::INFINITY.to_bits(),
         f32::NAN.to_bits(),

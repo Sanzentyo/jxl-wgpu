@@ -4,11 +4,12 @@
 //! curves. This module never reads image samples. GPU backends lower the resulting transform
 //! once and execute its ordered stages on resident pixels.
 //!
-//! Matrix/TRC and floating-point multi-process elements support all four rendering intents.
-//! Unimplemented legacy LUT methods return structured errors. Unknown MPE element types
-//! follow the ICC fallback rule; malformed supported elements never substitute another method.
+//! Matrix/TRC, integer LUT and floating-point multi-process elements preserve intent selection.
+//! Unknown MPE element types follow the ICC fallback rule; malformed supported elements never
+//! substitute another method.
 
 mod curve;
+mod lut;
 mod mpe;
 mod profile;
 mod program;
@@ -17,8 +18,8 @@ mod transform;
 pub use curve::{IccCurve, IccCurveKind, IccInverseDirection};
 pub use profile::{IccHeader, IccProfile, IccTag};
 pub use program::{
-    IccAffine, IccClut, IccCurveSegment, IccCurveSegmentKind, IccProgram, IccSegmentedCurve,
-    IccStage,
+    IccAffine, IccClut, IccClutInterpolation, IccCurveSegment, IccCurveSegmentKind, IccProgram,
+    IccSegmentedCurve, IccStage,
 };
 pub use transform::{IccMatrixTrc, IccProfileProgram, IccTransform, IccTransformEndpoint};
 
@@ -124,6 +125,8 @@ pub enum IccError {
     },
     #[error("ICC selected method {tag} is not supported by this operation")]
     TransformTag { tag: IccSignature },
+    #[error("ICC v2 LUT black-point connection for {tag} is not implemented")]
+    LutBlackPoint { tag: IccSignature },
     #[error("ICC tag {tag} has invalid curve parameters")]
     CurveParameters { tag: IccSignature },
     #[error("ICC tag {tag} has unsupported parametric function {function}")]

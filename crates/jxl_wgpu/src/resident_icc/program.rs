@@ -3,7 +3,7 @@
 //! immutable and shared; no shader address is derived from unchecked profile bytes.
 use std::collections::{BTreeMap, HashMap};
 
-use jxl_gpu_protocol::icc::{IccCurveSegmentKind, IccStage};
+use jxl_gpu_protocol::icc::{IccClutInterpolation, IccCurveSegmentKind, IccStage};
 
 use super::*;
 
@@ -17,6 +17,7 @@ enum Opcode {
     LabToXyz = 5,
     XyzToLab = 6,
     ClampedAffine = 7,
+    MultilinearClut = 8,
 }
 
 pub(super) fn program_size(transform: &IccTransform, limit: u64) -> Result<u64, ResidentIccError> {
@@ -171,7 +172,11 @@ fn encode(transform: &IccTransform, mut sink: Sink) -> Result<Sink, ResidentIccE
                     cluts.insert(key, payload);
                     payload
                 };
-                (Opcode::Clut, payload)
+                let opcode = match clut.interpolation() {
+                    IccClutInterpolation::Tetrahedral => Opcode::Clut,
+                    IccClutInterpolation::Multilinear => Opcode::MultilinearClut,
+                };
+                (opcode, payload)
             }
             IccStage::SegmentedCurves(curves) => {
                 let payload = sink.allocate(curves.len())?;

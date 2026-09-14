@@ -6,6 +6,7 @@ const SEGMENTED_CURVES: u32 = 4u;
 const LAB_TO_XYZ: u32 = 5u;
 const XYZ_TO_LAB: u32 = 6u;
 const CLAMPED_AFFINE: u32 = 7u;
+const MULTILINEAR_CLUT: u32 = 8u;
 
 override wg_x: u32 = 16u;
 override wg_y: u32 = 16u;
@@ -533,7 +534,7 @@ fn segmented_curve(base: u32, x: f32) -> f32 {
     return scaled_value(scaled_add(scaled_multiply(scaled(p0), scaled_power(scaled(p1), exponent)), scaled(p4)));
 }
 
-fn clut_value(base: u32, dimensions: u32, channel: u32, values: ptr<function, array<f32, 16>>) -> f32 {
+fn clut_value(base: u32, dimensions: u32, channel: u32, values: ptr<function, array<f32, 16>>, multilinear: bool) -> f32 {
     var weights: array<f32, 16>;
     var strides: array<u32, 16>;
     var origin = base + dimensions * 2u + channel;
@@ -550,7 +551,7 @@ fn clut_value(base: u32, dimensions: u32, channel: u32, values: ptr<function, ar
     }
     // One/two dimensions use linear/bilinear interpolation. Higher dimensions use
     // tetrahedra on the last three axes and linear interpolation on preceding axes.
-    let tail = min(dimensions, 3u);
+    let tail = select(min(dimensions, 3u), 0u, multilinear);
     let leading = dimensions - tail;
     var order = array<u32, 3>(leading, leading + 1u, leading + 2u);
     if tail == 3u {
@@ -636,7 +637,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 if opcode == CLAMPED_AFFINE { value = clamp(value, 0.0, 1.0); }
                 next[c] = value;
             }
-            else if opcode == CLUT { next[c] = clut_value(base, p, c, &values); }
+            else if opcode == CLUT || opcode == MULTILINEAR_CLUT { next[c] = clut_value(base, p, c, &values, opcode == MULTILINEAR_CLUT); }
             else if opcode == SEGMENTED_CURVES { next[c] = segmented_curve(program[base + c], values[c]); }
         }
         if opcode == LAB_TO_XYZ {

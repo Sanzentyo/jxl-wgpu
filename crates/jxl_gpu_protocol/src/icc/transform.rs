@@ -233,7 +233,14 @@ impl IccProfile {
         };
         for tag in [IccSignature(requested), IccSignature(base)] {
             if self.tag(tag).is_some() {
-                return Err(IccError::TransformTag { tag });
+                return Ok(IccProfileProgram {
+                    header,
+                    tag: Some(tag),
+                    program: super::lut::parse(self, tag, direction, inputs, outputs)?,
+                    matrix_trc: None,
+                    media_white: validated_white(self)?,
+                    device_channels,
+                });
             }
         }
         let matrix_trc = self.parse_matrix_trc(direction)?;
@@ -417,7 +424,7 @@ impl IccTransform {
         target: IccTransformEndpoint,
         intent: IccRenderingIntent,
     ) -> Result<Self, IccError> {
-        let connection = intent::Connection::new(&source, &target, intent);
+        let connection = intent::Connection::new(&source, &target, intent)?;
         let mut first = source.stages(IccDirection::DeviceToPcs)?;
         let mut last = target.stages(IccDirection::PcsToDevice)?;
         let same_geometry = source

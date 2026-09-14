@@ -172,3 +172,62 @@ a small representable result fails. No older radius or reference is changed. The
 components are checked 437,184 times across both directions and all three kernel variants,
 including buffer guards. These are scalar comparisons; they do not claim native CMM coverage
 of these extreme profiles or arbitrary ill-conditioned power/offset combinations.
+
+## Legacy integer LUT programs
+
+`lut.cpp` constructs `mft1`, `mft2`, `mAB` and `mBA` bytes and independently evaluates their
+ordered stages in f64. `lut/profile.hpp` defines profile/tag layout; `curve.hpp` and `stages.hpp`
+define scalar equations and propagated intervals. The ordinary headers share no production
+Rust/WGSL implementation. Little CMS **2.19** reopens each exact profile and executes native
+conversions with `NOOPTIMIZE | NOCACHE`.
+
+The 436 resident files contain 41 profiles (33 v4, eight v2), both 221-pixel input directions,
+a manifest and 312 directional/intent references. All four A/B stage combinations, reverse
+physical ordering, shared curve sets/suffixes, table precisions and XYZ/Lab PCS are represented.
+Device spaces include Gray, RGB, CMYK, 2CLR, 5CLR and FCLR. Little CMS's CMYK/5–15-channel float
+formatters use percentages; corpus device inputs remain normalized unit values. V2 source LUT
+perceptual/saturation connections to v4 are explicitly excluded from generation and asserted as
+`LutBlackPoint` errors by the GPU test until source black detection executes on the GPU.
+
+`lut_decoder.cpp` uses libjxl **0.12.0** to encode/decode 24 original-color 17×9 images with the
+exact resident LUT profiles. Both source and data profile queries must preserve the ICC bytes.
+Twelve RGB/Gray × XYZ/Lab × LUT-format cases run through Modular and VarDCT, then request the
+next LUT format and the opposite RGB/Gray/PCS space with all four intents. Original Modular words
+and all alpha words must equal input bits. Native color conversion consumes decoded original
+samples; an output-profile label is never used as a color oracle. The 145 decoder files contain
+24 `.jxl` streams, 24 native `.f32le` images, 96 references and a manifest.
+
+The A/B fixture matrix keeps primary Y nonzero so libjxl can represent the extracted
+primary chromaticities. Negative X, clipped matrix/curve
+intermediates and distinct intent curves remain exercised by independent/native/GPU checks.
+
+```sh
+c++ -std=c++17 -Wall -Wextra -Werror -ffp-contract=off \
+  crates/jxl_wgpu/test-data/icc_generator/lut.cpp \
+  $(pkg-config --cflags --libs lcms2) -o .git/icc-regenerate/lut
+.git/icc-regenerate/lut crates/jxl_wgpu/test-data/icc/mpe/identity.icc \
+  .git/icc-regenerate/lut-corpus
+c++ -std=c++17 -Wall -Wextra -Werror -ffp-contract=off \
+  crates/jxl_wgpu/test-data/icc_generator/lut_decoder.cpp \
+  $(pkg-config --cflags --libs libjxl lcms2) -o .git/icc-regenerate/lut-decoder
+.git/icc-regenerate/lut-decoder .git/icc-regenerate/lut-corpus \
+  .git/icc-regenerate/lut-corpus/decoder
+diff -rq crates/jxl_wgpu/test-data/icc/lut .git/icc-regenerate/lut-corpus
+```
+
+Every `.reference` retains the existing six-F32/u32 layout. Primary scalar intervals use an
+F32 arithmetic budget `epsilon = 4e-7`: affine coefficient/input magnitudes, curve endpoint
+and breakpoint extrema with `8*epsilon*(1+abs(value))`, CLUT per-axis gradients plus
+`16*epsilon*dimensions`, and every Lab error-box corner plus cancellation operand magnitudes.
+The decoder adds only the existing source uncertainty (zero for Modular, 2e-5 for VarDCT).
+
+Native scalar evaluation separately models the unclipped matrices and analytical curves in
+Little CMS [`cmslut.c`](https://github.com/mm2/Little-CMS/blob/lcms2.19/src/cmslut.c) and
+[`cmsgamma.c`](https://github.com/mm2/Little-CMS/blob/lcms2.19/src/cmsgamma.c), including the
+offset curve's zero-clamped threshold. Native intervals add half a 16-bit quantization step
+at sampled-curve input/output and CLUT input, plus `dimensions/(2*65535)` for nested integer
+CLUT interpolation. Mask bit 5 propagates any departure from the primary clipped equations.
+Both native and GPU intervals are asserted for every component, including marked records.
+Original native values are retained, no GPU pixels enter the generator, and no primary interval
+is widened to cover a different CMM policy. The 202,436 resident and 29,376 decoder components
+produce 607,308 and 117,504 GPU comparisons respectively. All earlier corpora remain unchanged.

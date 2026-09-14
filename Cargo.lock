@@ -898,6 +898,8 @@ dependencies = [
  "jxl_wgpu_encode",
  "naga",
  "pollster",
+ "serde",
+ "serde_json",
  "sha2",
  "thiserror",
  "wgpu",

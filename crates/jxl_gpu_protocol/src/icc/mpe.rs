@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 
 use super::profile::{Reader, invalid, limit};
 use super::{
-    IccAffine, IccClut, IccError, IccLimits, IccProfile, IccProgram, IccSignature, IccStage,
+    IccAffine, IccClut, IccClutInterpolation, IccError, IccLimits, IccProfile, IccProgram,
+    IccSignature, IccStage,
 };
 
 mod curve;
@@ -185,5 +186,6 @@ fn clut(data: Reader<'_>, p: usize, q: usize, limits: IccLimits) -> Result<IccSt
         grid: grid.into(),
         output_channels: q,
         values: values.into(),
+        interpolation: IccClutInterpolation::Tetrahedral,
     }))
 }

@@ -15,15 +15,20 @@ pixel, coefficient, restoration, color, packing, and display work executes in WG
 operations, layouts, precision contracts, and device limits return typed errors before an output
 is authoritative.
 
-`ResidentIccProgram` and `ResidentIccPipeline` execute all four RGB/Gray ICC matrix/TRC intents
-and floating-point MPE stage programs on resident planar F32 channels, including absolute media white and v4 perceptual/saturation
-black compensation. A checked profile retains exact colorants,
-independent curves and original ICC bytes. MPE matrices, segmented curves, CLUTs and Lab/XYZ PCS\nconversions share one interpreter; unknown MPE elements follow the specified fallback, while\nmalformed supported methods and selected legacy LUTs return typed errors. The
-same program connects profiles to unbounded linear RGB using shared f64 CIE/Bradford metadata
-before one F32 lowering; signed and above-one linear values remain intact. Owned ICC pixel
-formats and Gray/alpha storage describe these domains independently of execution admission. The
-[ICC execution contract](../../docs/ICC_COLOR.md) documents unit-domain semantics, memory
-ownership, native/scalar evidence and remaining decoder integration.
+`ResidentIccProgram` and `ResidentIccPipeline` execute RGB/Gray ICC matrix/TRC, legacy
+`mft1`/`mft2`/`mAB`/`mBA` LUTs and floating-point MPE programs on resident planar F32 channels.
+The ordered interpreter retains exact profile metadata, explicit curve/matrix clipping and
+XYZ/Lab PCS boundaries. Each CLUT declares tetrahedral or multilinear interpolation. Unknown
+MPE elements follow the specified fallback; malformed selected methods return typed errors.
+All four rendering intents include absolute media-white scaling and v4 perceptual/saturation
+black compensation. V2 source-LUT black detection remains unsupported where that connection
+requires it. Forty-one LUT profiles cover up to fifteen channels and 607,308 GPU component
+comparisons across both directions and all three kernels.
+
+The same program connects profiles to unbounded linear RGB using shared f64 CIE/Bradford metadata
+before one F32 lowering. Owned ICC pixel formats and Gray/alpha storage describe these domains
+independently of execution admission. The [ICC execution contract](../../docs/ICC_COLOR.md)
+documents stage semantics, memory ownership, native/scalar evidence and remaining conformance.
 
 `ImageOutputParams::for_icc_device` packs values already in the exact target ICC profile. It
 supports U8/F32 Gray/Gray-alpha and RGB/BGR/RGBA/BGRA, planar or interleaved, with orientation and

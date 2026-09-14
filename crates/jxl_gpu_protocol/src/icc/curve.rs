@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::profile::{invalid, limit};
+use super::profile::{Reader, invalid, limit};
 use super::{IccError, IccProfile, IccSignature};
 
 /// Exact ICC curve data. Parameters are signed s15Fixed16, gamma is unsigned u8Fixed8,
@@ -44,16 +44,50 @@ impl IccCurve {
     }
 
     pub(super) fn parse(profile: &IccProfile, tag: IccSignature) -> Result<Self, IccError> {
-        let data = profile.required(tag)?;
+        Self::parse_data(profile.required(tag)?, tag, profile.max_curve_samples())
+    }
+
+    /// Preflight embedded curves without allocating their sample payloads.
+    pub(super) fn encoded_len(
+        data: Reader<'_>,
+        tag: IccSignature,
+        max_samples: u32,
+    ) -> Result<u64, IccError> {
         let kind = data.signature(0)?;
+        data.zeros(4, 8, "reserved curve")?;
+        let end = match &kind.0 {
+            b"curv" => {
+                let count = data.u32(8)?;
+                limit("curve samples", u64::from(count), u64::from(max_samples))?;
+                12 + u64::from(count) * 2
+            }
+            b"para" => 12 + parameter_count(data.u16(8)?, tag)? as u64 * 4,
+            _ => return Err(IccError::TagType { tag, kind }),
+        };
+        data.slice(0, end, "embedded curve")?;
+        Ok(end)
+    }
+
+    pub(super) fn from_samples(samples: Vec<u16>) -> Result<Self, IccError> {
+        if samples.len() < 2 {
+            return invalid("sampled curve entries", 0);
+        }
+        Ok(Self {
+            kind: IccCurveKind::Sampled(samples.into()),
+        })
+    }
+
+    pub(super) fn parse_data(
+        data: Reader<'_>,
+        tag: IccSignature,
+        max_samples: u32,
+    ) -> Result<Self, IccError> {
+        let kind = data.signature(0)?;
+        data.zeros(4, 8, "reserved curve")?;
         let (kind, end) = match &kind.0 {
             b"curv" => {
                 let count = data.u32(8)?;
-                limit(
-                    "curve samples",
-                    u64::from(count),
-                    u64::from(profile.max_curve_samples()),
-                )?;
+                limit("curve samples", u64::from(count), u64::from(max_samples))?;
                 let end = 12 + u64::from(count) * 2;
                 let samples = data.slice(12, end, "curve samples")?;
                 let curve = match count {
@@ -79,14 +113,7 @@ impl IccCurve {
             b"para" => {
                 let function = data.u16(8)?;
                 data.zeros(10, 12, "reserved curve function")?;
-                let count = match function {
-                    0 => 1,
-                    1 => 3,
-                    2 => 4,
-                    3 => 5,
-                    4 => 7,
-                    _ => return Err(IccError::CurveFunction { tag, function }),
-                };
+                let count = parameter_count(function, tag)?;
                 let mut parameters = [0; 7];
                 for (index, parameter) in parameters.iter_mut().enumerate().take(count) {
                     *parameter = data.i32(12 + index as u64 * 4)?;
@@ -173,6 +200,17 @@ impl IccCurve {
                 Ok(IccInverseDirection::Increasing)
             }
         }
+    }
+}
+
+fn parameter_count(function: u16, tag: IccSignature) -> Result<usize, IccError> {
+    match function {
+        0 => Ok(1),
+        1 => Ok(3),
+        2 => Ok(4),
+        3 => Ok(5),
+        4 => Ok(7),
+        _ => Err(IccError::CurveFunction { tag, function }),
     }
 }
 

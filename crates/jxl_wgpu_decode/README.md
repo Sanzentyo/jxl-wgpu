@@ -644,12 +644,13 @@ color matrix after component upsampling, using their actual RGB/Gray device prof
 References and frame blends stay in that domain, including
 extended values; conversion returns its actual layout along with its buffer.
 
-For these inputs, requested enumerated SDR output and other RGB/Gray matrix/TRC profiles execute
-the resident ICC pipeline. The original profile is parsed once per selected image and its selected
+For these inputs, requested enumerated SDR output and other RGB/Gray matrix/TRC, LUT or MPE
+profiles execute the resident ICC pipeline. The original profile is parsed once per selected image and its selected
 GPU program uploads lazily once, with exact budget admission, retry and completion ownership.
 `with_icc_rendering_intent` defaults to relative colorimetric and executes all four matrix/TRC
 intents, including absolute media-white scaling and v4 perceptual/saturation black compensation.
-Non-Bradford conversion and unsupported selected LUT/MPE methods return typed errors.
+Non-Bradford conversion, unsupported selected methods and v2 source-LUT connections requiring
+automatic black detection return typed errors.
 Same-profile U8/F32 planar/interleaved Gray/RGB output
 performs only packing, orientation and requested alpha association, with no CMS curve evaluation.
 F32 with preserved association retains the existing Modular IEEE words, including nonfinite values,
@@ -678,8 +679,16 @@ implicit/explicit background-alpha references. Exact alpha and independent color
 both output layouts and whole/fragmented input. A selection registry shares one GPU program
 across reconstruction and presentation, with exact-budget cancellation coverage.
 
-Broader ICC XYB alpha/crop/reference conformance, enumerated-source-to-ICC conversion, spot-ink rendering, LUT/MPE,
-CMYK, broader ICC intent/gamut policies, HDR luminance mapping and standalone codec color admission remain open.
+Legacy `mft1`/`mft2`/`mAB`/`mBA` source and requested-output programs share the ordered GPU
+interpreter. Twenty-four original RGB/Gray Modular/VarDCT streams cover XYZ/Lab PCS and all
+four requested intents through 384 whole/fragmented planar/interleaved presentations.
+The 117,504 color comparisons propagate codec uncertainty through independent LUT equations;
+alpha words remain exact, held frames stay readable, and final release returns the byte budget.
+See the [LUT reference recipe](../jxl_wgpu/test-data/icc_generator/README.md#legacy-integer-lut-programs).
+
+Broader ICC XYB alpha/crop/reference conformance, enumerated-source-to-ICC conversion, spot-ink
+rendering, v2 LUT source-black detection, complete MPE ranges, CMYK image plumbing, other profile
+classes, HDR/gamut policies and standalone codec color admission remain open.
 Numeric and extra-channel bypasses keep their existing independent contracts.
 
 `tests/original_color` covers 228 streams with independent native references: integer/F32, gray/RGBA,

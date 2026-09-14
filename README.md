@@ -96,8 +96,11 @@ original/XYB RGB/Gray in 768 whole/fragmented planar/interleaved presentations.
 An ordered GPU interpreter also executes floating-point MPE matrices, segmented curves, CLUTs
 and Lab PCS connections. Its native/scalar corpus checks 135,864 resident components and 192
 original RGB/Gray decoder presentations through both codecs.
-Broader ICC XYB conformance, enumerated sources targeting ICC, spot rendering, legacy LUT/CMYK and full
-intent/HDR policies remain incomplete.
+The same interpreter executes legacy `mft1`, `mft2`, `mAB` and `mBA` LUT methods with explicit
+PCS normalization and interpolation. Forty-one v2/v4 profiles have 607,308 directional/kernel
+GPU comparisons; 24 embedded-LUT images add 384 decoded presentations across both codecs.
+Broader ICC XYB conformance, enumerated sources targeting ICC, spot rendering, CMYK image plumbing,
+v2 LUT black-point connections and full intent/HDR policies remain incomplete.
 
 Creating an encoder or decoder requires a compatible `wgpu` backend. Unsupported codestream
 features or device limits return typed errors before a partial output becomes authoritative.

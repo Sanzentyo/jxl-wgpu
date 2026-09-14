@@ -721,3 +721,16 @@ of far-from-unit bases. Metadata-only implicit sampled endpoints use compensated
 and 437,184 directional/kernel GPU checks; all 160 earlier MPE reference files remain unchanged.
 No feature row is completed by this checkpoint. Complete formula-range validation, arbitrary
 conditioning, remaining ICC methods and all broader full JPEG XL gates remain required.
+
+Legacy ICC LUT checkpoint: `mft1`, `mft2`, `mAB` and `mBA` lower to the shared ordered GPU
+program with explicit curve/matrix clipping, normalized XYZ/legacy-Lab boundaries and typed
+CLUT interpolation. Metadata preflight validates counts, named offsets, complete/suffix curve
+sharing, storage overlap and stage combinations before allocation. Forty-one v2/v4 profiles
+provide 202,436 independent/native components and 607,308 GPU directional/kernel comparisons.
+Twenty-four compressed-ICC RGB/Gray Modular/VarDCT streams add 96 LUT-to-LUT references and
+384 decoded presentations, with propagated codec precision, exact alpha, bounded fragmented
+input and completion-owned memory. All earlier reference data remain unchanged.
+V2 source-LUT automatic black-point connections return a typed error pending GPU metadata
+execution. `COLOR-01/02`, `IO-01`, `QA-03/06` and the full goal remain **Partial**: that connection,
+CMYK image plumbing, other profile classes, broader MPE/XYB and HDR/gamut policy, full-range
+arithmetic and the remaining conformance/encoder gates are still required. See [ICC processing](ICC_COLOR.md).
