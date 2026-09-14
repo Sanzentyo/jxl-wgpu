@@ -3969,9 +3969,10 @@ infinities, and signaling/quiet NaNs with independent payloads. Original Modular
 and unchanged F32 packing use integer words throughout, avoiding WGSL floating reinterpretation.
 The native scalar packer independently checks 64 oriented Gray/RGB color, alpha and depth-plane
 selections against literal IEEE words, including signaling NaNs and poisoned alignment gaps.
-ICC color reconstruction from XYB, enumerated-source ICC targets, spot rendering, standalone
-color entry points, LUT/MPE/Lab/CMYK, full intent/HDR/display integration and browser execution
-conformance remain open. The full JPEG XL goal and affected roadmap rows remain **Partial**.
+Broader ICC XYB conformance, spot rendering, standalone color entry points, CMYK image plumbing,
+complete HDR/display integration and browser execution conformance remain open. Later sections
+cover LUT/MPE, rendering-intent and enumerated-RGB execution. The full JPEG XL goal and affected
+roadmap rows remain **Partial**.
 
 ## ICC YCbCr reconstruction and presentation
 
@@ -4108,3 +4109,30 @@ exact-budget tests include the 304-byte dispatch storage and four-byte validatio
 concurrent immutable-program reuse and reverse consumer completion. CMY/device-Lab endpoint
 selection has metadata tests; native image conformance for those and other uncommon spaces,
 complete MPE ranges, other classes and full JPEG XL remain open.
+
+## Enumerated RGB to requested ICC
+
+`crates/jxl_wgpu_decode/test-data/rgb_icc` adds 913 files while reusing every original source and
+target profile unchanged. All 228 original-color streams (570 presented frames) are explicitly
+paired with nine RGB/Gray matrix/TRC, v2/v4 integer-LUT and identity-MPE targets under four
+intents. The 4,049,280 native/independent reference components are checked through 9,120 actual
+presentations: interleaved progressive and planar final-only F32, each under whole and bounded
+fragmented input. All 16,197,120 color comparisons use propagated primary intervals. Alpha words
+match original output, retained updates stay readable after session release, and final results
+agree exactly across transport/layout/progression modes with the byte budget fully released.
+
+Original and composed source pixels use existing native references. Direct XYB stills use
+independent unbounded pre-OETF reconstruction, preserving Gamma/DCI values lost by the original
+codec black floor. Shared test-only f64 transfers, CIE/Bradford matrices and interval arithmetic
+produce physical PCS inputs; native and primary ICC models are evaluated independently of
+production. The source bound propagates through signed matrices, target inverse curves and
+LUT/CLUT/Lab stages. Native-only mask bit 6 records Little CMS 2.19's rounded perceptual-black Z,
+while bit 5 retains its LUT extension convention. Every record checks both intervals.
+
+The native and primary models distinguish perceptual/saturation/absolute from relative in
+562,786/558,471/83,309 disjoint intervals. Fresh generations reproduce all 913 files exactly.
+Resident tests independently cover eight transfers, five RGB geometries, both directions and
+all three kernel variants; protocol tests check directional ordering and the linear no-op.
+Exact-budget tests include the enumerated transfer programs, rollback, reuse and cancellation.
+The [generator and precision contract](../crates/jxl_wgpu_decode/test-data/rgb_icc_generator/README.md)
+states the pairing, source provenance and remaining full JPEG XL requirements.

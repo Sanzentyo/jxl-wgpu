@@ -2,6 +2,7 @@ use super::*;
 
 mod lut;
 mod mpe;
+mod rgb;
 
 fn affine(transform: &IccTransform) -> &IccAffine {
     let matrices = transform

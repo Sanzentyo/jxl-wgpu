@@ -17,6 +17,7 @@ tracing = "0.1.41"
 wgpu = "30.0.1"
 
 [dev-dependencies]
+jxl_test_support.workspace = true
 jxl_gpu_formats = { workspace = true, features = ["cpu-reference"] }
 jxl_transforms.workspace = true
 naga = { version = "30.0.1", features = ["wgsl-in"] }

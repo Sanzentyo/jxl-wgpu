@@ -507,12 +507,9 @@ pub(crate) struct ImageColorTransform {
     pub(crate) primaries: [[f32; 4]; 3],
 }
 
-pub(crate) fn image_color_transform(
-    source: RgbColorEncoding,
-    target: &PixelFormat,
-    adaptation: WhitePointAdaptation,
-) -> Result<ImageColorTransform> {
-    let source_transfer = match source.transfer {
+/// Shared selector and gamma ABI for image packing and ordered ICC RGB stages.
+pub(crate) fn transfer_parameters(transfer: SourceTransferFunction) -> (u32, f32) {
+    let code = match transfer {
         SourceTransferFunction::Linear => 0,
         SourceTransferFunction::Srgb => 1,
         SourceTransferFunction::Bt709 => 2,
@@ -522,6 +519,19 @@ pub(crate) fn image_color_transform(
         SourceTransferFunction::Gamma(_) => 6,
         SourceTransferFunction::Dci => 7,
     };
+    let gamma = match transfer {
+        SourceTransferFunction::Gamma(exponent) => exponent.value(),
+        _ => 1.0,
+    };
+    (code, gamma)
+}
+
+pub(crate) fn image_color_transform(
+    source: RgbColorEncoding,
+    target: &PixelFormat,
+    adaptation: WhitePointAdaptation,
+) -> Result<ImageColorTransform> {
+    let (source_transfer, source_gamma) = transfer_parameters(source.transfer);
     let target_color = match target.color_spec {
         ColorSpecification::Defined(color) => color,
         ColorSpecification::Icc(_) => return Err(Error::Unsupported("ICC color must be converted by the resident ICC pipeline before enumerated RGB packing or display".into())),
@@ -553,10 +563,7 @@ pub(crate) fn image_color_transform(
     Ok(ImageColorTransform {
         source_transfer,
         target_transfer,
-        source_gamma: match source.transfer {
-            SourceTransferFunction::Gamma(exponent) => exponent.value(),
-            _ => 1.0,
-        },
+        source_gamma,
         target_gamma: match target_color.transfer {
             ImageTransferFunction::Gamma(exponent) => exponent.value(),
             _ => 1.0,

@@ -1,4 +1,7 @@
-use crate::{Chromaticity, ColorMatrix, RgbColorSpace, WhitePointAdaptation};
+use crate::{
+    Chromaticity, ColorMatrix, RgbColorEncoding, RgbColorSpace, TransferFunction,
+    WhitePointAdaptation,
+};
 
 use super::{
     IccAffine, IccCurve, IccDirection, IccError, IccHeader, IccProfile, IccProgram,
@@ -324,11 +327,12 @@ fn device_channels(signature: IccSignature) -> Result<usize, IccError> {
     })
 }
 
-/// A selected directional profile or an unbounded linear RGB connection.
+/// A selected directional profile or an enumerated RGB endpoint. RGB transfers preserve their
+/// own extended-range rules independently of ICC device-curve clipping.
 #[derive(Clone, Debug, PartialEq)]
 pub enum IccTransformEndpoint {
     Profile(Box<IccProfileProgram>),
-    LinearRgb(RgbColorSpace),
+    Rgb(RgbColorEncoding),
 }
 
 impl IccTransformEndpoint {
@@ -336,39 +340,51 @@ impl IccTransformEndpoint {
     pub fn channels(&self) -> usize {
         match self {
             Self::Profile(p) => p.channels(),
-            Self::LinearRgb(_) => 3,
+            Self::Rgb(_) => 3,
         }
     }
     #[must_use]
     pub fn profile(&self) -> Option<&IccProfileProgram> {
         match self {
             Self::Profile(p) => Some(p),
-            Self::LinearRgb(_) => None,
+            Self::Rgb(_) => None,
         }
     }
 
     fn stages(&self, direction: IccDirection) -> Result<Vec<IccStage>, IccError> {
         match self {
             Self::Profile(p) => Ok(p.program.stages().to_vec()),
-            Self::LinearRgb(space) => {
+            Self::Rgb(encoding) => {
                 let matrix = match direction {
                     IccDirection::DeviceToPcs => ColorMatrix::rgb_to_xyz(
-                        *space,
+                        encoding.space,
                         Chromaticity::ICC_D50,
                         WhitePointAdaptation::Bradford,
                     )?,
                     IccDirection::PcsToDevice => ColorMatrix::xyz_to_rgb(
                         Chromaticity::ICC_D50,
-                        *space,
+                        encoding.space,
                         WhitePointAdaptation::Bradford,
                     )?,
                 };
-                Ok(vec![IccStage::Matrix(IccAffine::new(
+                let mut stages = vec![IccStage::Matrix(IccAffine::new(
                     3,
                     matrix.rows().iter().flatten().copied().collect(),
                     vec![0.0; 3],
                     false,
-                )?)])
+                )?)];
+                if encoding.transfer != TransferFunction::Linear {
+                    let transfer = IccStage::RgbTransfer {
+                        transfer: encoding.transfer,
+                        to_linear: direction == IccDirection::DeviceToPcs,
+                    };
+                    if direction == IccDirection::DeviceToPcs {
+                        stages.insert(0, transfer);
+                    } else {
+                        stages.push(transfer);
+                    }
+                }
+                Ok(stages)
             }
         }
     }
@@ -401,9 +417,12 @@ impl IccTransform {
         target: RgbColorSpace,
         intent: IccRenderingIntent,
     ) -> Result<Self, IccError> {
-        Self::connect(
-            IccTransformEndpoint::Profile(source.select(IccDirection::DeviceToPcs, intent)?.into()),
-            IccTransformEndpoint::LinearRgb(target),
+        Self::to_rgb(
+            source,
+            RgbColorEncoding {
+                space: target,
+                transfer: TransferFunction::Linear,
+            },
             intent,
         )
     }
@@ -412,8 +431,37 @@ impl IccTransform {
         target: &IccProfile,
         intent: IccRenderingIntent,
     ) -> Result<Self, IccError> {
+        Self::from_rgb(
+            RgbColorEncoding {
+                space: source,
+                transfer: TransferFunction::Linear,
+            },
+            target,
+            intent,
+        )
+    }
+
+    /// Connect an ICC profile to RGB using its declared transfer and exact color geometry.
+    pub fn to_rgb(
+        source: &IccProfile,
+        target: RgbColorEncoding,
+        intent: IccRenderingIntent,
+    ) -> Result<Self, IccError> {
         Self::connect(
-            IccTransformEndpoint::LinearRgb(source),
+            IccTransformEndpoint::Profile(source.select(IccDirection::DeviceToPcs, intent)?.into()),
+            IccTransformEndpoint::Rgb(target),
+            intent,
+        )
+    }
+
+    /// Linearize RGB on the GPU before its PCS connection and selected output-profile method.
+    pub fn from_rgb(
+        source: RgbColorEncoding,
+        target: &IccProfile,
+        intent: IccRenderingIntent,
+    ) -> Result<Self, IccError> {
+        Self::connect(
+            IccTransformEndpoint::Rgb(source),
             IccTransformEndpoint::Profile(target.select(IccDirection::PcsToDevice, intent)?.into()),
             intent,
         )

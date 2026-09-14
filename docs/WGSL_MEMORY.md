@@ -1313,7 +1313,8 @@ while the generic BT.709 color space retains the standard CIE coordinates.
 ## Resident ICC processing records
 
 The reusable ICC storage buffer is an array of u32 words. A 16-byte header carries the stage
-count and optional source-black payload offset (word one; zero when absent), followed by one\n16-byte record per stage: opcode, input count, output count and payload
+count and optional source-black payload offset (word one; zero when absent), followed by one
+16-byte record per stage: opcode, input count, output count and payload
 word offset. Payloads contain checked variable-size matrices/offsets, curve-reference arrays,
 CLUT grids/strides and float samples, or segmented-curve records. Legacy curve descriptors remain
 48 bytes and store every original parameter; their u16 tables occupy u32 words. Sample positions
@@ -1333,6 +1334,12 @@ program offset, endpoint channel count, two reserved words, three target-black F
 one reserved word, then normalized source endpoint values. The nested source program uses the
 same headers and records. Its curves/CLUTs share existing immutable payloads. This internally
 constructed probe cannot contain another connection.
+
+Opcode 10 applies an enumerated RGB transfer. Its three-word payload stores the transfer
+selector, F32 gamma exponent bits and direction (one for linearization, zero for encoding).
+It has three input/output channels and uses the shared image-transfer WGSL functions. A nonlinear
+endpoint adds one 16-byte stage record and 12-byte payload; linear endpoints add neither.
+Dispatch storage, bindings and per-image intermediates are unchanged.
 
 The 304-byte, 16-byte-aligned writable dispatch storage stores extent/channel counts at byte 0
 and four sixteen-entry u32 plane arrays at bytes 16, 80, 144 and 208: input offsets, input strides,

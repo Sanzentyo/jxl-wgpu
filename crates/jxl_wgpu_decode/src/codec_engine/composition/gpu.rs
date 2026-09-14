@@ -109,10 +109,7 @@ enum Packing {
         pipeline: wgpu::ComputePipeline,
         params: RasterPacking,
     },
-    Icc {
-        original: Option<Box<icc::Presentation>>,
-        linear: Option<Box<icc::Presentation>>,
-    },
+    Icc(Vec<icc::Presentation>),
 }
 
 /// Color domains actually consumed by this image's presentation and reference plan.
@@ -327,7 +324,11 @@ impl Compositor {
         } else {
             None
         };
-        let packing = if matches!(&original, FrameSurfaceEncoding::Icc(_))
+        let packing = if (matches!(&original, FrameSurfaceEncoding::Icc(_))
+            || matches!(
+                request.format().color_spec,
+                jxl_gpu_formats::ColorSpecification::Icc(_)
+            ))
             && request.mapping() == crate::GpuOutputMapping::Color
         {
             if !spots.is_empty() {
@@ -340,7 +341,7 @@ impl Compositor {
                     encoding.clone(),
                     &device.limits(),
                 )?;
-                Ok(Box::new(icc::Presentation::new(
+                icc::Presentation::new(
                     &backend,
                     &source,
                     request,
@@ -348,22 +349,29 @@ impl Compositor {
                     alpha_conversion,
                     first_alpha.map(|(index, _)| index),
                     &mut transforms,
-                )?))
+                )
             };
-            Packing::Icc {
-                original: usage
-                    .original
-                    .then(|| presentation(original.clone()))
-                    .transpose()?,
-                linear: usage
-                    .linear
-                    .then(|| {
-                        presentation(FrameSurfaceEncoding::Rgb(
-                            jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709,
-                        ))
-                    })
-                    .transpose()?,
+            let mut encodings = Vec::new();
+            if usage.original {
+                encodings.push(original.clone());
             }
+            if usage.linear {
+                let linear = FrameSurfaceEncoding::Rgb(original.rgb_encoding().map_or(
+                    jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709,
+                    crate::image_color::linear_encoding,
+                ));
+                // An originally linear image has one color encoding regardless of how a
+                // physical frame reached it. Select by that encoding, not its history.
+                if !encodings.contains(&linear) {
+                    encodings.push(linear);
+                }
+            }
+            Packing::Icc(
+                encodings
+                    .into_iter()
+                    .map(&mut presentation)
+                    .collect::<Result<_>>()?,
+            )
         } else {
             let (packing, source) = if native.is_some() || scalar_float {
                 if let (Some(native), Some((_, extra))) = (native, selected)
@@ -707,16 +715,13 @@ impl Compositor {
             params: packing,
         } = &self.packing
         else {
-            let Packing::Icc { original, linear } = &self.packing else {
+            let Packing::Icc(presentations) = &self.packing else {
                 unreachable!()
             };
-            let icc = if source.encoding == self.original {
-                original
-            } else {
-                linear
-            }
-            .as_ref()
-            .ok_or(Error::EngineContract("unplanned presentation color domain"))?;
+            let icc = presentations
+                .iter()
+                .find(|presentation| presentation.source_encoding == source.encoding)
+                .ok_or(Error::EngineContract("unplanned presentation color domain"))?;
             return icc.pack(&self.backend, source);
         };
         let mut native;

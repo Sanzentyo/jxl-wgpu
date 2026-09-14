@@ -27,8 +27,10 @@ callers validate that status before accepting output. Twenty v2 profiles contrib
 additional component comparisons, including clipped/reset lightness and unavailable estimates. Forty-one LUT profiles cover up to fifteen channels and 607,308 GPU component
 comparisons across both directions and all three kernels.
 
-The same program connects profiles to unbounded linear RGB using shared f64 CIE/Bradford metadata
-before one F32 lowering. Owned ICC pixel formats and Gray/alpha storage describe these domains
+The same program connects profiles to declared RGB encodings using shared f64 CIE/Bradford metadata
+before one F32 lowering. `IccTransform::from_rgb` and `to_rgb` include an explicit GPU transfer
+stage around the PCS connection; linear RGB needs no transfer stage. Enumerated transfers keep
+their own extended-range rules, separately from ICC device-curve clipping. Owned ICC pixel formats and Gray/alpha storage describe these domains
 independently of execution admission. The [ICC execution contract](../../docs/ICC_COLOR.md)
 documents stage semantics, memory ownership, native/scalar evidence and remaining conformance.
 

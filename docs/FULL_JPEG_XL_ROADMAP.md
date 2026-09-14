@@ -428,9 +428,10 @@ alpha association. Same-profile F32 output preserves Modular IEEE words without 
 Image-owned programs upload once with retryable exact admission and completion-owned resources.
 The eight-stream corpus retains all previous bytes and adds native original VarDCT pixels,
 Little CMS references and independent f64 color results; a metadata-only Gray composition case
-retains values above one across blending and orientation. Broader ICC XYB/YCbCr conformance, enumerated-source ICC
-targets, spot rendering, standalone color admission, LUT/MPE/Lab/CMYK, full intents and HDR/display
-integration still require implementation and conformance. This is progress toward the original
+retains values above one across blending and orientation. Broader ICC XYB/YCbCr conformance,
+spot rendering, standalone color admission, CMYK image plumbing, complete profile/range
+conformance and HDR/display integration remain open. Later LUT/MPE, intent and enumerated-RGB
+checkpoints extend this initial execution scope. This is progress toward the original
 full JPEG XL objective; no feature row or completion gate is marked complete by this checkpoint.
 
 ICC YCbCr checkpoint: inverse codec reconstruction now carries either the actual enumerated RGB
@@ -441,8 +442,9 @@ extras; 44 both-codec original-color sources cover stills and composed sequences
 and bounded fragmented input are word-identical, and retained outputs survive session release.
 Five source cases additionally check linear/sRGB and opposite RGB/Gray ICC targets against
 independent scalar intervals propagated from unchanged codec bounds and checked with Little CMS.
-Broader ICC XYB conformance, enumerated-source ICC targets, spot rendering, standalone color admission, LUT/MPE/Lab/CMYK,
-full intents and HDR/display integration remain open. All affected rows and completion gates
+Broader ICC XYB conformance, spot rendering, standalone color admission, CMYK image plumbing,
+complete profile/range conformance and HDR/display integration remain open. Later checkpoints
+cover LUT/MPE, intent and enumerated-RGB execution. All affected rows and completion gates
 remain **Partial**.
 
 ICC XYB checkpoint: inverse opsin reconstructs into linear D65 BT.709 independently of the
@@ -750,3 +752,20 @@ checks, exact alpha and bounded fragmented input. All 718 new files reproduce tw
 all 581 prior LUT files also regenerate unchanged. CMY/device-Lab endpoint metadata is covered,
 with native image conformance for those and other uncommon spaces still open. No feature row
 or full JPEG XL completion gate is closed by this checkpoint.
+
+Enumerated RGB-to-ICC checkpoint: selected profile programs now connect to `RgbColorEncoding`
+through an explicit GPU transfer stage and exact CIE/Bradford geometry. Linear endpoints omit
+the transfer stage. The common decoder routes requested ICC output through these programs for
+original RGB/Gray, YCbCr, direct XYB and original-domain reference composition. Presentations
+are selected by actual source encoding, deduplicating originally linear color. Programs and
+intermediates retain exact admission, retry and completion ownership; alpha stays outside CMS.
+
+All 228 existing enumerated streams are paired with nine matrix/TRC, LUT and identity-MPE targets
+under four intents. The independently derived/native 4,049,280 reference components are checked
+16,197,120 times in 9,120 presentations across layouts and whole/fragmented input. Held progressive
+output agrees with final-only output. The independent oracle is a normal shared test-support
+module; no path inclusion or additional warning suppression is introduced. Existing source
+fixtures and profile bytes remain unchanged. See the [RGB-to-ICC recipe](../crates/jxl_wgpu_decode/test-data/rgb_icc_generator/README.md).
+This progresses `COLOR-01/02`, `IO-01`, `QA-03/06`; those rows and the full goal remain **Partial**.
+ICC spot rendering, complete CMYK/HDR plumbing, wider profile/method/range conformance and the
+remaining codestream/container/encoder requirements are still required.

@@ -25,7 +25,7 @@ mod tests;
 
 #[derive(Debug)]
 pub(super) struct Presentation {
-    source_encoding: FrameSurfaceEncoding,
+    pub(super) source_encoding: FrameSurfaceEncoding,
     transform: Option<Arc<Transform>>,
     working: FrameSurfaceLayout,
     output: ImageLayout,
@@ -81,21 +81,14 @@ impl Presentation {
                         request.icc_rendering_intent(),
                     )?),
                 ),
-                (FrameSurfaceEncoding::Rgb(encoding), ColorSpecification::Icc(target)) => {
-                    if encoding.transfer != jxl_gpu_protocol::TransferFunction::Linear {
-                        return Err(Error::EngineContract(
-                            "ICC connection requires linear RGB input",
-                        ));
-                    }
-                    (
-                        FrameSurfaceEncoding::Icc(target.clone()),
-                        Some(IccTransform::from_linear_rgb(
-                            encoding.space,
-                            target,
-                            request.icc_rendering_intent(),
-                        )?),
-                    )
-                }
+                (FrameSurfaceEncoding::Rgb(encoding), ColorSpecification::Icc(target)) => (
+                    FrameSurfaceEncoding::Icc(target.clone()),
+                    Some(IccTransform::from_rgb(
+                        *encoding,
+                        target,
+                        request.icc_rendering_intent(),
+                    )?),
+                ),
                 (FrameSurfaceEncoding::Rgb(_), ColorSpecification::Defined(_)) => {
                     (source_encoding.clone(), None)
                 }

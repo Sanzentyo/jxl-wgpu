@@ -691,7 +691,16 @@ adding 384 presentations and 117,504 independent color checks. Concurrent reuse,
 rollback and cancellation include the dispatch storage and validation word.
 See the [LUT reference recipe](../jxl_wgpu/test-data/icc_generator/README.md#legacy-integer-lut-programs).
 
-Broader ICC XYB alpha/crop/reference conformance, enumerated-source-to-ICC conversion, spot-ink
+Enumerated SDR RGB/Gray sources also convert to requested RGB/Gray ICC output. Original RGB,
+YCbCr reconstruction and composed references linearize their declared transfer before the PCS
+connection. Direct XYB keeps linear values in the original primaries, including custom whites.
+ICC presentation plans are keyed by actual source encoding, so originally linear color has one
+plan even when original and linear uses coincide. The 228-source corpus exercises nine selected
+matrix/TRC, LUT and MPE targets and all four intents: 9,120 presentations and 16,197,120 color
+comparisons, both F32 layouts, progressive/final-only equality, fragmented input, exact alpha
+and held-frame ownership. See the [reference and precision contract](test-data/rgb_icc_generator/README.md).
+
+Broader ICC XYB alpha/crop/reference conformance, spot-ink
 rendering, complete MPE ranges, CMYK image plumbing, other profile
 classes, HDR/gamut policies and standalone codec color admission remain open.
 Numeric and extra-channel bypasses keep their existing independent contracts.

@@ -160,7 +160,7 @@ fn profile_binding_capabilities_fail_before_pipeline_creation() {
 
 #[test]
 fn icc_shader_and_dispatch_abi_are_webgpu_portable() {
-    let module = naga::front::wgsl::parse_str(include_str!("../../shaders/icc.wgsl")).unwrap();
+    let module = naga::front::wgsl::parse_str(ICC_SHADER).unwrap();
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::empty(),

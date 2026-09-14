@@ -24,6 +24,7 @@ mod linear;
 mod lut;
 mod metadata;
 mod mpe;
+mod rgb;
 
 #[derive(Deserialize)]
 struct Manifest {

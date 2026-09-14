@@ -8,7 +8,8 @@ reconstruction and LF configuration are independent of color conversion. The com
 also handles original and XYB ICC RGB/Gray color surfaces, including YCbCr reconstruction,
 original-domain references and composition, all four matrix/TRC intents and U8/F32 requested output.
 Requested RGB MPE output and embedded/requested RGB/Gray LUTs are also exercised through the public decoder.
-Broader ICC XYB conformance, enumerated-source-to-ICC conversion, spot rendering, other ICC methods
+Enumerated SDR sources also target ICC through original/XYB/YCbCr reconstruction and composition.
+Broader ICC XYB conformance, spot rendering, other ICC methods
 and HDR mapping remain open.
 This checkpoint does not change the full JPEG XL support claim.
 
@@ -132,13 +133,15 @@ interval count with portable u32 arithmetic, then rounds only the fractional wei
 losing the interpolation coordinate in large or sharply varying tables. GPU tests include 1,001
 and 1,000,003 irregular samples, subnormal/near-zero coordinates and exact endpoint guards.
 
-## Linear RGB connections
+## Enumerated RGB connections
 
-`IccTransform::to_linear_rgb` and `from_linear_rgb` connect the selected profile to a declared
-`RgbColorSpace`. The endpoint model distinguishes a selected profile program from three unbounded linear RGB components. Relative colorimetric intent uses Bradford
+`IccTransform::to_rgb` and `from_rgb` connect the selected profile to a declared
+`RgbColorEncoding`. `IccTransformEndpoint::Rgb` owns both its geometry and transfer;
+`to_linear_rgb` and `from_linear_rgb` are convenience constructors with a linear transfer.
+Relative colorimetric intent uses Bradford
 between the RGB reference white and ICC's exact encoded PCS D50. Colorants are connected directly
 in f64; no synthetic quantized profile or approximation by recognized primaries is introduced.
-All intents treat this linear endpoint as an ideal, fully adapted v4 endpoint with PCS D50 white
+All intents treat this RGB endpoint as an ideal, fully adapted v4 endpoint with PCS D50 white
 and zero black. The same media-white and black-compensation rules therefore work in both directions.
 
 `ColorMatrix` in the backend-neutral protocol owns the shared CIE geometry and white adaptation
@@ -150,6 +153,29 @@ The linear endpoint has no ICC curve descriptor and applies no unit clipping. A 
 or input above one reaches the PCS matrix unchanged. A linear output can remain negative or
 above one after conversion from a wider gamut. The profile endpoint still follows the bounded
 ICC curve contract. This does not extend arbitrary ICC device curves to unbounded/HDR domains.
+
+Nonlinear RGB adds one `IccStage::RgbTransfer` before the input PCS matrix or after the output
+PCS matrix. Its WGSL functions are shared with image output, with explicit transfer selector,
+gamma exponent and direction. Linear, sRGB, BT.709, BT.2020, PQ, HLG, Gamma and DCI retain their
+declared extended-range rules. This resident normalized-transfer API does not admit PQ/HLG JPEG XL
+metadata or establish HDR luminance mapping. The decoder still admits its existing SDR declarations.
+No surrogate ICC profile, CPU pixel conversion or additional linearization image is introduced.
+
+Requested ICC output enters the common compositor even for a plain unreferenced sRGB stream.
+Original and composed surfaces use their declared RGB transfer; direct XYB surfaces use linear
+RGB in the original primaries. Plans retain actual source encodings and deduplicate equal ones:
+an originally linear image cannot accidentally select an absent original-history slot. Alpha
+and extra planes remain outside the ICC program and are copied to the target's actual color count.
+
+The [RGB-to-ICC corpus](../crates/jxl_wgpu_decode/test-data/rgb_icc_generator/README.md) pairs all
+228 existing enumerated streams with nine matrix/TRC, LUT and identity-MPE targets, using all
+four intents. Its 4,049,280 independent/native reference components are checked 16,197,120 times
+in 9,120 decoder presentations. Whole and fragmented input, planar/interleaved F32, retained
+progressive images, final-only equality, exact alpha and final memory release are covered.
+The independent input bound includes codec reconstruction before propagating through target
+curves, matrices, Lab and CLUTs. Little CMS's rounded reference-black Z has a separate native
+model; it never enlarges the primary GPU interval. Standalone resident tests additionally cover
+both directions, all eight transfers, five RGB geometries and three kernel variants.
 
 ## GPU contract
 
@@ -200,7 +226,8 @@ and curve clipping boundaries remain explicit and cannot be removed by affine co
 Interpolation is a typed property of the CLUT. Legacy Lab-indexed output LUTs use multilinear
 interpolation; other LUTs use the existing tetrahedral/leading-axis-linear policy. This follows
 Little CMS 2.19's legacy LUT selection without changing floating MPE interpolation. GPU payload
-addresses and shared payload storage retain checked layouts. The dispatch record is now\n304-byte writable storage so a preparation pass can publish its connection coefficients.
+addresses and shared payload storage retain checked layouts. The dispatch record is now
+304-byte writable storage so a preparation pass can publish its connection coefficients.
 
 The v4 selected-method black policy also applies to LUTs. Perceptual/saturation conversion
 from a v2 LUT to a v4 or virtual linear endpoint embeds its selected source program and a

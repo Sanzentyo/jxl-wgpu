@@ -11,6 +11,7 @@ rust-version.workspace = true
 jxl.workspace = true
 jxl-bitstream.workspace = true
 jxl-image.workspace = true
+jxl-oxide.workspace = true
 jxl-oxide-common.workspace = true
 jxl_gpu_bitstream.workspace = true
 jxl_gpu_formats = { workspace = true, features = ["cpu-reference"] }

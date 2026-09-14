@@ -101,8 +101,12 @@ PCS normalization and interpolation. Forty-one v2/v4 profiles have 607,308 direc
 GPU comparisons; 24 embedded-LUT images add 384 decoded presentations across both codecs.
 V2 LUT source-black detection now executes as a GPU metadata pass, with a checked status word
 before output acceptance. Twenty more profiles add 954,720 resident GPU comparisons, and
-24 embedded-ICC streams add 117,504 decoded color comparisons. Broader ICC XYB conformance,
-enumerated sources targeting ICC, spot rendering, CMYK image plumbing and full intent/HDR
+24 embedded-ICC streams add 117,504 decoded color comparisons. Enumerated SDR RGB/Gray now
+also targets requested ICC profiles through both codecs, XYB/YCbCr reconstruction and reference
+composition. The 228-source [RGB-to-ICC corpus](crates/jxl_wgpu_decode/test-data/rgb_icc_generator/README.md)
+checks 9,120 presentations and 16,197,120 components with independent bounds, exact alpha,
+retained outputs and fragmented input. Broader ICC XYB conformance,
+spot rendering, CMYK image plumbing and full intent/HDR
 policies remain incomplete.
 
 Creating an encoder or decoder requires a compatible `wgpu` backend. Unsupported codestream

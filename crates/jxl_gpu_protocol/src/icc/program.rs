@@ -81,6 +81,11 @@ pub enum IccStage {
     Matrix(IccAffine),
     Clut(IccClut),
     SegmentedCurves(Arc<[IccSegmentedCurve]>),
+    /// An enumerated three-channel RGB transfer, with its own extended-range rules.
+    RgbTransfer {
+        transfer: crate::TransferFunction,
+        to_linear: bool,
+    },
     /// CIE Lab in physical units (L*, a*, b*) to PCS XYZ, without unit-range clipping.
     LabToXyz,
     XyzToLab,
@@ -96,7 +101,10 @@ impl IccStage {
             Self::Matrix(matrix) => matrix.input_channels,
             Self::Clut(clut) => clut.grid.len(),
             Self::SegmentedCurves(curves) => curves.len(),
-            Self::LabToXyz | Self::XyzToLab | Self::BlackPointConnection(_) => 3,
+            Self::LabToXyz
+            | Self::XyzToLab
+            | Self::BlackPointConnection(_)
+            | Self::RgbTransfer { .. } => 3,
         }
     }
 

@@ -8,8 +8,10 @@ use jxl_wgpu_decode::{
 };
 use std::num::{NonZeroU64, NonZeroUsize};
 
+mod icc;
 mod numeric;
-mod oracle;
+use jxl_test_support::oracles::color as oracle;
+mod oracle_checks;
 mod output;
 
 fn tolerance(case: &corpus::Case) -> f32 {

@@ -1,128 +1,6 @@
-//! Test-only references: jxl-oxide and f64 colorimetry derived from primary chromaticities.
-use super::{corpus, tolerance};
+//! Independent f64 RGB colorimetry and jxl-oxide reconstruction, for tests and offline fixtures.
+use crate::fixtures::original_color as corpus;
 use jxl_gpu_formats::{ColorSpace, TransferFunction};
-
-#[test]
-fn native_still_references_agree_with_independent_decoder() {
-    check_still_references(corpus::cases());
-}
-
-#[test]
-fn analytic_native_still_references_agree_with_independent_decoder() {
-    check_still_references(corpus::analytic_cases());
-}
-
-fn check_still_references(cases: Vec<corpus::Case>) {
-    use jxl_oxide::color::{ColourSpace, Customxy, Primaries, TransferFunction as Tf, WhitePoint};
-    let xy = |p: jxl_gpu_bitstream::ChromaticityInventory| Customxy { x: p.x, y: p.y };
-    // jxl-frame 0.13.3 reads an extra-channel source selector using the color blend mode.
-    // These sequences use full-canvas color Mul/Blend with alpha Replace, where that selector
-    // is absent. libjxl and our parser use the extra's own mode; jxl-oxide loses bit alignment.
-    // All 148 originals still have native references and GPU coverage; this second oracle
-    // therefore covers the 74 stills. See the generator README for the precise upstream sites.
-    for case in cases.into_iter().filter(|case| !case.sequence) {
-        let mut image = jxl_oxide::JxlImage::read_with_defaults(case.bytes().as_slice()).unwrap();
-        image.set_render_spot_color(false);
-        image.request_color_encoding(jxl_oxide::EnumColourEncoding {
-            colour_space: if case.profile.grayscale {
-                ColourSpace::Grey
-            } else {
-                ColourSpace::Rgb
-            },
-            white_point: match case.profile.white {
-                jxl_gpu_bitstream::WhitePointInventory::D65 => WhitePoint::D65,
-                jxl_gpu_bitstream::WhitePointInventory::E => WhitePoint::E,
-                jxl_gpu_bitstream::WhitePointInventory::Dci => WhitePoint::Dci,
-                jxl_gpu_bitstream::WhitePointInventory::Custom(p) => WhitePoint::Custom(xy(p)),
-            },
-            primaries: match case.profile.primaries {
-                jxl_gpu_bitstream::PrimariesInventory::Srgb => Primaries::Srgb,
-                jxl_gpu_bitstream::PrimariesInventory::Bt2100 => Primaries::Bt2100,
-                jxl_gpu_bitstream::PrimariesInventory::P3 => Primaries::P3,
-                jxl_gpu_bitstream::PrimariesInventory::Custom { red, green, blue } => {
-                    Primaries::Custom {
-                        red: xy(red),
-                        green: xy(green),
-                        blue: xy(blue),
-                    }
-                }
-            },
-            tf: match case.transfer.transfer {
-                jxl_gpu_bitstream::TransferFunctionInventory::Linear => Tf::Linear,
-                jxl_gpu_bitstream::TransferFunctionInventory::Srgb => Tf::Srgb,
-                jxl_gpu_bitstream::TransferFunctionInventory::Bt709 => Tf::Bt709,
-                jxl_gpu_bitstream::TransferFunctionInventory::Dci => Tf::Dci,
-                jxl_gpu_bitstream::TransferFunctionInventory::Gamma {
-                    scaled_gamma,
-                    inverted,
-                } => Tf::Gamma {
-                    g: scaled_gamma,
-                    inverted,
-                },
-                _ => unreachable!(),
-            },
-            rendering_intent: jxl_oxide::RenderingIntent::Relative,
-        });
-        // jxl-color clips or gamut maps before a primary/Gray conversion. Ask it for the
-        // unbounded XYB intermediate, then perform the reference's requested conversion in f64.
-        if case.mode.xyb() {
-            image.request_color_encoding(jxl_oxide::EnumColourEncoding::srgb_linear(
-                jxl_oxide::RenderingIntent::Relative,
-            ));
-        }
-        let expected = case.reference();
-        assert_eq!(
-            image.num_loaded_keyframes(),
-            if case.sequence { 4 } else { 1 }
-        );
-        for frame in 0..image.num_loaded_keyframes() {
-            let render = image.render_frame(frame).unwrap();
-            let pixels = render.image_all_channels();
-            assert!(pixels.channels() == 4 || (case.profile.grayscale && pixels.channels() == 2));
-            let mut words: Vec<_> = if pixels.channels() == 2 {
-                pixels
-                    .buf()
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .flat_map(|p| [p[0], p[0], p[0], p[1]])
-                    .map(f32::to_bits)
-                    .collect()
-            } else {
-                pixels.buf().iter().map(|v| v.to_bits()).collect()
-            };
-            if case.mode.xyb() {
-                let jxl_gpu_formats::ColorSpecification::Defined(target) = case.format().color_spec
-                else {
-                    unreachable!()
-                };
-                for pixel in words.as_chunks_mut::<4>().0 {
-                    let rgb = [pixel[0], pixel[1], pixel[2]].map(|v| f64::from(f32::from_bits(v)));
-                    let linear = xyb_original_linear(rgb, &case);
-                    for (channel, value) in linear.into_iter().enumerate() {
-                        // The native JPEG XL original OETF has a black floor, unlike a general CMS conversion.
-                        let value = if matches!(
-                            target.transfer,
-                            TransferFunction::Gamma(_) | TransferFunction::Dci
-                        ) && value <= 1e-5
-                        {
-                            0.0
-                        } else {
-                            value
-                        };
-                        pixel[channel] = (from_linear(value, target.transfer) as f32).to_bits();
-                    }
-                }
-            }
-            super::compare(
-                &words,
-                &expected[frame * 37 * 19 * 4..(frame + 1) * 37 * 19 * 4],
-                tolerance(&case),
-                &format!("oxide {}", case.name),
-            );
-        }
-    }
-}
 
 /// Unbounded, pre-OETF samples for unreferenced XYB stills. Gamma/DCI original pixels are
 /// non-invertible after the codec black floor, so they cannot serve as a linear-output oracle.
@@ -148,7 +26,7 @@ pub fn linear_original_still(case: &corpus::Case) -> Vec<[f64; 4]> {
         .collect()
 }
 
-fn xyb_original_linear(mut rgb: [f64; 3], case: &corpus::Case) -> [f64; 3] {
+pub fn xyb_original_linear(mut rgb: [f64; 3], case: &corpus::Case) -> [f64; 3] {
     use jxl_gpu_protocol::{Chromaticity as Xy, RgbChromaticities};
     let space = if case.profile.grayscale || case.profile.space() == ColorSpace::Bt709 {
         ColorSpace::Bt709
@@ -171,7 +49,7 @@ fn xyb_original_linear(mut rgb: [f64; 3], case: &corpus::Case) -> [f64; 3] {
 pub fn to_linear(value: f64, transfer: TransferFunction) -> f64 {
     match transfer {
         TransferFunction::Linear => value,
-        TransferFunction::Srgb => {
+        TransferFunction::Srgb | TransferFunction::Sycc => {
             let a = value.abs();
             if a <= 0.04045 {
                 value / 12.92
@@ -196,14 +74,43 @@ pub fn to_linear(value: f64, transfer: TransferFunction) -> f64 {
                 value.powf(2.6)
             }
         }
-        _ => unreachable!(),
+        TransferFunction::Bt2020 => {
+            let a = 1.09929682680944;
+            let b = 0.018053968510807;
+            if value.abs() < 4.5 * b {
+                value / 4.5
+            } else {
+                ((value.abs() + a - 1.0) / a)
+                    .powf(1.0 / 0.45)
+                    .copysign(value)
+            }
+        }
+        TransferFunction::Pq => {
+            let p = value.abs().powf(32.0 / 2523.0);
+            ((p - 3424.0 / 4096.0).max(0.0) / (2413.0 / 128.0 - 2392.0 / 128.0 * p).max(1e-10))
+                .powf(16384.0 / 2610.0)
+                .copysign(value)
+        }
+        TransferFunction::Hlg => {
+            let a = 0.17883277;
+            let magnitude = value.abs();
+            let linear = if magnitude <= 0.5 {
+                magnitude * magnitude / 3.0
+            } else {
+                (((magnitude - 0.5599107295) / a).exp() + 1.0 - 4.0 * a) / 12.0
+            };
+            linear.copysign(value)
+        }
+        TransferFunction::Undefined | TransferFunction::Smpte240M => {
+            panic!("unsupported reference transfer")
+        }
     }
 }
 
 pub fn from_linear(value: f64, transfer: TransferFunction) -> f64 {
     match transfer {
         TransferFunction::Linear => value,
-        TransferFunction::Srgb => {
+        TransferFunction::Srgb | TransferFunction::Sycc => {
             let a = value.abs();
             if a <= 0.0031308 {
                 value * 12.92
@@ -226,7 +133,32 @@ pub fn from_linear(value: f64, transfer: TransferFunction) -> f64 {
                 value.powf(1.0 / 2.6)
             }
         }
-        _ => unreachable!(),
+        TransferFunction::Bt2020 => {
+            if value.abs() < 0.018053968510807 {
+                value * 4.5
+            } else {
+                (1.09929682680944 * value.abs().powf(0.45) - 0.09929682680944).copysign(value)
+            }
+        }
+        TransferFunction::Pq => {
+            let p = value.abs().powf(2610.0 / 16384.0);
+            ((3424.0 / 4096.0 + 2413.0 / 128.0 * p) / (1.0 + 2392.0 / 128.0 * p))
+                .powf(2523.0 / 32.0)
+                .copysign(value)
+        }
+        TransferFunction::Hlg => {
+            let a = 0.17883277;
+            let magnitude = value.abs();
+            let encoded = if magnitude <= 1.0 / 12.0 {
+                (3.0 * magnitude).sqrt()
+            } else {
+                a * (12.0 * magnitude - (1.0 - 4.0 * a)).ln() + 0.5599107295
+            };
+            encoded.copysign(value)
+        }
+        TransferFunction::Undefined | TransferFunction::Smpte240M => {
+            panic!("unsupported reference transfer")
+        }
     }
 }
 
@@ -304,29 +236,47 @@ pub fn matrix(source: ColorSpace, target: ColorSpace) -> Matrix {
 }
 
 pub fn matrix_with_adaptation(source: ColorSpace, target: ColorSpace, adapt: bool) -> Matrix {
-    let multiply = |a: Matrix, b: Matrix| {
-        a.map(|row| std::array::from_fn(|c| (0..3).map(|k| row[k] * b[k][c]).sum()))
-    };
+    multiply(
+        inverse(xyz(target)),
+        adapted_xyz(source, white(target), adapt),
+    )
+}
+
+/// Physical PCS XYZ, adapted to ICC's exact encoded D50 rather than a surrogate RGB profile.
+pub fn pcs_matrix(source: ColorSpace) -> Matrix {
+    let white = [0xf6d6 as f64 / 65536.0, 1.0, 0xd32d as f64 / 65536.0];
+    let sum: f64 = white.iter().sum();
+    adapted_xyz(source, [white[0] / sum, white[1] / sum], true)
+}
+
+pub fn inverse_pcs_matrix(target: ColorSpace) -> Matrix {
+    inverse(pcs_matrix(target))
+}
+
+fn multiply(a: Matrix, b: Matrix) -> Matrix {
+    a.map(|row| std::array::from_fn(|c| (0..3).map(|k| row[k] * b[k][c]).sum()))
+}
+
+fn adapted_xyz(source: ColorSpace, target_white: [f64; 2], adapt: bool) -> Matrix {
     let mut source_xyz = xyz(source);
-    if adapt && white(source) != white(target) {
+    if adapt && white(source) != target_white {
         let cone = [
             [0.8951, 0.2664, -0.1614],
             [-0.7502, 1.7135, 0.0367],
             [0.0389, -0.0685, 1.0296],
         ];
-        let response = |space| {
-            let [x, y] = white(space);
+        let response = |[x, y]: [f64; 2]| {
             let xyz = [x / y, 1.0, (1.0 - x - y) / y];
             cone.map(|row| (0..3).map(|c| row[c] * xyz[c]).sum::<f64>())
         };
-        let from = response(source);
-        let to = response(target);
+        let from = response(white(source));
+        let to = response(target_white);
         let scale: Matrix = std::array::from_fn(|r| {
             std::array::from_fn(|c| if r == c { to[r] / from[r] } else { 0.0 })
         });
         source_xyz = multiply(multiply(multiply(inverse(cone), scale), cone), source_xyz);
     }
-    multiply(inverse(xyz(target)), source_xyz)
+    source_xyz
 }
 
 pub fn convert(

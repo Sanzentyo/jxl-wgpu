@@ -12,6 +12,12 @@ The module tree follows the source tree:
 - `gpu` drives whole or fragmented test input and reads explicitly requested test output.
 - `offline` writes fixture files and manages native generator processes and hexadecimal formats.
 
+`oracles::color` owns independent f64 transfer, CIE/Bradford and interval calculations shared by
+original-color tests, resident ICC tests and the offline RGB-to-ICC exporter. Its jxl-oxide path
+provides unbounded pre-OETF XYB stills; the codec's Gamma/DCI black floor makes inversion of an
+already encoded original image unsuitable for that reference. These helpers use ordinary module
+imports and stay outside production dependencies.
+
 `native/icc` owns the shared C++ f64 ICC curve and CIE/Bradford reference equations used by the
 resident-ICC and embedded-JPEG-XL generators. Both compile with `-Itools/jxl_test_support/native`
 and include the named `icc` headers. Cargo and production decoding never compile or link this

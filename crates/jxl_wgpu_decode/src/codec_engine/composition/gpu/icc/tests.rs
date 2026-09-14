@@ -17,15 +17,45 @@ fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
         )
         .unwrap()
     });
+    let enumerated = jxl_test_support::fixtures::original_color::cases()
+        .into_iter()
+        .chain(jxl_test_support::fixtures::original_color::analytic_cases())
+        .filter(|case| {
+            !case.sequence
+                && !case.mode.xyb()
+                && !case.mode.ycbcr()
+                && case.mode.encoding() == jxl_gpu_bitstream::FrameEncoding::Modular
+        })
+        .map(|case| (case.bytes(), true));
+    let target = jxl_gpu_protocol::icc::IccProfile::parse(
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../jxl_wgpu/test-data/icc/gray.icc"),
+        )
+        .unwrap()
+        .into(),
+        Default::default(),
+    )
+    .unwrap();
     let mut dynamic = 0;
-    for bytes in matrix.chain(black) {
+    let mut rgb_transfers = 0;
+    for (bytes, to_icc) in matrix
+        .chain(black)
+        .map(|bytes| (bytes, false))
+        .chain(enumerated)
+    {
         let image = jxl_gpu_bitstream::parse(&bytes, Default::default())
             .unwrap()
             .codestream_inventory(Default::default())
             .unwrap()
             .image_header;
         let request = GpuOutputRequest::color(
-            FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709).format(),
+            if to_icc {
+                FrameSurfaceEncoding::Icc(target.clone())
+            } else {
+                FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709)
+            }
+            .format(),
         )
         .unwrap()
         .with_alpha_output_policy(crate::AlphaOutputPolicy::Preserve)
@@ -38,14 +68,14 @@ fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
             ColorUsage::ORIGINAL,
         )
         .unwrap();
-        let super::super::Packing::Icc {
-            original: Some(presentation),
-            ..
-        } = &compositor.packing
-        else {
+        let super::super::Packing::Icc(presentations) = &compositor.packing else {
             panic!("ICC presentation plan")
         };
+        assert_eq!(presentations.len(), 1);
+        let presentation = &presentations[0];
         let transform = presentation.transform.as_ref().unwrap();
+        rgb_transfers += usize::from(matches!(presentation.source_encoding,
+            FrameSurfaceEncoding::Rgb(encoding) if encoding.transfer != jxl_gpu_protocol::TransferFunction::Linear));
         dynamic += usize::from(transform.memory.validation_bytes == 4);
         assert!(super::super::super::lock(&transform.uploaded).is_none());
         assert_eq!(memory.snapshot().reserved_bytes, 0);
@@ -124,4 +154,5 @@ fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
         assert_eq!(memory.snapshot().reserved_bytes, 0);
     }
     assert_eq!(dynamic, 4);
+    assert!(rgb_transfers >= 10);
 }

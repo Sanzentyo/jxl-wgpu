@@ -8,6 +8,7 @@ const XYZ_TO_LAB: u32 = 6u;
 const CLAMPED_AFFINE: u32 = 7u;
 const MULTILINEAR_CLUT: u32 = 8u;
 const BLACK_POINT_CONNECTION: u32 = 9u;
+const RGB_TRANSFER: u32 = 10u;
 
 override wg_x: u32 = 16u;
 override wg_y: u32 = 16u;
@@ -638,6 +639,12 @@ fn process_program(start: u32, input_values: array<f32, 16>) -> array<f32, 16> {
             }
             else if opcode == CLUT || opcode == MULTILINEAR_CLUT { next[c] = clut_value(base, p, c, &values, opcode == MULTILINEAR_CLUT); }
             else if opcode == BLACK_POINT_CONNECTION { next[c] = params.connection_scale[c] * values[c] + params.connection_offset[c]; }
+            else if opcode == RGB_TRANSFER {
+                let transfer = program[base];
+                let gamma = bitcast<f32>(program[base + 1u]);
+                if program[base + 2u] != 0u { next[c] = transfer_to_linear(values[c], transfer, gamma); }
+                else { next[c] = transfer_from_linear(values[c], transfer, gamma); }
+            }
             else if opcode == SEGMENTED_CURVES { next[c] = segmented_curve(program[base + c], values[c]); }
         }
         if opcode == LAB_TO_XYZ {

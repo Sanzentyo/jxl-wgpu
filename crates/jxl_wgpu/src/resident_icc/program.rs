@@ -19,6 +19,7 @@ enum Opcode {
     ClampedAffine = 7,
     MultilinearClut = 8,
     BlackPointConnection = 9,
+    RgbTransfer = 10,
 }
 
 pub(super) fn program_size(transform: &IccTransform, limit: u64) -> Result<u64, ResidentIccError> {
@@ -252,6 +253,17 @@ impl<'a> Encoder<'a> {
                     }
                     self.sink.word(start + 1, payload);
                     (Opcode::BlackPointConnection, payload)
+                }
+                IccStage::RgbTransfer {
+                    transfer,
+                    to_linear,
+                } => {
+                    let (code, gamma) = crate::image_output::transfer_parameters(*transfer);
+                    let payload = self.sink.allocate(3)?;
+                    self.sink.word(payload, code);
+                    self.sink.word(payload + 1, gamma.to_bits());
+                    self.sink.word(payload + 2, u32::from(*to_linear));
+                    (Opcode::RgbTransfer, payload)
                 }
                 IccStage::LabToXyz => (Opcode::LabToXyz, 0),
                 IccStage::XyzToLab => (Opcode::XyzToLab, 0),

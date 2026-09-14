@@ -16,6 +16,12 @@ use wgpu::util::DeviceExt;
 
 use crate::{KernelVariant, ResidentStorageBinding};
 
+const ICC_SHADER: &str = concat!(
+    include_str!("../shaders/image_transfer.wgsl"),
+    "\n",
+    include_str!("../shaders/icc.wgsl"),
+);
+
 mod program;
 use program::{lower_program, program_size};
 
@@ -205,7 +211,10 @@ impl ResidentIccPipeline {
             .validate_for("resident_icc", &device.limits(), 0)
             .map_err(|_| ResidentIccError::Workgroup { variant })?;
         let (x, y) = variant.workgroup_size();
-        let module = device.create_shader_module(wgpu::include_wgsl!("../shaders/icc.wgsl"));
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("jxl-wgpu ICC shader"),
+            source: wgpu::ShaderSource::Wgsl(ICC_SHADER.into()),
+        });
         let bindings = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("jxl-wgpu ICC storage layout"),
             entries: &std::array::from_fn::<_, 4, _>(|binding| wgpu::BindGroupLayoutEntry {
