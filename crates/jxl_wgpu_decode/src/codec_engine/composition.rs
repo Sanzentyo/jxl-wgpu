@@ -575,8 +575,7 @@ fn composed_source(
         usage,
     )?);
     let original = compositor.original.clone();
-    let working = GpuOutputRequest::color(original.format())?
-        .for_frame_surface(original)
+    let working = GpuOutputRequest::frame_surface(original)
         .with_progressive_output(request.progressive_output())
         .with_max_frame_slots(request.max_frame_slots());
     let source = SequenceSource {
@@ -589,7 +588,7 @@ fn composed_source(
                 .iter()
                 .zip(&inventory.frames)
                 .map(|(node, frame)| {
-                    if matches!(compositor.original, FrameSurfaceEncoding::Icc(_))
+                    if compositor.original.icc_profile().is_some()
                         || frame.flags & 0x12 != 0
                         || (node.save_reference.is_some() && frame.save_before_color_transform)
                     {

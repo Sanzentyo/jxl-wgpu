@@ -2,11 +2,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use jxl_gpu_formats::ImageLayout;
 use jxl_gpu_protocol::icc::IccTransform;
 use jxl_wgpu::{
     MemoryPermit, ResidentIccDispatch, ResidentIccInputs, ResidentIccMemoryPlan,
-    ResidentIccPipeline, ResidentIccPlane, ResidentIccProgram, ResidentStorageBinding, WgpuBackend,
+    ResidentIccPipeline, ResidentIccProgram, ResidentStorageBinding, WgpuBackend,
 };
 
 use crate::{Error, Result};
@@ -53,7 +52,8 @@ pub(super) struct Program {
 
 pub(super) struct ColorBinding<'a> {
     pub(super) storage: ResidentStorageBinding<'a>,
-    pub(super) layout: &'a ImageLayout,
+    pub(super) layout: &'a crate::frame_surface::FrameSurfaceLayout,
+    pub(super) encoding: &'a crate::frame_surface::FrameSurfaceEncoding,
 }
 
 impl Transform {
@@ -90,19 +90,9 @@ impl Transform {
         source: ColorBinding<'_>,
         target: ColorBinding<'_>,
     ) -> Result<ResidentIccDispatch> {
-        if source.layout.extent != target.layout.extent {
+        if source.layout.color.extent != target.layout.color.extent {
             return Err(Error::EngineContract("ICC connection extent mismatch"));
         }
-        let planes = |layout: &ImageLayout| {
-            layout
-                .planes
-                .iter()
-                .map(|plane| ResidentIccPlane {
-                    offset: (plane.offset / 4) as u32,
-                    stride: (plane.row_stride / 4) as u32,
-                })
-                .collect::<Vec<_>>()
-        };
         Ok(self.pipeline.encode(
             backend.device(),
             encoder,
@@ -110,9 +100,11 @@ impl Transform {
             ResidentIccInputs {
                 input: source.storage,
                 output: target.storage,
-                extent: source.layout.extent,
-                input_planes: &planes(source.layout),
-                output_planes: &planes(target.layout),
+                extent: source.layout.color.extent,
+                input_planes: &source.layout.icc_planes(source.encoding)?,
+                output_planes: &target.layout.icc_planes(target.encoding)?,
+                input_encoding: source.encoding.icc_sample_encoding(),
+                output_encoding: target.encoding.icc_sample_encoding(),
             },
         )?)
     }

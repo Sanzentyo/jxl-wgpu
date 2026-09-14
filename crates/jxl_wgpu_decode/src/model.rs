@@ -619,6 +619,12 @@ impl GpuOutputRequest {
         self.icc_rendering_intent
     }
 
+    /// Create a reference-frame request from its explicit sample domain, independently of
+    /// presentation settings. CMY components have non-color storage and a separate Black plane.
+    pub(crate) fn frame_surface(encoding: crate::frame_surface::FrameSurfaceEncoding) -> Self {
+        Self::from_parts(encoding.format(), GpuOutputMapping::Color).for_frame_surface(encoding)
+    }
+
     pub(crate) fn for_frame_surface(
         mut self,
         encoding: crate::frame_surface::FrameSurfaceEncoding,
@@ -736,7 +742,9 @@ impl GpuOutputRequest {
         Ok(self)
     }
 
-    /// Selects gray (`0`) or one original RGB component (`0` red, `1` green, `2` blue).
+    /// Selects an original color component: gray (`0`), RGB (`0` red, `1` green, `2` blue),
+    /// or complemented CMY (`0` cyan, `1` magenta, `2` yellow) for a CMYK original image.
+    /// CMYK Black is selected separately by its extra-channel index.
     pub fn with_color_channel(self, index: u32) -> Result<Self> {
         self.with_numeric_channel(NumericChannel::Color(index))
     }

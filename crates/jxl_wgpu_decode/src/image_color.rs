@@ -127,6 +127,36 @@ pub(crate) fn original_domain(
     if let Some(icc) = &image.embedded_icc {
         use jxl_gpu_protocol::icc::{IccLimits, IccProfile, IccSignature};
         let profile = IccProfile::parse(icc.profile.clone(), IccLimits::default())?;
+        if !image.grayscale && profile.header().device_space == IccSignature(*b"CMYK") {
+            let mut black = image
+                .extra_channels
+                .iter()
+                .enumerate()
+                .filter(|(_, extra)| {
+                    matches!(
+                        extra.channel_type,
+                        jxl_gpu_bitstream::ExtraChannelTypeInventory::Black
+                    )
+                });
+            let Some((black_extra, _)) = black.next() else {
+                return Err(crate::UnsupportedProfile::new(
+                    crate::UnsupportedCodestreamFeature::ColorEncoding,
+                    "CMYK ICC requires a Black extra channel",
+                )
+                .into());
+            };
+            if black.next().is_some() {
+                return Err(crate::UnsupportedProfile::new(
+                    crate::UnsupportedCodestreamFeature::ColorEncoding,
+                    "CMYK ICC has ambiguous Black extra channels",
+                )
+                .into());
+            }
+            return Ok(crate::frame_surface::FrameSurfaceEncoding::Cmyk {
+                profile,
+                black_extra,
+            });
+        }
         let expected = IccSignature(if image.grayscale { *b"GRAY" } else { *b"RGB " });
         if profile.header().device_space != expected {
             return Err(crate::UnsupportedProfile::new(
@@ -172,6 +202,34 @@ pub(crate) fn reconstruction_black_threshold(
 mod tests {
     use super::*;
     use jxl_gpu_bitstream::{ChromaticityInventory, EmbeddedIccInventory};
+
+    #[test]
+    fn cmyk_domain_owns_its_profile_and_requires_an_unambiguous_black_plane() {
+        use crate::frame_surface::FrameSurfaceEncoding;
+        let bytes = include_bytes!("../test-data/cmyk/generated/lut8_xyz_4_0.jxl");
+        let mut image = jxl_gpu_bitstream::parse(bytes, Default::default())
+            .unwrap()
+            .codestream_inventory(Default::default())
+            .unwrap()
+            .image_header;
+        for black in [0, 2] {
+            if black == 2 {
+                image.extra_channels.swap(0, 2);
+            }
+            let domain = original_domain(&image).unwrap();
+            assert!(
+                matches!(&domain, FrameSurfaceEncoding::Cmyk { profile, black_extra }
+                if *black_extra == black && profile.bytes().as_ref() == image.embedded_icc.as_ref().unwrap().profile.as_ref())
+            );
+            assert!(FrameSurfaceEncoding::from_format(&domain.format()).is_none());
+            assert_eq!(domain.rgb_encoding(), None);
+        }
+        let mut missing = image.clone();
+        missing.extra_channels.clear();
+        assert!(original_domain(&missing).is_err());
+        image.extra_channels.push(image.extra_channels[2].clone());
+        assert!(original_domain(&image).is_err());
+    }
 
     fn header() -> ImageHeaderInventory {
         let data = jxl_test_support::fixtures::original_color::cases()[0].bytes();

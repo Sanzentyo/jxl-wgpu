@@ -27,6 +27,13 @@ pub(crate) enum FrameSurfaceEncoding {
     Rgb(RgbColorEncoding),
     /// Original device values with their exact profile, with one gray or three RGB planes.
     Icc(IccProfile),
+    /// Original JPEG XL CMY components and their independently stored Black extra channel.
+    /// Stored samples are complements of ICC ink amounts. Reference blending stays in this
+    /// codestream domain; a four-channel ICC view borrows Black without duplicating it.
+    Cmyk {
+        profile: IccProfile,
+        black_extra: usize,
+    },
     /// Codec components before the inverse color transform. The private producer contract
     /// carries this tag explicitly; a pixel format alone can never identify this domain.
     Encoded,
@@ -42,7 +49,7 @@ impl FrameSurfaceEncoding {
                 PixelFormat::rgb_f32(RgbChannelOrder::Rgb, true, color)
             };
         }
-        if *self == Self::Encoded {
+        if matches!(self, Self::Encoded | Self::Cmyk { .. }) {
             let mut format = PixelFormat::non_color(
                 SampleKind::Float,
                 32,
@@ -93,6 +100,8 @@ impl FrameSurfaceEncoding {
         PixelFormat::rgb_f32(RgbChannelOrder::Rgb, true, color)
     }
 
+    /// Recognize only a complete canonical color layout. Codec components and CMYK's
+    /// separately stored Black channel always require the producer's explicit domain.
     pub(crate) fn from_format(format: &PixelFormat) -> Option<Self> {
         format.validate().ok()?;
         if let jxl_gpu_formats::ColorSpecification::Icc(profile) = &format.color_spec {
@@ -112,7 +121,22 @@ impl FrameSurfaceEncoding {
     pub(crate) const fn rgb_encoding(&self) -> Option<RgbColorEncoding> {
         match self {
             Self::Rgb(encoding) => Some(*encoding),
-            Self::Icc(_) | Self::Encoded => None,
+            Self::Icc(_) | Self::Cmyk { .. } | Self::Encoded => None,
+        }
+    }
+
+    pub(crate) fn icc_profile(&self) -> Option<&IccProfile> {
+        match self {
+            Self::Icc(profile) | Self::Cmyk { profile, .. } => Some(profile),
+            Self::Rgb(_) | Self::Encoded => None,
+        }
+    }
+
+    pub(crate) fn icc_sample_encoding(&self) -> jxl_wgpu::ResidentIccSampleEncoding {
+        if matches!(self, Self::Cmyk { .. }) {
+            jxl_wgpu::ResidentIccSampleEncoding::Complement
+        } else {
+            jxl_wgpu::ResidentIccSampleEncoding::Direct
         }
     }
 }
@@ -144,6 +168,41 @@ pub(crate) struct FrameSurfaceLayout {
 }
 
 impl FrameSurfaceLayout {
+    pub(crate) fn icc_planes(
+        &self,
+        encoding: &FrameSurfaceEncoding,
+    ) -> crate::Result<Vec<jxl_wgpu::ResidentIccPlane>> {
+        let black = if let FrameSurfaceEncoding::Cmyk { black_extra, .. } = encoding {
+            let black = self
+                .extras
+                .get(*black_extra)
+                .ok_or(crate::Error::EngineContract(
+                    "CMYK Black plane is outside the frame surface",
+                ))?;
+            if self.color.planes.len() != 3
+                || black.planes.len() != 1
+                || black.extent != self.color.extent
+            {
+                return Err(crate::Error::EngineContract(
+                    "CMYK planes have incompatible extents",
+                ));
+            }
+            Some(&black.planes[0])
+        } else {
+            None
+        };
+        Ok(self
+            .color
+            .planes
+            .iter()
+            .chain(black)
+            .map(|plane| jxl_wgpu::ResidentIccPlane {
+                offset: (plane.offset / 4) as u32,
+                stride: (plane.row_stride / 4) as u32,
+            })
+            .collect())
+    }
+
     pub(crate) fn with_encoding(
         extent: Extent2d,
         extra_count: usize,

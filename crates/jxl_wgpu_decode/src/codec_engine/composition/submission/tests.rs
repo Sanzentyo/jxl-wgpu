@@ -60,6 +60,8 @@ fn recorded(backend: &WgpuBackend, status: u32) -> GpuWork {
             &mut encoder,
             &program,
             ResidentIccInputs {
+                input_encoding: Default::default(),
+                output_encoding: Default::default(),
                 input: binding(&input),
                 output: binding(&output),
                 extent: Extent2d::new(1, 1),

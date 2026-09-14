@@ -123,6 +123,65 @@ pub struct ImageOutputParams {
     pub(crate) transfer_parameters: [f32; 4],
 }
 impl ImageOutputParams {
+    /// Pack three F32 codec components without assigning RGB or ICC meaning to their storage.
+    pub fn for_components(
+        layout: &ImageLayout,
+        source: ImageOutputGeometry,
+        dispatch_width: u32,
+    ) -> Result<Self> {
+        use jxl_gpu_formats::{Channel, PixelFormat, PlaneFormat, PlaneSampling, SampleKind};
+        let mut expected =
+            PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X, Channel::Y, Channel::Z]);
+        expected.planes = [Channel::X, Channel::Y, Channel::Z]
+            .map(|channel| PlaneFormat::separate_words(PlaneSampling::FULL, 1, &[channel], 32))
+            .into();
+        if layout.format != expected {
+            return Err(Error::InvalidPayload(
+                "component packing requires three planar native F32 channels".into(),
+            ));
+        }
+        let validated =
+            ImageLayout::from_planes(layout.extent, layout.format.clone(), layout.planes.clone())?;
+        if validated.logical_size != layout.logical_size {
+            return Err(Error::InvalidPayload(
+                "component layout logical size disagrees with its planes".into(),
+            ));
+        }
+        let mut plane_offsets = [0; 4];
+        let mut plane_strides = [0; 4];
+        for (index, plane) in layout.planes.iter().enumerate() {
+            plane_offsets[index] = to_shader_u32(plane.offset)?;
+            plane_strides[index] = to_shader_u32(plane.row_stride)?;
+        }
+        Self::lower(
+            layout,
+            source,
+            dispatch_width,
+            PreparedImageOutput {
+                kind: 1,
+                channels: 3,
+                order: 0,
+                matrix: 1,
+                range: 0,
+                siting_x: 1,
+                siting_y: 1,
+                subsample_x: 1,
+                subsample_y: 1,
+                bits: 32,
+                storage_bits: 32,
+                plane_offsets,
+                plane_strides,
+            },
+            ImageColorTransform {
+                source_transfer: 0,
+                target_transfer: 0,
+                source_gamma: 1.0,
+                target_gamma: 1.0,
+                primaries: IDENTITY_3.map(|row| [row[0] as f32, row[1] as f32, row[2] as f32, 0.0]),
+            },
+        )
+    }
+
     /// Clamp target-linear components at or below a codec reconstruction threshold to zero.
     /// This happens before the target transfer; it does not clamp encoded reference samples.
     pub fn with_linear_black_threshold(mut self, threshold: f32) -> Result<Self> {

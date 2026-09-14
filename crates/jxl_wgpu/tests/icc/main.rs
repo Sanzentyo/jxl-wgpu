@@ -25,6 +25,7 @@ mod lut;
 mod metadata;
 mod mpe;
 mod rgb;
+mod samples;
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -184,7 +185,7 @@ fn run(
     let plan = ResidentIccMemoryPlan::new(transform, &backend.device().limits()).unwrap();
     let program = ResidentIccProgram::new(backend.device(), transform).unwrap();
     assert_eq!(program.memory_plan(), plan);
-    assert_eq!(plan.dispatch_bytes, 304);
+    assert_eq!(plan.dispatch_bytes, 320);
     run_program(backend, pipeline, &program, extent, input, padding)
 }
 
@@ -195,6 +196,26 @@ fn run_program(
     extent: Extent2d,
     input: &[f32],
     padding: u32,
+) -> Vec<f32> {
+    run_encoded_program(
+        backend,
+        pipeline,
+        program,
+        extent,
+        input,
+        padding,
+        [jxl_wgpu::ResidentIccSampleEncoding::Direct; 2],
+    )
+}
+
+fn run_encoded_program(
+    backend: &WgpuBackend,
+    pipeline: &ResidentIccPipeline,
+    program: &ResidentIccProgram,
+    extent: Extent2d,
+    input: &[f32],
+    padding: u32,
+    encoding: [jxl_wgpu::ResidentIccSampleEncoding; 2],
 ) -> Vec<f32> {
     let source = Storage::new(
         backend,
@@ -223,6 +244,8 @@ fn run_program(
             &mut encoder,
             program,
             ResidentIccInputs {
+                input_encoding: encoding[0],
+                output_encoding: encoding[1],
                 input: source.binding(),
                 output: target.binding(),
                 extent,

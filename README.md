@@ -218,9 +218,10 @@ within one code value under whole and bounded asynchronous input.
 
 XYB VarDCT accepts every integer source depth from 1 through 31.
 Twenty synthetic fixtures cover every depth, plus high-depth grayscale, orientation, resampling,
-multiple LF groups, and recursive DC. Both reference decoders agree within one RGB8 code; the
-non-XYB YCbCr profile remains limited to 8-bit integer input. XYB VarDCT also accepts legal JPEG XL
-floating source precision without rescaling its reconstructed XYB samples.
+multiple LF groups, and recursive DC. Both reference decoders agree within one RGB8 code.
+VarDCT applies the same legal integer/floating source-precision validation to XYB, original
+RGB and YCbCr without rescaling the reconstructed components. The CMYK corpus adds six actual
+F32 YCbCr sequences with native reconstruction and independent ICC precision checks.
 Original-sRGB VarDCT uses an explicit RGB plane contract and the same source-precision validation;
 8-bit RGB/gray, rotated Gray16, F32 RGB, restoration/resampling and animation have dual-oracle
 F32 coverage, including signaled noise and zero-model controls.

@@ -24,7 +24,7 @@ struct Case {
     modular: bool,
 }
 
-fn reference(directory: &Path, name: &str, intent: IccRenderingIntent) -> Vec<[f32; 6]> {
+pub(super) fn reference(directory: &Path, name: &str, intent: IccRenderingIntent) -> Vec<[f32; 6]> {
     let bytes =
         std::fs::read(directory.join(format!("{name}_{}.reference", intent as u32))).unwrap();
     let (records, tail) = bytes.as_chunks::<28>();

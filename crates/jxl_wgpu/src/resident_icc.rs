@@ -32,6 +32,17 @@ pub struct ResidentIccPlane {
     pub stride: u32,
 }
 
+/// Conversion between stored image samples and the selected ICC program's domain.
+/// This affects image loads/stores only; profile metadata and black-point probes stay unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ResidentIccSampleEncoding {
+    #[default]
+    Direct = 0,
+    /// JPEG XL CMYK stores `1 - ink_amount` for each of its four components.
+    Complement = 1,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ResidentIccInputs<'a> {
     pub input: ResidentStorageBinding<'a>,
@@ -40,6 +51,8 @@ pub struct ResidentIccInputs<'a> {
     /// One plane per selected device channel. Every source value must be finite.
     pub input_planes: &'a [ResidentIccPlane],
     pub output_planes: &'a [ResidentIccPlane],
+    pub input_encoding: ResidentIccSampleEncoding,
+    pub output_encoding: ResidentIccSampleEncoding,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -382,6 +395,7 @@ struct DispatchParams {
     connection_scale: [f32; 4],
     connection_offset: [f32; 3],
     status: u32,
+    sample_encoding: [u32; 4],
 }
 
 fn validate_capabilities(limits: &wgpu::Limits) -> Result<(), ResidentIccError> {
@@ -497,6 +511,12 @@ fn validate_inputs(
         connection_scale: [1.0; 4],
         connection_offset: [0.0; 3],
         status: 0,
+        sample_encoding: [
+            inputs.input_encoding as u32,
+            inputs.output_encoding as u32,
+            0,
+            0,
+        ],
     })
 }
 
@@ -513,11 +533,12 @@ fn plane_end(plane: ResidentIccPlane, extent: Extent2d) -> Result<u64, ResidentI
 const _: () = {
     assert!(std::mem::size_of::<CurveParams>() == 48);
     assert!(std::mem::offset_of!(CurveParams, parameters) == 16);
-    assert!(std::mem::size_of::<DispatchParams>() == 304);
+    assert!(std::mem::size_of::<DispatchParams>() == 320);
     assert!(std::mem::offset_of!(DispatchParams, input_offsets) == 16);
     assert!(std::mem::offset_of!(DispatchParams, output_strides) == 208);
     assert!(std::mem::offset_of!(DispatchParams, connection_scale) == 272);
     assert!(std::mem::offset_of!(DispatchParams, status) == 300);
+    assert!(std::mem::offset_of!(DispatchParams, sample_encoding) == 304);
 };
 
 #[cfg(test)]

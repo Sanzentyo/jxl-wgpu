@@ -43,7 +43,7 @@ pub enum UnsupportedVarDctPacketFeature {
     #[error("the combined one-entry VarDCT packet cannot address multiple LF groups")]
     CombinedPacketMultipleLfGroups,
     #[error(
-        "GPU VarDCT accepts 1–31-bit integer or legal floating XYB, or 8-bit YCbCr input, got {bits_per_sample}-bit {color_transform:?}"
+        "GPU VarDCT accepts 1–31-bit integer or legal floating sample declarations, got {bits_per_sample}-bit {color_transform:?}"
     )]
     BitDepth {
         bits_per_sample: u32,
@@ -885,11 +885,7 @@ impl BoundedVarDctPacketPlan {
         let profile = StandardVarDctProfile::negotiate_for_role(inventory, role)?;
         let supported_precision =
             crate::modular_sample::ModularSampleEncoding::new(profile.sample_bit_depth).is_some();
-        if !supported_precision
-            || (profile.color_transform == VarDctColorTransform::Ycbcr
-                && profile.sample_bit_depth
-                    != (jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample: 8 }))
-        {
+        if !supported_precision {
             return Err(UnsupportedVarDctPacketFeature::BitDepth {
                 bits_per_sample: profile.bits_per_sample(),
                 color_transform: profile.color_transform,

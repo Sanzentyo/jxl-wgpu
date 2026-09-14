@@ -42,7 +42,7 @@ pub(super) fn convert(
             "inverse color transform extra channel count",
         ));
     }
-    if matches!(original, FrameSurfaceEncoding::Icc(_)) && !image.xyb_encoded {
+    if original.icc_profile().is_some() && !image.xyb_encoded {
         if encoding != *original {
             return Err(Error::EngineContract(
                 "ICC component reconstruction requires the original device profile",
@@ -156,6 +156,7 @@ pub(super) fn convert(
             let encoding = match original {
                 FrameSurfaceEncoding::Rgb(encoding) => ColorOutputEncoding::Rgb(*encoding),
                 FrameSurfaceEncoding::Icc(profile) => ColorOutputEncoding::Icc(profile.clone()),
+                FrameSurfaceEncoding::Cmyk { .. } => ColorOutputEncoding::Components,
                 FrameSurfaceEncoding::Encoded => {
                     return Err(Error::EngineContract(
                         "original color interpretation cannot be codec components",
@@ -205,7 +206,8 @@ pub(super) fn convert(
                     offset: 0,
                     size: NonZeroU64::new(rendered.storage_bytes).expect("nonempty linear surface"),
                 },
-                layout: &rendered.color,
+                layout: rendered,
+                encoding: &compositor.linear_encoding(),
             },
             ColorBinding {
                 storage: ResidentStorageBinding {
@@ -213,7 +215,8 @@ pub(super) fn convert(
                     offset: 0,
                     size: NonZeroU64::new(layout.storage_bytes).expect("nonempty original surface"),
                 },
-                layout: &layout.color,
+                layout: &layout,
+                encoding: &encoding,
             },
         )?)
     } else {

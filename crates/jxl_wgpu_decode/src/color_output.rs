@@ -56,6 +56,9 @@ pub enum ColorOutputEncoding {
     Rgb(RgbColorEncoding),
     /// Original RGB or Gray device values owned by this exact profile.
     Icc(jxl_gpu_protocol::icc::IccProfile),
+    /// Three untagged codec components, such as complemented CMY after a JPEG matrix.
+    /// Their image-owned color domain is interpreted by the later ICC connection.
+    Components,
 }
 
 impl From<RgbColorEncoding> for ColorOutputEncoding {
@@ -219,6 +222,15 @@ impl ColorOutputConfig {
                     strides,
                 },
                 &profile,
+                dispatch_width,
+            )?,
+            ColorOutputEncoding::Components => ImageOutputParams::for_components(
+                layout,
+                jxl_wgpu::ImageOutputGeometry {
+                    extent: self.extent,
+                    orientation: self.orientation,
+                    strides,
+                },
                 dispatch_width,
             )?,
         }

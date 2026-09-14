@@ -315,7 +315,7 @@ impl Compositor {
         } else {
             None
         };
-        let packing = if (matches!(&original, FrameSurfaceEncoding::Icc(_))
+        let packing = if (original.icc_profile().is_some()
             || matches!(
                 request.format().color_spec,
                 jxl_gpu_formats::ColorSpecification::Icc(_)
@@ -332,6 +332,7 @@ impl Compositor {
                 icc::Presentation::new(
                     &backend,
                     &source,
+                    encoding,
                     request,
                     orientation,
                     extras,
@@ -592,7 +593,7 @@ impl Compositor {
             FrameSurfaceEncoding::Rgb(original) => {
                 FrameSurfaceEncoding::Rgb(crate::image_color::linear_encoding(*original))
             }
-            FrameSurfaceEncoding::Icc(_) => {
+            FrameSurfaceEncoding::Icc(_) | FrameSurfaceEncoding::Cmyk { .. } => {
                 FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709)
             }
             FrameSurfaceEncoding::Encoded => unreachable!("original image color domain"),
@@ -737,7 +738,7 @@ impl Compositor {
                 let original_colors = native.color[2];
                 let source_colors = source.layout.color.planes.len() as u32;
                 if source.encoding != self.original
-                    && matches!(self.original, FrameSurfaceEncoding::Icc(_))
+                    && self.original.icc_profile().is_some()
                     && native.source[2] < original_colors
                 {
                     return Err(Error::EngineContract(

@@ -22,6 +22,7 @@ struct Params {
     connection_scale: vec4<f32>,
     connection_offset: vec3<f32>,
     status: u32,
+    sample_encoding: vec4<u32>,
 }
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
@@ -671,9 +672,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     var values: array<f32, 16>;
     for (var c = 0u; c < params.extent_channels.z; c++) {
         values[c] = input[params.input_offsets[c / 4u][c % 4u] + id.y * params.input_strides[c / 4u][c % 4u] + id.x];
+        if params.sample_encoding.x == 1u { values[c] = 1.0 - values[c]; }
     }
     values = process_program(0u, values);
     for (var c = 0u; c < params.extent_channels.w; c++) {
+        if params.sample_encoding.y == 1u { values[c] = 1.0 - values[c]; }
         output[params.output_offsets[c / 4u][c % 4u] + id.y * params.output_strides[c / 4u][c % 4u] + id.x] = values[c];
     }
 }

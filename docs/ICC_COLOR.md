@@ -8,6 +8,8 @@ reconstruction and LF configuration are independent of color conversion. The com
 also handles original and XYB ICC RGB/Gray color surfaces, including YCbCr reconstruction,
 original-domain references and composition, all four matrix/TRC intents and U8/F32 requested output.
 Requested RGB MPE output and embedded/requested RGB/Gray LUTs are also exercised through the public decoder.
+Original CMYK sources now connect to RGB/Gray through the independently composed Black extra,
+including YCbCr reconstruction and source-domain spot presentation.
 Enumerated SDR sources also target ICC through original/XYB/YCbCr reconstruction and composition.
 Spot presentation runs before ICC connections in the actual source domain, after reference storage.
 Broader ICC XYB conformance, other ICC methods
@@ -34,9 +36,30 @@ and native CMM comparisons. Same-profile F32 output bypasses curves and preserve
 rendered values; CMM references for an actual connection apply the specified unit device range
 at the native float API boundary.
 
+Original CMYK surfaces explicitly own their ICC profile and Black extra-channel index. They store
+three complemented CMY planes and borrow the actual Black plane for a four-channel ICC view;
+Black is never duplicated into color storage. Separate blend modes and reference slots therefore
+remain authoritative. YCbCr inversion packs these three components into non-color storage with
+`ImageOutputParams::for_components`; only the image-owned domain gives them CMYK meaning.
+The resident ICC dispatch maps image samples through `ResidentIccSampleEncoding::Complement`
+on input/output as selected. Its 320-byte storage record adds the image encoding flags at byte
+304 and retains preparation status at byte 300. Profile black-point probes remain in the ICC
+program's device domain. All three GPU kernel variants check both sample conventions and guards.
+
+The official `cmyk_layers` corpus checks all five original CMY/Black/Alpha components against
+unchanged upstream bounds. The [CMYK recipe](../crates/jxl_wgpu_decode/test-data/cmyk_generator/README.md)
+adds 18 three-frame sequences with three LUT formats, both PCS domains, non-leading Black,
+independent Black references, F32 extras, both codecs and YCbCr. Native reconstruction and
+independent F64/native ICC references check RGB/Gray presentation under four intents, spot
+Render/Preserve, both layouts, bounded input, held frames and memory release. Missing or ambiguous
+Black declarations remain typed unsupported profiles. Requested CMYK output layouts,
+XYB-to-original CMYK reconstruction, wider sampling/range/profile combinations and full JPEG XL
+conformance remain open.
+
 YCbCr reconstruction carries the actual original device profile through the inverse codec matrix;
 it does not select an ICC transform or introduce an enumerated RGB carrier. The resulting surface
-has one Gray or three RGB planes before reference storage and composition. Same-profile requests
+has one Gray plane, three RGB planes, or three CMY planes with a separate Black extra before
+reference storage and composition. Same-profile RGB/Gray requests
 therefore work independently of the requested CMS intent. A 146-source corpus checks both codecs,
 sampling, precision, filtering, resampling and retained compositions. Five sources also check
 linear/sRGB and other-profile conversion with independent error propagation from each existing
@@ -83,7 +106,7 @@ when an actual profile conversion is requested.
 Requested color conversion uses a selected immutable program shared across physical frames. Program
 upload is lazy, budgeted and retryable; each dispatch retains its uploaded program through GPU
 completion even if the image session is dropped. Intermediate color surfaces, unchanged extra
-planes, output words, the 304-byte ICC dispatch storage, optional four-byte validation word
+planes, output words, the 320-byte ICC dispatch storage, optional four-byte validation word
 and 208-byte packing uniform are all accounted.
 No frame readback or CPU pixel CMS is involved. `GpuOutputRequest::with_icc_rendering_intent`
 defaults to relative colorimetric; non-Bradford conversion and unsupported selected methods return errors.
@@ -116,7 +139,8 @@ selected matrix/TRC method; LUT/MPE callers use the general selected program.
 Matrix/TRC covers RGB input/display and monochrome input/display/output classes with XYZ PCS.
 LUT/MPE supports input/display/output profiles, recognized device channel counts and XYZ/Lab PCS;
 this resident metadata support is broader than JPEG XL decoder admission, which still uses
-RGB/Gray image color surfaces. Complete CMYK image plumbing, other profile classes,
+RGB/Gray and original CMYK image color surfaces. Requested CMYK layouts, XYB-to-original CMYK
+reconstruction, other profile classes,
 full floating-point-range conformance and broader gamut/HDR policies remain open.
 
 Relative intent connects the profiles in media-relative PCS. Absolute intent uses fully adapted
@@ -248,7 +272,7 @@ Interpolation is a typed property of the CLUT. Legacy Lab-indexed output LUTs us
 interpolation; other LUTs use the existing tetrahedral/leading-axis-linear policy. This follows
 Little CMS 2.19's legacy LUT selection without changing floating MPE interpolation. GPU payload
 addresses and shared payload storage retain checked layouts. The dispatch record is now
-304-byte writable storage so a preparation pass can publish its connection coefficients.
+320-byte writable storage so a preparation pass can publish its connection coefficients.
 
 The v4 selected-method black policy also applies to LUTs. Perceptual/saturation conversion
 from a v2 LUT to a v4 or virtual linear endpoint embeds its selected source program and a
@@ -419,7 +443,7 @@ component is excluded from the primary GPU assertion.
 Additional GPU tests cover both monotone directions, exact plateau endpoint rules, all parametric
 inverse branches, clipped plateaus/gaps, metadata reuse after abandoned commands, Scalar/Lanes32/
 Tile16x16 dispatches, multiple extents/pitches, exact program limits and invalid bindings.
-The shader is Naga-validated without optional capabilities and its 304-byte storage record is checked
+The shader is Naga-validated without optional capabilities and its 320-byte storage record is checked
 against the parsed WGSL layout.
 
 The `linear` subcorpus adds 100 connections between the ten original profiles and five linear

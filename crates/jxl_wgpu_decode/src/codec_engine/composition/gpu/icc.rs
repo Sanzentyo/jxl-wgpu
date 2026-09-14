@@ -31,6 +31,7 @@ pub(super) struct Presentation {
     transform: Option<Arc<Transform>>,
     spots: Option<Rendering>,
     working: FrameSurfaceLayout,
+    working_encoding: FrameSurfaceEncoding,
     output: ImageLayout,
     pipeline: wgpu::ComputePipeline,
     params: ImageOutputParams,
@@ -41,14 +42,16 @@ impl Presentation {
     pub(super) fn new(
         backend: &WgpuBackend,
         source: &FrameSurfaceLayout,
+        source_encoding: FrameSurfaceEncoding,
         request: &GpuOutputRequest,
         orientation: OutputOrientation,
         extras: &[ExtraChannelInventory],
         transforms: &mut Transforms,
     ) -> Result<Self> {
         let device = backend.device();
-        let source_encoding = FrameSurfaceEncoding::from_format(&source.color.format)
-            .ok_or(Error::EngineContract("color presentation source layout"))?;
+        if source.color.format != source_encoding.format() {
+            return Err(Error::EngineContract("color presentation source layout"));
+        }
         if extras.len() != source.extras.len() {
             return Err(Error::EngineContract(
                 "color presentation extra-channel count",
@@ -70,44 +73,51 @@ impl Presentation {
         {
             return Err(crate::color_output::ColorOutputError::HdrLuminanceMappingRequired.into());
         }
-        let (encoding, selected) =
-            match (&source_encoding, &output.format.color_spec) {
-                (FrameSurfaceEncoding::Icc(profile), ColorSpecification::Icc(target)) => (
-                    FrameSurfaceEncoding::Icc(target.clone()),
-                    if target == profile {
-                        None
-                    } else {
-                        Some(IccTransform::new(
-                            profile,
-                            target,
-                            request.icc_rendering_intent(),
-                        )?)
-                    },
-                ),
-                (FrameSurfaceEncoding::Icc(profile), ColorSpecification::Defined(_)) => (
-                    FrameSurfaceEncoding::Rgb(RgbColorEncoding::LINEAR_BT709),
-                    Some(IccTransform::to_linear_rgb(
+        let (encoding, selected) = match (&source_encoding, &output.format.color_spec) {
+            (
+                FrameSurfaceEncoding::Icc(profile) | FrameSurfaceEncoding::Cmyk { profile, .. },
+                ColorSpecification::Icc(target),
+            ) => (
+                FrameSurfaceEncoding::Icc(target.clone()),
+                if target == profile && matches!(source_encoding, FrameSurfaceEncoding::Icc(_)) {
+                    None
+                } else {
+                    Some(IccTransform::new(
                         profile,
-                        RgbColorSpace::Bt709,
-                        request.icc_rendering_intent(),
-                    )?),
-                ),
-                (FrameSurfaceEncoding::Rgb(encoding), ColorSpecification::Icc(target)) => (
-                    FrameSurfaceEncoding::Icc(target.clone()),
-                    Some(IccTransform::from_rgb(
-                        *encoding,
                         target,
                         request.icc_rendering_intent(),
-                    )?),
-                ),
-                (FrameSurfaceEncoding::Rgb(_), ColorSpecification::Defined(_)) => {
-                    (source_encoding.clone(), None)
-                }
-                _ => return Err(Error::UnsupportedOutputFormat(
+                    )?)
+                },
+            ),
+            (
+                FrameSurfaceEncoding::Icc(profile) | FrameSurfaceEncoding::Cmyk { profile, .. },
+                ColorSpecification::Defined(_),
+            ) => (
+                FrameSurfaceEncoding::Rgb(RgbColorEncoding::LINEAR_BT709),
+                Some(IccTransform::to_linear_rgb(
+                    profile,
+                    RgbColorSpace::Bt709,
+                    request.icc_rendering_intent(),
+                )?),
+            ),
+            (FrameSurfaceEncoding::Rgb(encoding), ColorSpecification::Icc(target)) => (
+                FrameSurfaceEncoding::Icc(target.clone()),
+                Some(IccTransform::from_rgb(
+                    *encoding,
+                    target,
+                    request.icc_rendering_intent(),
+                )?),
+            ),
+            (FrameSurfaceEncoding::Rgb(_), ColorSpecification::Defined(_)) => {
+                (source_encoding.clone(), None)
+            }
+            _ => {
+                return Err(Error::UnsupportedOutputFormat(
                     "ICC color output requires an explicit target profile or enumerated encoding"
                         .into(),
-                )),
-            };
+                ));
+            }
+        };
         if selected.is_some() && request.white_point_adaptation() != WhitePointAdaptation::Bradford
         {
             return Err(Error::UnsupportedOutputFormat(
@@ -143,7 +153,9 @@ impl Presentation {
                 dispatch[0] * 64,
                 request.white_point_adaptation(),
             )?,
-            FrameSurfaceEncoding::Encoded => unreachable!("resolved presentation color"),
+            FrameSurfaceEncoding::Encoded | FrameSurfaceEncoding::Cmyk { .. } => {
+                unreachable!("resolved presentation color")
+            }
         }
         .with_alpha_conversion(request.alpha_conversion(extras));
         let color_count = working.color.planes.len() as u32;
@@ -177,6 +189,7 @@ impl Presentation {
             transform,
             spots,
             working,
+            working_encoding: encoding,
             output,
             pipeline,
             params,
@@ -250,11 +263,13 @@ impl Presentation {
                 program,
                 ColorBinding {
                     storage: binding(source_buffer, source.layout.storage_bytes),
-                    layout: &source.layout.color,
+                    layout: &source.layout,
+                    encoding: &self.source_encoding,
                 },
                 ColorBinding {
                     storage: binding(&buffer, self.working.storage_bytes),
-                    layout: &self.working.color,
+                    layout: &self.working,
+                    encoding: &self.working_encoding,
                 },
             )?);
             source.copy_extras(

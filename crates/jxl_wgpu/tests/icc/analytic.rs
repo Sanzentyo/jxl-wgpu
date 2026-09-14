@@ -155,6 +155,8 @@ fn uploaded_profile_program_reuses_metadata_across_extents_pitches_and_abandoned
             &mut abandoned,
             &program,
             ResidentIccInputs {
+                input_encoding: Default::default(),
+                output_encoding: Default::default(),
                 input: source.binding(),
                 output: target.binding(),
                 extent,
@@ -339,6 +341,8 @@ fn resident_icc_rejects_invalid_bindings_aliasing_and_unadmitted_program_sizes()
     let target = Storage::new(&backend, extent, 3, None, 3);
     let mut encoder = backend.device().create_command_encoder(&Default::default());
     let input = ResidentIccInputs {
+        input_encoding: Default::default(),
+        output_encoding: Default::default(),
         input: source.binding(),
         output: target.binding(),
         extent,
@@ -362,6 +366,8 @@ fn resident_icc_rejects_invalid_bindings_aliasing_and_unadmitted_program_sizes()
     };
     assert!(matches!(
         check(ResidentIccInputs {
+            input_encoding: Default::default(),
+            output_encoding: Default::default(),
             input_planes: &source.planes[..2],
             ..input
         }),
@@ -373,6 +379,8 @@ fn resident_icc_rejects_invalid_bindings_aliasing_and_unadmitted_program_sizes()
     ));
     assert_eq!(
         check(ResidentIccInputs {
+            input_encoding: Default::default(),
+            output_encoding: Default::default(),
             output: source.binding(),
             ..input
         }),
@@ -380,6 +388,8 @@ fn resident_icc_rejects_invalid_bindings_aliasing_and_unadmitted_program_sizes()
     );
     assert_eq!(
         check(ResidentIccInputs {
+            input_encoding: Default::default(),
+            output_encoding: Default::default(),
             output_planes: &overlapping,
             ..input
         }),
@@ -387,6 +397,8 @@ fn resident_icc_rejects_invalid_bindings_aliasing_and_unadmitted_program_sizes()
     );
     assert!(matches!(
         check(ResidentIccInputs {
+            input_encoding: Default::default(),
+            output_encoding: Default::default(),
             input: ResidentStorageBinding {
                 offset: 1,
                 ..source.binding()
@@ -397,6 +409,8 @@ fn resident_icc_rejects_invalid_bindings_aliasing_and_unadmitted_program_sizes()
     ));
     assert!(matches!(
         check(ResidentIccInputs {
+            input_encoding: Default::default(),
+            output_encoding: Default::default(),
             extent: Extent2d::new(0, 5),
             ..input
         }),
@@ -404,6 +418,8 @@ fn resident_icc_rejects_invalid_bindings_aliasing_and_unadmitted_program_sizes()
     ));
     assert!(matches!(
         check(ResidentIccInputs {
+            input_encoding: Default::default(),
+            output_encoding: Default::default(),
             input_planes: &overflowing,
             ..input
         }),
@@ -411,6 +427,8 @@ fn resident_icc_rejects_invalid_bindings_aliasing_and_unadmitted_program_sizes()
     ));
     assert!(matches!(
         check(ResidentIccInputs {
+            input_encoding: Default::default(),
+            output_encoding: Default::default(),
             input_planes: &short_stride,
             ..input
         }),

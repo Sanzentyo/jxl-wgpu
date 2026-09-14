@@ -54,7 +54,7 @@ fn unsupported_integer_depth_errors_preserve_the_declared_depth_and_color_domain
         (
             include_str!("../../test-data/testsrc_vardct_jpeg_orientation_6.jxl.hex"),
             VarDctColorTransform::Ycbcr,
-            [1, 10, 16],
+            [0, 32, u32::MAX],
         ),
     ];
     for (hex, expected_transform, depths) in cases {

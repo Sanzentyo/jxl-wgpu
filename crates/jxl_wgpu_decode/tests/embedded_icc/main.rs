@@ -9,6 +9,7 @@ use jxl_wgpu_decode::{
 };
 use std::num::NonZeroU64;
 
+mod cmyk;
 mod color;
 mod intents;
 mod lut;

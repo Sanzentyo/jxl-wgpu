@@ -102,7 +102,7 @@ pub use resident_gaborish::{
 };
 pub use resident_icc::{
     ResidentIccDispatch, ResidentIccError, ResidentIccInputs, ResidentIccMemoryPlan,
-    ResidentIccPipeline, ResidentIccPlane, ResidentIccProgram,
+    ResidentIccPipeline, ResidentIccPlane, ResidentIccProgram, ResidentIccSampleEncoding,
 };
 pub use resident_noise::{
     ResidentNoiseError, ResidentNoiseInputs, ResidentNoiseParameters, ResidentNoisePipeline,

@@ -30,7 +30,7 @@ fn singular_gpu_black_connection_rejects_status_and_leaves_pixels_untouched() {
         output_channels: 3,
         memory: ResidentIccMemoryPlan {
             program_bytes: words.len() as u64 * 4,
-            dispatch_bytes: 304,
+            dispatch_bytes: 320,
             validation_bytes: 4,
         },
     };
@@ -70,6 +70,8 @@ fn singular_gpu_black_connection_rejects_status_and_leaves_pixels_untouched() {
                 &mut encoder,
                 &program,
                 ResidentIccInputs {
+                    input_encoding: Default::default(),
+                    output_encoding: Default::default(),
                     input: binding(&input),
                     output: binding(&output),
                     extent: Extent2d::new(2, 1),
@@ -146,7 +148,7 @@ fn profile_binding_capabilities_fail_before_pipeline_creation() {
         ),
         (
             wgpu::Limits {
-                max_storage_buffer_binding_size: 303,
+                max_storage_buffer_binding_size: 319,
                 ..Default::default()
             },
             "dispatch storage bytes",
@@ -181,6 +183,6 @@ fn icc_shader_and_dispatch_abi_are_webgpu_portable() {
             .iter()
             .map(|member| member.offset)
             .collect::<Vec<_>>(),
-        vec![0, 16, 80, 144, 208, 272, 288, 300]
+        vec![0, 16, 80, 144, 208, 272, 288, 300, 304]
     );
 }

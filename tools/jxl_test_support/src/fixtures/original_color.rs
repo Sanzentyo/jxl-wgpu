@@ -1,9 +1,9 @@
 //! Original SDR profiles with independently encoded RGB/XYB sources and explicit YCbCr recipes.
 
 use jxl_gpu_bitstream::{
-    BitReader, BitWriter, CodestreamInventory, ColourEncodingInventory, ColourSpaceInventory,
-    FrameEncoding, PrimariesInventory, RenderingIntentInventory, SampleBitDepth,
-    TransferFunctionInventory, WhitePointInventory,
+    CodestreamInventory, ColourEncodingInventory, ColourSpaceInventory, FrameEncoding,
+    PrimariesInventory, RenderingIntentInventory, SampleBitDepth, TransferFunctionInventory,
+    WhitePointInventory,
 };
 use jxl_gpu_formats::{
     ColorSpace, ColorSpecification, PixelFormat, RgbChannelOrder, TransferFunction,
@@ -271,48 +271,23 @@ impl Case {
             info.image_header.bit_depth,
             SampleBitDepth::Integer { bits_per_sample: 8 }
         );
-        let source = parsed.codestream();
-        let mut output = source[..info.frames[0].header_bits.offset as usize / 8].to_vec();
-        for frame in &info.frames {
-            assert!(!frame.do_ycbcr && !frame.uses_lf_frame());
-            let start = frame.header_bits.offset;
-            let mut reader = BitReader::new(source);
-            reader.skip_bits(start).unwrap();
-            assert_eq!(reader.read_bits(1).unwrap(), 0, "explicit frame header");
-            reader.skip_bits(3).unwrap();
-            let mut flags = BitWriter::new();
-            frame_features::flags(&mut flags, frame.flags);
-            let mut expected = BitReader::new(flags.as_bytes());
-            assert_eq!(
-                reader.read_bits(flags.bit_len() as u8).unwrap(),
-                expected.read_bits(flags.bit_len() as u8).unwrap()
-            );
-            assert_eq!(reader.read_bits(1).unwrap(), 0, "RGB source");
-            let transform_offset = start + 4 + flags.bit_len() as u64;
-            let mut header = BitWriter::new();
-            frame_features::copy_bits(&mut header, source, start, transform_offset);
-            header.write_bits(1, 1).unwrap();
-            header.write_bits(0, 6).unwrap(); // Three independent full-resolution selectors.
-            frame_features::copy_bits(
-                &mut header,
-                source,
-                transform_offset + 1,
-                frame.header_bits.end().unwrap(),
-            );
-            output.extend(frame_features::packet_frame_prefix(
-                source,
-                frame,
-                jxl_wgpu_encode::BitFragment::new(header.as_bytes().to_vec(), header.bit_len())
-                    .unwrap(),
-                None,
-            ));
-        }
-        output
+        frame_features::as_ycbcr_444(&source)
     }
 }
 
 pub fn directory() -> std::path::PathBuf {
     crate::decoder_directory().join("test-data/original_color")
+}
+
+#[test]
+fn shared_ycbcr_assembly_preserves_the_existing_frozen_corpus() {
+    for case in cases()
+        .into_iter()
+        .chain(analytic_cases())
+        .filter(|case| case.mode.ycbcr())
+    {
+        assert_eq!(case.encode_ycbcr(), case.bytes(), "{}", case.name);
+    }
 }
 
 fn read_bytes(name: &str) -> Vec<u8> {

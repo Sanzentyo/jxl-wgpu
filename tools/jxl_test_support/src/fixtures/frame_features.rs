@@ -20,6 +20,51 @@ pub fn copy_bits(writer: &mut BitWriter, bytes: &[u8], start: u64, end: u64) {
     }
 }
 
+/// Interpret unchanged native component entropy as full-resolution YCbCr. Native decoding
+/// must verify the assembled stream before it is used as a pixel oracle.
+pub fn as_ycbcr_444(source: &[u8]) -> Vec<u8> {
+    let parsed = jxl_gpu_bitstream::parse(source, Default::default()).unwrap();
+    let info = parsed.codestream_inventory(Default::default()).unwrap();
+    assert!(!info.image_header.xyb_encoded && !info.image_header.grayscale);
+    let source = parsed.codestream();
+    let mut output = source[..info.frames[0].header_bits.offset as usize / 8].to_vec();
+    for frame in &info.frames {
+        assert!(!frame.do_ycbcr && !frame.uses_lf_frame());
+        let start = frame.header_bits.offset;
+        let mut reader = BitReader::new(source);
+        reader.skip_bits(start).unwrap();
+        assert_eq!(reader.read_bits(1).unwrap(), 0, "explicit frame header");
+        reader.skip_bits(3).unwrap();
+        let mut flag_bits = BitWriter::new();
+        flags(&mut flag_bits, frame.flags);
+        let mut expected = BitReader::new(flag_bits.as_bytes());
+        assert_eq!(
+            reader.read_bits(flag_bits.bit_len() as u8).unwrap(),
+            expected.read_bits(flag_bits.bit_len() as u8).unwrap()
+        );
+        assert_eq!(reader.read_bits(1).unwrap(), 0, "RGB source");
+        let transform_offset = start + 4 + flag_bits.bit_len() as u64;
+        let mut header = BitWriter::new();
+        copy_bits(&mut header, source, start, transform_offset);
+        header.write_bits(1, 1).unwrap();
+        header.write_bits(0, 6).unwrap(); // Three independent full-resolution selectors.
+        copy_bits(
+            &mut header,
+            source,
+            transform_offset + 1,
+            frame.header_bits.end().unwrap(),
+        );
+        output.extend(packet_frame_prefix(
+            source,
+            frame,
+            jxl_wgpu_encode::BitFragment::new(header.as_bytes().to_vec(), header.bit_len())
+                .unwrap(),
+            None,
+        ));
+    }
+    output
+}
+
 pub fn dictionary(values: &[u32]) -> BitWriter {
     // Keep the existing packet's padding unchanged. Select a legal hybrid configuration whose
     // entropy prefix ends at a byte boundary; there is no invented padding between substreams.

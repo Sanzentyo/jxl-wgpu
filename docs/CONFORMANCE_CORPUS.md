@@ -647,7 +647,7 @@ On Apple M5/Metal (2026-09-07), every case differs from Rust `jxl` and installed
 one RGB8 code. The `djxl` comparison uses explicitly sRGB float PFM, reads its declared endianness,
 reverses bottom-first rows, and rounds/clamps each float to RGB8 once. This avoids PNM's original-depth
 quantization, which would discard the lossy reconstruction precision for low-depth sources.
-The profile test checks typed rejection of out-of-range XYB and non-8-bit YCbCr depths while
+The profile test checks typed rejection of out-of-range integer depths in every color domain while
 retaining the original depth and color transform. These fixtures do not claim integer input above
 16 bits, floating-point source metadata, non-8-bit YCbCr input, or non-RGB8 VarDCT output.
 
@@ -4105,7 +4105,7 @@ See the [source-black recipe](../crates/jxl_wgpu/test-data/icc_generator/README.
 
 A deliberately singular GPU probe must return precision failure without touching output on
 all three kernels. Decoder completion tests cover typed wait/poll errors and cancellation;
-exact-budget tests include the 304-byte dispatch storage and four-byte validation word,
+exact-budget tests include the 320-byte dispatch storage and four-byte validation word,
 concurrent immutable-program reuse and reverse consumer completion. CMY/device-Lab endpoint
 selection has metadata tests; native image conformance for those and other uncommon spaces,
 complete MPE ranges, other classes and full JPEG XL remain open.
@@ -4166,3 +4166,28 @@ nine numeric extras add 88,128 native comparisons with byte-identical Render/Pre
 Source-shaped memory tests include one-byte-short admission, rollback/retry, shared program
 reuse, reverse completion and cancellation. Old fixtures remain unchanged. Full profile/range,
 render combinations and every remaining JPEG XL conformance gate remain open.
+
+## CMYK source domains and independent Black composition
+
+`crates/jxl_wgpu_decode/test-data/cmyk` retains the unchanged official `cmyk_layers` input,
+original ICC, JSON requirements and gzip-compressed NumPy reference. The test verifies their
+upstream SHA-256 digests. Its 512 × 512 × 5 complemented CMY/Black/Alpha image must meet the
+unchanged `0.000976562` per-channel RMSE and absolute peak bounds. Whole and fragmented input
+with 256-byte GPU windows also require identical words.
+
+The generated corpus contains 18 three-frame sources and 181 files. Six unchanged CMYK LUT
+profiles cover three table formats and XYZ/Lab PCS. Original Modular/VarDCT and assembled 4:4:4
+YCbCr use Black at extra index 0 or 2, alpha at index 1 and an independent spot. Color and Black
+read different reference slots in the final frame; Black also uses Add and Multiply instead of
+the color blend. Assembly preserves all encoded sections and verifies declared transform flags.
+Native libjxl independently decodes the completed streams before color reference generation.
+
+Independent F64 ink/complement/LUT equations and Little CMS provide 132,192 color components
+with separate primary/native intervals. The GPU checks 528,768 components in 1,728 presentations
+across both F32 layouts, four intents, Render/Preserve and whole/bounded input. Original numeric
+selections keep all six source channels available without inks. Modular and extra words are
+exact; VarDCT color uses the unchanged `2e-5` source uncertainty. Completed frames are retained,
+reread after session release, and all transient memory must be released. The resident sample
+encoding test separately checks CMYK input/output and v2 black-point preparation through all
+three kernels with padded buffer guards. See the [recipe](../crates/jxl_wgpu_decode/test-data/cmyk_generator/README.md)
+for regeneration, records, interval propagation and the remaining full JPEG XL requirements.
