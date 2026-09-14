@@ -549,9 +549,7 @@ fn composed_source(
             .nodes
             .iter()
             .zip(&inventory.frames)
-            .map(|(node, frame)| {
-                uses_linear(image, node, frame, request.uses_original_sample_domain())
-            })
+            .map(|(node, frame)| uses_linear(image, node, frame))
             .collect();
         let mut usage = gpu::ColorUsage {
             original: false,
@@ -611,7 +609,7 @@ fn presentation_encoding(
     frame: &jxl_gpu_bitstream::FrameInventory,
 ) -> Result<FrameSurfaceEncoding> {
     let original = compositor.original.clone();
-    if uses_linear(image, node, frame, compositor.original_samples) {
+    if uses_linear(image, node, frame) {
         Ok(compositor.linear_encoding())
     } else {
         Ok(original)
@@ -622,13 +620,11 @@ fn uses_linear(
     image: &jxl_gpu_bitstream::ImageHeaderInventory,
     node: &crate::FrameExecutionNode,
     frame: &jxl_gpu_bitstream::FrameInventory,
-    original_samples: bool,
 ) -> bool {
     image.xyb_encoded
         && !frame.do_ycbcr
         && !node.needs_composition
         && (node.save_reference.is_none() || frame.save_before_color_transform)
-        && !(image.embedded_icc.is_some() && original_samples)
 }
 
 fn validate(inventory: &CodestreamInventory, plan: &FrameExecutionPlan) -> Result<()> {

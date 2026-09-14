@@ -30,22 +30,19 @@ impl WgpuDecodeEngine {
         plan: FrameExecutionPlan,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
         validate_codestream_limit(codestream.logical_bytes(), self.parse_limits())?;
-        let (execution, slots) = if super::composition::needs_surface(inventory, request, &plan)
+        let execution = if super::composition::needs_surface(inventory, request, &plan)
             || inventory
                 .frames
                 .iter()
                 .any(|frame| frame.frame_type == FrameType::LowFrequency)
         {
-            (
-                SequenceExecution::Dependent(DependentSession::new(
-                    self.clone(),
-                    codestream,
-                    inventory,
-                    request,
-                    &plan,
-                )?),
-                request.max_frame_slots(),
-            )
+            SequenceExecution::Dependent(DependentSession::new(
+                self.clone(),
+                codestream,
+                inventory,
+                request,
+                &plan,
+            )?)
         } else {
             let source = Arc::new(SequenceSource {
                 engine: self.clone(),
@@ -54,8 +51,7 @@ impl WgpuDecodeEngine {
                 request: request.clone(),
                 surface_encodings: None,
             });
-            let (session, slots) = IndependentSession::new(source, &plan)?;
-            (SequenceExecution::Independent(session), slots)
+            SequenceExecution::Independent(IndependentSession::new(source, &plan)?)
         };
         Ok(PreparedGpuSession::new(
             DecodeProfile::FrameSequence {
@@ -69,7 +65,9 @@ impl WgpuDecodeEngine {
                 plan,
             })),
         )
-        .with_resolved_frame_slots(slots))
+        // Every physical frame gets its own producer and byte-admitted output. A producer's
+        // single-frame slot limit must not restrict held outputs of the entire sequence.
+        .with_resolved_frame_slots(request.max_frame_slots()))
     }
 }
 

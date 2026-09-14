@@ -53,7 +53,7 @@ independent Black references, F32 extras, both codecs and YCbCr. Native reconstr
 independent F64/native ICC references check RGB/Gray presentation under four intents, spot
 Render/Preserve, both layouts, bounded input, held frames and memory release. Missing or ambiguous
 Black declarations remain typed unsupported profiles.
-CMYK-suggested XYB output and numeric selection conformance, wider sampling/range/profile combinations and full JPEG XL
+Broader CMYK-suggested XYB precision/crop conformance, wider sampling/range/profile combinations and full JPEG XL
 conformance remain open.
 
 YCbCr reconstruction carries the actual original device profile through the inverse codec matrix;
@@ -101,7 +101,7 @@ Requested color conversion uses a selected immutable program shared across physi
 upload is lazy, budgeted and retryable; each dispatch retains its uploaded program through GPU
 completion even if the image session is dropped. Intermediate color surfaces, unchanged extra
 planes, output words, the 320-byte ICC dispatch storage, optional four-byte validation word
-and the 208-byte RGB/Gray or 320-byte device packing uniform are all accounted.
+and the 80-byte numeric, 208-byte RGB/Gray or 320-byte device packing uniform are all accounted.
 No frame readback or CPU pixel CMS is involved. `GpuOutputRequest::with_icc_rendering_intent`
 defaults to relative colorimetric; non-Bradford conversion and unsupported selected methods return errors.
 Exact same-profile packing does not select a CMS method and therefore does not require an
@@ -127,7 +127,7 @@ records, and all 56 now require rejection. Earlier claims that these calculation
 ICC XYB composition conformance were incorrect. Native encoder acceptance and independently
 computed pixels did not establish stream validity. The 28 remaining spot cases provide 2,808
 presentations, 1,002,456 color comparisons and 71,604 numeric extra comparisons. The broader
-full JPEG XL goal remains open, including legal CMYK-suggested XYB output and numeric selection.
+full JPEG XL goal remains open. Legal CMYK-suggested output has separate positive evidence below.
 
 ## Profile component output
 
@@ -167,8 +167,40 @@ The standalone packer checks 1,152 guarded dispatches and 931,040 bytes, includi
 orientations, component permutations, varied plane pitches, missing alpha and alpha conversion.
 Exact-budget tests include fifteen-component targets, dynamic black preparation, same-profile
 CMYK, failed admission, retry, concurrent submissions and cancellation. These checks do not
-complete CMYK-suggested XYB output and numeric selection conformance, uncommon device-space image conformance, HDR,
+complete broader CMYK-suggested XYB conformance, uncommon device-space image conformance, HDR,
 full profile range/conditioning or the remaining full JPEG XL requirements.
+
+## CMYK-suggested XYB and numeric output
+
+XYB's original ICC profile suggests an output encoding. Numeric color selection now evaluates
+that profile at presentation, using its header intent independently of requested color-output
+policies. Frame reconstruction remains in linear RGB when reference/composition requirements
+permit it. Gray, RGB and CMYK use the same selected ICC presenter and resource ownership.
+Extra selection does not select an original-profile inverse or render spot inks.
+
+The ICC working output retains every device component and then the independent decoded extras.
+CMYK's generated K is therefore distinct from its encoded Black extra. `with_color_channel(0..3)`
+returns complemented generated CMY for a CMYK suggestion; `with_extra_channel(black_index)`
+returns the encoded Black sample. `PixelFormat::icc_device` returns all four generated unit ink
+amounts and, when requested, a separate alpha component. A same-profile suggestion on XYB still
+requires conversion from linear RGB; it is not original-device passthrough.
+
+The [CMYK XYB recipe](../crates/jxl_wgpu_decode/test-data/cmyk_xyb_generator/README.md) generates
+12 legal full-canvas three-frame sequences, both codecs, six unchanged LUT profiles and Black
+at index 0 or 2. Native linear reconstruction, 88,128 independent/native ICC reference components,
+352,512 GPU device comparisons and 66,096 numeric comparisons separate generated K from stored
+Black. Both F32 layouts, bounded transport, retained outputs and exact alpha/extra words are covered.
+RGB/Gray numeric output and patched LF alpha/depth substitutions cover the shared boundary.
+Private tests include exact 80-byte numeric packing admission and the complete device-plus-extra
+working allocation, retry and completion-owned cancellation.
+
+Independent frame sequences retain the caller's requested frame window. Each physical producer
+has separate byte-admitted storage, so a single-frame producer's one-slot capacity cannot limit
+the entire animation to one retained output. Whole and fragmented asynchronous numeric tests
+hold all three frames and reread them after session destruction.
+
+These are F32 full-canvas cases. Broader precision/sampling, legal ICC crop/blend combinations,
+profile methods/ranges and HDR remain part of the full JPEG XL goal.
 
 ## Model and supported scope
 
@@ -197,7 +229,7 @@ Matrix/TRC covers RGB input/display and monochrome input/display/output classes 
 LUT/MPE supports input/display/output profiles, recognized device channel counts and XYZ/Lab PCS;
 this resident metadata support is broader than JPEG XL decoder admission, which still uses
 RGB/Gray and original CMYK source surfaces. Requested device outputs support up to fifteen
-color components. CMYK-suggested XYB output and numeric selection conformance, other profile classes,
+color components. Broader CMYK-suggested XYB precision/crop conformance, other profile classes,
 full floating-point-range conformance and broader gamut/HDR policies remain open.
 
 Relative intent connects the profiles in media-relative PCS. Absolute intent uses fully adapted

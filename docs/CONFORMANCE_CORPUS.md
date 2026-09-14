@@ -4183,3 +4183,24 @@ reread after session release, and all transient memory must be released. The res
 encoding test separately checks CMYK input/output and v2 black-point preparation through all
 three kernels with padded buffer guards. See the [recipe](../crates/jxl_wgpu_decode/test-data/cmyk_generator/README.md)
 for regeneration, records, interval propagation and the remaining full JPEG XL requirements.
+
+## CMYK-suggested XYB output and numeric selection
+
+The 73-file `cmyk_xyb` corpus contains 12 legal three-frame XYB streams, native linear RGB plus
+three independent extras, and four-intent ICC references. F32 Modular/VarDCT, XYZ/Lab PCS,
+8-/16-bit tables and A/B profiles, and Black indices 0/2 are explicit in the manifest. All frames
+replace the canvas without retaining post-transform references. Profiles and all prior corpus
+bytes remain unchanged. See the [generator](../crates/jxl_wgpu_decode/test-data/cmyk_xyb_generator/README.md).
+
+Native decoding checks actual linear D65 BT.709 DATA metadata and exact encoded extras. Independent
+F64 CIE/Bradford, black/media-white connection and reverse-LUT equations produce 88,128 components
+with separate native CMM bounds. Primary intervals propagate the unchanged native XYB precision
+contract. Each case distinguishes generated K from the complemented stored Black independently
+of GPU pixels. F32 GPU output checks 352,512 components in 576 presentations across four intents,
+both layouts and both input transports. Numeric selection checks 66,096 CMY/Black/Alpha/spot samples.
+
+Asynchronous tests retain all three independent frames and reread them after session destruction.
+The image window must remain separate from a physical producer's one-frame capacity. RGB/Gray
+numeric output, four patched LF alpha/depth substitutions, selected/unused inverse-profile separation,
+complete device-plus-extra admission, retry and cancellation cover the shared implementation.
+Broader precision/sampling, legal ICC crop/blend cases, profile methods/ranges and HDR remain open.

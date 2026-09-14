@@ -110,8 +110,10 @@ retained outputs and fragmented input. Spot presentation now also precedes ICC c
 the actual source color domain. The [spot corpus](crates/jxl_wgpu_decode/test-data/icc_spots_generator/README.md)
 contains 28 supported streams and four explicitly invalid reference cases. Supported cases cover
 both codecs, RGB/Gray, original/XYB and original-domain animations, with independent intervals,
-numeric bypass and completion-owned ink metadata. Broader ICC XYB conformance, CMYK-suggested XYB
-output and numeric selection, and full intent/HDR policies remain incomplete.
+numeric bypass and completion-owned ink metadata. Twelve legal CMYK-suggested XYB sequences now
+check complete F32 CMYK output and numeric color/extra selection, keeping generated K distinct
+from encoded Black. [Semantics and evidence](docs/ICC_COLOR.md#cmyk-suggested-xyb-and-numeric-output).
+Broader ICC XYB conformance, CMYK precision/sampling and full intent/HDR policies remain incomplete.
 
 Creating an encoder or decoder requires a compatible `wgpu` backend. Unsupported codestream
 features or device limits return typed errors before a partial output becomes authoritative.

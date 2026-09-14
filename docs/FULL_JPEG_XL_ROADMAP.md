@@ -821,3 +821,21 @@ previously accepted invalid streams remain unchanged as negative fixtures. Whole
 behaviour. The corpus audit separates 56 negative inputs from 2,516 accepted inventories;
 acceptance alone is not a pixel-conformance claim. No completion gate closes at this checkpoint.
 [Specification basis and corrected evidence](ICC_COLOR.md#xyb-reference-validity).
+
+CMYK-suggested XYB checkpoint: numeric color reconstruction now runs in the ICC output stage,
+using the suggested original profile's header intent. Complete device storage keeps generated K
+separate from the encoded Black extra; numeric CMY complements only the selected generated color
+component. Extra selections do not request an inverse ICC method. RGB/Gray share this boundary.
+Independent sequences now preserve the caller's retained-frame window instead of copying a
+single physical VarDCT producer's one-slot capacity; byte admission remains per allocation.
+
+Twelve legal three-frame full-canvas F32 sequences cover six unchanged CMYK LUT profiles,
+both codecs, both PCS domains and Black at extra index 0 or 2. Native decoding verifies the
+linear basis and exact extras. The 88,128 independent/native ICC components are compared
+352,512 times in 576 GPU presentations, and numeric selection adds 66,096 sample comparisons.
+Four patched LF substitutions also check Alpha/Depth selection across whole and bounded input.
+Exact device-plus-extra storage, numeric uniform/program admission, retry and cancellation are
+covered. [Recipe and precision](../crates/jxl_wgpu_decode/test-data/cmyk_xyb_generator/README.md).
+`COLOR-01/02/03/04`, `IO-01`, `API-05`, `QA-03/06` and the full JPEG XL goal remain **Partial**:
+broader source precision/sampling, legal ICC crop/blend combinations, profile methods/ranges,
+HDR and every remaining roadmap gate still require completion.

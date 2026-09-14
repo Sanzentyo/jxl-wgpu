@@ -37,6 +37,14 @@ pub(super) fn frames_bytes(
         decoder.open(data, request).unwrap()
     };
     let mut held = Vec::new();
+    // Every returned frame is retained. Fail explicitly if a producer's local capacity
+    // accidentally narrows a sequence's public window, rather than parking on our own leases.
+    assert!(
+        session
+            .metadata()
+            .frame_count_hint
+            .is_none_or(|count| count <= session.resolved_frame_slots().get())
+    );
     while let Some(frame) = pollster::block_on(session.next_frame_async()).unwrap() {
         let output = &frame.output().outputs[0];
         assert_eq!(output.layout.format, format);

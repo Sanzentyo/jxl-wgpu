@@ -1,7 +1,6 @@
 //! Full-canvas Replace presentations retain native producer output. Overwritten layers still
 //! execute and validate, one at a time, without a floating-point composition surface.
 
-use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,24 +39,15 @@ pub(super) struct IndependentSession {
 }
 
 impl IndependentSession {
-    pub(super) fn new(
-        source: Arc<SequenceSource>,
-        plan: &FrameExecutionPlan,
-    ) -> Result<(Self, NonZeroUsize)> {
+    pub(super) fn new(source: Arc<SequenceSource>, plan: &FrameExecutionPlan) -> Result<Self> {
         let range = &plan.presentations[0].physical_frames;
         let first = range.start;
         let prepared = prepare(&source, first, plan.metadata.extent, first + 1 == range.end)?;
-        let slots = prepared
-            .resolved_frame_slots()
-            .unwrap_or(source.request.max_frame_slots());
-        Ok((
-            Self {
-                source: Some(source),
-                submissions: Arc::new(AtomicUsize::new(prepared.session.submissions_per_frame())),
-                prepared: Some(prepared.session),
-            },
-            slots,
-        ))
+        Ok(Self {
+            source: Some(source),
+            submissions: Arc::new(AtomicUsize::new(prepared.session.submissions_per_frame())),
+            prepared: Some(prepared.session),
+        })
     }
 
     pub(super) fn submissions(&self) -> usize {

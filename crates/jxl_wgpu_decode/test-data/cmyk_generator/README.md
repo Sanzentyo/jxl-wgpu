@@ -65,5 +65,6 @@ Render/Preserve. Alpha is bit-exact. All six original numeric channels are also 
 native output without inks; Modular and extra words are exact, VarDCT color uses its source
 bound. Three simultaneous frame slots allow all outputs to remain held and reread after session
 release; the transient budget must return to zero. The separate official case retains the
-upstream limits. This corpus does not complete CMYK output layouts, XYB-to-original CMYK
-reconstruction, wider sampling/profile/range coverage, or the full JPEG XL goal.
+upstream limits. Complete device layouts and CMYK-suggested XYB have separate
+[output evidence](../../../../docs/ICC_COLOR.md#cmyk-suggested-xyb-and-numeric-output).
+Wider sampling/profile/range coverage and the full JPEG XL goal remain open.

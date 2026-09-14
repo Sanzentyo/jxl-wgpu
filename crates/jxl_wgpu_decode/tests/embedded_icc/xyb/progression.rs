@@ -161,3 +161,56 @@ fn icc_xyb_lf_and_coefficient_previews_preserve_dependency_pixels_and_update_ide
         }
     }
 }
+
+#[test]
+fn icc_xyb_patched_lf_producers_preserve_selected_alpha_and_depth() {
+    use jxl_gpu_bitstream::SampleBitDepth;
+    use jxl_gpu_formats::{Channel, SampleKind};
+    use jxl_wgpu_decode::NumericSampleMapping;
+    let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
+    let donor = corpus::cases()
+        .find(|case| case.xyb && !case.gray)
+        .unwrap()
+        .bytes();
+    for name in [
+        "vardct_gab0",
+        "modular_gab1",
+        "nested_vardct_gab1",
+        "nested_modular_gab1",
+    ] {
+        let path = corpus::directory()
+            .parent()
+            .unwrap()
+            .join(format!("patches/lf_producers/{name}.jxl.hex"));
+        let original = jxl_test_support::offline::unhex(&std::fs::read_to_string(path).unwrap());
+        let parsed = inventory(&original);
+        assert!(
+            parsed
+                .frames
+                .iter()
+                .any(|frame| frame.lf_level != 0 && frame.flags & 2 != 0)
+        );
+        assert_eq!(parsed.image_header.extra_channels.len(), 2);
+        let data = profile::replace(&original, &donor);
+        for (index, extra) in parsed.image_header.extra_channels.iter().enumerate() {
+            let request = GpuOutputRequest::numeric(
+                PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X]),
+                match extra.bit_depth {
+                    SampleBitDepth::Float { .. } => NumericSampleMapping::NativeFloat,
+                    SampleBitDepth::Integer { .. } => NumericSampleMapping::NormalizedUnsigned,
+                },
+            )
+            .unwrap()
+            .with_extra_channel(index as u32)
+            .unwrap();
+            let expected = crate::output::frames(&backend, &original, request.clone(), None);
+            for limit in [None, NonZeroU64::new(40)] {
+                assert_eq!(
+                    crate::output::frames(&backend, &data, request.clone(), limit),
+                    expected,
+                    "{name} extra {index} {limit:?}"
+                );
+            }
+        }
+    }
+}

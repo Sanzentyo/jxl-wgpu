@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use jxl_gpu_bitstream::{ExtraChannelInventory, ExtraChannelTypeInventory};
 use jxl_gpu_formats::{ColorSpecification, ImageLayout};
-use jxl_gpu_protocol::icc::IccTransform;
+use jxl_gpu_protocol::icc::{IccProfile, IccSignature, IccTransform};
 use jxl_gpu_protocol::{OutputOrientation, RgbColorEncoding, RgbColorSpace, WhitePointAdaptation};
 use jxl_wgpu::{
     GpuBufferLease, ImageOutputGeometry, ImageOutputParams, ImageOutputSource,
@@ -18,12 +18,21 @@ use super::super::spot::render::Rendering;
 use super::super::submission::{
     GpuWork, IccWork, completion_fence_bytes, submit_icc_recorded, validate_size,
 };
-use super::{Surface, aligned, dispatch, pipeline};
+use super::{NativeParams, Surface, aligned, dispatch, pipeline};
 use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
 use crate::{Error, GpuOutputRequest, Result};
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
+
+pub(super) enum Output<'a> {
+    Color(&'a GpuOutputRequest),
+    Numeric {
+        request: &'a GpuOutputRequest,
+        params: NativeParams,
+        profile: &'a IccProfile,
+    },
+}
 
 #[derive(Debug)]
 pub(super) struct Presentation {
@@ -35,6 +44,7 @@ pub(super) struct Presentation {
     output: ImageLayout,
     pipeline: wgpu::ComputePipeline,
     params: Vec<u8>,
+    bindings: [u32; 2],
     dispatch: [u32; 2],
 }
 
@@ -43,11 +53,19 @@ impl Presentation {
         backend: &WgpuBackend,
         source: &FrameSurfaceLayout,
         source_encoding: FrameSurfaceEncoding,
-        request: &GpuOutputRequest,
+        output: Output<'_>,
         orientation: OutputOrientation,
         extras: &[ExtraChannelInventory],
         transforms: &mut Transforms,
     ) -> Result<Self> {
+        let (request, numeric) = match output {
+            Output::Color(request) => (request, None),
+            Output::Numeric {
+                request,
+                params,
+                profile,
+            } => (request, Some((params, profile))),
+        };
         let device = backend.device();
         if source.color.format != source_encoding.format() {
             return Err(Error::EngineContract("color presentation source layout"));
@@ -75,13 +93,22 @@ impl Presentation {
         }
         let device_output = output.format.model == jxl_gpu_formats::ColorModel::IccDevice;
         let target_encoding = |profile: &jxl_gpu_protocol::icc::IccProfile| {
-            if device_output {
+            if device_output || numeric.is_some() {
                 FrameSurfaceEncoding::Device(profile.clone())
             } else {
                 FrameSurfaceEncoding::Icc(profile.clone())
             }
         };
-        let (encoding, selected) = match (&source_encoding, &output.format.color_spec) {
+        let target = numeric.map_or_else(
+            || output.format.color_spec.clone(),
+            |(_, profile)| ColorSpecification::Icc(profile.clone()),
+        );
+        // Numeric reconstruction follows the suggested original profile's intent, independent
+        // of presentation options. Complete device output keeps generated K separate from Black.
+        let intent = numeric.map_or(request.icc_rendering_intent(), |(_, profile)| {
+            profile.header().rendering_intent
+        });
+        let (encoding, selected) = match (&source_encoding, &target) {
             (
                 FrameSurfaceEncoding::Icc(profile)
                 | FrameSurfaceEncoding::Device(profile)
@@ -96,11 +123,7 @@ impl Presentation {
                 if target == profile {
                     None
                 } else {
-                    Some(IccTransform::new(
-                        profile,
-                        target,
-                        request.icc_rendering_intent(),
-                    )?)
+                    Some(IccTransform::new(profile, target, intent)?)
                 },
             ),
             (
@@ -113,16 +136,12 @@ impl Presentation {
                 Some(IccTransform::to_linear_rgb(
                     profile,
                     RgbColorSpace::Bt709,
-                    request.icc_rendering_intent(),
+                    intent,
                 )?),
             ),
             (FrameSurfaceEncoding::Rgb(encoding), ColorSpecification::Icc(target)) => (
                 target_encoding(target),
-                Some(IccTransform::from_rgb(
-                    *encoding,
-                    target,
-                    request.icc_rendering_intent(),
-                )?),
+                Some(IccTransform::from_rgb(*encoding, target, intent)?),
             ),
             (FrameSurfaceEncoding::Rgb(_), ColorSpecification::Defined(_)) => {
                 (source_encoding.clone(), None)
@@ -134,7 +153,9 @@ impl Presentation {
                 ));
             }
         };
-        if selected.is_some() && request.white_point_adaptation() != WhitePointAdaptation::Bradford
+        if numeric.is_none()
+            && selected.is_some()
+            && request.white_point_adaptation() != WhitePointAdaptation::Bradford
         {
             return Err(Error::UnsupportedOutputFormat(
                 "ICC color conversion currently requires Bradford adaptation".into(),
@@ -158,7 +179,17 @@ impl Presentation {
             orientation,
             strides: [source.color.extent.width; 3],
         };
-        let params = if device_output {
+        let params = if let Some((mut params, profile)) = numeric {
+            params.color[2] = working.color.planes.len() as u32;
+            params.source[0] = (working.color_plane_bytes / 4) as u32;
+            params.source[1] = alpha_extra.map_or(u32::MAX, |index| params.color[2] + index as u32);
+            if matches!(encoding, FrameSurfaceEncoding::Device(_))
+                && profile.header().device_space == IccSignature(*b"CMYK")
+            {
+                params.source[3] |= 4;
+            }
+            bytemuck::bytes_of(&params).to_vec()
+        } else if device_output {
             let planes = working.icc_planes(&encoding)?;
             let alpha = alpha_extra.map(|index| {
                 let plane = &working.extras[index].planes[0];
@@ -223,7 +254,9 @@ impl Presentation {
         }
         let color_count = working.color.planes.len() as u32;
         let alpha_channel = alpha_extra.map_or(u32::MAX, |index| color_count + index as u32);
-        let shader = if device_output {
+        let shader = if numeric.is_some() {
+            super::native_shader(super::super::spot::shader(false))
+        } else if device_output {
             jxl_wgpu::DEVICE_OUTPUT_SHADER.to_owned()
         } else {
             format!(
@@ -233,8 +266,12 @@ impl Presentation {
                 include_str!("../output.wgsl")
             )
         };
-        let mut constants = vec![("wg_x", 64.0), ("wg_y", 1.0)];
-        if !device_output {
+        let mut constants = if numeric.is_some() {
+            Vec::new()
+        } else {
+            vec![("wg_x", 64.0), ("wg_y", 1.0)]
+        };
+        if !device_output && numeric.is_none() {
             constants.extend([
                 (
                     "surface_plane_words",
@@ -262,6 +299,7 @@ impl Presentation {
             output,
             pipeline,
             params,
+            bindings: if numeric.is_some() { [1, 2] } else { [3, 4] },
             dispatch,
         })
     }
@@ -363,11 +401,11 @@ impl Presentation {
                     resource: input.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 3,
+                    binding: self.bindings[0],
                     resource: output.as_wgpu_buffer().as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 4,
+                    binding: self.bindings[1],
                     resource: uniform.as_entire_binding(),
                 },
             ],

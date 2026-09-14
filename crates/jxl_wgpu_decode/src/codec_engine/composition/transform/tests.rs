@@ -316,9 +316,36 @@ fn linear_icc_gray_surfaces_select_numeric_extras_from_the_actual_plane_layout()
     // An unused original CMS intent must not prevent exact extra-channel selection.
     let mut profile = case.profile();
     profile[64..68].copy_from_slice(&0u32.to_be_bytes());
-    image.embedded_icc.as_mut().unwrap().profile = profile.into();
+    let profile =
+        jxl_gpu_protocol::icc::IccProfile::parse(profile.into(), Default::default()).unwrap();
+    let profile = jxl_test_support::fixtures::icc::with_nonfinite_matrix_mpe(
+        &profile,
+        jxl_gpu_protocol::icc::IccDirection::PcsToDevice,
+        jxl_gpu_protocol::icc::IccRenderingIntent::Perceptual,
+    );
+    image.embedded_icc.as_mut().unwrap().profile = profile.bytes().clone();
     image.extra_channels.push(image.extra_channels[0].clone());
     let extent = jxl_gpu_protocol::Extent2d::new(image.width, image.height);
+    let color_request = GpuOutputRequest::numeric(
+        PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X]),
+        NumericSampleMapping::NativeFloat,
+    )
+    .unwrap()
+    .with_color_channel(0)
+    .unwrap();
+    assert!(matches!(
+        Compositor::new(
+            backend.clone(),
+            extent,
+            &image,
+            &color_request,
+            ColorUsage::LINEAR
+        ),
+        Err(Error::Icc(jxl_gpu_protocol::icc::IccError::Invalid {
+            field: "non-finite float",
+            ..
+        }))
+    ));
     let encoding = FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709);
     let layout =
         FrameSurfaceLayout::with_encoding(extent, 2, encoding.clone(), &backend.device().limits())

@@ -8,6 +8,7 @@ use std::num::NonZeroU64;
 
 mod alpha;
 mod animation;
+mod cmyk;
 mod progression;
 mod references;
 
@@ -197,6 +198,49 @@ fn icc_xyb_requested_profiles_match_independent_device_values_and_plane_counts()
                     }
                     baseline = Some(frames);
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn icc_xyb_numeric_colors_use_the_suggested_gray_or_rgb_profile_at_output() {
+    let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
+    for case in corpus::cases().filter(|case| case.xyb) {
+        let data = case.bytes();
+        let colors = if case.gray { 1 } else { 3 };
+        let expected = reference(
+            case,
+            if case.gray {
+                "gray.scalar"
+            } else {
+                "rgb.scalar"
+            },
+        );
+        for channel in 0..colors {
+            let mut baseline = None;
+            for limit in [None, NonZeroU64::new(256)] {
+                let request = crate::numeric_float()
+                    .with_color_channel(channel as u32)
+                    .unwrap()
+                    .with_white_point_adaptation(WhitePointAdaptation::None)
+                    .with_icc_rendering_intent(IccRenderingIntent::Saturation);
+                let frames = output::frames(&backend, &data, request, limit);
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].len(), 153);
+                for (pixel, &actual) in frames[0].iter().enumerate() {
+                    let actual = f32::from_bits(actual);
+                    let expected = f32::from_bits(expected[pixel * (colors + 1) + channel]);
+                    assert!(
+                        actual.is_finite() && (actual - expected).abs() <= 2e-4,
+                        "{} channel {channel} pixel {pixel} {limit:?}: {actual} vs {expected}",
+                        case.name()
+                    );
+                }
+                if let Some(baseline) = &baseline {
+                    assert_eq!(&frames, baseline);
+                }
+                baseline = Some(frames);
             }
         }
     }

@@ -4,7 +4,7 @@ struct Params {
     format: vec4<u32>, // channels, valid bits, bytes per sample, row bytes
     output: vec4<u32>, // logical bytes, dispatch width, orientation, alpha conversion
     color: vec4<u32>, // original transfer selector, gamma bits, color channels, reserved
-    source: vec4<u32>, // plane stride, first alpha plane, selected scalar plane, flags (F32, linear RGB)
+    source: vec4<u32>, // plane stride, first alpha plane, selected scalar plane, flags (F32, linear RGB, complement)
 };
 @group(0) @binding(0) var<storage, read> source: array<u32>;
 @group(0) @binding(1) var<storage, read_write> destination: array<u32>;
@@ -37,12 +37,17 @@ fn output_byte(offset: u32) -> u32 {
     if channel != 3u {
         value_word = source[source_channel * params.source.x + position];
         if source_channel < params.color.z {
-            var rgb = vec3<u32>(source[position]);
-            if params.color.z == 3u {
-                rgb = vec3<u32>(source[position], source[params.source.x + position],
-                    source[2u * params.source.x + position]);
+            if params.color.z <= 3u {
+                var rgb = vec3<u32>(source[position]);
+                if params.color.z == 3u {
+                    rgb = vec3<u32>(source[position], source[params.source.x + position],
+                        source[2u * params.source.x + position]);
+                }
+                value_word = original_rgb_words(present_rgb_words(rgb, position))[source_channel];
             }
-            value_word = original_rgb_words(present_rgb_words(rgb, position))[source_channel];
+            if (params.source.w & 4u) != 0u {
+                value_word = bitcast<u32>(1.0 - bitcast<f32>(value_word));
+            }
             if params.output.w != 0u {
                 value_word = bitcast<u32>(bitcast<f32>(value_word)
                     * image_alpha_multiplier(bitcast<f32>(alpha_word), params.output.w));

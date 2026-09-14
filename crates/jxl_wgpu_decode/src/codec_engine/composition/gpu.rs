@@ -139,7 +139,6 @@ pub(super) struct Compositor {
     backend: WgpuBackend,
     canvas: Extent2d,
     pub(super) original: FrameSurfaceEncoding,
-    pub(super) original_samples: bool,
     pub(super) reconstruction: Option<Arc<super::icc_transform::Transform>>,
     extras: Vec<ExtraChannelInventory>,
     surface: FrameSurfaceLayout,
@@ -333,7 +332,7 @@ impl Compositor {
                     &backend,
                     &source,
                     encoding,
-                    request,
+                    icc::Output::Color(request),
                     orientation,
                     extras,
                     &mut transforms,
@@ -436,12 +435,7 @@ impl Compositor {
                             u32::from(scalar_float),
                         ],
                     }),
-                    format!(
-                        "{IMAGE_ORIENTATION_SHADER}\n{}\n{}\n{spot_source}\n{}",
-                        jxl_wgpu::ALPHA_OUTPUT_SHADER,
-                        jxl_wgpu::IMAGE_TRANSFER_SHADER,
-                        crate::modular_sample::shader(include_str!("native.wgsl"))
-                    ),
+                    native_shader(spot_source),
                 )
             } else {
                 if request.mapping() != crate::GpuOutputMapping::Color {
@@ -512,11 +506,52 @@ impl Compositor {
             } else {
                 Vec::new()
             };
-            let pipeline = pipeline(device, "JPEG XL composed frame output", &source, &constants);
-            Packing::Raster {
-                pipeline,
-                params: packing,
-                spots,
+            if let RasterPacking::Native(params) = packing
+                && color_channel.is_some()
+                && let Some(profile) = original.icc_profile()
+                && usage.linear
+            {
+                let linear =
+                    FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709);
+                let encodings = if usage.original {
+                    vec![original.clone(), linear]
+                } else {
+                    vec![linear]
+                };
+                Packing::Icc(
+                    encodings
+                        .into_iter()
+                        .map(|encoding| {
+                            let source = FrameSurfaceLayout::with_encoding(
+                                canvas,
+                                extras.len(),
+                                encoding.clone(),
+                                &device.limits(),
+                            )?;
+                            icc::Presentation::new(
+                                &backend,
+                                &source,
+                                encoding,
+                                icc::Output::Numeric {
+                                    request,
+                                    params,
+                                    profile,
+                                },
+                                orientation,
+                                extras,
+                                &mut transforms,
+                            )
+                        })
+                        .collect::<Result<_>>()?,
+                )
+            } else {
+                let pipeline =
+                    pipeline(device, "JPEG XL composed frame output", &source, &constants);
+                Packing::Raster {
+                    pipeline,
+                    params: packing,
+                    spots,
+                }
             }
         };
         let blend = pipeline(
@@ -529,7 +564,6 @@ impl Compositor {
             backend,
             canvas,
             original,
-            original_samples: request.uses_original_sample_domain(),
             reconstruction,
             extras: extras.to_vec(),
             surface,
@@ -774,6 +808,15 @@ impl Compositor {
             },
         )
     }
+}
+
+fn native_shader(spot_source: &str) -> String {
+    format!(
+        "{IMAGE_ORIENTATION_SHADER}\n{}\n{}\n{spot_source}\n{}",
+        jxl_wgpu::ALPHA_OUTPUT_SHADER,
+        jxl_wgpu::IMAGE_TRANSFER_SHADER,
+        crate::modular_sample::shader(include_str!("native.wgsl"))
+    )
 }
 
 pub(super) fn pipeline(

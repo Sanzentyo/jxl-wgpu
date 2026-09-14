@@ -84,8 +84,15 @@ fn exercise(backend: &WgpuBackend, compositor: Compositor) {
     let presentation = &presentations[0];
     let memory = backend.transient_memory_budget();
     assert_eq!(memory.snapshot().reserved_bytes, 0);
-    let size = compositor.surface.storage_bytes;
-    let source = compositor.completed_surface(GpuBufferLease::from_tracked(
+    let layout = FrameSurfaceLayout::with_encoding(
+        compositor.canvas,
+        compositor.extras.len(),
+        presentation.source_encoding.clone(),
+        &backend.device().limits(),
+    )
+    .unwrap();
+    let size = layout.storage_bytes;
+    let buffer = GpuBufferLease::from_tracked(
         backend.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("device output admission source"),
             size,
@@ -93,13 +100,18 @@ fn exercise(backend: &WgpuBackend, compositor: Compositor) {
             mapped_at_creation: false,
         }),
         memory.try_reserve(size).unwrap(),
-    ));
+    );
+    let source = Surface {
+        buffer,
+        layout: Arc::new(layout),
+        encoding: presentation.source_encoding.clone(),
+    };
     let output_size = aligned(compositor.layout.logical_size).unwrap();
     let program = presentation
         .transform
         .as_ref()
         .map_or(0, |t| t.memory.program_bytes);
-    let transient = 320
+    let transient = presentation.params.len() as u64
         + completion_fence_bytes()
         + presentation
             .spots
@@ -163,4 +175,69 @@ fn exercise(backend: &WgpuBackend, compositor: Compositor) {
     assert_eq!(memory.snapshot().reserved_bytes, output_size);
     drop(output);
     assert_eq!(memory.snapshot().reserved_bytes, 0);
+}
+
+#[test]
+fn numeric_icc_device_reconstruction_admits_complete_channels_and_owned_scratch() {
+    use crate::NumericSampleMapping;
+    use jxl_gpu_formats::{Channel, SampleKind};
+    let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
+    let mut images: Vec<_> = jxl_test_support::fixtures::embedded_icc::cases()
+        .filter(|case| case.xyb)
+        .map(|case| case.bytes())
+        .collect();
+    for name in ["ab_lab_4_modular", "lut16_xyz_4_vardct"] {
+        images.push(
+            std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("test-data/cmyk_xyb")
+                    .join(format!("{name}.jxl")),
+            )
+            .unwrap(),
+        );
+    }
+    for bytes in images {
+        let image = jxl_gpu_bitstream::parse(&bytes, Default::default())
+            .unwrap()
+            .codestream_inventory(Default::default())
+            .unwrap()
+            .image_header;
+        let request = GpuOutputRequest::numeric(
+            PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X]),
+            NumericSampleMapping::NativeFloat,
+        )
+        .unwrap()
+        .with_color_channel(if image.grayscale { 0 } else { 2 })
+        .unwrap();
+        let compositor = Compositor::new(
+            backend.clone(),
+            Extent2d::new(image.width, image.height),
+            &image,
+            &request,
+            ColorUsage::LINEAR,
+        )
+        .unwrap();
+        assert!(compositor.reconstruction.is_none());
+        let Packing::Icc(presentations) = &compositor.packing else {
+            panic!("numeric ICC presentation")
+        };
+        assert_eq!(presentations.len(), 1);
+        let presentation = &presentations[0];
+        assert_eq!(presentation.params.len(), 80);
+        assert_eq!(presentation.bindings, [1, 2]);
+        let FrameSurfaceEncoding::Device(profile) = &presentation.working_encoding else {
+            panic!("complete reconstructed device");
+        };
+        assert_eq!(
+            presentation.working.color.planes.len(),
+            profile.header().device_space.device_channels().unwrap() as usize
+        );
+        assert_eq!(
+            presentation.working.extras.len(),
+            image.extra_channels.len()
+        );
+        assert!(presentation.spots.is_none());
+        assert!(presentation.transform.is_some());
+        exercise(&backend, compositor);
+    }
 }

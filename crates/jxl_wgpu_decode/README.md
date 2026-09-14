@@ -713,8 +713,14 @@ physical packing fields; CMYK F32 values are unit ink amounts, with zero meaning
 Original CMYK retains its separately composed Black plane until this output boundary. Same-profile
 output bypasses CMS evaluation. See [device output semantics and evidence](../../docs/ICC_COLOR.md#profile-component-output).
 
+CMYK-suggested XYB now has F32 full-canvas sequence coverage through both codecs. ICC output
+generates all four unit ink amounts; numeric color selection returns complemented CMY using the
+original profile's header intent. The encoded Black extra remains independent of generated K.
+Numeric ICC reconstruction runs at the output boundary, while Alpha/Black/spot selection skips
+the inverse profile. [Corpus, precision and retention tests](test-data/cmyk_xyb_generator/README.md).
+
 Broader legal ICC XYB alpha/crop/reference conformance, complete MPE ranges,
-CMYK-suggested XYB output and numeric selection, other profile
+CMYK source precision/sampling, other profile
 classes, HDR/gamut policies and standalone codec color admission remain open.
 Numeric and extra-channel bypasses keep their existing independent contracts.
 

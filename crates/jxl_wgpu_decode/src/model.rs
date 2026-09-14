@@ -350,7 +350,8 @@ pub enum GpuOutputMapping {
 }
 
 /// Source of a scalar numeric output. Color indices follow the original image encoding:
-/// `0` for grayscale, or `0`, `1`, `2` for red, green and blue. Extra indices follow stream metadata.
+/// `0` for grayscale, or `0`, `1`, `2` for RGB or complemented CMY. Extra indices follow stream
+/// metadata. With XYB, color values are reconstructed using the suggested original encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NumericChannel {
     Color(u32),
@@ -744,7 +745,10 @@ impl GpuOutputRequest {
 
     /// Selects an original color component: gray (`0`), RGB (`0` red, `1` green, `2` blue),
     /// or complemented CMY (`0` cyan, `1` magenta, `2` yellow) for a CMYK original image.
-    /// CMYK Black is selected separately by its extra-channel index.
+    /// With XYB, these are reconstructed from linear RGB using the suggested profile's intent.
+    /// Its generated K belongs to complete [`PixelFormat::icc_device`] color output. The encoded
+    /// Black extra is selected independently by [`Self::with_extra_channel`], and need not equal
+    /// the complement of generated K.
     pub fn with_color_channel(self, index: u32) -> Result<Self> {
         self.with_numeric_channel(NumericChannel::Color(index))
     }
