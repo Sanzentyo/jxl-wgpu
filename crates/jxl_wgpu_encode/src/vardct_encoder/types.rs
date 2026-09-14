@@ -223,14 +223,6 @@ impl TiledVarDctGrid {
             lf_group_columns: width.div_ceil(Self::LF_GROUP_DIMENSION),
             lf_group_rows: height.div_ceil(Self::LF_GROUP_DIMENSION),
         };
-        if grid.ac_group_count()? == 1 {
-            return Err(UnsupportedFeature::TiledVarDctSingleAcGroup {
-                width,
-                height,
-                group_dimension: Self::AC_GROUP_DIMENSION,
-            }
-            .into());
-        }
         Ok(grid)
     }
 
@@ -254,9 +246,12 @@ impl TiledVarDctGrid {
         )
     }
 
-    /// TOC entries for the deliberately non-fused tiled profile: DC global,
-    /// every DC group, AC global, then one pass packet per AC group.
+    /// One fused packet for a single AC group; otherwise DC global, every DC
+    /// group, AC global, then one pass packet per AC group.
     pub fn toc_entries(self) -> Result<u32, EncodeError> {
+        if self.ac_group_count()? == 1 {
+            return Ok(1);
+        }
         self.lf_group_count()?
             .checked_add(self.ac_group_count()?)
             .and_then(|groups| groups.checked_add(2))
@@ -550,6 +545,15 @@ pub(super) struct ScalableVarDctKernelParams {
     pub(super) lf_groups_y: u32,
     pub(super) lf_quantization: [f32; 3],
     pub(super) lf_correlation: [f32; 2],
+    pub(super) hf_prefix: [GpuPrefixEntry; RAW_SYMBOLS],
+    pub(super) hf_correlation: [f32; 2],
+    pub(super) hf_quantization: [f32; 3],
+    pub(super) ac_descriptor_offset: u32,
+    pub(super) ac_descriptor_len: u32,
+    pub(super) ac_fragment_offset: u32,
+    pub(super) ac_words_per_block: u32,
+    pub(super) ac_fragment_words: u32,
+    pub(super) padding: [u32; 16],
 }
 
 #[repr(C)]
@@ -559,7 +563,7 @@ pub(super) struct ScalableVarDctArtifactHeader {
     pub(super) block_count: u32,
     pub(super) dc_sample_count: u32,
     pub(super) strategy: u32,
-    pub(super) ac_all_zero: u32,
+    pub(super) ac_payload: u32,
     pub(super) strategy_offset: u32,
     pub(super) strategy_len: u32,
     pub(super) dc_offset: u32,
@@ -583,7 +587,12 @@ pub(super) struct ScalableVarDctArtifactHeader {
     pub(super) lf_groups_x: u32,
     pub(super) lf_groups_y: u32,
     pub(super) lf_group_count: u32,
-    pub(super) padding: [u32; 18],
+    pub(super) ac_descriptor_offset: u32,
+    pub(super) ac_descriptor_len: u32,
+    pub(super) ac_fragment_offset: u32,
+    pub(super) ac_words_per_block: u32,
+    pub(super) ac_fragment_words: u32,
+    pub(super) padding: [u32; 13],
 }
 
 #[repr(C)]
@@ -600,7 +609,7 @@ const _: () = {
     assert!(std::mem::align_of::<VarDctKernelParams>() == 4);
     assert!(std::mem::size_of::<VarDctKernelArtifact>() == 26_880);
     assert!(std::mem::align_of::<VarDctKernelArtifact>() == 4);
-    assert!(std::mem::size_of::<ScalableVarDctKernelParams>() == 256);
+    assert!(std::mem::size_of::<ScalableVarDctKernelParams>() == 512);
     assert!(std::mem::align_of::<ScalableVarDctKernelParams>() == 4);
     assert!(std::mem::size_of::<ScalableVarDctArtifactHeader>() == 256);
     assert!(std::mem::align_of::<ScalableVarDctArtifactHeader>() == 4);
@@ -623,6 +632,11 @@ pub(super) struct ScalableArtifactLayout {
     pub(super) fragment_offset: u32,
     pub(super) fragment_word_capacity: u32,
     pub(super) fragment_max_bits: u32,
+    pub(super) ac_descriptor_offset: u32,
+    pub(super) ac_descriptor_len: u32,
+    pub(super) ac_fragment_offset: u32,
+    pub(super) ac_words_per_block: u32,
+    pub(super) ac_fragment_words: u32,
     pub(super) artifact_words: u32,
 }
 
@@ -632,7 +646,7 @@ impl ScalableArtifactLayout {
         Self::for_block_grid(blocks_x, blocks_y, 1, code)
     }
 
-    pub(super) fn for_block_grid(
+    fn for_block_grid(
         blocks_x: u32,
         blocks_y: u32,
         lf_group_count: u32,
@@ -720,8 +734,78 @@ impl ScalableArtifactLayout {
             fragment_offset,
             fragment_word_capacity,
             fragment_max_bits,
+            ac_descriptor_offset: 0,
+            ac_descriptor_len: 0,
+            ac_fragment_offset: 0,
+            ac_words_per_block: 0,
+            ac_fragment_words: 0,
             artifact_words,
         })
+    }
+
+    pub(super) fn for_tiled_grid(
+        frame: VarDctFrameLayout,
+        code: &PrefixCode,
+        hf_entropy: &super::entropy::HfEntropyPlan,
+    ) -> Result<Self, EncodeError> {
+        let mut layout = Self::for_block_grid(
+            frame.blocks_x,
+            frame.blocks_y,
+            frame.lf_group_count()?,
+            code,
+        )?;
+        // Each GPU workgroup owns a word-aligned block fragment. The entropy
+        // model maps all contexts to one distribution, so these independently
+        // packed Y/X/B fragments can be concatenated in AC-group raster order.
+        let entries = hf_entropy.gpu_entries();
+        let token_bits: [u32; RAW_SYMBOLS] =
+            std::array::from_fn(|token| entries[token].bit_len + token.saturating_sub(1) as u32);
+        let max_count_bits = token_bits[..7]
+            .iter()
+            .copied()
+            .max()
+            .ok_or(EncodeError::InvalidConfiguration("empty HF count alphabet"))?;
+        let max_coefficient_bits =
+            token_bits
+                .iter()
+                .copied()
+                .max()
+                .ok_or(EncodeError::InvalidConfiguration(
+                    "empty HF coefficient alphabet",
+                ))?;
+        let block_bits = max_coefficient_bits
+            .checked_mul((DCT8_COEFFICIENTS - 1) as u32)
+            .and_then(|bits| bits.checked_add(max_count_bits))
+            .and_then(|bits| bits.checked_mul(3))
+            .ok_or(EncodeError::InvalidConfiguration(
+                "VarDCT AC block capacity overflow",
+            ))?;
+        layout.ac_words_per_block = block_bits.div_ceil(32);
+        layout.ac_descriptor_offset = layout.artifact_words;
+        layout.ac_descriptor_len = layout.strategy_len;
+        layout.ac_fragment_offset = align_words(
+            layout
+                .ac_descriptor_offset
+                .checked_add(layout.ac_descriptor_len)
+                .ok_or(EncodeError::InvalidConfiguration(
+                    "VarDCT AC descriptor overflow",
+                ))?,
+        )?;
+        layout.ac_fragment_words = layout
+            .ac_words_per_block
+            .checked_mul(layout.strategy_len)
+            .ok_or(EncodeError::InvalidConfiguration(
+                "VarDCT AC fragment capacity overflow",
+            ))?;
+        layout.artifact_words = align_words(
+            layout
+                .ac_fragment_offset
+                .checked_add(layout.ac_fragment_words)
+                .ok_or(EncodeError::InvalidConfiguration(
+                    "VarDCT AC artifact overflow",
+                ))?,
+        )?;
+        Ok(layout)
     }
 
     pub(super) const fn artifact_bytes(self) -> u64 {
@@ -893,13 +977,12 @@ pub(super) struct VarDctArtifactData<'a> {
     pub(super) dc_fragment_words: &'a [u32],
     pub(super) dc_fragment_bit_len: u32,
     pub(super) dc_fragment_descriptors: &'a [ScalableDcFragmentDescriptor],
-    pub(super) ac_fragment_words: &'a [u32],
-    pub(super) ac_fragment_bit_len: u32,
+    pub(super) ac: super::ac::AcFragments<'a>,
 }
 
 impl VarDctArtifactData<'_> {
     pub(super) const fn has_ac_payload(self) -> bool {
-        self.ac_fragment_bit_len != 0
+        !matches!(self.ac, super::ac::AcFragments::Empty)
     }
 
     pub(super) fn dc_fragment_descriptor(

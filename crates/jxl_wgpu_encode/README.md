@@ -123,52 +123,54 @@ dequantization multipliers. Generated explicit-metadata streams are parsed back 
 frontend and agree across Rust `jxl`, the stock GPU decoder, and optional `djxl` within one RGB8
 code; blocking and runtime-neutral Future assembly are identical.
 
-The GPU executes sRGB linearization, XYB conversion, LF quantization, the per-8×8 clamped-gradient
-DC predictor, signed tokenization, prefix packing, histogramming, and construction of the standard
-strategy map. Through 32×32, one workgroup also records the complete diagnostic forward transform.
-Its built-in workgroup is 256 lanes with 16 KiB of fixed shared XYB storage. Larger strategies
-dispatch one 64-lane workgroup per 8×8 block (1,024 bytes of workgroup storage)
-and then end that compute pass before a one-invocation control pass, making all DC writes visible
-before deterministic prediction and entropy serialization. The host validates the complete typed
-artifact, including status, live counts, orientation, every section offset/length, fragment length,
-histogram, tokens, strategy map, and zero padding, before serializing control metadata. This LF-first
-distance-25 profile deliberately quantizes every AC coefficient to zero, so it is interoperable but
-is not yet a general quality or rate-control implementation.
+The GPU executes sRGB linearization, XYB conversion, LF quantization, the per-8×8
+clamped-Gradient DC predictor, signed tokenization, prefix packing, histogramming, and the
+standard strategy map. Bounded DCT8 and `TiledVarDctEncoder` also retain real AC coefficients:
+they share the default-matrix quantizer and natural coefficient order, with one prefix distribution
+for all 495 coefficient contexts and no LZ77. Quantization is fixed at the distance-25 profile's
+parameters; general distance/quality guarantees and rate control remain unimplemented. The other
+26 single-transform strategies still have zero AC.
 
-`TiledVarDctEncoder` extends that same honest LF-only contract to a grid of independent regular
-DCT8 transforms. Width and height may independently reach the checked 16,384-pixel bound, with at
-least one axis above 256; partial edge blocks are padded by GPU-side edge replication. A
-one-AC-group frame has a normatively fused one-packet
-layout that cannot identify this tiled subset, so it returns typed
-`UnsupportedFeature::TiledVarDctSingleAcGroup` instead of emitting an ambiguous stream.
-Within it, the codestream uses the full `ceil(width / 256) * ceil(height / 256)` AC/pass-group grid,
-so 257-pixel and larger axes exercise real multi-packet TOC topology rather than pretending that
-the image is one transform. The corresponding LF/DC grid is
-`ceil(width / 2048) * ceil(height / 2048)`. Each 8×8 block is marked as a first DCT8 transform.
-GPU workgroups produce the block DC values, reset the clamped-Gradient predictor at every LF-group
-boundary, serialize one bit range per LF group, and record those ranges in a checked descriptor
-table. The CPU validates every token, predictor result, descriptor, fragment bit and zero-padding
-word before packetizing the LF groups; it does not pad pixels, transform, quantize, predict, or
-entropy-code them. Quantization dispatches the two-dimensional block grid rather than a
-block-product axis. Source, artifact, buffer and per-axis dispatch limits remain independently
-bounded by the selected device.
+`TiledVarDctEncoder` accepts nonzero RGB8 dimensions through the checked 16,384-pixel per-axis
+bound. Partial edge blocks replicate the final source row/column on GPU. A single AC group uses
+the standard fused packet, including tiny and odd images; larger images carry every
+`ceil(width / 256) * ceil(height / 256)` AC group and
+`ceil(width / 2048) * ceil(height / 2048)` LF group. Each block is an independent DCT8 transform.
+The first pass dispatches a two-dimensional block grid, with 64 lanes by default. Each workgroup
+uses exactly 2,048 bytes for 64 XYB pixels and 64 quantized AC vectors. Coefficients stay in shared
+memory and are immediately packed into one word-aligned block fragment; adjacent workgroups never
+write the same storage word. The second pass predicts and packs DC, resetting Gradient at LF-group
+boundaries and writing a checked descriptor per LF group. Ending the first compute pass is the
+global visibility boundary before the control pass publishes the completed artifact.
+
+The host validates status, every layout field, live counts, DC residuals/histogram, AC counts and
+coefficient ranges, exact fragment consumption, and zero padding. It appends the GPU-owned block
+bits in AC-group raster order (Y, X, B inside each block), with byte alignment only at packet ends.
+There is no host transform, quantization, source padding, coefficient re-encoding, or pixel-codec
+fallback. The independently concatenable block format relies on the single-distribution prefix
+policy; future contextual or ANS encoders must maintain their state on GPU.
 
 `VarDctMemoryPlan::kernel_layout` distinguishes fixed, scalable single-transform, and tiled-DCT8
-artifacts. Fixed submissions
-reserve exactly 51,456 encoder-owned bytes: one 256-byte parameter record, one 25,600-byte artifact,
-and one equal-size readback. Scalable artifacts are computed from the live block/sample count and
-the maximum fragment bits derived from the actual prefix entries. Including the LF-fragment
-descriptor section, the single-transform range is 2,816 bytes for 64×32 or 32×64 through 51,200
-bytes for 256×256. Tiled artifacts scale with the live block and LF-group counts; the exact
-reservation remains one 256-byte parameter record plus one artifact and one equal-size readback.
-Every section starts on a 256-byte boundary. Parameter/header records are `bytemuck::Pod`, all
-arithmetic is checked, and source binding, buffer, workgroup-storage, invocation, and dispatch
-limits are validated before submission. Completion supports blocking native use and a
-runtime-neutral `Future`, and is deterministic on one device. Actual-GPU tests run every strategy
-through the published Rust `jxl` decoder; black is exact and solid-red and gradient fixtures carry
-explicit quality guards. `djxl` verifies emitted streams, while `cjxl` serves as a development
-quality oracle rather than a strategy-selection oracle. There is no CPU transform, quantization,
-residual, entropy, pixel-codec fallback, or compatibility alias.
+artifacts. Fixed submissions reserve exactly 54,272 encoder-owned bytes: a 512-byte parameter,
+26,880-byte artifact, and equal-size readback. That artifact retains the bounded diagnostic
+forward transform. Scalable parameters are also 512 bytes; their LF artifact ranges from 2,816
+bytes for 64×32/32×64 to 51,200 bytes for 256×256. Tiled artifacts add one length word and a
+125-word AC slot per block, with each section aligned to 256 bytes. The slot bound comes from
+the actual prefix lengths for three counts and at most 63 signed coefficients per channel.
+The complete parameter + artifact + readback reservation remains live through validation or
+abandoned-job cleanup; caller-owned source bytes are reported separately. Source binding,
+artifact binding, buffer size, workgroup storage, invocation count, and per-axis dispatch limits
+are checked before submission. A full 16K square therefore also depends on adapter and budget
+capacity.
+
+Actual-GPU tests compare emitted streams with Rust `jxl`, installed `djxl`, and the stock GPU
+decoder. Procedural checkerboards, stripes, impulses, gradients, and colour patterns exercise
+single-packet images, AC/LF boundaries, custom correlation, and a 2057×2057 four-LF-group image.
+An independent f64 cosine-sum reference checks AC values within one integer quantizer step;
+this is a numerical regression bound, not ISO precision or perceptual-quality certification.
+Blocking/Future assembly and all supported linear workgroup variants produce identical bytes.
+The suite also rejects malformed or missing GPU AC output, checks an insufficient device binding,
+and tests exact budgets, one-byte backpressure, abandoned completion, and successful reuse.
 
 Contexts created with `WgpuContext::from_backend` inherit that backend's adapter-validated
 `KernelPolicy`. Autotune keys `vardct_encode_bounded` and `vardct_encode_quantize` accept

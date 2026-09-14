@@ -247,19 +247,7 @@ fn append_gpu_dc_fragment(
     Ok(())
 }
 
-fn append_gpu_ac_fragment(
-    output: &mut BitWriter,
-    artifact: VarDctArtifactData<'_>,
-) -> Result<(), EncodeError> {
-    append_gpu_fragment(
-        output,
-        artifact.ac_fragment_words,
-        0,
-        artifact.ac_fragment_bit_len,
-    )
-}
-
-fn append_gpu_fragment(
+pub(super) fn append_gpu_fragment(
     output: &mut BitWriter,
     fragment_words: &[u32],
     bit_offset: u32,
@@ -280,9 +268,14 @@ fn append_gpu_fragment(
         )
         .into());
     }
-    for source_bit in bit_offset..bit_end {
-        let word = fragment_words[source_bit / 32];
-        output.write_bits(u64::from((word >> (source_bit % 32)) & 1), 1)?;
+    let mut source_bit = bit_offset;
+    while source_bit < bit_end {
+        let shift = source_bit % 32;
+        let count = (32 - shift).min(bit_end - source_bit);
+        let mask = u32::MAX >> (32 - count);
+        let word = (fragment_words[source_bit / 32] >> shift) & mask;
+        output.write_bits(u64::from(word), count as u8)?;
+        source_bit += count;
     }
     Ok(())
 }
@@ -357,7 +350,7 @@ pub(super) fn build_frame_packet(
         )?;
         write_lf_group(&mut group, code, artifact, frame, 0)?;
         hf_entropy.write_global(&mut group, ac_groups, coefficient_payload)?;
-        append_gpu_ac_fragment(&mut group, artifact)?;
+        artifact.ac.append_group(&mut group, frame, 0)?;
         group.align_to_byte()?;
         return Ok(FramePacketSet::new(
             frame_header()?,
@@ -406,10 +399,15 @@ pub(super) fn build_frame_packet(
         GroupPacketKind::AcGlobal,
         ac_global.into_bytes(),
     ));
-    packets
-        .extend((0..ac_groups).map(|group| {
-            GroupPacket::new(GroupPacketKind::AcGroup { pass: 0, group }, Vec::new())
-        }));
+    for group in 0..ac_groups {
+        let mut output = BitWriter::new();
+        artifact.ac.append_group(&mut output, frame, group)?;
+        output.align_to_byte()?;
+        packets.push(GroupPacket::new(
+            GroupPacketKind::AcGroup { pass: 0, group },
+            output.into_bytes(),
+        ));
+    }
     Ok(FramePacketSet::new(
         frame_header()?,
         FrameGroupLayout::new(lf_groups, ac_groups, 1)?,

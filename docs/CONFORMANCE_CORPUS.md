@@ -230,12 +230,38 @@ validated fragment descriptor per group and resets the clamped-Gradient predicto
 Rust `jxl` and installed `djxl` must decode each emitted codestream, while the stock GPU decoder plus
 explicit readback must differ from Rust `jxl` by at most one RGB8 code.
 
-The bounded 8x8 patterned DCT8 case is also a nonzero-AC gate. The actual GPU performs the forward
-transform and default-matrix quantization, emits natural-order signed tokens through one prefix
-cluster shared by all 495 coefficient contexts, and supplies the AC fragment consumed by the host
-packet assembler. The test requires a nonempty validated fragment and agreement among Rust `jxl`,
-installed `djxl`, and the stock GPU decoder. This is evidence for the bounded one-pass DCT8 policy;
-it does not cover the still-zero-AC scalable path, other strategies, adaptive clustering, or LZ77.
+Bounded and tiled DCT8 both encode real AC. GPU block workgroups run the shared forward
+transform/default-matrix quantizer, then pack natural-order Y/X/B tokens through one prefix
+cluster for all 495 coefficient contexts. Tiled coefficients remain in workgroup memory; only
+complete bit fragments and their lengths are stored. The host checks those fragments and joins
+them in group order. Partial final words are not inserted into the codestream as block padding.
+
+`vardct_encoder/tests/ac.rs` and its independent `reference.rs` add seven procedural block
+patterns: checkerboard, horizontal/vertical stripes, impulse, gradient, colour pattern, and solid.
+Coefficient-level checks cover 257x1, 1x257, 255x257, 257x255, 263x265, 2057x17, 17x2057, and
+2057x2057. They independently generate the zigzag order and evaluate f64 cosine sums and
+log-interpolated matrix weights, cache repeated source blocks, and require every encoded AC
+coefficient to agree within one integer quantizer step. The 257x255 and 2057x17 cases use explicit
+LF/HF correlation metadata. Group coverage is exact, counts terminate correctly, and only final
+byte padding remains. The f64 allowance covers rounding-boundary differences; it is a regression
+gate, not ISO 18181-3 precision or distance-quality certification.
+
+Eleven complete-image cases compare GPU and installed libjxl `djxl` output with Rust `jxl` within
+one RGB8 code. They include 1x1, 7x5, 8x8, 17x9, 256x256, default/custom 263x265, 1x257, 257x1,
+2057x17 and 17x2057; 17x9, custom 263x265, 257x1 and 2057x17 use explicit correlation. The 8x8
+checkerboard emits exactly the same bytes as bounded DCT8 and retains visible within-block
+variation. Blocking/Future outputs match in every case, and nine small/AC-boundary configurations
+match under Scalar/32/64/128/256 lanes. The actual-adapter tests require a GPU and log its identity
+and native-oracle availability; the checked run uses Apple M5/Metal and `djxl` 0.12.0.
+
+CPU adversarial tests fill a block with 189 maximum-magnitude AC values, exercise its last
+allocated word, and reject impossible counts, out-of-range coefficients, incomplete/trailing
+entropy, nonzero padding, missing first/last block writes, forged ready/AC/layout fields, and
+truncation. Actual-GPU admission tests check a source that fits a 1 MiB device binding while its
+AC artifact does not, exact and one-byte-deficient in-flight budgets, and abandoned nonzero work
+followed by successful reuse. ABI tests fix the five AC parameter fields at words 107–111 and
+header fields at words 46–50. Other strategies, adaptive clustering, ANS/LZ77 and progressive
+encoding remain outside this DCT8 policy.
 
 An additional generated 8x8 patterned case serializes non-default exact-binary16 LF
 dequantization, colour factor 256, non-default X/B base correlations, and signed LF factors. The

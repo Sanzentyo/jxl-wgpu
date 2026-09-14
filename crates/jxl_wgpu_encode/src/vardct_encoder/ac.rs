@@ -1,0 +1,154 @@
+//! GPU coefficient fragments and their checked placement in pass groups.
+
+use jxl_gpu_bitstream::BitWriter;
+
+use super::bitstream::append_gpu_fragment;
+use super::entropy::{HfEntropyPlan, read_fragment_slice, validate_fragment_padding};
+use super::types::{AC_GROUP_DIM_PIXELS, MAX_HF_QUANTIZED_MAGNITUDE, VarDctFrameLayout};
+use crate::{BackendError, EncodeError};
+
+#[derive(Clone, Copy)]
+pub(super) enum AcFragments<'a> {
+    Empty,
+    Single {
+        words: &'a [u32],
+        bit_len: u32,
+    },
+    Dct8Blocks {
+        words: &'a [u32],
+        bit_lengths: &'a [u32],
+        words_per_block: u32,
+    },
+}
+
+impl AcFragments<'_> {
+    pub(super) fn append_group(
+        self,
+        output: &mut BitWriter,
+        frame: VarDctFrameLayout,
+        group: u32,
+    ) -> Result<(), EncodeError> {
+        if group >= frame.ac_group_count()? {
+            return Err(BackendError::Invariant("VarDCT AC group is out of range").into());
+        }
+        match self {
+            Self::Empty => Ok(()),
+            Self::Single { words, bit_len } => {
+                if frame.ac_group_count()? != 1 {
+                    return Err(
+                        BackendError::Invariant("single AC fragment in a tiled frame").into(),
+                    );
+                }
+                append_gpu_fragment(output, words, 0, bit_len)
+            }
+            Self::Dct8Blocks {
+                words,
+                bit_lengths,
+                words_per_block,
+            } => {
+                let side = AC_GROUP_DIM_PIXELS / 8;
+                let x0 = group % frame.ac_groups_x * side;
+                let y0 = group / frame.ac_groups_x * side;
+                let x1 = (x0 + side).min(frame.blocks_x);
+                let y1 = (y0 + side).min(frame.blocks_y);
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let block = (y * frame.blocks_x + x) as usize;
+                        let bit_len = *bit_lengths
+                            .get(block)
+                            .ok_or(BackendError::Invariant("missing VarDCT AC block length"))?;
+                        let start = block
+                            .checked_mul(words_per_block as usize)
+                            .ok_or(BackendError::Invariant("VarDCT AC block offset overflow"))?;
+                        let end = start
+                            .checked_add(words_per_block as usize)
+                            .ok_or(BackendError::Invariant("VarDCT AC block end overflow"))?;
+                        let fragment = words.get(start..end).ok_or(BackendError::Invariant(
+                            "VarDCT AC block exceeds its allocation",
+                        ))?;
+                        append_gpu_fragment(output, fragment, 0, bit_len)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Validation only: no decoded coefficients are retained, transformed or re-encoded.
+/// A block must contain three Y/X/B counts and exactly the coefficients those counts
+/// describe, followed by zero allocation padding. Zero-length or truncated workgroup
+/// output must never silently become a valid all-zero block.
+pub(super) fn validate_blocks(
+    words: &[u32],
+    bit_lengths: &[u32],
+    words_per_block: u32,
+    entropy: &HfEntropyPlan,
+) -> Result<(), BackendError> {
+    let stride = words_per_block as usize;
+    if stride == 0 || bit_lengths.len().checked_mul(stride) != Some(words.len()) {
+        return Err(BackendError::InvalidArtifact(
+            "VarDCT AC block allocation mismatch",
+        ));
+    }
+    let entries = entropy.gpu_entries();
+    for (words, &bit_len) in words.chunks_exact(stride).zip(bit_lengths) {
+        let mut cursor = 0u32;
+        let mut unsigned = || {
+            for (symbol, entry) in entries.iter().enumerate() {
+                if cursor
+                    .checked_add(entry.bit_len)
+                    .is_none_or(|end| end > bit_len)
+                {
+                    continue;
+                }
+                if read_fragment_slice(words, bit_len, cursor, entry.bit_len)? != entry.bits {
+                    continue;
+                }
+                cursor += entry.bit_len;
+                if symbol == 0 {
+                    return Ok(0);
+                }
+                let extra_bits = symbol as u32 - 1;
+                let extra = read_fragment_slice(words, bit_len, cursor, extra_bits)?;
+                cursor += extra_bits;
+                return Ok((1 << extra_bits) + extra);
+            }
+            Err(BackendError::InvalidArtifact(
+                "VarDCT AC prefix is truncated or invalid",
+            ))
+        };
+        for _ in 0..3 {
+            let mut remaining = unsigned()?;
+            if remaining > 63 {
+                return Err(BackendError::InvalidArtifact(
+                    "VarDCT DCT8 nonzero count exceeds 63",
+                ));
+            }
+            for _ in 1..64 {
+                if remaining == 0 {
+                    break;
+                }
+                let coefficient = unsigned()?;
+                if coefficient > 2 * MAX_HF_QUANTIZED_MAGNITUDE as u32 {
+                    return Err(BackendError::InvalidArtifact(
+                        "VarDCT AC coefficient exceeds quantizer range",
+                    ));
+                }
+                remaining -= u32::from(coefficient != 0);
+            }
+            if remaining != 0 {
+                return Err(BackendError::InvalidArtifact(
+                    "VarDCT DCT8 nonzero count is inconsistent",
+                ));
+            }
+        }
+        if cursor != bit_len {
+            return Err(BackendError::InvalidArtifact(
+                "VarDCT AC block has trailing entropy bits",
+            ));
+        }
+        validate_fragment_padding(words, bit_len)?;
+    }
+    Ok(())
+}

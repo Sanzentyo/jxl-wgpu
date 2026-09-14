@@ -1,15 +1,11 @@
-// Scalable LF-first VarDCT frontend for the nine regular strategies larger
-// than 32x32. The first dispatch owns one 8x8 block per workgroup; the second
-// dispatch owns deterministic prediction and entropy serialization. Ending
+// Scalable tiled DCT8 and LF-first large-transform frontend. The first dispatch
+// owns one 8x8 block per workgroup, including its AC bits for tiled DCT8; the
+// second dispatch owns deterministic LF prediction and serialization. Ending
 // the first WebGPU compute pass before beginning the second is the global
 // storage-visibility boundary between these entry points.
 
-struct PrefixEntry {
-    bits: u32,
-    bit_len: u32,
-}
 
-// Exactly 256 bytes. All artifact offsets and lengths are expressed in u32
+// Exactly 512 bytes. All artifact offsets and lengths are expressed in u32
 // words and are independently checked by the host before dispatch.
 struct Params {
     row_stride: u32,
@@ -36,6 +32,15 @@ struct Params {
     lf_groups_y: u32,
     lf_quantization: array<f32, 3>,
     lf_correlation: array<f32, 2>,
+    hf_prefix: array<PrefixEntry, 19>,
+    hf_correlation: array<f32, 2>,
+    hf_quantization: array<f32, 3>,
+    ac_descriptor_offset: u32,
+    ac_descriptor_len: u32,
+    ac_fragment_offset: u32,
+    ac_words_per_block: u32,
+    ac_fragment_words: u32,
+    padding: array<u32, 16>,
 }
 
 @group(0) @binding(0)
@@ -47,60 +52,15 @@ var<storage, read> params: Params;
 @group(0) @binding(2)
 var<storage, read_write> artifact_words: array<u32>;
 
-// vec3<f32> has a 16-byte storage stride, so the complete reduction consumes
-// 1,024 bytes: far below WebGPU's portable 16 KiB workgroup-storage floor.
+// Both vec3 arrays have a 16-byte stride: exactly 2,048 workgroup bytes.
+// AC coefficients live only here, never in storage or mapped readback buffers.
 var<workgroup> block_xyb: array<vec3<f32>, 64>;
+var<workgroup> block_ac: array<vec3<i32>, 64>;
 
 override wg_x: u32 = 64u;
 
 const ARTIFACT_READY: u32 = 0x56444354u;
 const HEADER_HISTOGRAM_OFFSET: u32 = 22u;
-const OPSIN_BIAS: f32 = 0.0037930732552754493;
-const NEG_OPSIN_BIAS_CBRT: f32 = -0.15595420054924863;
-
-fn load_u8(byte_address: u32) -> u32 {
-    let word = source_words[byte_address >> 2u];
-    return (word >> ((byte_address & 3u) * 8u)) & 255u;
-}
-
-fn srgb_to_linear(encoded: f32) -> f32 {
-    if encoded <= 0.04045 {
-        return encoded / 12.92;
-    }
-    return pow((encoded + 0.055) / 1.055, 2.4);
-}
-
-fn linear_rgb_to_xyb(rgb: vec3<f32>) -> vec3<f32> {
-    let mixed = max(
-        vec3<f32>(
-            0.3000000000 * rgb.x + 0.6220000000 * rgb.y + 0.0780000000 * rgb.z,
-            0.2300000000 * rgb.x + 0.6920000000 * rgb.y + 0.0780000000 * rgb.z,
-            0.2434226892 * rgb.x + 0.2047674442 * rgb.y + 0.5518098665 * rgb.z,
-        ) + vec3<f32>(OPSIN_BIAS),
-        vec3<f32>(0.0),
-    );
-    let absorbance = vec3<f32>(
-        pow(mixed.x, 1.0 / 3.0) + NEG_OPSIN_BIAS_CBRT,
-        pow(mixed.y, 1.0 / 3.0) + NEG_OPSIN_BIAS_CBRT,
-        pow(mixed.z, 1.0 / 3.0) + NEG_OPSIN_BIAS_CBRT,
-    );
-    return vec3<f32>(
-        0.5 * (absorbance.x - absorbance.y),
-        0.5 * (absorbance.x + absorbance.y),
-        absorbance.z,
-    );
-}
-
-fn zigzag_signed(value: i32) -> u32 {
-    if value < 0 {
-        return u32(-value) * 2u - 1u;
-    }
-    return u32(value) * 2u;
-}
-
-fn clamped_gradient(top: i32, left: i32, top_left: i32) -> i32 {
-    return clamp(top + left - top_left, min(top, left), max(top, left));
-}
 
 fn append_fragment_bits(value: u32, count: u32, start: u32) -> u32 {
     let capacity_bits = params.fragment_word_capacity * 32u;
@@ -134,6 +94,56 @@ fn encode_dc_token(slot: u32, signed_value: i32, start: u32) -> u32 {
         return append_fragment_bits(extra, extra_bit_count, after_prefix);
     }
     return params.fragment_word_capacity * 32u + 1u;
+}
+
+fn append_ac_bits(base: u32, value: u32, count: u32, start: u32) -> u32 {
+    for (var index = 0u; index < count; index += 1u) {
+        let bit_offset = start + index;
+        if bit_offset < params.ac_words_per_block * 32u {
+            artifact_words[base + (bit_offset >> 5u)] |=
+                ((value >> index) & 1u) << (bit_offset & 31u);
+        }
+    }
+    return start + count;
+}
+
+fn encode_ac_unsigned(base: u32, value: u32, start: u32) -> u32 {
+    var token = 0u;
+    var extra_count = 0u;
+    var extra = 0u;
+    if value != 0u {
+        extra_count = 31u - countLeadingZeros(value);
+        token = extra_count + 1u;
+        extra = value - (1u << extra_count);
+    }
+    if token >= 19u {
+        return params.ac_words_per_block * 32u + 1u;
+    }
+    let prefix = params.hf_prefix[token];
+    let after_prefix = append_ac_bits(base, prefix.bits, prefix.bit_len, start);
+    return append_ac_bits(base, extra, extra_count, after_prefix);
+}
+
+fn serialize_block_ac(block: u32) {
+    // Fixed word-sized slots have disjoint writes even when adjacent blocks
+    // finish mid-word. All 495 contexts use one prefix distribution, so the
+    // complete block token sequences can be joined without entropy state.
+    let base = params.ac_fragment_offset + block * params.ac_words_per_block;
+    var bit_offset = 0u;
+    for (var channel_index = 0u; channel_index < 3u; channel_index += 1u) {
+        let channel = array<u32, 3>(1u, 0u, 2u)[channel_index];
+        var nonzero = 0u;
+        for (var order = 1u; order < 64u; order += 1u) {
+            nonzero += u32(block_ac[DCT8_NATURAL_ORDER[order]][channel] != 0);
+        }
+        bit_offset = encode_ac_unsigned(base, nonzero, bit_offset);
+        for (var order = 1u; order < 64u && nonzero != 0u; order += 1u) {
+            let value = block_ac[DCT8_NATURAL_ORDER[order]][channel];
+            bit_offset = encode_ac_unsigned(base, zigzag_signed(value), bit_offset);
+            nonzero -= u32(value != 0);
+        }
+    }
+    artifact_words[params.ac_descriptor_offset + block] = bit_offset;
 }
 
 @compute @workgroup_size(wg_x, 1, 1)
@@ -171,6 +181,26 @@ fn quantize_blocks(
     }
     workgroupBarrier();
 
+    if params.topology == 1u {
+        for (var index = local_index; index < 64u; index += wg_x) {
+            if index == 0u {
+                continue;
+            }
+            let fx = index & 7u;
+            let fy = index >> 3u;
+            var coefficient = vec3<f32>(0.0);
+            for (var pixel = 0u; pixel < 64u; pixel += 1u) {
+                let basis = dct_basis(fx, pixel & 7u, 8u)
+                    * dct_basis(fy, pixel >> 3u, 8u) / 64.0;
+                coefficient += block_xyb[pixel] * basis;
+            }
+            // ComputeScaledDCT's wire layout is transposed (row = horizontal
+            // frequency). DC belongs to the separate LF stream.
+            block_ac[fx * 8u + fy] = quantize_dct8_ac(coefficient, fx, fy);
+        }
+    }
+    workgroupBarrier();
+
     if local_index == 0u {
         var sum = vec3<f32>(0.0);
         for (var index = 0u; index < 64u; index += 1u) {
@@ -190,6 +220,9 @@ fn quantize_blocks(
         artifact_words[params.dc_offset + block] = bitcast<u32>(quantized_y);
         artifact_words[params.dc_offset + block_count + block] = bitcast<u32>(quantized_x);
         artifact_words[params.dc_offset + 2u * block_count + block] = bitcast<u32>(quantized_b);
+        if params.topology == 1u {
+            serialize_block_ac(block);
+        }
     }
 }
 
@@ -268,7 +301,7 @@ fn serialize_control() {
     artifact_words[1] = block_count;
     artifact_words[2] = sample_count;
     artifact_words[3] = params.strategy;
-    artifact_words[4] = 1u; // AC coefficients are deliberately quantized to zero.
+    artifact_words[4] = u32(params.topology == 1u);
     artifact_words[5] = params.strategy_offset;
     artifact_words[6] = block_count;
     artifact_words[7] = params.dc_offset;
@@ -291,5 +324,10 @@ fn serialize_control() {
     artifact_words[43] = params.lf_groups_x;
     artifact_words[44] = params.lf_groups_y;
     artifact_words[45] = lf_group_count;
+    artifact_words[46] = params.ac_descriptor_offset;
+    artifact_words[47] = params.ac_descriptor_len;
+    artifact_words[48] = params.ac_fragment_offset;
+    artifact_words[49] = params.ac_words_per_block;
+    artifact_words[50] = params.ac_fragment_words;
     artifact_words[0] = ARTIFACT_READY;
 }

@@ -3,8 +3,8 @@
 use jxl_gpu_bitstream::{BitWriter, PrefixCodeEntry};
 
 use super::types::GpuPrefixEntry;
-use crate::EncodeError;
 use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS};
+use crate::{BackendError, EncodeError};
 
 pub(super) fn fixed_prefix_code() -> Result<PrefixCode, EncodeError> {
     PrefixCode::from_aggregated_counts(&[0; RAW_SYMBOLS], &[0; LZ77_SYMBOLS], RAW_SYMBOLS - 1, true)
@@ -12,9 +12,9 @@ pub(super) fn fixed_prefix_code() -> Result<PrefixCode, EncodeError> {
 
 /// Entropy policy shared by HF-global metadata and the GPU pass-group serializer.
 ///
-/// Stage 1 deliberately maps every legal coefficient context to one prefix distribution. The
-/// plan boundary is permanent: adaptive context clustering and ANS can add plan variants without
-/// changing the GPU fragment contract or moving coefficient scans to the host.
+/// Every coefficient context currently maps to one prefix distribution. Tiled DCT8's independent
+/// block fragments rely on that stateless policy. A future contextual or ANS policy must preserve
+/// its state on the GPU and provide complete group fragments instead.
 #[derive(Clone, Debug)]
 pub(super) struct HfEntropyPlan {
     pub(super) code: PrefixCode,
@@ -90,4 +90,66 @@ pub(super) fn prefix_entries(code: &PrefixCode) -> [GpuPrefixEntry; RAW_SYMBOLS]
             bits: u32::from(bits),
             bit_len: u32::from(bit_len),
         })
+}
+
+pub(super) fn validate_fragment_padding(words: &[u32], bit_len: u32) -> Result<(), BackendError> {
+    let used_words = bit_len
+        .checked_add(31)
+        .ok_or(BackendError::InvalidArtifact(
+            "VarDCT fragment word count overflow",
+        ))?
+        / 32;
+    let used_words = usize::try_from(used_words)
+        .map_err(|_| BackendError::InvalidArtifact("VarDCT fragment size does not fit usize"))?;
+    if let Some(&last_word) = used_words.checked_sub(1).and_then(|index| words.get(index)) {
+        let live_bits = bit_len % 32;
+        if live_bits != 0 && last_word & !((1u32 << live_bits) - 1) != 0 {
+            return Err(BackendError::InvalidArtifact(
+                "scalable VarDCT fragment has nonzero high padding bits",
+            ));
+        }
+    }
+    if words
+        .get(used_words..)
+        .ok_or(BackendError::InvalidArtifact(
+            "VarDCT fragment used-word count is out of bounds",
+        ))?
+        .iter()
+        .any(|&word| word != 0)
+    {
+        return Err(BackendError::InvalidArtifact(
+            "scalable VarDCT fragment word padding is nonzero",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn read_fragment_slice(
+    words: &[u32],
+    bit_len: u32,
+    start: u32,
+    count: u32,
+) -> Result<u32, BackendError> {
+    let end = start
+        .checked_add(count)
+        .ok_or(BackendError::InvalidArtifact(
+            "VarDCT GPU fragment address overflow",
+        ))?;
+    let capacity = u32::try_from(words.len())
+        .ok()
+        .and_then(|len| len.checked_mul(32))
+        .ok_or(BackendError::InvalidArtifact(
+            "VarDCT GPU fragment capacity overflow",
+        ))?;
+    if count > 32 || end > bit_len || end > capacity {
+        return Err(BackendError::InvalidArtifact(
+            "VarDCT GPU fragment is truncated",
+        ));
+    }
+    let mut value = 0u32;
+    for index in 0..count {
+        let bit = start + index;
+        value |= ((words[(bit / 32) as usize] >> (bit % 32)) & 1) << index;
+    }
+    Ok(value)
 }

@@ -5,6 +5,7 @@
 //! control-plane syntax is kept separate from the lossless Modular encoder so neither coding mode
 //! becomes a compatibility layer for the other.
 
+mod ac;
 mod bitstream;
 mod dispatch;
 mod entropy;

@@ -1,5 +1,9 @@
 //! Existing VarDCT semantic, ABI, and GPU interoperability tests.
 
+mod ac;
+mod artifact;
+mod reference;
+
 use std::fs;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -28,7 +32,7 @@ use super::bitstream::{build_frame_packet, image_header};
 use super::dispatch::{
     BOUNDED_KERNEL_KEY, LARGE_SHADER, SCALABLE_QUANTIZE_KERNEL_KEY, SHADER, TiledVarDctEncoder,
     VarDctEncoder, align_up, clamped_gradient_i32, fixed_artifact_data, gradient_residual_i32,
-    signed_token,
+    shader_source, signed_token,
 };
 use super::entropy::{HfEntropyPlan, fixed_prefix_code, prefix_entries};
 use super::types::{
@@ -464,7 +468,7 @@ fn abi_records_are_pod_and_word_aligned() {
     assert_eq!(std::mem::size_of::<VarDctKernelParams>(), 512);
     assert_eq!(std::mem::size_of::<VarDctKernelArtifact>(), 26_880);
     assert_eq!(std::mem::align_of::<VarDctKernelArtifact>(), 4);
-    assert_eq!(std::mem::size_of::<ScalableVarDctKernelParams>(), 256);
+    assert_eq!(std::mem::size_of::<ScalableVarDctKernelParams>(), 512);
     assert_eq!(std::mem::size_of::<ScalableVarDctArtifactHeader>(), 256);
     assert_eq!(std::mem::size_of::<ScalableDcFragmentDescriptor>(), 8);
 
@@ -473,9 +477,18 @@ fn abi_records_are_pod_and_word_aligned() {
     params.fragment_descriptor_len = 0x56;
     params.lf_groups_x = 0x57;
     params.lf_groups_y = 0x58;
+    params.ac_descriptor_offset = 0x107;
+    params.ac_descriptor_len = 0x108;
+    params.ac_fragment_offset = 0x109;
+    params.ac_words_per_block = 0x110;
+    params.ac_fragment_words = 0x111;
     let params = [params];
     let parameter_words = bytemuck::cast_slice::<ScalableVarDctKernelParams, u32>(&params);
     assert_eq!(&parameter_words[55..59], &[0x55, 0x56, 0x57, 0x58]);
+    assert_eq!(
+        &parameter_words[107..112],
+        &[0x107, 0x108, 0x109, 0x110, 0x111]
+    );
 
     let mut header: ScalableVarDctArtifactHeader = bytemuck::Zeroable::zeroed();
     header.fragment_descriptor_offset = 0x41;
@@ -483,14 +496,20 @@ fn abi_records_are_pod_and_word_aligned() {
     header.lf_groups_x = 0x43;
     header.lf_groups_y = 0x44;
     header.lf_group_count = 0x45;
+    header.ac_descriptor_offset = 0x46;
+    header.ac_descriptor_len = 0x47;
+    header.ac_fragment_offset = 0x48;
+    header.ac_words_per_block = 0x49;
+    header.ac_fragment_words = 0x50;
     let headers = [header];
     let header_words = bytemuck::cast_slice::<ScalableVarDctArtifactHeader, u32>(&headers);
     assert_eq!(&header_words[41..46], &[0x41, 0x42, 0x43, 0x44, 0x45]);
+    assert_eq!(&header_words[46..51], &[0x46, 0x47, 0x48, 0x49, 0x50]);
 }
 
 #[test]
 fn naga_validates_vardct_shaders() {
-    let module = naga::front::wgsl::parse_str(SHADER).expect("VarDCT WGSL parses");
+    let module = naga::front::wgsl::parse_str(&shader_source(SHADER)).expect("VarDCT WGSL parses");
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::empty(),
@@ -498,7 +517,8 @@ fn naga_validates_vardct_shaders() {
     .validate(&module)
     .expect("VarDCT WGSL validates");
 
-    let module = naga::front::wgsl::parse_str(LARGE_SHADER).expect("scalable VarDCT WGSL parses");
+    let module = naga::front::wgsl::parse_str(&shader_source(LARGE_SHADER))
+        .expect("scalable VarDCT WGSL parses");
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::empty(),
@@ -746,7 +766,7 @@ fn tiled_dct8_emits_multiple_ac_groups_for_odd_black_extent() {
     let plan = encoder.memory_plan(&source).unwrap();
     let grid = encoder.grid(&source).unwrap();
     assert_eq!(plan.kernel_layout, VarDctKernelLayout::TiledDct8);
-    assert_eq!(plan.parameter_storage_bytes, 256);
+    assert_eq!(plan.parameter_storage_bytes, 512);
     assert_eq!((grid.block_columns, grid.block_rows), (33, 3));
     assert_eq!(grid.block_count().unwrap(), 99);
     assert_eq!((grid.ac_group_columns, grid.ac_group_rows), (2, 1));
@@ -894,17 +914,12 @@ fn tiled_dct8_gpu_encodes_checked_16k_panorama_axes() {
 }
 
 #[test]
-fn tiled_dct8_reports_fused_single_group_ambiguity_as_a_typed_error() {
-    assert!(matches!(
-        TiledVarDctGrid::new(17, 9),
-        Err(EncodeError::Unsupported(
-            UnsupportedFeature::TiledVarDctSingleAcGroup {
-                width: 17,
-                height: 9,
-                group_dimension: 256,
-            }
-        ))
-    ));
+fn tiled_dct8_uses_one_fused_packet_through_256_pixels() {
+    for (width, height) in [(1, 1), (17, 9), (256, 256)] {
+        let grid = TiledVarDctGrid::new(width, height).unwrap();
+        assert_eq!(grid.ac_group_count().unwrap(), 1);
+        assert_eq!(grid.toc_entries().unwrap(), 1);
+    }
 }
 
 #[test]
@@ -914,14 +929,14 @@ fn abandoned_tiled_job_holds_and_releases_its_exact_budget() {
     };
     let width = 513usize;
     let height = 259usize;
-    let pixels = vec![[0u8; 3]; width * height];
+    let pixels = reference::pattern(width, height);
     let provisional = TiledVarDctEncoder::new(base_context.clone()).unwrap();
     let provisional_source = padded_rgb_source_sized(&base_context, width, height, &pixels);
     let plan = provisional.memory_plan(&provisional_source).unwrap();
     assert_eq!(plan.kernel_layout, VarDctKernelLayout::TiledDct8);
     assert_eq!(
         plan.owned_bytes_per_job,
-        256 + 2 * plan.artifact_storage_bytes
+        512 + 2 * plan.artifact_storage_bytes
     );
 
     let limited_context = WgpuContext::with_memory_budget(
@@ -938,7 +953,7 @@ fn abandoned_tiled_job_holds_and_releases_its_exact_budget() {
         plan.owned_bytes_per_job
     );
     assert!(matches!(
-        encoder.submit(source),
+        encoder.submit(source.clone()),
         Err(EncodeError::MemoryBackpressure(_))
     ));
     drop(abandoned);
@@ -967,6 +982,11 @@ fn abandoned_tiled_job_holds_and_releases_its_exact_budget() {
             .expect("drive abandoned tiled VarDCT map callback");
         std::thread::yield_now();
     }
+    let recovered = encoder.encode(source).unwrap();
+    assert_eq!(
+        decode_rgb8_sized(&recovered, width, height).len(),
+        width * height * 3
+    );
     assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
 }
 
@@ -1044,10 +1064,10 @@ fn every_executable_strategy_emits_a_standard_black_codestream() {
             let layout =
                 ScalableArtifactLayout::new(strategy, &fixed_prefix_code().unwrap()).unwrap();
             assert_eq!(plan.kernel_layout, VarDctKernelLayout::Scalable);
-            assert_eq!(plan.parameter_storage_bytes, 256);
+            assert_eq!(plan.parameter_storage_bytes, 512);
             assert_eq!(plan.artifact_storage_bytes, layout.artifact_bytes());
             assert_eq!(plan.readback_bytes, layout.artifact_bytes());
-            assert_eq!(plan.owned_bytes_per_job, 256 + 2 * layout.artifact_bytes());
+            assert_eq!(plan.owned_bytes_per_job, 512 + 2 * layout.artifact_bytes());
         } else {
             assert_eq!(plan.kernel_layout, VarDctKernelLayout::Bounded);
         }

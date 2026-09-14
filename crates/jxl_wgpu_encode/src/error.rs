@@ -62,14 +62,6 @@ pub enum UnsupportedFeature {
         height: u32,
         max_dimension: u32,
     },
-    #[error(
-        "tiled VarDCT requires at least two AC groups so its section topology is unambiguous; {width}x{height} fits one {group_dimension}px group"
-    )]
-    TiledVarDctSingleAcGroup {
-        width: u32,
-        height: u32,
-        group_dimension: u32,
-    },
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]

@@ -10,8 +10,12 @@ use std::task::{Context, Poll, Waker};
 use jxl_gpu_bitstream::PrefixCodeEntry;
 use jxl_wgpu::{KernelVariant, MemoryPermit};
 
+use super::ac::{AcFragments, validate_blocks};
 use super::bitstream::{build_frame_packet, image_header, pack_signed_control};
-use super::entropy::{HfEntropyPlan, fixed_prefix_code, prefix_entries};
+use super::entropy::{
+    HfEntropyPlan, fixed_prefix_code, prefix_entries, read_fragment_slice,
+    validate_fragment_padding,
+};
 use super::types::{
     DCT8_COEFFICIENTS, DCT8_NATURAL_ORDER, GLOBAL_SCALE, HF_QUANTIZATION, MAX_AC_FRAGMENT_WORDS,
     MAX_BLOCKS, MAX_COEFFICIENTS, MAX_DC_FRAGMENT_WORDS, MAX_HF_QUANTIZED_MAGNITUDE, QUANT_LF,
@@ -30,13 +34,17 @@ use crate::{
     WgpuContext, assemble_frame,
 };
 
-pub(super) const SHADER: &str = include_str!("../vardct_encoder.wgsl");
-pub(super) const LARGE_SHADER: &str = include_str!("../vardct_large_encoder.wgsl");
+pub(super) const SHADER: &str = include_str!("bounded.wgsl");
+pub(super) const LARGE_SHADER: &str = include_str!("scalable.wgsl");
+
+pub(super) fn shader_source(entry_points: &str) -> String {
+    format!("{}\n{entry_points}", include_str!("common.wgsl"))
+}
 pub(super) const PROFILE_DISTANCE: f32 = 25.0;
 pub(super) const BOUNDED_KERNEL_KEY: &str = "vardct_encode_bounded";
 pub(super) const SCALABLE_QUANTIZE_KERNEL_KEY: &str = "vardct_encode_quantize";
 pub(super) const BOUNDED_WORKGROUP_STORAGE_BYTES: u32 = 1_024 * 16;
-pub(super) const LARGE_WORKGROUP_STORAGE_BYTES: u32 = 64 * 16;
+pub(super) const LARGE_WORKGROUP_STORAGE_BYTES: u32 = 2 * 64 * 16;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct VarDctDispatchPlan {
@@ -157,7 +165,7 @@ impl VarDctBackend {
                 .device()
                 .create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("jxl-wgpu scalable VarDCT kernel"),
-                    source: wgpu::ShaderSource::Wgsl(LARGE_SHADER.into()),
+                    source: wgpu::ShaderSource::Wgsl(shader_source(LARGE_SHADER).into()),
                 });
             VarDctPipelines::Scalable {
                 quantize: Arc::new(context.device().create_compute_pipeline(
@@ -189,7 +197,7 @@ impl VarDctBackend {
                 .device()
                 .create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("jxl-wgpu VarDCT forward-transform kernel"),
-                    source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+                    source: wgpu::ShaderSource::Wgsl(shader_source(SHADER).into()),
                 });
             VarDctPipelines::Bounded(Arc::new(context.device().create_compute_pipeline(
                 &wgpu::ComputePipelineDescriptor {
@@ -355,12 +363,9 @@ impl VarDctBackend {
                 VarDctTopology::SingleTransform(strategy) => {
                     ScalableArtifactLayout::new(strategy, &self.code)?
                 }
-                VarDctTopology::TiledDct8 => ScalableArtifactLayout::for_block_grid(
-                    blocks_x,
-                    blocks_y,
-                    frame.lf_group_count()?,
-                    &self.code,
-                )?,
+                VarDctTopology::TiledDct8 => {
+                    ScalableArtifactLayout::for_tiled_grid(frame, &self.code, &self.hf_entropy)?
+                }
             };
             let required_workgroup_axis = blocks_x.max(blocks_y);
             if required_workgroup_axis > self.max_compute_workgroups_per_dimension {
@@ -415,6 +420,15 @@ impl VarDctBackend {
                         lf_groups_y: frame.lf_groups_y,
                         lf_quantization,
                         lf_correlation,
+                        hf_prefix: self.hf_entropy.gpu_entries(),
+                        hf_correlation,
+                        hf_quantization: HF_QUANTIZATION,
+                        ac_descriptor_offset: layout.ac_descriptor_offset,
+                        ac_descriptor_len: layout.ac_descriptor_len,
+                        ac_fragment_offset: layout.ac_fragment_offset,
+                        ac_words_per_block: layout.ac_words_per_block,
+                        ac_fragment_words: layout.ac_fragment_words,
+                        padding: [0; 16],
                     },
                     layout,
                 },
@@ -512,7 +526,7 @@ fn validate_vardct_request(
         })
     {
         return Err(EncodeError::InvalidConfiguration(
-            "the requested VarDCT distance does not match the fixed LF-first profile",
+            "the requested VarDCT distance does not match the fixed quantization profile",
         ));
     }
     Ok(())
@@ -645,7 +659,7 @@ impl GpuEncodeBackend for VarDctBackend {
                     create_bind_group(quantize, "jxl-wgpu scalable VarDCT quantization bindings");
                 {
                     let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("jxl-wgpu scalable VarDCT 8x8 DC quantization"),
+                        label: Some("jxl-wgpu scalable VarDCT block transform and entropy"),
                         timestamp_writes: None,
                     });
                     pass.set_pipeline(quantize);
@@ -877,9 +891,13 @@ impl VarDctJob {
                         })?;
                     validate_artifact(artifact, &self.code, &self.hf_entropy, self.frame_layout)?
                 }
-                VarDctJobLayout::Scalable(layout) => {
-                    validate_scalable_artifact(&mapped, layout, &self.code, self.frame_layout)?
-                }
+                VarDctJobLayout::Scalable(layout) => validate_scalable_artifact(
+                    &mapped,
+                    layout,
+                    &self.code,
+                    &self.hf_entropy,
+                    self.frame_layout,
+                )?,
             };
             Ok(GpuFrameArtifacts {
                 frame_index: self.frame_index,
@@ -1252,15 +1270,22 @@ pub(super) fn fixed_artifact_data(artifact: &VarDctKernelArtifact) -> VarDctArti
         dc_fragment_words: &artifact.dc_fragment_words,
         dc_fragment_bit_len: artifact.dc_fragment_bit_len,
         dc_fragment_descriptors: &[],
-        ac_fragment_words: &artifact.ac_fragment_words,
-        ac_fragment_bit_len: artifact.ac_fragment_bit_len,
+        ac: if artifact.ac_fragment_bit_len == 0 {
+            AcFragments::Empty
+        } else {
+            AcFragments::Single {
+                words: &artifact.ac_fragment_words,
+                bit_len: artifact.ac_fragment_bit_len,
+            }
+        },
     }
 }
 
-fn validate_scalable_artifact<'a>(
+pub(super) fn validate_scalable_artifact<'a>(
     mapped: &'a [u8],
     layout: ScalableArtifactLayout,
     code: &PrefixCode,
+    hf_entropy: &HfEntropyPlan,
     frame: VarDctFrameLayout,
 ) -> Result<VarDctArtifactData<'a>, BackendError> {
     let expected_bytes = usize::try_from(layout.artifact_bytes()).map_err(|_| {
@@ -1301,7 +1326,7 @@ fn validate_scalable_artifact<'a>(
         || header.block_count != block_count
         || header.dc_sample_count != dc_sample_count
         || header.strategy != u32::from(strategy.codestream_id())
-        || header.ac_all_zero != 1
+        || header.ac_payload != u32::from(frame.topology == VarDctTopology::TiledDct8)
         || header.strategy_offset != layout.strategy_offset
         || header.strategy_len != layout.strategy_len
         || header.dc_offset != layout.dc_offset
@@ -1323,6 +1348,11 @@ fn validate_scalable_artifact<'a>(
         || header.lf_groups_x != frame.lf_groups_x
         || header.lf_groups_y != frame.lf_groups_y
         || header.lf_group_count != lf_group_count
+        || header.ac_descriptor_offset != layout.ac_descriptor_offset
+        || header.ac_descriptor_len != layout.ac_descriptor_len
+        || header.ac_fragment_offset != layout.ac_fragment_offset
+        || header.ac_words_per_block != layout.ac_words_per_block
+        || header.ac_fragment_words != layout.ac_fragment_words
     {
         return Err(BackendError::InvalidArtifact(
             "scalable VarDCT status, live counts, orientation, or layout metadata mismatch",
@@ -1397,11 +1427,32 @@ fn validate_scalable_artifact<'a>(
         layout.extra_offset + layout.extra_len,
         layout.fragment_offset,
     )?;
-    validate_zero_gap(
-        words,
-        layout.fragment_offset + layout.fragment_word_capacity,
-        layout.artifact_words,
-    )?;
+    let dc_end = layout.fragment_offset + layout.fragment_word_capacity;
+    let ac = if layout.ac_descriptor_len == 0 {
+        validate_zero_gap(words, dc_end, layout.artifact_words)?;
+        AcFragments::Empty
+    } else {
+        validate_zero_gap(words, dc_end, layout.ac_descriptor_offset)?;
+        validate_zero_gap(
+            words,
+            layout.ac_descriptor_offset + layout.ac_descriptor_len,
+            layout.ac_fragment_offset,
+        )?;
+        validate_zero_gap(
+            words,
+            layout.ac_fragment_offset + layout.ac_fragment_words,
+            layout.artifact_words,
+        )?;
+        let bit_lengths =
+            artifact_words(words, layout.ac_descriptor_offset, layout.ac_descriptor_len)?;
+        let ac_words = artifact_words(words, layout.ac_fragment_offset, layout.ac_fragment_words)?;
+        validate_blocks(ac_words, bit_lengths, layout.ac_words_per_block, hf_entropy)?;
+        AcFragments::Dct8Blocks {
+            words: ac_words,
+            bit_lengths,
+            words_per_block: layout.ac_words_per_block,
+        }
+    };
 
     let expected_strategy = u32::from(strategy.codestream_id());
     for (block, &value) in strategy_map.iter().enumerate() {
@@ -1520,8 +1571,7 @@ fn validate_scalable_artifact<'a>(
         dc_fragment_words: fragment_words,
         dc_fragment_bit_len: header.dc_fragment_bit_len,
         dc_fragment_descriptors: fragment_descriptors,
-        ac_fragment_words: &[],
-        ac_fragment_bit_len: 0,
+        ac,
     })
 }
 
@@ -1554,68 +1604,6 @@ fn validate_zero_gap(words: &[u32], start: u32, end: u32) -> Result<(), BackendE
         ));
     }
     Ok(())
-}
-
-fn validate_fragment_padding(words: &[u32], bit_len: u32) -> Result<(), BackendError> {
-    let used_words = bit_len
-        .checked_add(31)
-        .ok_or(BackendError::InvalidArtifact(
-            "VarDCT fragment word count overflow",
-        ))?
-        / 32;
-    let used_words = usize::try_from(used_words)
-        .map_err(|_| BackendError::InvalidArtifact("VarDCT fragment size does not fit usize"))?;
-    if let Some(&last_word) = used_words.checked_sub(1).and_then(|index| words.get(index)) {
-        let live_bits = bit_len % 32;
-        if live_bits != 0 && last_word & !((1u32 << live_bits) - 1) != 0 {
-            return Err(BackendError::InvalidArtifact(
-                "scalable VarDCT fragment has nonzero high padding bits",
-            ));
-        }
-    }
-    if words
-        .get(used_words..)
-        .ok_or(BackendError::InvalidArtifact(
-            "VarDCT fragment used-word count is out of bounds",
-        ))?
-        .iter()
-        .any(|&word| word != 0)
-    {
-        return Err(BackendError::InvalidArtifact(
-            "scalable VarDCT fragment word padding is nonzero",
-        ));
-    }
-    Ok(())
-}
-
-fn read_fragment_slice(
-    words: &[u32],
-    bit_len: u32,
-    start: u32,
-    count: u32,
-) -> Result<u32, BackendError> {
-    let end = start
-        .checked_add(count)
-        .ok_or(BackendError::InvalidArtifact(
-            "VarDCT GPU fragment address overflow",
-        ))?;
-    let capacity = u32::try_from(words.len())
-        .ok()
-        .and_then(|len| len.checked_mul(32))
-        .ok_or(BackendError::InvalidArtifact(
-            "VarDCT GPU fragment capacity overflow",
-        ))?;
-    if end > bit_len || end > capacity {
-        return Err(BackendError::InvalidArtifact(
-            "VarDCT GPU fragment is truncated",
-        ));
-    }
-    let mut value = 0u32;
-    for index in 0..count {
-        let bit = start + index;
-        value |= ((words[(bit / 32) as usize] >> (bit % 32)) & 1) << index;
-    }
-    Ok(value)
 }
 
 pub(super) fn clamped_gradient_i32(top: i32, left: i32, top_left: i32) -> i32 {
@@ -1806,12 +1794,12 @@ impl VarDctEncoder {
 /// GPU-only JPEG XL VarDCT encoder for a rectangular grid of independent
 /// regular DCT8 transforms.
 ///
-/// The current executable subset accepts RGB8 dimensions through 16,384 pixels
-/// on each axis when at least one axis exceeds 256 pixels, including partial
-/// 8x8 edge blocks. This guarantees an explicit multi-section TOC with every
-/// 2,048x2,048 LF/DC group and at least two 256x256 AC/pass groups. AC
-/// coefficients are deliberately zero, so decoded quality is the profile's
-/// LF-only contract rather than a general distance-25 guarantee.
+/// Accepts nonzero RGB8 dimensions through 16,384 pixels on each axis, with
+/// partial edge blocks replicated on the GPU. Every block carries quantized
+/// DC and AC, using default matrices, natural order and one prefix distribution.
+/// The frame has every 2,048-pixel LF group and 256-pixel AC group; a single
+/// AC group uses the standard fused packet. Quantization is fixed and does
+/// not yet provide a general distance or rate-control guarantee.
 pub struct TiledVarDctEncoder {
     encoder: GpuEncoder<VarDctBackend>,
 }
