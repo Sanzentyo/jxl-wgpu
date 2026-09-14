@@ -1,7 +1,12 @@
 # Third-party notices
 
 The production workspace does not vendor a CPU JPEG XL codec. The following implementation
-reference was adapted into focused GPU-codec control-plane code:
+references were adapted into focused GPU-codec code and bounded metadata expansion:
+
+- libjxl 0.12.0 default quantization constants, natural coefficient orders and forward-transform
+  equations at commit `a7a9c787341cf703dede03c2009fa460cae5e5df`. The affected modules and
+  copyright notices are recorded in `crates/jxl_gpu_protocol/THIRD_PARTY.md` and
+  `crates/jxl_wgpu/THIRD_PARTY.md`; BSD-3-Clause terms are included in each crate's `LICENSE`.
 
 - `zune-jpegxl` 0.5.2 fast-lossless prefix-code and JPEG XL header construction. Adapted portions
   are identified in `crates/jxl_gpu_bitstream/src/acceleration.rs`,

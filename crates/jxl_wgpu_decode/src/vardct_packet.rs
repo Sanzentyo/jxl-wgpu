@@ -3,7 +3,9 @@
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_bitstream::{BitRange, BitReader, CodestreamInventory};
 use jxl_gpu_protocol::TransformKind;
+#[cfg(test)]
 use jxl_oxide_common::Bundle;
+#[cfg(test)]
 use jxl_vardct::{DequantMatrixSet, DequantMatrixSetParams};
 use thiserror::Error;
 
@@ -2112,31 +2114,20 @@ fn expand_hf_dequant_matrices(
         })
     }
 
-    let encoded_default = [1_u8];
-    let mut default_bits = jxl_bitstream::Bitstream::new(&encoded_default);
-    let pool = jxl_threadpool::JxlThreadPool::none();
-    let defaults = DequantMatrixSet::parse(
-        &mut default_bits,
-        DequantMatrixSetParams::new(8, 1, None, None, &pool),
-    )
-    .map_err(|_| BoundedVarDctPacketError::HfDequantMatrixValue {
-        matrix: 0,
-        reason: "normative defaults could not be constructed",
-    })?;
     let mut packed = Vec::new();
     for transform in TransformKind::ALL {
         let index = crate::vardct_resource::hf_matrix_param_index(transform);
         let extent = transform.pixel_extent();
         let channels = match &encodings[index] {
             HfDequantMatrixEncoding::Default | HfDequantMatrixEncoding::Raw => {
-                let transform_type = crate::vardct_resource::vardct_transform_type(transform);
-                std::array::from_fn(|channel| {
-                    if transform.needs_transpose() {
-                        defaults.get_transposed(channel, transform_type).to_vec()
-                    } else {
-                        defaults.get(channel, transform_type).to_vec()
-                    }
-                })
+                packed.extend(
+                    transform
+                        .default_dequant_matrix()
+                        .scales
+                        .into_iter()
+                        .map(|[x, y, b]| [x.to_bits(), y.to_bits(), b.to_bits(), 0]),
+                );
+                continue;
             }
             encoding => {
                 let representative = representative(index);
@@ -3691,7 +3682,7 @@ mod tests {
         };
         let (codestream, plan, packet_end) = jpeg_transcode_raw_matrix_fixture();
         let layout = VarDctResourceLayout::new(1, 1, 1).unwrap();
-        let initial_resources = layout.initial_values().unwrap();
+        let initial_resources = layout.initial_values();
         let source = crate::GpuCodestream::from_shared(
             codestream.clone().into(),
             0..codestream.len(),

@@ -1,19 +1,18 @@
 use jxl_gpu_bitstream::BitWriter;
 
-use super::super::dispatch::validate_scalable_artifact;
+use super::super::dispatch::validate_artifact;
 use super::super::entropy::{HfEntropyPlan, fixed_prefix_code};
 use super::super::types::{
-    SCALABLE_ARTIFACT_READY, ScalableArtifactLayout, ScalableVarDctArtifactHeader,
-    VarDctFrameLayout,
+    ARTIFACT_READY, ArtifactLayout, VarDctArtifactHeader, VarDctFrameLayout,
 };
 use super::ac::write_tokens;
 
 #[test]
-fn scalable_artifact_rejects_missing_ac_writes_and_forged_layout() {
+fn artifact_rejects_missing_ac_writes_and_forged_layout() {
     let frame = VarDctFrameLayout::tiled_dct8(2057, 17).unwrap();
     let dc = fixed_prefix_code().unwrap();
     let hf = HfEntropyPlan::single_cluster_prefix().unwrap();
-    let layout = ScalableArtifactLayout::for_tiled_grid(frame, &dc, &hf).unwrap();
+    let layout = ArtifactLayout::for_tiled_grid(frame, &dc, &hf).unwrap();
     let mut words = vec![0u32; layout.artifact_words as usize];
     let mut dc_fragment = BitWriter::new();
     for group in 0..frame.lf_group_count().unwrap() {
@@ -38,8 +37,8 @@ fn scalable_artifact_rejects_missing_ac_writes_and_forged_layout() {
     }
     let mut histogram = [0; 19];
     histogram[0] = layout.dc_len;
-    let header = ScalableVarDctArtifactHeader {
-        status: SCALABLE_ARTIFACT_READY,
+    let header = VarDctArtifactHeader {
+        status: ARTIFACT_READY,
         block_count: layout.strategy_len,
         dc_sample_count: layout.dc_len,
         strategy: 0,
@@ -76,7 +75,7 @@ fn scalable_artifact_rejects_missing_ac_writes_and_forged_layout() {
     };
     words[..64].copy_from_slice(bytemuck::cast_slice(std::slice::from_ref(&header)));
     let valid = |words: &[u32]| {
-        validate_scalable_artifact(bytemuck::cast_slice(words), layout, &dc, &hf, frame).is_ok()
+        validate_artifact(bytemuck::cast_slice(words), layout, &dc, &hf, frame).is_ok()
     };
     assert!(valid(&words));
     // Every new AC header field, its presence marker and final ready status.

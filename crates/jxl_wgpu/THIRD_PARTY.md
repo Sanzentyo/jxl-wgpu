@@ -1,5 +1,16 @@
 # Third-party notices
 
+## JPEG XL forward transforms
+
+`src/forward_vardct/basis.rs` derives bounded strategy constants from the forward-transform
+equations in libjxl 0.12.0 `enc_transforms-inl.h` at commit
+`a7a9c787341cf703dede03c2009fa460cae5e5df`. AFV reuses the inverse basis described below.
+All source-dependent arithmetic executes in `shaders/forward_vardct.wgsl`. The independent
+fixture generator calls the pinned native implementation offline.
+
+Copyright (c) the JPEG XL Project Authors. The BSD-3-Clause terms are reproduced in this
+crate's `LICENSE` file.
+
 ## JPEG XL frame upsampling
 
 `src/resident_upsample.rs` expands compact image-header weights using the normative symmetry

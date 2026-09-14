@@ -74,30 +74,7 @@ pub(super) fn block(
 }
 
 pub(super) fn quantized_ac(pixels: &[[u8; 3]; 64], metadata: VarDctLfMetadata) -> [[i32; 64]; 3] {
-    let xyb = pixels.map(|pixel| {
-        let rgb = pixel.map(|value| {
-            let value = f64::from(value) / 255.0;
-            if value <= 0.04045 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
-            }
-        });
-        let bias = 0.0037930732552754493f64;
-        let absorbance = [
-            [0.3, 0.622, 0.078],
-            [0.23, 0.692, 0.078],
-            [0.2434226892, 0.2047674442, 0.5518098665],
-        ]
-        .map(|row| {
-            (bias + row.into_iter().zip(rgb).map(|(a, b)| a * b).sum::<f64>()).cbrt() - bias.cbrt()
-        });
-        [
-            (absorbance[0] - absorbance[1]) * 0.5,
-            (absorbance[0] + absorbance[1]) * 0.5,
-            absorbance[2],
-        ]
-    });
+    let xyb = pixels.map(xyb);
     let basis: [[f64; 8]; 8] = std::array::from_fn(|frequency| {
         std::array::from_fn(|position| {
             if frequency == 0 {
@@ -163,4 +140,29 @@ pub(super) fn quantized_ac(pixels: &[[u8; 3]; 64], metadata: VarDctLfMetadata) -
         }
     }
     result
+}
+
+pub(super) fn xyb(pixel: [u8; 3]) -> [f64; 3] {
+    let rgb = pixel.map(|value| {
+        let value = f64::from(value) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    });
+    let bias = 0.0037930732552754493f64;
+    let absorbance = [
+        [0.3, 0.622, 0.078],
+        [0.23, 0.692, 0.078],
+        [0.2434226892, 0.2047674442, 0.5518098665],
+    ]
+    .map(|row| {
+        (bias + row.into_iter().zip(rgb).map(|(a, b)| a * b).sum::<f64>()).cbrt() - bias.cbrt()
+    });
+    [
+        (absorbance[0] - absorbance[1]) * 0.5,
+        (absorbance[0] + absorbance[1]) * 0.5,
+        absorbance[2],
+    ]
 }

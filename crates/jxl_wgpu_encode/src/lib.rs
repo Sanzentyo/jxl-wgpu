@@ -76,5 +76,5 @@ pub use session::{
 pub use vardct_encoder::{
     TiledVarDctEncoder, TiledVarDctGrid, VarDctBackend, VarDctColorEncoding, VarDctEncoder,
     VarDctJob, VarDctKernelLayout, VarDctLfMetadata, VarDctMemoryPlan, VarDctStrategy,
-    VarDctSubmission,
+    VarDctSubmission, VarDctTransformMemoryPlan,
 };

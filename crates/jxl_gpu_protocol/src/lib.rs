@@ -21,6 +21,7 @@ pub use color::{
     WhitePointAdaptation,
 };
 pub mod icc;
+mod vardct;
 
 /// Stable identifier for a logical image plane in a [`RenderPlan`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -965,8 +966,11 @@ pub struct GroupPayload {
     pub vardct: Option<VarDctPacket>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// JPEG XL transform identifier, shared by forward and inverse GPU pipelines.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
 pub enum TransformKind {
+    #[default]
     Dct8,
     Hornuss,
     Dct2x2,
@@ -997,6 +1001,11 @@ pub enum TransformKind {
 }
 
 impl TransformKind {
+    /// Exact identifier in the JPEG XL codestream strategy alphabet.
+    pub const fn codestream_id(self) -> u8 {
+        self as u8
+    }
+
     /// Every transform strategy defined by the JPEG XL codestream, in codestream order.
     pub const ALL: [Self; 27] = [
         Self::Dct8,

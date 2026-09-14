@@ -105,7 +105,7 @@ pub(super) fn validate_fragment_padding(words: &[u32], bit_len: u32) -> Result<(
         let live_bits = bit_len % 32;
         if live_bits != 0 && last_word & !((1u32 << live_bits) - 1) != 0 {
             return Err(BackendError::InvalidArtifact(
-                "scalable VarDCT fragment has nonzero high padding bits",
+                "VarDCT fragment has nonzero high padding bits",
             ));
         }
     }
@@ -118,7 +118,7 @@ pub(super) fn validate_fragment_padding(words: &[u32], bit_len: u32) -> Result<(
         .any(|&word| word != 0)
     {
         return Err(BackendError::InvalidArtifact(
-            "scalable VarDCT fragment word padding is nonzero",
+            "VarDCT fragment word padding is nonzero",
         ));
     }
     Ok(())

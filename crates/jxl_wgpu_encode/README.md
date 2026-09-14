@@ -109,27 +109,38 @@ provided by the application.
 `VarDctEncoder::new` takes an explicit `VarDctStrategy` and accepts one padded, interleaved sRGB8
 image whose extent equals that transform. All 27 standard strategies are executable end to end,
 from the 8×8-footprint strategies through the regular 16/32/64/128/256 square and rectangular
-families. `VarDctStrategy::EXECUTABLE` is the authoritative inventory, and every entry emits its
-exact standard identifier rather than being relabeled or lowered to DCT8.
+families. `VarDctStrategy` re-exports the shared protocol `TransformKind`; `ALL` enumerates the
+standard alphabet and `pixel_extent()` supplies its spatial geometry. Every entry emits its
+exact standard identifier and real AC coefficients.
 
 `VarDctEncoder::new_with_lf_metadata` and `TiledVarDctEncoder::new_with_lf_metadata` accept a
 validated `VarDctLfMetadata`. Its LF dequantization and base-correlation fields retain exact finite
 binary16 values, while the colour factor and signed LF factors use their normative integer
 domains. Construction rejects dequantized coefficients below libjxl's `1e-8` threshold, colour
 factors outside `2..=65793`, and base correlations outside `[-4, 4]` with typed `EncodeError`
-variants. Default and explicit bundles share one serializer, and both bounded and scalable GPU
+variants. Default and explicit bundles share one serializer, and both single-transform and tiled GPU
 kernels subtract the selected LF chroma-from-luma slopes and quantize with the selected channel
 dequantization multipliers. Generated explicit-metadata streams are parsed back by the stock
 frontend and agree across Rust `jxl`, the stock GPU decoder, and optional `djxl` within one RGB8
 code; blocking and runtime-neutral Future assembly are identical.
 
-The GPU executes sRGB linearization, XYB conversion, LF quantization, the per-8×8
+The GPU executes sRGB linearization, XYB conversion, forward transforms, LF/AC quantization, the per-8×8
 clamped-Gradient DC predictor, signed tokenization, prefix packing, histogramming, and the
-standard strategy map. Bounded DCT8 and `TiledVarDctEncoder` also retain real AC coefficients:
-they share the default-matrix quantizer and natural coefficient order, with one prefix distribution
+standard strategy map. All 27 strategies and `TiledVarDctEncoder` use default dequantization
+matrices and natural coefficient orders, with one prefix distribution
 for all 495 coefficient contexts and no LZ77. Quantization is fixed at the distance-25 profile's
-parameters; general distance/quality guarantees and rate control remain unimplemented. The other
-26 single-transform strategies still have zero AC.
+parameters; general distance/quality guarantees and rate control remain unimplemented.
+
+Single transforms use the shared `ForwardVarDctPipeline`: regular DCTs run separable horizontal
+and vertical passes, while special 8×8 transforms evaluate a constant basis on GPU. A final pass
+extracts LF from the transform's lowest-frequency rectangle using the normative resampling
+factors and inverse small DCT. This replaces the old large-transform approximation by independent
+8×8 means. Raw coefficients, LF and quantized coefficients remain GPU-resident. The host expands
+only bounded strategy constants, dequantization matrices and coefficient orders, shared with the
+decoder; it never evaluates image samples.
+The decoder's direct dependencies on `jxl-vardct`, `jxl-threadpool` and `jxl-oxide-common` now
+serve development oracles. Production defaults no longer instantiate a CPU decoder's matrix
+parser; common metadata dependencies may still use the latter two transitively.
 
 `TiledVarDctEncoder` accepts nonzero RGB8 dimensions through the checked 16,384-pixel per-axis
 bound. Partial edge blocks replicate the final source row/column on GPU. A single AC group uses
@@ -150,21 +161,30 @@ There is no host transform, quantization, source padding, coefficient re-encodin
 fallback. The independently concatenable block format relies on the single-distribution prefix
 policy; future contextual or ANS encoders must maintain their state on GPU.
 
-`VarDctMemoryPlan::kernel_layout` distinguishes fixed, scalable single-transform, and tiled-DCT8
-artifacts. Fixed submissions reserve exactly 54,272 encoder-owned bytes: a 512-byte parameter,
-26,880-byte artifact, and equal-size readback. That artifact retains the bounded diagnostic
-forward transform. Scalable parameters are also 512 bytes; their LF artifact ranges from 2,816
-bytes for 64×32/32×64 to 51,200 bytes for 256×256. Tiled artifacts add one length word and a
+`VarDctMemoryPlan::kernel_layout` distinguishes `SingleTransform` and `TiledDct8`. Both use
+512-byte parameters and a runtime-sized artifact with a 256-byte header and independently
+256-byte-aligned sections. Single-transform plans additionally report exact XYB, raw coefficient,
+LF, quantized coefficient, matrix/order, and forward scratch allocations in `transform`.
+An 8×8 DCT submission owns 10,340 bytes: 512 parameters, 2,560 artifact, 2,560 readback and
+4,708 resident transform bytes. It no longer allocates a fixed diagnostic coefficient readback.
+Single transforms reserve one AC slot for three counts and at most `area - area / 64` coefficients
+per channel; the largest 256×256 slot has 127,010 words. Tiled artifacts add one length word and a
 125-word AC slot per block, with each section aligned to 256 bytes. The slot bound comes from
 the actual prefix lengths for three counts and at most 63 signed coefficients per channel.
-The complete parameter + artifact + readback reservation remains live through validation or
+The complete parameter + artifact + readback + resident transform reservation remains live through validation or
 abandoned-job cleanup; caller-owned source bytes are reported separately. Source binding,
-artifact binding, buffer size, workgroup storage, invocation count, and per-axis dispatch limits
+artifact and transform bindings, buffer size, workgroup storage, invocation count, and per-axis dispatch limits
 are checked before submission. A full 16K square therefore also depends on adapter and budget
 capacity.
 
 Actual-GPU tests compare emitted streams with Rust `jxl`, installed `djxl`, and the stock GPU
-decoder. Procedural checkerboards, stripes, impulses, gradients, and colour patterns exercise
+decoder. All 27 strategies run textured RGB8 inputs with default and custom correlation: each AC
+coefficient is checked against independent f64 transforms and pinned native basis/matrix/order
+data, and all 54 streams agree across the three decoders within one RGB8 code. The shared
+forward primitive separately checks 667 native coefficient/LF cases, including complete impulse
+bases for all ten strategies with an 8×8 footprint. See the
+[native fixture generator](../jxl_wgpu/test-data/forward_vardct_generator/README.md).
+Procedural checkerboards, stripes, impulses, gradients, and colour patterns also exercise
 single-packet images, AC/LF boundaries, custom correlation, and a 2057×2057 four-LF-group image.
 An independent f64 cosine-sum reference checks AC values within one integer quantizer step;
 this is a numerical regression bound, not ISO precision or perceptual-quality certification.
@@ -173,7 +193,7 @@ The suite also rejects malformed or missing GPU AC output, checks an insufficien
 and tests exact budgets, one-byte backpressure, abandoned completion, and successful reuse.
 
 Contexts created with `WgpuContext::from_backend` inherit that backend's adapter-validated
-`KernelPolicy`. Autotune keys `vardct_encode_bounded` and `vardct_encode_quantize` accept
+`KernelPolicy`. Autotune keys `vardct_encode_forward` and `vardct_encode_quantize` accept
 `Scalar`, `Lanes32`, `Lanes64`, `Lanes128`, and `Lanes256`; actual-GPU tests require every choice to
 emit the same codestream as the built-in variant. The fixed `serialize_control` pass is deliberately
 not tunable because its DC predictor and bit offset are sequential. The lossless Modular token
@@ -187,7 +207,8 @@ compaction algorithm.
 #     source_16_by_8: BufferImageSource,
 # ) -> Result<Vec<u8>, jxl_wgpu_encode::EncodeError> {
 let encoder = VarDctEncoder::new(context, VarDctStrategy::Dct8x16)?;
-assert_eq!(encoder.strategy().block_extent(), (16, 8));
+assert_eq!(encoder.strategy().pixel_extent().width, 16);
+assert_eq!(encoder.strategy().pixel_extent().height, 8);
 encoder.encode(source_16_by_8)
 # }
 ```

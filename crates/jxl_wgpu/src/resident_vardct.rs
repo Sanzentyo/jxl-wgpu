@@ -467,15 +467,15 @@ fn validate_inputs(
     if inputs.config.task_capacity == 0 {
         return Err(ResidentVarDctError::ZeroTaskCapacity);
     }
-    for (role, binding, writable) in [
-        ("coefficient", inputs.coefficients, false),
-        ("artifact", inputs.artifact, false),
-        ("resource", inputs.resources, false),
-        ("X output", inputs.outputs[0].storage, true),
-        ("Y output", inputs.outputs[1].storage, true),
-        ("B output", inputs.outputs[2].storage, true),
+    for (role, binding) in [
+        ("coefficient", inputs.coefficients),
+        ("artifact", inputs.artifact),
+        ("resource", inputs.resources),
+        ("X output", inputs.outputs[0].storage),
+        ("Y output", inputs.outputs[1].storage),
+        ("B output", inputs.outputs[2].storage),
     ] {
-        validate_storage_binding(device, role, binding, writable)?;
+        validate_storage_binding(device, role, binding)?;
     }
     let available_words = inputs.artifact.size.get() / 4;
     let task_end = u64::from(inputs.config.task_word_offset)
@@ -619,11 +619,10 @@ fn resident_params(
     })
 }
 
-fn validate_storage_binding(
+pub(crate) fn validate_storage_binding(
     device: &wgpu::Device,
     role: &'static str,
     binding: ResidentStorageBinding<'_>,
-    _writable: bool,
 ) -> Result<(), ResidentVarDctError> {
     if !binding.buffer.usage().contains(wgpu::BufferUsages::STORAGE) {
         return Err(ResidentVarDctError::MissingUsage {

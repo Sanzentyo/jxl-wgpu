@@ -90,8 +90,7 @@ fn solid_source(
     strategy: VarDctStrategy,
     rgb: [u8; 3],
 ) -> BufferImageSource {
-    let (width, height) = strategy.block_extent();
-    let extent = Extent2d::new(u32::from(width), u32::from(height));
+    let extent = strategy.pixel_extent();
     let pixels = extent.area().unwrap();
     let bytes = rgb.repeat(pixels);
     let layout = ImageLayout::from_planes(
@@ -1363,8 +1362,7 @@ fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
     let mut dct8_packet = None;
 
     for (index, strategy) in SUPPORTED_STRATEGIES.into_iter().enumerate() {
-        let (width, height) = strategy.block_extent();
-        let extent = Extent2d::new(u32::from(width), u32::from(height));
+        let extent = strategy.pixel_extent();
         let encoded = VarDctEncoder::new(context.clone(), strategy)
             .unwrap()
             .encode(solid_source(&context, strategy, rgb))

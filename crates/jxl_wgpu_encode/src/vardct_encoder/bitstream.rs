@@ -4,8 +4,8 @@ use jxl_gpu_bitstream::BitWriter;
 
 use super::entropy::HfEntropyPlan;
 use super::types::{
-    GLOBAL_SCALE, HF_MUL, QUANT_LF, ScalableDcFragmentDescriptor, VarDctArtifactData,
-    VarDctFrameLayout, VarDctLfMetadata,
+    DcFragmentDescriptor, GLOBAL_SCALE, HF_MUL, QUANT_LF, VarDctArtifactData, VarDctFrameLayout,
+    VarDctLfMetadata,
 };
 use crate::prefix::PrefixCode;
 use crate::{
@@ -226,7 +226,7 @@ pub(super) fn pack_signed_control(value: i32) -> u32 {
 fn append_gpu_dc_fragment(
     output: &mut BitWriter,
     fragment_words: &[u32],
-    descriptor: ScalableDcFragmentDescriptor,
+    descriptor: DcFragmentDescriptor,
 ) -> Result<(), EncodeError> {
     let bit_offset = usize::try_from(descriptor.bit_offset)
         .map_err(|_| EncodeError::Backend("GPU DC fragment offset overflow".into()))?;

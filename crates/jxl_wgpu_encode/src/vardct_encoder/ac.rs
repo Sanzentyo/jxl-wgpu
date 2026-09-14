@@ -85,6 +85,16 @@ pub(super) fn validate_blocks(
     words_per_block: u32,
     entropy: &HfEntropyPlan,
 ) -> Result<(), BackendError> {
+    validate_transform_fragments(words, bit_lengths, words_per_block, 63, entropy)
+}
+
+pub(super) fn validate_transform_fragments(
+    words: &[u32],
+    bit_lengths: &[u32],
+    words_per_block: u32,
+    maximum_nonzero: u32,
+    entropy: &HfEntropyPlan,
+) -> Result<(), BackendError> {
     let stride = words_per_block as usize;
     if stride == 0 || bit_lengths.len().checked_mul(stride) != Some(words.len()) {
         return Err(BackendError::InvalidArtifact(
@@ -120,12 +130,12 @@ pub(super) fn validate_blocks(
         };
         for _ in 0..3 {
             let mut remaining = unsigned()?;
-            if remaining > 63 {
+            if remaining > maximum_nonzero {
                 return Err(BackendError::InvalidArtifact(
-                    "VarDCT DCT8 nonzero count exceeds 63",
+                    "VarDCT nonzero count exceeds the transform AC area",
                 ));
             }
-            for _ in 1..64 {
+            for _ in 0..maximum_nonzero {
                 if remaining == 0 {
                     break;
                 }
@@ -139,7 +149,7 @@ pub(super) fn validate_blocks(
             }
             if remaining != 0 {
                 return Err(BackendError::InvalidArtifact(
-                    "VarDCT DCT8 nonzero count is inconsistent",
+                    "VarDCT nonzero count is inconsistent",
                 ));
             }
         }

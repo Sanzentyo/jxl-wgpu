@@ -19,7 +19,9 @@ use crate::color_output::{ColorOutputInputs, ColorOutputPlane, ColorOutputScratc
 use crate::progressive_dc::{
     ProgressiveDcGpuError, ProgressiveDcPackInputs, ProgressiveDcXybPlanes,
 };
-use crate::vardct_artifact::{GpuVarDctArtifactStatus, HfMetadataLoweringBuffers};
+use crate::vardct_artifact::{
+    BACKEND_REQUIREMENT_FREQUENCY_CFL_GRID, GpuVarDctArtifactStatus, HfMetadataLoweringBuffers,
+};
 use crate::vardct_lf::{AdaptiveLfBuffers, AdaptiveLfParams};
 use crate::vardct_packet::{
     GpuVarDctPacketStatus, VarDctModularParams, VarDctPacketBuffers, VarDctPacketValidation,
@@ -1691,7 +1693,13 @@ impl FramePendingFrame {
                     first_blocks,
                     artifact.consumed_block_info_entries,
                 ),
-                ("backend_requirements", 0, artifact.backend_requirements),
+                // The resident renderer indexes CfL per frequency across 64-pixel
+                // cells. Reject only capabilities it does not implement.
+                (
+                    "unknown_backend_requirements",
+                    0,
+                    artifact.backend_requirements & !BACKEND_REQUIREMENT_FREQUENCY_CFL_GRID,
+                ),
             ] {
                 if actual != expected {
                     return Err(VarDctDecodeError::ArtifactStatus {
@@ -2164,7 +2172,7 @@ fn submit_vardct(
             wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         )
     });
-    let mut resource_values = source.resource_layout.initial_values()?;
+    let mut resource_values = source.resource_layout.initial_values();
     if let Some(words) = source
         .packet
         .hf_coefficients

@@ -26,7 +26,7 @@ fn decode_matrix(
 ) -> MatrixResult {
     let device = backend.device();
     let layout = VarDctResourceLayout::new(1, 1, 1).unwrap();
-    let initial = layout.initial_values().unwrap();
+    let initial = layout.initial_values();
     let transform_index = TransformKind::ALL
         .into_iter()
         .position(|transform| hf_matrix_param_index(transform) == plan.matrix_index)

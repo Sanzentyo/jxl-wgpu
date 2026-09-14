@@ -2,8 +2,9 @@
 
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_protocol::TransformKind;
-use jxl_oxide_common::Bundle;
-use jxl_vardct::{DequantMatrixSet, DequantMatrixSetParams, TransformType};
+
+#[cfg(test)]
+use jxl_vardct::TransformType;
 use jxl_wgpu::{KernelVariant, VAR_DCT_AFV_BASIS};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
@@ -163,15 +164,19 @@ impl VarDctResourceLayout {
     /// Builds immutable correlation defaults, all normative default dequantization matrices, and
     /// the AFV basis. Per-task and per-channel quantization scales are populated by GPU artifact
     /// lowering from decoded `hf_mul` and the frame header.
-    pub fn initial_values(self) -> Result<Vec<[f32; 4]>, VarDctResourceError> {
+    pub fn initial_values(self) -> Vec<[f32; 4]> {
         let mut values = vec![[0.0; 4]; self.vector_count as usize];
         let correlation_end = self.correlation_offset + self.correlation_count;
         values[self.correlation_offset as usize..correlation_end as usize]
             .fill([0.0, 1.0, 0.0, 0.0]);
-        let matrices = default_dequant_matrices()?;
         for (strategy, transform) in TransformKind::ALL.into_iter().enumerate() {
             let matrix_offset = self.matrix_offsets[strategy] as usize;
-            let matrix = matrices.matrix(transform);
+            let matrix = transform
+                .default_dequant_matrix()
+                .scales
+                .into_iter()
+                .map(|[x, y, b]| [x, y, b, 0.0])
+                .collect::<Vec<_>>();
             values[matrix_offset..matrix_offset + matrix.len()].copy_from_slice(&matrix);
         }
         for (destination, basis) in values[self.afv_basis_offset as usize..]
@@ -180,7 +185,7 @@ impl VarDctResourceLayout {
         {
             destination.copy_from_slice(basis);
         }
-        Ok(values)
+        values
     }
 
     pub(crate) fn install_dequant_matrix_words(
@@ -271,8 +276,6 @@ pub enum VarDctResourceError {
     },
     #[error("VarDCT resource preparation requires at least one quantization entry")]
     ZeroQuantizationEntries,
-    #[error("failed to construct the normative default VarDCT dequantization matrices")]
-    DefaultDequantMatrices,
     #[error(
         "VarDCT dequantization matrix payload has {actual} vectors; expected exactly {expected}"
     )]
@@ -431,32 +434,6 @@ fn validate_channel_shifts(
     Ok(())
 }
 
-struct DefaultDequantMatrices(DequantMatrixSet);
-
-impl DefaultDequantMatrices {
-    fn matrix(&self, transform: TransformKind) -> Vec<[f32; 4]> {
-        let transform_type = vardct_transform_type(transform);
-        let channel = |index| {
-            if transform.needs_transpose() {
-                self.0.get_transposed(index, transform_type)
-            } else {
-                self.0.get(index, transform_type)
-            }
-        };
-        let [x, y, b] = [channel(0), channel(1), channel(2)];
-        let extent = transform.pixel_extent();
-        let mut packed = vec![[0.0; 4]; x.len()];
-        for frequency_y in 0..extent.height {
-            for frequency_x in 0..extent.width {
-                let raster = (frequency_y * extent.width + frequency_x) as usize;
-                let packed_index = backend_matrix_index(transform, frequency_x, frequency_y);
-                packed[packed_index] = [x[raster], y[raster], b[raster], 0.0];
-            }
-        }
-        packed
-    }
-}
-
 #[must_use]
 pub(crate) const fn hf_matrix_param_index(transform: TransformKind) -> usize {
     match transform {
@@ -480,6 +457,7 @@ pub(crate) const fn hf_matrix_param_index(transform: TransformKind) -> usize {
     }
 }
 
+#[cfg(test)]
 fn backend_matrix_index(transform: TransformKind, frequency_x: u32, frequency_y: u32) -> usize {
     let extent = transform.pixel_extent();
     let index = if transform.is_special() || extent.height < extent.width {
@@ -490,16 +468,7 @@ fn backend_matrix_index(transform: TransformKind, frequency_x: u32, frequency_y:
     index as usize
 }
 
-fn default_dequant_matrices() -> Result<DefaultDequantMatrices, VarDctResourceError> {
-    let encoded_default = [1u8];
-    let mut bitstream = jxl_bitstream::Bitstream::new(&encoded_default);
-    let pool = jxl_threadpool::JxlThreadPool::none();
-    let params = DequantMatrixSetParams::new(8, 1, None, None, &pool);
-    DequantMatrixSet::parse(&mut bitstream, params)
-        .map(DefaultDequantMatrices)
-        .map_err(|_| VarDctResourceError::DefaultDequantMatrices)
-}
-
+#[cfg(test)]
 pub(crate) const fn vardct_transform_type(transform: TransformKind) -> TransformType {
     match transform {
         TransformKind::Dct8 => TransformType::Dct8,
@@ -634,6 +603,15 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
+    fn default_matrix(transform: TransformKind) -> Vec<[f32; 4]> {
+        transform
+            .default_dequant_matrix()
+            .scales
+            .into_iter()
+            .map(|[x, y, b]| [x, y, b, 0.0])
+            .collect()
+    }
+
     use super::*;
 
     #[test]
@@ -697,10 +675,7 @@ mod tests {
                 layout.matrix_offsets[index - 1] + previous_area
             );
         }
-        assert_eq!(
-            layout.initial_values().unwrap().len(),
-            layout.vector_count as usize
-        );
+        assert_eq!(layout.initial_values().len(), layout.vector_count as usize);
         let module = naga::front::wgsl::parse_str(RESOURCE_SHADER).unwrap();
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
@@ -736,7 +711,7 @@ mod tests {
         assert_eq!(layout.correlation_count, 6);
         assert_eq!(layout.correlation_offset, 1);
         assert_eq!(layout.lf_offsets, [7; 3]);
-        let values = layout.initial_values().unwrap();
+        let values = layout.initial_values();
         assert_eq!(&values[1..7], &[[0.0, 1.0, 0.0, 0.0]; 6]);
     }
 
@@ -750,16 +725,14 @@ mod tests {
         assert_eq!(layout.lf_offsets, [11; 3]);
         assert_eq!(layout.matrix_offsets[0], 164);
 
-        let values = layout.initial_values().unwrap();
+        let values = layout.initial_values();
         assert_eq!(&values[..5], &[[0.0; 4]; 5]);
         assert_eq!(&values[5..11], &[[0.0, 1.0, 0.0, 0.0]; 6]);
     }
 
     #[test]
     fn default_dct8_matrix_matches_normative_band_interpolation_samples() {
-        let matrix = default_dequant_matrices()
-            .unwrap()
-            .matrix(TransformKind::Dct8);
+        let matrix = default_matrix(TransformKind::Dct8);
         let expected = [
             [0.000_317_460_3, 0.001_785_714_3, 0.001_953_125],
             [0.000_745_078_5, 0.003_473_115_4, 0.016_986_076],
@@ -787,9 +760,8 @@ mod tests {
 
     #[test]
     fn rectangular_default_matrices_follow_wire_transposition() {
-        let matrices = default_dequant_matrices().unwrap();
-        let tall = matrices.matrix(TransformKind::Dct16x8);
-        let wide = matrices.matrix(TransformKind::Dct8x16);
+        let tall = default_matrix(TransformKind::Dct16x8);
+        let wide = default_matrix(TransformKind::Dct8x16);
         assert_eq!(tall.len(), wide.len());
         for y in 0..16 {
             for x in 0..8 {

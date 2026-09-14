@@ -222,6 +222,23 @@ error before submission. Naga semantically validates both generated storage-text
 
 ## Procedural VarDCT encoder matrix
 
+All 27 single-transform strategies now emit real AC. The shared forward primitive has 667
+independent native coefficient/LF records, including complete impulse bases for all ten strategies
+with an 8x8 footprint. Every native order matches exactly; all consumed default-matrix entries
+match within 3e-6 relative error. The native comparison corrected the previous dependency's Y/B
+defaults for the 128x256 matrix family. See the
+[pinned generator, binary schemas and precision limits](../crates/jxl_wgpu/test-data/forward_vardct_generator/README.md).
+
+`vardct_encoder/tests/single.rs` adds textured images for all 27 strategies with default and custom
+LF/HF correlation. Each compressed AC value is checked against independent f64 color conversion,
+cosine sums or native impulse bases, and native matrices/orders within one integer quantizer step.
+All 54 streams agree across Rust `jxl`, `djxl` and the stock GPU decoder within one RGB8 code,
+and their bytes are identical under Scalar/32/64/128/256 lanes. Large-transform decoding now
+accepts the frequency-CfL requirement implemented by the resident renderer, while unknown
+capability bits remain errors. A maximum-magnitude 256x256 fragment uses 4,064,313 bits in its
+127,010-word allocation; invalid lengths/counts are rejected. A 400 KiB storage-binding limit
+independently rejects the 524,288-byte matrix/order allocation before any job reservation.
+
 The `jxl_wgpu_encode` actual-adapter suite generates its VarDCT inputs in memory rather than
 checking in large duplicate raster files. Odd 257x17, asymmetric 513x259 and 768x513, horizontal
 2056x256 and vertical 256x2056 LF-boundary images exercise padded edge blocks and row/column group
@@ -230,7 +247,7 @@ validated fragment descriptor per group and resets the clamped-Gradient predicto
 Rust `jxl` and installed `djxl` must decode each emitted codestream, while the stock GPU decoder plus
 explicit readback must differ from Rust `jxl` by at most one RGB8 code.
 
-Bounded and tiled DCT8 both encode real AC. GPU block workgroups run the shared forward
+Single-transform and tiled DCT8 both encode real AC. GPU tile workgroups run the DCT8 forward
 transform/default-matrix quantizer, then pack natural-order Y/X/B tokens through one prefix
 cluster for all 495 coefficient contexts. Tiled coefficients remain in workgroup memory; only
 complete bit fragments and their lengths are stored. The host checks those fragments and joins
@@ -249,7 +266,7 @@ gate, not ISO 18181-3 precision or distance-quality certification.
 Eleven complete-image cases compare GPU and installed libjxl `djxl` output with Rust `jxl` within
 one RGB8 code. They include 1x1, 7x5, 8x8, 17x9, 256x256, default/custom 263x265, 1x257, 257x1,
 2057x17 and 17x2057; 17x9, custom 263x265, 257x1 and 2057x17 use explicit correlation. The 8x8
-checkerboard emits exactly the same bytes as bounded DCT8 and retains visible within-block
+checkerboard emits exactly the same bytes as single-transform DCT8 and retains visible within-block
 variation. Blocking/Future outputs match in every case, and nine small/AC-boundary configurations
 match under Scalar/32/64/128/256 lanes. The actual-adapter tests require a GPU and log its identity
 and native-oracle availability; the checked run uses Apple M5/Metal and `djxl` 0.12.0.
@@ -260,14 +277,14 @@ entropy, nonzero padding, missing first/last block writes, forged ready/AC/layou
 truncation. Actual-GPU admission tests check a source that fits a 1 MiB device binding while its
 AC artifact does not, exact and one-byte-deficient in-flight budgets, and abandoned nonzero work
 followed by successful reuse. ABI tests fix the five AC parameter fields at words 107–111 and
-header fields at words 46–50. Other strategies, adaptive clustering, ANS/LZ77 and progressive
-encoding remain outside this DCT8 policy.
+header fields at words 46–50, with the single-transform linearized X dispatch at parameter word
+112. Mixed strategy maps, adaptive clustering, ANS/LZ77 and progressive encoding remain incomplete.
 
 An additional generated 8x8 patterned case serializes non-default exact-binary16 LF
 dequantization, colour factor 256, non-default X/B base correlations, and signed LF factors. The
 stock frontend must recover every field exactly. The synchronous encoder and runtime-neutral
-Future must emit identical bytes, the patterned fixed-kernel case must exceed 9 dB PSNR, and a
-257x1 solid-red scalable-kernel case must exceed 30 dB PSNR. Rust `jxl`, the stock GPU decoder plus
+Future must emit identical bytes, the patterned single-transform case must exceed 9 dB PSNR, and a
+257x1 solid-red tiled case must exceed 30 dB PSNR. Rust `jxl`, the stock GPU decoder plus
 explicit readback, and installed `djxl` must differ by at most one RGB8 code. Lower-level actual-GPU
 probes independently read back the LF dequantization/CfL result and the per-cell HF correlation
 vectors, so a parser-only round trip cannot satisfy this gate.

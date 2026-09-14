@@ -29,6 +29,7 @@ mod context;
 mod device_output;
 mod display;
 mod error;
+mod forward_vardct;
 mod image_output;
 mod memory_budget;
 mod metrics;
@@ -64,6 +65,10 @@ pub use display::{
     NumericDisplaySource, NumericDisplayTransfer, NumericNonFinitePolicy,
 };
 pub use error::{Error, Result};
+pub use forward_vardct::{
+    ForwardVarDctError, ForwardVarDctInputs, ForwardVarDctMemoryPlan, ForwardVarDctPipeline,
+    ForwardVarDctScratch,
+};
 pub use image_output::{
     ALPHA_OUTPUT_SHADER, AlphaConversion, IMAGE_ORIENTATION_SHADER, IMAGE_OUTPUT_SHADER,
     IMAGE_TRANSFER_SHADER, ImageOutputGeometry, ImageOutputParams, ImageOutputSource,

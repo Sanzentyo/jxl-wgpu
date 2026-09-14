@@ -1,14 +1,14 @@
 //! Standard VarDCT still-image encoder frontend.
 //!
-//! The bounded frontend encodes one strategy over a small image extent, while
+//! [`VarDctEncoder`] encodes one complete transform with GPU-resident coefficients, while
 //! [`TiledVarDctEncoder`] uses regular DCT8 blocks across checked AC- and LF-group grids. Their
-//! control-plane syntax is kept separate from the lossless Modular encoder so neither coding mode
-//! becomes a compatibility layer for the other.
+//! control syntax shares the deterministic frame assembler with the lossless Modular encoder.
 
 mod ac;
 mod bitstream;
 mod dispatch;
 mod entropy;
+mod single;
 mod types;
 
 #[cfg(test)]
@@ -17,5 +17,5 @@ mod tests;
 pub use dispatch::{TiledVarDctEncoder, VarDctBackend, VarDctEncoder, VarDctJob, VarDctSubmission};
 pub use types::{
     TiledVarDctGrid, VarDctColorEncoding, VarDctKernelLayout, VarDctLfMetadata, VarDctMemoryPlan,
-    VarDctStrategy,
+    VarDctStrategy, VarDctTransformMemoryPlan,
 };

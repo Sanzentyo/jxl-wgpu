@@ -5,6 +5,10 @@ use jxl_gpu_formats::{
     ByteOrder, Channel, ChromaSubsampling, ColorModel, ColorSpecification, PixelFormat,
     PlaneFormat, PlaneSampling, SampleKind, Swizzle,
 };
+use jxl_gpu_protocol::Extent2d;
+
+pub use jxl_gpu_protocol::TransformKind as VarDctStrategy;
+use jxl_wgpu::ForwardVarDctMemoryPlan;
 
 use crate::prefix::{PrefixCode, RAW_SYMBOLS};
 use crate::{EncodeError, UnsupportedFeature};
@@ -12,25 +16,14 @@ use crate::{EncodeError, UnsupportedFeature};
 pub(super) const GLOBAL_SCALE: u32 = 8_813;
 pub(super) const QUANT_LF: u32 = 10;
 pub(super) const HF_MUL: i32 = 6;
-pub(super) const MAX_BLOCKS: usize = 16;
-pub(super) const MAX_COEFFICIENTS: usize = 32 * 32;
-pub(super) const MAX_DC_SAMPLES: usize = 3 * MAX_BLOCKS;
-pub(super) const MAX_DC_FRAGMENT_WORDS: usize = 64;
-pub(super) const MAX_AC_FRAGMENT_WORDS: usize = 256;
-pub(super) const DCT8_COEFFICIENTS: usize = 8 * 8;
 pub(super) const MAX_HF_QUANTIZED_MAGNITUDE: i32 = 131_071;
 pub(super) const HF_QUANTIZATION: [f32; 3] = [1.25, 1.0, 1.0];
-pub(super) const DCT8_NATURAL_ORDER: [usize; DCT8_COEFFICIENTS] = [
-    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
-    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
-    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
-];
 
 pub(super) const AC_GROUP_DIM_PIXELS: u32 = 256;
 pub(super) const LF_GROUP_DIM_PIXELS: u32 = 2_048;
-pub(super) const SCALABLE_HEADER_WORDS: u32 = 64;
-pub(super) const SCALABLE_SECTION_ALIGNMENT_WORDS: u32 = 64;
-pub(super) const SCALABLE_ARTIFACT_READY: u32 = 0x5644_4354;
+pub(super) const HEADER_WORDS: u32 = 64;
+pub(super) const SECTION_ALIGNMENT_WORDS: u32 = 64;
+pub(super) const ARTIFACT_READY: u32 = 0x5644_4354;
 pub(super) const SINGLE_TRANSFORM_TOPOLOGY: u32 = 0;
 pub(super) const TILED_DCT8_TOPOLOGY: u32 = 1;
 
@@ -261,155 +254,11 @@ impl TiledVarDctGrid {
     }
 }
 
-/// Typed JPEG XL VarDCT strategy identifier.
-///
-/// The enum covers the complete standard strategy alphabet. Use
-/// [`Self::EXECUTABLE`] to enumerate the strategies implemented by the
-/// current GPU kernel.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum VarDctStrategy {
-    #[default]
-    Dct8 = 0,
-    Hornuss,
-    Dct2x2,
-    Dct4x4,
-    Dct16x16,
-    Dct32x32,
-    Dct16x8,
-    Dct8x16,
-    Dct32x8,
-    Dct8x32,
-    Dct32x16,
-    Dct16x32,
-    Dct4x8,
-    Dct8x4,
-    Afv0,
-    Afv1,
-    Afv2,
-    Afv3,
-    Dct64x64,
-    Dct64x32,
-    Dct32x64,
-    Dct128x128,
-    Dct128x64,
-    Dct64x128,
-    Dct256x256,
-    Dct256x128,
-    Dct128x256,
-}
-
-impl VarDctStrategy {
-    /// Every JPEG XL VarDCT strategy in its standard codestream order.
-    pub const ALL: [Self; 27] = [
-        Self::Dct8,
-        Self::Hornuss,
-        Self::Dct2x2,
-        Self::Dct4x4,
-        Self::Dct16x16,
-        Self::Dct32x32,
-        Self::Dct16x8,
-        Self::Dct8x16,
-        Self::Dct32x8,
-        Self::Dct8x32,
-        Self::Dct32x16,
-        Self::Dct16x32,
-        Self::Dct4x8,
-        Self::Dct8x4,
-        Self::Afv0,
-        Self::Afv1,
-        Self::Afv2,
-        Self::Afv3,
-        Self::Dct64x64,
-        Self::Dct64x32,
-        Self::Dct32x64,
-        Self::Dct128x128,
-        Self::Dct128x64,
-        Self::Dct64x128,
-        Self::Dct256x256,
-        Self::Dct256x128,
-        Self::Dct128x256,
-    ];
-
-    /// Strategies implemented end-to-end by this encoder.
-    pub const EXECUTABLE: [Self; 27] = Self::ALL;
-
-    #[must_use]
-    pub const fn codestream_id(self) -> u8 {
-        self as u8
-    }
-
-    #[must_use]
-    pub const fn block_extent(self) -> (u16, u16) {
-        use VarDctStrategy::*;
-        match self {
-            Dct8 | Hornuss | Dct2x2 | Dct4x4 | Dct4x8 | Dct8x4 | Afv0 | Afv1 | Afv2 | Afv3 => {
-                (8, 8)
-            }
-            Dct16x16 => (16, 16),
-            Dct32x32 => (32, 32),
-            Dct16x8 => (8, 16),
-            Dct8x16 => (16, 8),
-            Dct32x8 => (8, 32),
-            Dct8x32 => (32, 8),
-            Dct32x16 => (16, 32),
-            Dct16x32 => (32, 16),
-            Dct64x64 => (64, 64),
-            Dct64x32 => (32, 64),
-            Dct32x64 => (64, 32),
-            Dct128x128 => (128, 128),
-            Dct128x64 => (64, 128),
-            Dct64x128 => (128, 64),
-            Dct256x256 => (256, 256),
-            Dct256x128 => (128, 256),
-            Dct128x256 => (256, 128),
-        }
-    }
-
-    /// Whether this strategy has a GPU transform and standard emitter in this
-    /// frontend.
-    #[must_use]
-    pub const fn is_executable(self) -> bool {
-        true
-    }
-
-    pub(super) const fn uses_scalable_kernel(self) -> bool {
-        !matches!(
-            self,
-            Self::Dct8
-                | Self::Hornuss
-                | Self::Dct2x2
-                | Self::Dct4x4
-                | Self::Dct16x8
-                | Self::Dct8x16
-                | Self::Dct16x16
-                | Self::Dct32x8
-                | Self::Dct8x32
-                | Self::Dct32x32
-                | Self::Dct32x16
-                | Self::Dct16x32
-                | Self::Dct4x8
-                | Self::Dct8x4
-                | Self::Afv0
-                | Self::Afv1
-                | Self::Afv2
-                | Self::Afv3
-        )
-    }
-
-    pub(super) const fn block_grid(self) -> (u32, u32) {
-        let (width, height) = self.block_extent();
-        (width as u32 / 8, height as u32 / 8)
-    }
-}
-
 /// GPU artifact implementation selected for a VarDCT memory plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VarDctKernelLayout {
-    /// Fixed 26.25 KiB coefficient and entropy artifact used through 32x32.
-    Bounded,
-    /// Runtime-sized artifact and 8x8-block reduction used above 32x32.
-    Scalable,
+    /// One complete transform with GPU-resident coefficients and LF.
+    SingleTransform,
     /// Runtime-sized artifact where every 8x8 block is an independent DCT8
     /// transform and the frame may contain multiple 2,048-pixel LF groups and
     /// 256-pixel AC groups.
@@ -426,33 +275,69 @@ pub struct VarDctMemoryPlan {
     pub parameter_storage_bytes: u64,
     pub artifact_storage_bytes: u64,
     pub readback_bytes: u64,
+    /// Resident forward-transform allocations, retained until submission completion.
+    pub transform: Option<VarDctTransformMemoryPlan>,
     pub owned_bytes_per_job: u64,
     pub addressed_bytes_per_job: u64,
 }
 
-impl VarDctMemoryPlan {
-    pub(super) const fn fixed(source_binding_bytes: u64) -> Self {
-        let parameter_storage_bytes = std::mem::size_of::<VarDctKernelParams>() as u64;
-        let artifact_storage_bytes = std::mem::size_of::<VarDctKernelArtifact>() as u64;
-        let readback_bytes = artifact_storage_bytes;
-        let owned_bytes_per_job = parameter_storage_bytes + artifact_storage_bytes + readback_bytes;
+/// Exact resident storage for one general forward transform and its quantizer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VarDctTransformMemoryPlan {
+    pub forward: ForwardVarDctMemoryPlan,
+    pub xyb_bytes: u64,
+    pub coefficient_bytes: u64,
+    pub lf_bytes: u64,
+    pub quantized_bytes: u64,
+    pub quantization_metadata_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl VarDctTransformMemoryPlan {
+    #[must_use]
+    pub const fn new(strategy: VarDctStrategy) -> Self {
+        let forward = ForwardVarDctMemoryPlan::new(strategy);
+        let xyb_bytes = forward.coefficient_bytes;
+        let coefficient_bytes = forward.coefficient_bytes;
+        let lf_bytes = forward.lf_bytes;
+        let quantized_bytes = forward.coefficient_bytes;
+        let quantization_metadata_bytes = coefficient_bytes / 3 * 4;
         Self {
-            kernel_layout: VarDctKernelLayout::Bounded,
-            source_binding_bytes,
-            parameter_storage_bytes,
-            artifact_storage_bytes,
-            readback_bytes,
-            owned_bytes_per_job,
-            addressed_bytes_per_job: source_binding_bytes + owned_bytes_per_job,
+            forward,
+            xyb_bytes,
+            coefficient_bytes,
+            lf_bytes,
+            quantized_bytes,
+            quantization_metadata_bytes,
+            total_bytes: forward.transient_bytes
+                + xyb_bytes
+                + coefficient_bytes
+                + lf_bytes
+                + quantized_bytes
+                + quantization_metadata_bytes,
         }
     }
 
-    pub(super) const fn scalable(
+    pub(super) const fn storage_sizes(self) -> [u64; 7] {
+        [
+            self.forward.basis_bytes,
+            self.forward.horizontal_bytes,
+            self.xyb_bytes,
+            self.coefficient_bytes,
+            self.lf_bytes,
+            self.quantized_bytes,
+            self.quantization_metadata_bytes,
+        ]
+    }
+}
+
+impl VarDctMemoryPlan {
+    pub(super) const fn new(
         source_binding_bytes: u64,
         artifact_storage_bytes: u64,
         kernel_layout: VarDctKernelLayout,
     ) -> Self {
-        let parameter_storage_bytes = std::mem::size_of::<ScalableVarDctKernelParams>() as u64;
+        let parameter_storage_bytes = std::mem::size_of::<VarDctKernelParams>() as u64;
         let readback_bytes = artifact_storage_bytes;
         let owned_bytes_per_job = parameter_storage_bytes + artifact_storage_bytes + readback_bytes;
         Self {
@@ -461,31 +346,19 @@ impl VarDctMemoryPlan {
             parameter_storage_bytes,
             artifact_storage_bytes,
             readback_bytes,
+            transform: None,
             owned_bytes_per_job,
             addressed_bytes_per_job: source_binding_bytes + owned_bytes_per_job,
         }
     }
-}
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub(super) struct VarDctKernelParams {
-    pub(super) row_stride: u32,
-    pub(super) byte_offset: u32,
-    pub(super) width: u32,
-    pub(super) height: u32,
-    pub(super) blocks_x: u32,
-    pub(super) blocks_y: u32,
-    pub(super) strategy: u32,
-    pub(super) global_scale: u32,
-    pub(super) quant_lf: u32,
-    pub(super) dc_prefix: [GpuPrefixEntry; RAW_SYMBOLS],
-    pub(super) hf_prefix: [GpuPrefixEntry; RAW_SYMBOLS],
-    pub(super) lf_quantization: [f32; 3],
-    pub(super) lf_correlation: [f32; 2],
-    pub(super) hf_correlation: [f32; 2],
-    pub(super) hf_quantization: [f32; 3],
-    pub(super) padding: [u32; 33],
+    pub(super) const fn with_transform(mut self, strategy: VarDctStrategy) -> Self {
+        let transform = VarDctTransformMemoryPlan::new(strategy);
+        self.owned_bytes_per_job += transform.total_bytes;
+        self.addressed_bytes_per_job += transform.total_bytes;
+        self.transform = Some(transform);
+        self
+    }
 }
 
 #[repr(C)]
@@ -497,30 +370,7 @@ pub(super) struct GpuPrefixEntry {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub(super) struct VarDctKernelArtifact {
-    pub(super) strategy_map: [u32; MAX_BLOCKS],
-    pub(super) quantized_dc_yxb: [i32; MAX_DC_SAMPLES],
-    pub(super) dc_raw_tokens: [u32; MAX_DC_SAMPLES],
-    pub(super) dc_extra_bits: [u32; MAX_DC_SAMPLES],
-    pub(super) dc_fragment_words: [u32; MAX_DC_FRAGMENT_WORDS],
-    pub(super) dc_fragment_bit_len: u32,
-    pub(super) dc_sample_count: u32,
-    pub(super) block_count: u32,
-    pub(super) strategy: u32,
-    pub(super) raw_histogram: [u32; RAW_SYMBOLS],
-    pub(super) dc_padding: [u32; 9],
-    pub(super) ac_fragment_words: [u32; MAX_AC_FRAGMENT_WORDS],
-    pub(super) ac_fragment_bit_len: u32,
-    pub(super) ac_token_count: u32,
-    pub(super) ac_histogram: [u32; RAW_SYMBOLS],
-    pub(super) ac_padding: [u32; 43],
-    pub(super) forward_xyb_bits: [u32; 3 * MAX_COEFFICIENTS],
-    pub(super) quantized_xyb: [i32; 3 * MAX_COEFFICIENTS],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub(super) struct ScalableVarDctKernelParams {
+pub(super) struct VarDctKernelParams {
     pub(super) row_stride: u32,
     pub(super) byte_offset: u32,
     pub(super) width: u32,
@@ -553,12 +403,13 @@ pub(super) struct ScalableVarDctKernelParams {
     pub(super) ac_fragment_offset: u32,
     pub(super) ac_words_per_block: u32,
     pub(super) ac_fragment_words: u32,
-    pub(super) padding: [u32; 16],
+    pub(super) workgroups_x: u32,
+    pub(super) padding: [u32; 15],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub(super) struct ScalableVarDctArtifactHeader {
+pub(super) struct VarDctArtifactHeader {
     pub(super) status: u32,
     pub(super) block_count: u32,
     pub(super) dc_sample_count: u32,
@@ -597,7 +448,7 @@ pub(super) struct ScalableVarDctArtifactHeader {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub(super) struct ScalableDcFragmentDescriptor {
+pub(super) struct DcFragmentDescriptor {
     pub(super) bit_offset: u32,
     pub(super) bit_len: u32,
 }
@@ -607,18 +458,14 @@ const _: () = {
     assert!(std::mem::align_of::<GpuPrefixEntry>() == 4);
     assert!(std::mem::size_of::<VarDctKernelParams>() == 512);
     assert!(std::mem::align_of::<VarDctKernelParams>() == 4);
-    assert!(std::mem::size_of::<VarDctKernelArtifact>() == 26_880);
-    assert!(std::mem::align_of::<VarDctKernelArtifact>() == 4);
-    assert!(std::mem::size_of::<ScalableVarDctKernelParams>() == 512);
-    assert!(std::mem::align_of::<ScalableVarDctKernelParams>() == 4);
-    assert!(std::mem::size_of::<ScalableVarDctArtifactHeader>() == 256);
-    assert!(std::mem::align_of::<ScalableVarDctArtifactHeader>() == 4);
-    assert!(std::mem::size_of::<ScalableDcFragmentDescriptor>() == 8);
-    assert!(std::mem::align_of::<ScalableDcFragmentDescriptor>() == 4);
+    assert!(std::mem::size_of::<VarDctArtifactHeader>() == 256);
+    assert!(std::mem::align_of::<VarDctArtifactHeader>() == 4);
+    assert!(std::mem::size_of::<DcFragmentDescriptor>() == 8);
+    assert!(std::mem::align_of::<DcFragmentDescriptor>() == 4);
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct ScalableArtifactLayout {
+pub(super) struct ArtifactLayout {
     pub(super) fragment_descriptor_offset: u32,
     pub(super) fragment_descriptor_len: u32,
     pub(super) strategy_offset: u32,
@@ -640,10 +487,19 @@ pub(super) struct ScalableArtifactLayout {
     pub(super) artifact_words: u32,
 }
 
-impl ScalableArtifactLayout {
+impl ArtifactLayout {
     pub(super) fn new(strategy: VarDctStrategy, code: &PrefixCode) -> Result<Self, EncodeError> {
-        let (blocks_x, blocks_y) = strategy.block_grid();
-        Self::for_block_grid(blocks_x, blocks_y, 1, code)
+        let Extent2d {
+            width: blocks_x,
+            height: blocks_y,
+        } = strategy.lf_extent();
+        let layout = Self::for_block_grid(blocks_x, blocks_y, 1, code)?;
+        let nonzero_count = blocks_x * blocks_y * 63;
+        layout.with_ac(
+            nonzero_count,
+            1,
+            &super::entropy::HfEntropyPlan::single_cluster_prefix()?,
+        )
     }
 
     fn for_block_grid(
@@ -690,7 +546,7 @@ impl ScalableArtifactLayout {
                 ))?
                 / 32;
 
-        let fragment_descriptor_offset = SCALABLE_HEADER_WORDS;
+        let fragment_descriptor_offset = HEADER_WORDS;
         let fragment_descriptor_len =
             lf_group_count
                 .checked_mul(2)
@@ -748,19 +604,29 @@ impl ScalableArtifactLayout {
         code: &PrefixCode,
         hf_entropy: &super::entropy::HfEntropyPlan,
     ) -> Result<Self, EncodeError> {
-        let mut layout = Self::for_block_grid(
+        let layout = Self::for_block_grid(
             frame.blocks_x,
             frame.blocks_y,
             frame.lf_group_count()?,
             code,
         )?;
-        // Each GPU workgroup owns a word-aligned block fragment. The entropy
+        layout.with_ac(63, frame.blocks_x * frame.blocks_y, hf_entropy)
+    }
+
+    fn with_ac(
+        mut self,
+        maximum_nonzero: u32,
+        transforms: u32,
+        hf_entropy: &super::entropy::HfEntropyPlan,
+    ) -> Result<Self, EncodeError> {
+        // Each GPU transform owns a word-aligned fragment. The entropy
         // model maps all contexts to one distribution, so these independently
         // packed Y/X/B fragments can be concatenated in AC-group raster order.
         let entries = hf_entropy.gpu_entries();
         let token_bits: [u32; RAW_SYMBOLS] =
             std::array::from_fn(|token| entries[token].bit_len + token.saturating_sub(1) as u32);
-        let max_count_bits = token_bits[..7]
+        let max_count_token = 32 - maximum_nonzero.leading_zeros();
+        let max_count_bits = token_bits[..=max_count_token as usize]
             .iter()
             .copied()
             .max()
@@ -774,38 +640,33 @@ impl ScalableArtifactLayout {
                     "empty HF coefficient alphabet",
                 ))?;
         let block_bits = max_coefficient_bits
-            .checked_mul((DCT8_COEFFICIENTS - 1) as u32)
+            .checked_mul(maximum_nonzero)
             .and_then(|bits| bits.checked_add(max_count_bits))
             .and_then(|bits| bits.checked_mul(3))
             .ok_or(EncodeError::InvalidConfiguration(
                 "VarDCT AC block capacity overflow",
             ))?;
-        layout.ac_words_per_block = block_bits.div_ceil(32);
-        layout.ac_descriptor_offset = layout.artifact_words;
-        layout.ac_descriptor_len = layout.strategy_len;
-        layout.ac_fragment_offset = align_words(
-            layout
-                .ac_descriptor_offset
-                .checked_add(layout.ac_descriptor_len)
+        self.ac_words_per_block = block_bits.div_ceil(32);
+        self.ac_descriptor_offset = self.artifact_words;
+        self.ac_descriptor_len = transforms;
+        self.ac_fragment_offset = align_words(
+            self.ac_descriptor_offset
+                .checked_add(self.ac_descriptor_len)
                 .ok_or(EncodeError::InvalidConfiguration(
                     "VarDCT AC descriptor overflow",
                 ))?,
         )?;
-        layout.ac_fragment_words = layout
-            .ac_words_per_block
-            .checked_mul(layout.strategy_len)
-            .ok_or(EncodeError::InvalidConfiguration(
-                "VarDCT AC fragment capacity overflow",
-            ))?;
-        layout.artifact_words = align_words(
-            layout
-                .ac_fragment_offset
-                .checked_add(layout.ac_fragment_words)
+        self.ac_fragment_words = self.ac_words_per_block.checked_mul(transforms).ok_or(
+            EncodeError::InvalidConfiguration("VarDCT AC fragment capacity overflow"),
+        )?;
+        self.artifact_words = align_words(
+            self.ac_fragment_offset
+                .checked_add(self.ac_fragment_words)
                 .ok_or(EncodeError::InvalidConfiguration(
                     "VarDCT AC artifact overflow",
                 ))?,
         )?;
-        Ok(layout)
+        Ok(self)
     }
 
     pub(super) const fn artifact_bytes(self) -> u64 {
@@ -834,16 +695,9 @@ impl VarDctTopology {
         }
     }
 
-    pub(super) const fn uses_scalable_kernel(self) -> bool {
-        match self {
-            Self::SingleTransform(strategy) => strategy.uses_scalable_kernel(),
-            Self::TiledDct8 => true,
-        }
-    }
-
     pub(super) const fn kernel_layout(self) -> VarDctKernelLayout {
         match self {
-            Self::SingleTransform(_) => VarDctKernelLayout::Scalable,
+            Self::SingleTransform(_) => VarDctKernelLayout::SingleTransform,
             Self::TiledDct8 => VarDctKernelLayout::TiledDct8,
         }
     }
@@ -864,11 +718,14 @@ pub(super) struct VarDctFrameLayout {
 
 impl VarDctFrameLayout {
     pub(super) fn single(strategy: VarDctStrategy) -> Self {
-        let (width, height) = strategy.block_extent();
-        let (blocks_x, blocks_y) = strategy.block_grid();
+        let Extent2d { width, height } = strategy.pixel_extent();
+        let Extent2d {
+            width: blocks_x,
+            height: blocks_y,
+        } = strategy.lf_extent();
         Self {
-            width: u32::from(width),
-            height: u32::from(height),
+            width,
+            height,
             blocks_x,
             blocks_y,
             ac_groups_x: 1,
@@ -962,10 +819,10 @@ impl LfGroupBlocks {
 }
 
 pub(super) fn align_words(words: u32) -> Result<u32, EncodeError> {
-    let adjustment = SCALABLE_SECTION_ALIGNMENT_WORDS - 1;
+    let adjustment = SECTION_ALIGNMENT_WORDS - 1;
     words
         .checked_add(adjustment)
-        .map(|value| value / SCALABLE_SECTION_ALIGNMENT_WORDS * SCALABLE_SECTION_ALIGNMENT_WORDS)
+        .map(|value| value / SECTION_ALIGNMENT_WORDS * SECTION_ALIGNMENT_WORDS)
         .ok_or(EncodeError::InvalidConfiguration(
             "VarDCT artifact alignment overflow",
         ))
@@ -976,7 +833,7 @@ pub(super) struct VarDctArtifactData<'a> {
     pub(super) strategy: u32,
     pub(super) dc_fragment_words: &'a [u32],
     pub(super) dc_fragment_bit_len: u32,
-    pub(super) dc_fragment_descriptors: &'a [ScalableDcFragmentDescriptor],
+    pub(super) dc_fragment_descriptors: &'a [DcFragmentDescriptor],
     pub(super) ac: super::ac::AcFragments<'a>,
 }
 
@@ -988,9 +845,9 @@ impl VarDctArtifactData<'_> {
     pub(super) fn dc_fragment_descriptor(
         self,
         group: u32,
-    ) -> Result<ScalableDcFragmentDescriptor, EncodeError> {
+    ) -> Result<DcFragmentDescriptor, EncodeError> {
         if self.dc_fragment_descriptors.is_empty() && group == 0 {
-            return Ok(ScalableDcFragmentDescriptor {
+            return Ok(DcFragmentDescriptor {
                 bit_offset: 0,
                 bit_len: self.dc_fragment_bit_len,
             });

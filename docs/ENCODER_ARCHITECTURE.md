@@ -160,8 +160,10 @@ On native `wgpu`, each context owns a bounded `SubmissionPoller`, and every cont
 single completion worker. `WgpuContext::from_backend` reuses the backend's worker and byte budget,
 and inherits its adapter-validated `KernelPolicy`, so encode, decode, and readback use one workgroup
 selection contract and do not create per-submission polling threads. The VarDCT keys
-`vardct_encode_bounded` and `vardct_encode_quantize` accept every linear `KernelVariant`; their
-fixed 16 KiB and 1 KiB workgroup allocations are checked before pipeline creation. VarDCT control
+`vardct_encode_forward` and `vardct_encode_quantize` accept every linear `KernelVariant`. Single
+transforms use resident coefficient/LF buffers and zero workgroup storage; tiled DCT8 uses exactly
+2 KiB. Complete parameter, basis, matrix/order, scratch, artifact and readback allocations are
+included in the pre-submission byte plan, and per-axis dispatch/device limits are checked. VarDCT control
 serialization and the lossless Modular token pass remain fixed scalar kernels because changing only
 their workgroup sizes would race sequential predictor and bit-offset state. Poll capacity is
 reserved before queue submission and saturation is a typed retryable error. A browser cannot block
@@ -321,25 +323,27 @@ cargo clippy -p jxl_wgpu_encode --all-targets -- -D warnings
 - **Lossless Modular animation (Slice 6)**: Multi-frame `LosslessModularAnimationSession` supporting
   standard timebases, exact durations and timecodes, signed crop rectangles, all 5 blend modes,
   alpha blending, and 4 reference slots with runtime-neutral in-flight futures.
-- **VarDCT baseline plus bounded DCT8 AC (Slice 5 partial)**: `VarDctEncoder` executes all 27
+- **VarDCT forward transforms and AC (Slice 5 partial)**: `VarDctEncoder` executes all 27
   standard strategies, and `TiledVarDctEncoder` supports multi-LF/multi-AC-group DCT8 grids with
   checked axes through 16K. Both frontends serialize validated exact-binary16 LF dequantization plus
-  LF/HF chroma-correlation metadata. The bounded DCT8 kernel additionally performs the forward DCT,
-  default-matrix quantization, natural-order coefficient scan, signed token generation, histogram
-  construction, and AC bit-fragment serialization without exposing pixels or coefficients to the
-  host. Its `HfEntropyPlan` currently selects one prefix cluster for all 495 coefficient contexts,
+  LF/HF chroma-correlation metadata. All 27 strategies perform the forward transform, normative LF
+  extraction, default-matrix quantization, natural-order scan and AC bit-fragment serialization
+  without exposing pixels or raw/quantized AC to the host. Single transforms use shared resident
+  passes; tiled DCT8 keeps each block in 2 KiB workgroup storage. The single `TransformKind`
+  alphabet and shared matrix/order metadata are used by both encoder and decoder. Its
+  `HfEntropyPlan` currently selects one prefix cluster for all 495 coefficient contexts,
   disables LZ77, and emits one pass. That plan is a stable policy boundary rather than a temporary
   wire format: future adaptive clustering, ANS/LZ, coefficient orders, and pass selection can use
-  different plans while retaining the GPU artifact contract. The scalable/tiled path and non-DCT8
-  strategies still quantize AC to zero.
+  different plans while retaining the GPU artifact contract. Native coefficient/LF fixtures and
+  independent f64 compressed-coefficient checks cover every strategy with default/custom correlation.
 
 ### Remaining work
 
 The authoritative encoder items, dependencies, priorities, and acceptance gates are the `MOD-E`,
 `VDCT-E`, `ENT-E`, `ENC`, and encoder-facing `IO` rows in
 [`FULL_JPEG_XL_ROADMAP.md`](FULL_JPEG_XL_ROADMAP.md). After the structural-refactoring gate, the
-nearest work remains parallel Modular token production, native YUV/NV12-family ingestion, scalable
-and strategy-complete nonzero VarDCT AC coding, and the rate/quality control built on top of it.
+nearest work remains parallel Modular token production, native YUV/NV12-family ingestion, mixed
+image-wide VarDCT strategy maps, broader entropy/progression and the rate/quality control built on top.
 Batched codec submission and advanced performance instrumentation stay separate from
 format-completeness claims.
 

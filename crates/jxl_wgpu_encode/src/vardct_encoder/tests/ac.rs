@@ -4,11 +4,11 @@ use jxl_gpu_bitstream::{BitReader, BitWriter, FrameSectionKind};
 
 use super::super::ac::validate_blocks;
 use super::super::entropy::{HfEntropyPlan, fixed_prefix_code};
-use super::super::types::{ScalableArtifactLayout, VarDctFrameLayout};
+use super::super::types::{ArtifactLayout, VarDctFrameLayout};
 use super::{
     Arc, Command, EncodeError, Extent2d, GpuDecoder, GpuOutputRequest, ImageReadbackPipeline,
-    KernelVariant, NonZeroU64, Path, SCALABLE_QUANTIZE_KERNEL_KEY, TiledVarDctEncoder,
-    VarDctEncoder, VarDctLfMetadata, VarDctStrategy, WgpuBackend, WgpuBackendConfig, WgpuContext,
+    KernelVariant, NonZeroU64, Path, TILED_KERNEL_KEY, TiledVarDctEncoder, VarDctEncoder,
+    VarDctLfMetadata, VarDctStrategy, WgpuBackend, WgpuBackendConfig, WgpuContext,
     custom_lf_metadata, decode_rgb8, decode_rgb8_sized, fs, max_abs_error, oracle_directory,
     padded_rgb_source, padded_rgb_source_sized, read_ppm_rgb8, reference, test_context,
     test_context_with_variants, test_device, vardct_rgb8_format,
@@ -48,7 +48,7 @@ pub(super) fn write_tokens(
 #[test]
 fn ac_fragment_capacity_and_corruption_are_checked() {
     let entropy = HfEntropyPlan::single_cluster_prefix().unwrap();
-    let layout = ScalableArtifactLayout::for_tiled_grid(
+    let layout = ArtifactLayout::for_tiled_grid(
         VarDctFrameLayout::tiled_dct8(1, 1).unwrap(),
         &fixed_prefix_code().unwrap(),
         &entropy,
@@ -87,7 +87,7 @@ fn ac_fragment_capacity_and_corruption_are_checked() {
     assert!(validate_blocks(&words, &[bits], 0, &entropy).is_err());
 }
 
-fn read_unsigned(reader: &mut BitReader<'_>, entropy: &HfEntropyPlan) -> u32 {
+pub(super) fn read_unsigned(reader: &mut BitReader<'_>, entropy: &HfEntropyPlan) -> u32 {
     let entries = entropy.gpu_entries();
     let mut bits = 0u32;
     for length in 1..=15 {
@@ -257,9 +257,9 @@ fn fused_tiled_ac_and_all_workgroup_sizes_interoperate() {
             stream
         );
         if width == 8 && height == 8 {
-            let bounded = VarDctEncoder::new(context.clone(), VarDctStrategy::Dct8).unwrap();
+            let single = VarDctEncoder::new(context.clone(), VarDctStrategy::Dct8).unwrap();
             let block = reference::block(&pixels, 8, 8, 0, 0);
-            let reference = bounded.encode(padded_rgb_source(&context, &block)).unwrap();
+            let reference = single.encode(padded_rgb_source(&context, &block)).unwrap();
             assert_eq!(stream, reference);
             let decoded = decode_rgb8(&stream);
             assert_ne!(
@@ -319,13 +319,9 @@ fn fused_tiled_ac_and_all_workgroup_sizes_interoperate() {
         KernelVariant::Lanes128,
         KernelVariant::Lanes256,
     ] {
-        let context = test_context_with_variants(
-            &device,
-            &queue,
-            &info,
-            &[(SCALABLE_QUANTIZE_KERNEL_KEY, variant)],
-        )
-        .unwrap();
+        let context =
+            test_context_with_variants(&device, &queue, &info, &[(TILED_KERNEL_KEY, variant)])
+                .unwrap();
         for (width, height, metadata, pixels, expected) in &streams {
             let encoder =
                 TiledVarDctEncoder::new_with_lf_metadata(context.clone(), *metadata).unwrap();
@@ -399,7 +395,7 @@ fn tiled_ac_storage_is_checked_against_the_device_binding_limit() {
     let source = padded_rgb_source_sized(&context, 513, 259, &pixels);
     assert!(source.buffer.size() < LIMIT);
     let encoder = TiledVarDctEncoder::new(context).unwrap();
-    let layout = ScalableArtifactLayout::for_tiled_grid(
+    let layout = ArtifactLayout::for_tiled_grid(
         VarDctFrameLayout::tiled_dct8(513, 259).unwrap(),
         &fixed_prefix_code().unwrap(),
         &HfEntropyPlan::single_cluster_prefix().unwrap(),
