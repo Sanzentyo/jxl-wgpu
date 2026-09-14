@@ -121,8 +121,9 @@ Any standard strategy may appear at an unaligned block origin when its rectangle
 partial source edges for every strategy. Dimensions share the checked 16K per-axis bound.
 The map is caller-selected metadata; content-adaptive strategy selection remains unimplemented.
 
-`VarDctEncoder::new_with_lf_metadata` and `TiledVarDctEncoder::new_with_lf_metadata` accept a
-validated `VarDctLfMetadata`. Its LF dequantization and base-correlation fields retain exact finite
+`VarDctEncoder::new_with_config`, `new_with_strategy_map`, and
+`TiledVarDctEncoder::new_with_config` accept a `VarDctConfig`. Its
+`lf_metadata` field holds validated `VarDctLfMetadata`. Its LF dequantization and base-correlation fields retain exact finite
 binary16 values, while the colour factor and signed LF factors use their normative integer
 domains. Construction rejects dequantized coefficients below libjxl's `1e-8` threshold, colour
 factors outside `2..=65793`, and base correlations outside `[-4, 4]` with typed `EncodeError`
@@ -136,8 +137,21 @@ The GPU executes sRGB linearization, XYB conversion, forward transforms, LF/AC q
 clamped-Gradient DC predictor, signed tokenization, prefix packing, histogramming, and the
 standard strategy map. All 27 strategies and `TiledVarDctEncoder` use default dequantization
 matrices and natural coefficient orders, with one prefix distribution
-for all 495 coefficient contexts and no LZ77. Quantization is fixed at the distance-25 profile's
-parameters; general distance/quality guarantees and rate control remain unimplemented.
+for all 495 coefficient contexts and no LZ77. `VarDctQuantization` validates exact global scale
+`1..=73728`, LF quantizer `1..=65536`, and a default `VarDctHfMultiplier` in `1..=256`.
+`VarDctTransform::with_hf_multiplier` overrides the default for that transform; sorting a map
+preserves its associated multiplier. GPU quantization and serialized LF/HF metadata use these
+same values. Defaults are `(8813, 10, 6)` and carry no perceptual-distance claim. The former
+`PerceptualDistance` API was removed; general distance/quality guarantees, adaptive selection,
+and rate control remain unimplemented.
+
+The LF and AC streams use 33-symbol raw prefix alphabets, covering every signed 32-bit value.
+The global MA tree is one Gradient leaf with no LZ77. Prefix bits retain all 15 canonical bits;
+Modular lossless retains its separate raw-plus-LZ77 policy. Quantization multiplies scalar
+controls in floating point before conversion and reports `BackendError::VarDctQuantizationOverflow`
+instead of saturating or clipping coefficients. Effective HF multipliers are limited to 256:
+JPEG XL decoders clamp each signed HF metadata sample to `0..=255` before adding one. The GPU
+decoder now performs the same clamp for negative and oversized source samples.
 
 Single transforms and image-wide maps share the `ForwardVarDctPipeline` batch path: regular DCTs run separable horizontal
 and vertical passes, while special 8×8 transforms evaluate a constant basis on GPU. A final pass
@@ -156,7 +170,7 @@ the standard fused packet, including tiny and odd images; larger images carry ev
 `ceil(width / 256) * ceil(height / 256)` AC group and
 `ceil(width / 2048) * ceil(height / 2048)` LF group. Each block is an independent DCT8 transform.
 The first pass dispatches a two-dimensional block grid, with 64 lanes by default. Each workgroup
-uses exactly 2,048 bytes for 64 XYB pixels and 64 quantized AC vectors. Coefficients stay in shared
+uses 2,048 bytes for 64 XYB pixels and 64 quantized AC vectors, plus a four-byte quantization error flag. Coefficients stay in shared
 memory and are immediately packed into one word-aligned block fragment; adjacent workgroups never
 write the same storage word. The second pass predicts and packs DC, resetting Gradient at LF-group
 boundaries and writing a checked descriptor per LF group. Ending the first compute pass is the
@@ -170,20 +184,22 @@ fallback. The independently concatenable block format relies on the single-distr
 policy; future contextual or ANS encoders must maintain their state on GPU.
 
 `VarDctMemoryPlan::kernel_layout` distinguishes `SingleTransform`, `StrategyMap` and `TiledDct8`. All use
-512-byte parameters and a runtime-sized artifact with a 256-byte header and independently
-256-byte-aligned sections. Single-transform plans additionally report exact XYB, raw coefficient,
+768-byte parameters and a runtime-sized artifact with a 272-byte header. LF descriptors
+follow the header; the subsequent strategy, sample and entropy sections align to 256 bytes. Single-transform plans additionally report exact XYB, raw coefficient,
 LF, quantized coefficient, matrix/order, transform-task and forward scratch allocations in `transform`.
 Mapped plans report their aggregate allocation sizes: basis/uniform storage is shared per strategy,
 while all transforms share image-wide XYB/coefficient/LF/quantized arenas. Each strategy batch
 owns one horizontal scratch allocation and a 20-byte forward task per transform; encoder tasks
-occupy 40 bytes per transform. No GPU allocation is created per individual transform.
-An 8×8 DCT submission owns 10,384 bytes: 512 parameters, 2,560 artifact, 2,560 readback and
-4,752 resident transform bytes. It no longer allocates a fixed diagnostic coefficient readback.
+occupy 44 bytes per transform. No GPU allocation is created per individual transform.
+Sources use channel origins within one complete XYB binding, so small maps also work on devices
+requiring 1024-byte storage offsets without padding each channel allocation.
+An 8×8 DCT submission owns 11,668 bytes: 768 parameters, 3,072 artifact, 3,072 readback and
+4,756 resident transform bytes. It no longer allocates a fixed diagnostic coefficient readback.
 Single transforms reserve one AC slot for three counts and at most `area - area / 64` coefficients
-per channel; the largest 256×256 slot has 127,010 words. Mixed maps reserve the exact
+per channel; the largest 256×256 slot has 217,730 words. Mixed maps reserve the exact
 strategy-specific bound per transform, with one length word each and no maximum-size slot
 for smaller transforms. Tiled artifacts add one length word and a
-125-word AC slot per block, with each section aligned to 256 bytes. The slot bound comes from
+214-word AC slot per block, with each section aligned to 256 bytes. The slot bound comes from
 the actual prefix lengths for three counts and at most 63 signed coefficients per channel.
 The complete parameter + artifact + readback + resident transform reservation remains live through validation or
 abandoned-job cleanup; caller-owned source bytes are reported separately. Source binding,
@@ -259,8 +275,8 @@ development-quality reference for the edge and two-LF-group fixtures.
 # use jxl_wgpu_encode::{BufferImageSource, VarDctEncoder, VarDctStrategy, VarDctStrategyMap, VarDctTransform, WgpuContext};
 # fn encode(context: WgpuContext, source_13_by_21: BufferImageSource) -> Result<Vec<u8>, jxl_wgpu_encode::EncodeError> {
 let map = VarDctStrategyMap::new(13, 21, vec![
-    VarDctTransform { block_x: 0, block_y: 0, strategy: VarDctStrategy::Dct16x16 },
-    VarDctTransform { block_x: 0, block_y: 2, strategy: VarDctStrategy::Dct8x16 },
+    VarDctTransform::new(0, 0, VarDctStrategy::Dct16x16),
+    VarDctTransform::new(0, 2, VarDctStrategy::Dct8x16),
 ])?;
 let encoder = VarDctEncoder::new_with_strategy_map(context, map, Default::default())?;
 encoder.encode(source_13_by_21)

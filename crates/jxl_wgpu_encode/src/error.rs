@@ -14,6 +14,13 @@ pub enum BackendError {
     Invariant(&'static str),
     #[error("invalid GPU artifact: {0}")]
     InvalidArtifact(&'static str),
+    #[error(
+        "VarDCT quantization exceeds signed 32-bit coefficients (LF: {low_frequency}, HF: {high_frequency})"
+    )]
+    VarDctQuantizationOverflow {
+        low_frequency: bool,
+        high_frequency: bool,
+    },
     #[error("GPU artifact mapping failed")]
     ArtifactMapping(#[source] wgpu::BufferAsyncError),
     #[error("the mapped GPU artifact range is invalid")]

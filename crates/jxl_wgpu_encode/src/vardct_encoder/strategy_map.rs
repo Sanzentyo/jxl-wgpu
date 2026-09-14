@@ -8,6 +8,7 @@ use super::types::{
     ArtifactLayout, TiledVarDctGrid, VarDctFrameLayout, VarDctStrategy, VarDctTopology,
     VarDctTransformMemoryPlan,
 };
+use super::{VarDctHfMultiplier, VarDctQuantization};
 use crate::EncodeError;
 
 /// A transform's upper-left corner, measured in 8×8 blocks of the padded image.
@@ -16,6 +17,26 @@ pub struct VarDctTransform {
     pub block_x: u32,
     pub block_y: u32,
     pub strategy: VarDctStrategy,
+    /// Uses the frame's default HF multiplier when absent.
+    pub hf_multiplier: Option<VarDctHfMultiplier>,
+}
+
+impl VarDctTransform {
+    #[must_use]
+    pub const fn new(block_x: u32, block_y: u32, strategy: VarDctStrategy) -> Self {
+        Self {
+            block_x,
+            block_y,
+            strategy,
+            hf_multiplier: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_hf_multiplier(mut self, multiplier: VarDctHfMultiplier) -> Self {
+        self.hf_multiplier = Some(multiplier);
+        self
+    }
 }
 
 /// An exact covering of the image's 8×8 block grid with standard VarDCT transforms.
@@ -104,7 +125,7 @@ impl VarDctStrategyMap {
     }
 }
 
-/// Scalar offsets into shared resident buffers; exactly 40 bytes in WGSL.
+/// Scalar offsets and quantization metadata; exactly 44 bytes in WGSL.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub(super) struct TransformTask {
@@ -118,6 +139,7 @@ pub(super) struct TransformTask {
     pub ac_word_offset: u32,
     pub ac_word_capacity: u32,
     pub strategy: u32,
+    pub hf_multiplier: u32,
 }
 
 #[derive(Debug)]
@@ -140,7 +162,10 @@ pub(super) struct TransformPlan {
 }
 
 impl TransformPlan {
-    pub fn new(map: VarDctStrategyMap) -> Result<Self, EncodeError> {
+    pub fn new(
+        map: VarDctStrategyMap,
+        quantization: VarDctQuantization,
+    ) -> Result<Self, EncodeError> {
         let code = fixed_prefix_code()?;
         let mut metadata = Vec::new();
         let mut batches = Vec::new();
@@ -177,6 +202,7 @@ impl TransformPlan {
         let mut lf_offset = 0;
         let mut ac_words = 0u32;
         let padded_width = map.extent.width.div_ceil(8) * 8;
+        let canvas_area = padded_width * map.extent.height.div_ceil(8) * 8;
         for placement in &map.transforms {
             let strategy = placement.strategy;
             let id = usize::from(strategy.codestream_id());
@@ -193,6 +219,10 @@ impl TransformPlan {
                 ac_word_offset: ac_words,
                 ac_word_capacity: capacities[id],
                 strategy: id as u32,
+                hf_multiplier: placement
+                    .hf_multiplier
+                    .unwrap_or(quantization.hf_multiplier())
+                    .get(),
             });
             batches
                 .iter_mut()
@@ -200,7 +230,11 @@ impl TransformPlan {
                 .expect("populated strategy batch")
                 .tasks
                 .push(ForwardVarDctTask {
-                    origins: [placement.block_y * 8 * padded_width + placement.block_x * 8; 3],
+                    origins: std::array::from_fn(|channel| {
+                        channel as u32 * canvas_area
+                            + placement.block_y * 8 * padded_width
+                            + placement.block_x * 8
+                    }),
                     coefficient_offset,
                     lf_offset,
                 });
@@ -261,7 +295,7 @@ impl TransformPlan {
     pub fn artifact_layout(
         &self,
         frame: VarDctFrameLayout,
-        code: &crate::prefix::PrefixCode,
+        code: &super::entropy::VarDctPrefixCode,
     ) -> Result<ArtifactLayout, EncodeError> {
         ArtifactLayout::for_strategy_map(frame, code, self.tasks.len() as u32, self.ac_words)
     }

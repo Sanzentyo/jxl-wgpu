@@ -2,7 +2,7 @@
 
 use super::native::{check_ac, forward, native_oracles};
 
-use super::super::dispatch::{VarDctBackend, profile_distance};
+use super::super::dispatch::VarDctBackend;
 use super::*;
 use crate::{
     AnimationHeader, Determinism, EncodeProfile, FrameEncodeRequest, FrameIndex, FrameOptions,
@@ -51,13 +51,14 @@ fn all_27_strategies_emit_native_checked_nonzero_ac_and_interoperate() {
             .enumerate()
         {
             let encoder =
-                VarDctBackend::new_with_lf_metadata(&context, strategy, metadata).unwrap();
+                VarDctBackend::new_with_config(&context, strategy, config_with_lf(metadata))
+                    .unwrap();
             let source = padded_rgb_source_sized(&context, w, h, &pixels);
             let request = FrameEncodeRequest {
                 frame_index: FrameIndex::new(0),
                 is_last: true,
                 profile: EncodeProfile::VarDct {
-                    distance: profile_distance(),
+                    quantization: VarDctQuantization::default(),
                 },
                 progressive: ProgressivePlan::single(),
                 minimum_determinism: Determinism::SameDevice,
@@ -70,13 +71,20 @@ fn all_27_strategies_emit_native_checked_nonzero_ac_and_interoperate() {
                 .submit(&context, GpuFrameSource::Buffer(source.clone()), &request)
                 .unwrap();
             let (words, bits, artifacts) = job.wait_with_ac_for_test().unwrap();
-            let nonzero = check_ac(&words, bits, &coefficients, oracle, metadata);
+            let nonzero = check_ac(
+                &words,
+                bits,
+                &coefficients,
+                oracle,
+                config_with_lf(metadata),
+            );
             assert!(nonzero > 0, "textured input must emit nonzero AC");
             let frame = assemble_frame(artifacts.packets).unwrap();
             let mut stream = image_header(width, height).unwrap().bytes().to_vec();
             stream.extend_from_slice(frame.bytes());
             let convenience =
-                VarDctEncoder::new_with_lf_metadata(context.clone(), strategy, metadata).unwrap();
+                VarDctEncoder::new_with_config(context.clone(), strategy, config_with_lf(metadata))
+                    .unwrap();
             assert_eq!(
                 pollster::block_on(convenience.submit(source).unwrap()).unwrap(),
                 stream
@@ -131,8 +139,12 @@ fn all_27_strategies_emit_native_checked_nonzero_ac_and_interoperate() {
                 .unwrap();
         for (strategy, metadata, pixels, expected) in &streams {
             let Extent2d { width, height } = strategy.pixel_extent();
-            let encoder =
-                VarDctEncoder::new_with_lf_metadata(context.clone(), *strategy, *metadata).unwrap();
+            let encoder = VarDctEncoder::new_with_config(
+                context.clone(),
+                *strategy,
+                config_with_lf(*metadata),
+            )
+            .unwrap();
             let actual = encoder
                 .encode(padded_rgb_source_sized(
                     &context,
@@ -157,7 +169,7 @@ fn maximum_transform_fragment_and_invalid_counts_are_bounded() {
         ArtifactLayout::new(VarDctStrategy::Dct256x256, &fixed_prefix_code().unwrap()).unwrap();
     let maximum = 65_536 - 1_024;
     let tokens = (0..3).flat_map(|_| {
-        std::iter::once(maximum).chain(std::iter::repeat_n(262_142, maximum as usize))
+        std::iter::once(maximum).chain(std::iter::repeat_n(u32::MAX, maximum as usize))
     });
     let (mut words, bits) = ac::write_tokens(tokens, &entropy);
     assert_eq!(words.len(), layout.ac_words_per_block as usize);
@@ -243,7 +255,7 @@ fn single_transform_dispatch_grid_is_checked_before_recording() {
 
 #[test]
 fn single_transform_metadata_storage_is_admitted_before_submission() {
-    const LIMIT: u64 = 400 * 1024;
+    const LIMIT: u64 = 500 * 1024;
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::None,

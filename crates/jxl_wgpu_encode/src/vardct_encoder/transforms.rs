@@ -156,7 +156,8 @@ impl Pipeline {
             area,
             false,
         );
-        let channel_bytes = memory.xyb_bytes / 3;
+        let xyb_storage =
+            ResidentStorageBinding::entire(&xyb).map_err(jxl_wgpu::ForwardVarDctError::from)?;
         let mut forward = Vec::with_capacity(inputs.plan.batches.len());
         for batch in &inputs.plan.batches {
             forward.push(
@@ -165,12 +166,8 @@ impl Pipeline {
                     commands,
                     ForwardVarDctBatchInputs {
                         transform: batch.strategy,
-                        sources: std::array::from_fn(|channel| ResidentF32Plane {
-                            storage: ResidentStorageBinding {
-                                buffer: &xyb,
-                                offset: channel as u64 * channel_bytes,
-                                size: std::num::NonZeroU64::new(channel_bytes).unwrap(),
-                            },
+                        sources: std::array::from_fn(|_| ResidentF32Plane {
+                            storage: xyb_storage,
                             width,
                             height,
                             stride: 0,
@@ -189,6 +186,7 @@ impl Pipeline {
             &self.quantize_ac,
             &[
                 entry(1, inputs.parameters),
+                entry(2, inputs.artifact),
                 entry(3, &coefficients),
                 entry(6, &quantized),
                 entry(7, &metadata),

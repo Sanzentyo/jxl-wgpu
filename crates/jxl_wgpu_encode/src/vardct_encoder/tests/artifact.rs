@@ -35,7 +35,7 @@ fn artifact_rejects_missing_ac_writes_and_forged_layout() {
         let start = (layout.ac_fragment_offset + block * layout.ac_words_per_block) as usize;
         words[start..start + ac_words.len()].copy_from_slice(&ac_words);
     }
-    let mut histogram = [0; 19];
+    let mut histogram = [0; 33];
     histogram[0] = layout.dc_len;
     let header = VarDctArtifactHeader {
         status: ARTIFACT_READY,
@@ -71,15 +71,15 @@ fn artifact_rejects_missing_ac_writes_and_forged_layout() {
         ac_fragment_offset: layout.ac_fragment_offset,
         ac_words_per_block: layout.ac_words_per_block,
         ac_fragment_words: layout.ac_fragment_words,
-        padding: [0; 13],
+        padding: [0; 3],
     };
-    words[..64].copy_from_slice(bytemuck::cast_slice(std::slice::from_ref(&header)));
+    words[..68].copy_from_slice(bytemuck::cast_slice(std::slice::from_ref(&header)));
     let valid = |words: &[u32]| {
         validate_artifact(bytemuck::cast_slice(words), layout, &dc, &hf, frame, None).is_ok()
     };
     assert!(valid(&words));
     // Every new AC header field, its presence marker and final ready status.
-    for index in [0, 4, 46, 47, 48, 49, 50, 51] {
+    for index in [0, 4, 60, 61, 62, 63, 64, 65] {
         let mut invalid = words.clone();
         invalid[index] ^= 1;
         assert!(!valid(&invalid), "header word {index}");

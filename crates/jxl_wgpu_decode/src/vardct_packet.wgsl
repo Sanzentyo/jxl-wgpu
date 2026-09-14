@@ -666,6 +666,11 @@ fn decode_hf_channels_bounded(first_blocks: u32) -> u32 {
     return continue_hf_channels_bounded(first_blocks);
 }
 
+fn first_hf_multiplier() -> u32 {
+    let raw = bitcast<i32>(raw_metadata[control.offsets.w]);
+    return u32(clamp(raw, 0i, 255i)) + 1u;
+}
+
 fn validate_hf_values(first_blocks: u32) {
     let block_count = control.geometry.z * control.geometry.w;
     if control.expected.y != 0u {
@@ -797,7 +802,7 @@ fn write_bounded_hf_status(status_code: u32, hf_decoded: u32, first_blocks: u32)
     }
     status[4] = hf_decoded;
     status[5] = raw_metadata[control.offsets.z];
-    status[6] = raw_metadata[control.offsets.w] + 1u;
+    status[6] = first_hf_multiplier();
     status[7] = control.capacities.x;
     status[8] = select(status[8], 0u, status_code == STATUS_OK);
     status[9] = control.quantization.x;
@@ -926,7 +931,7 @@ fn write_bounded_combined_status(status_code: u32) {
     status[3] = packet_lf_decoded;
     status[4] = packet_hf_decoded;
     status[5] = raw_metadata[control.offsets.z];
-    status[6] = raw_metadata[control.offsets.w] + 1u;
+    status[6] = first_hf_multiplier();
     status[7] = control.capacities.x;
     status[8] = select(status[8], 0u, status_code == STATUS_OK);
     status[9] = control.quantization.x;
@@ -990,7 +995,7 @@ fn decode_vardct_hf() {
     status[2] = params.entropy.token_end;
     status[4] = hf_decoded;
     status[5] = raw_metadata[control.offsets.z];
-    status[6] = raw_metadata[control.offsets.w] + 1u;
+    status[6] = first_hf_multiplier();
     status[7] = control.capacities.x;
     status[8] = select(status[8], 0u, decode_error == 0u);
     status[9] = control.quantization.x;
@@ -1026,7 +1031,7 @@ fn decode_vardct_hf_metadata() {
     status[2] = params.entropy.token_end;
     status[4] = hf_decoded;
     status[5] = raw_metadata[control.offsets.z];
-    status[6] = raw_metadata[control.offsets.w] + 1u;
+    status[6] = first_hf_multiplier();
     status[7] = control.capacities.x;
     status[8] = select(status[8], 0u, decode_error == 0u);
     status[9] = control.quantization.x;
@@ -1073,7 +1078,7 @@ fn decode_vardct_packet() {
     status[3] = lf_decoded;
     status[4] = hf_decoded;
     status[5] = raw_metadata[control.offsets.z];
-    status[6] = raw_metadata[control.offsets.w] + 1u;
+    status[6] = first_hf_multiplier();
     status[7] = control.capacities.x;
     status[9] = control.quantization.x;
     status[10] = control.quantization.y;

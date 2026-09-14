@@ -1,5 +1,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
+mod quantization;
+
 use std::sync::mpsc;
 
 use bytemuck::{Pod, Zeroable};

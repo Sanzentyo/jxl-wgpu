@@ -8,7 +8,7 @@ use super::super::types::{ArtifactLayout, VarDctFrameLayout};
 use super::{
     Arc, Command, EncodeError, Extent2d, GpuDecoder, GpuOutputRequest, ImageReadbackPipeline,
     KernelVariant, NonZeroU64, Path, TILED_KERNEL_KEY, TiledVarDctEncoder, VarDctEncoder,
-    VarDctLfMetadata, VarDctStrategy, WgpuBackend, WgpuBackendConfig, WgpuContext,
+    VarDctLfMetadata, VarDctStrategy, WgpuBackend, WgpuBackendConfig, WgpuContext, config_with_lf,
     custom_lf_metadata, decode_rgb8, decode_rgb8_sized, fs, max_abs_error, oracle_directory,
     padded_rgb_source, padded_rgb_source_sized, read_ppm_rgb8, reference, test_context,
     test_context_with_variants, test_device, vardct_rgb8_format,
@@ -55,7 +55,7 @@ fn ac_fragment_capacity_and_corruption_are_checked() {
     )
     .unwrap();
     let stride = layout.ac_words_per_block as usize;
-    assert_eq!(stride, 125);
+    assert_eq!(stride, 214);
     let check = |values: &[u32]| {
         let (mut words, bits) = write_tokens(values.iter().copied(), &entropy);
         words.resize(stride, 0);
@@ -63,13 +63,13 @@ fn ac_fragment_capacity_and_corruption_are_checked() {
     };
     assert!(check(&[0, 0, 0]).is_ok());
     assert!(check(&[64, 0, 0]).is_err());
-    assert!(check(&[1, 262_143, 0, 0]).is_err());
+    assert!(check(&[1, u32::MAX, 0, 0]).is_ok());
     assert!(check(&[1, 1, 0, 0, 0]).is_err()); // trailing token
     assert!(check(&[1, 0, 0]).is_err()); // count without its nonzero coefficient
     assert!(check(&[63]).is_err());
 
     // Three maximal-magnitude dense channels exercise the last allocated word.
-    let values = (0..3).flat_map(|_| std::iter::once(63).chain(std::iter::repeat_n(262_142, 63)));
+    let values = (0..3).flat_map(|_| std::iter::once(63).chain(std::iter::repeat_n(u32::MAX, 63)));
     let (mut words, bits) = write_tokens(values, &entropy);
     assert_eq!(words.len(), stride);
     eprintln!("maximal DCT8 fragment: {bits} bits in {stride} words");
@@ -197,7 +197,8 @@ fn tiled_ac_matches_f64_across_group_boundaries_and_custom_correlation() {
             VarDctLfMetadata::default()
         };
         let pixels = reference::pattern(width, height);
-        let encoder = TiledVarDctEncoder::new_with_lf_metadata(context.clone(), metadata).unwrap();
+        let encoder =
+            TiledVarDctEncoder::new_with_config(context.clone(), config_with_lf(metadata)).unwrap();
         let stream = encoder
             .encode(padded_rgb_source_sized(&context, width, height, &pixels))
             .unwrap();
@@ -249,7 +250,8 @@ fn fused_tiled_ac_and_all_workgroup_sizes_interoperate() {
         } else {
             VarDctLfMetadata::default()
         };
-        let encoder = TiledVarDctEncoder::new_with_lf_metadata(context.clone(), metadata).unwrap();
+        let encoder =
+            TiledVarDctEncoder::new_with_config(context.clone(), config_with_lf(metadata)).unwrap();
         let source = padded_rgb_source_sized(&context, width, height, &pixels);
         let stream = encoder.encode(source.clone()).unwrap();
         assert_eq!(
@@ -324,7 +326,8 @@ fn fused_tiled_ac_and_all_workgroup_sizes_interoperate() {
                 .unwrap();
         for (width, height, metadata, pixels, expected) in &streams {
             let encoder =
-                TiledVarDctEncoder::new_with_lf_metadata(context.clone(), *metadata).unwrap();
+                TiledVarDctEncoder::new_with_config(context.clone(), config_with_lf(*metadata))
+                    .unwrap();
             assert_eq!(
                 &encoder
                     .encode(padded_rgb_source_sized(&context, *width, *height, pixels))
@@ -346,7 +349,7 @@ fn nonzero_ac_admission_includes_every_fragment_and_readback_byte() {
     let plan = provisional.memory_plan(&source).unwrap();
     assert_eq!(
         plan.owned_bytes_per_job,
-        512 + 2 * plan.artifact_storage_bytes
+        768 + 2 * plan.artifact_storage_bytes
     );
     let limited = WgpuContext::with_memory_budget(
         Arc::new(base.device().clone()),

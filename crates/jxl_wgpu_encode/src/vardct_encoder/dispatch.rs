@@ -10,26 +10,26 @@ use std::task::{Context, Poll, Waker};
 use jxl_wgpu::{KernelVariant, MemoryPermit};
 
 use super::ac::{AcFragments, validate_blocks, validate_transform_fragments};
-use super::bitstream::{build_frame_packet, image_header};
+use super::bitstream::{build_frame_packet, image_header, pack_signed_control};
 use super::entropy::{
     HfEntropyPlan, fixed_prefix_code, prefix_entries, read_fragment_slice,
     validate_fragment_padding,
 };
+use super::entropy::{UINT_SYMBOLS, VarDctPrefixCode};
 use super::strategy_map::{TransformPlan, VarDctStrategyMap, VarDctTransform};
 use super::transforms;
 use super::types::{
-    ARTIFACT_READY, ArtifactLayout, DcFragmentDescriptor, GLOBAL_SCALE, HEADER_WORDS,
-    HF_QUANTIZATION, QUANT_LF, TiledVarDctGrid, VarDctArtifactData, VarDctArtifactHeader,
-    VarDctColorEncoding, VarDctFrameLayout, VarDctKernelParams, VarDctLfMetadata, VarDctMemoryPlan,
-    VarDctStrategy, VarDctTopology,
+    ARTIFACT_READY, ArtifactLayout, DcFragmentDescriptor, HEADER_WORDS, HF_QUANTIZATION,
+    TiledVarDctGrid, VarDctArtifactData, VarDctArtifactHeader, VarDctColorEncoding,
+    VarDctFrameLayout, VarDctKernelParams, VarDctLfMetadata, VarDctMemoryPlan, VarDctStrategy,
+    VarDctTopology,
 };
-use crate::prefix::{PrefixCode, RAW_SYMBOLS};
 use crate::{
     AnimationHeader, BackendError, BitFragment, BufferImageSource, Determinism, EncodeError,
     EncodeProfile, EncoderCapabilities, FrameEncodeRequest, FrameIndex, FrameOptions,
     FrameSubmission, GpuEncodeBackend, GpuEncodeJob, GpuEncoder, GpuFrameArtifacts, GpuFrameSource,
-    KernelStage, PerceptualDistance, ProfileCapability, ProgressivePlan, UnsupportedFeature,
-    WgpuContext, assemble_frame,
+    KernelStage, ProfileCapability, ProgressivePlan, UnsupportedFeature, VarDctConfig,
+    VarDctQuantization, WgpuContext, assemble_frame,
 };
 
 pub(super) const TILED_SHADER: &str = include_str!("tiled.wgsl");
@@ -41,10 +41,9 @@ pub(super) fn shader_source(entry_points: &str) -> String {
         include_str!("control.wgsl")
     )
 }
-pub(super) const PROFILE_DISTANCE: f32 = 25.0;
 pub(super) const FORWARD_KERNEL_KEY: &str = "vardct_encode_forward";
 pub(super) const TILED_KERNEL_KEY: &str = "vardct_encode_quantize";
-pub(super) const TILED_WORKGROUP_STORAGE_BYTES: u32 = 2 * 64 * 16;
+pub(super) const TILED_WORKGROUP_STORAGE_BYTES: u32 = 2 * 64 * 16 + 4;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct VarDctDispatchPlan {
@@ -77,11 +76,11 @@ enum VarDctPipelines {
 pub struct VarDctBackend {
     pipelines: VarDctPipelines,
     workgroup_variant: KernelVariant,
-    code: PrefixCode,
+    code: VarDctPrefixCode,
     hf_entropy: HfEntropyPlan,
     topology: VarDctTopology,
     transform_plan: Option<Arc<TransformPlan>>,
-    lf_metadata: VarDctLfMetadata,
+    config: VarDctConfig,
     capabilities: EncoderCapabilities,
     max_storage_binding_size: u64,
     max_buffer_size: u64,
@@ -97,20 +96,16 @@ impl VarDctBackend {
     /// Returns an encoder error if the fixed standard entropy tree cannot be
     /// represented by the JPEG XL prefix-code writer.
     pub fn new(context: &WgpuContext, strategy: VarDctStrategy) -> Result<Self, EncodeError> {
-        Self::new_with_lf_metadata(context, strategy, VarDctLfMetadata::default())
+        Self::new_with_config(context, strategy, VarDctConfig::default())
     }
 
-    /// Creates a standard VarDCT strategy backend with explicit LF metadata.
-    pub fn new_with_lf_metadata(
+    /// Creates a standard VarDCT strategy backend with explicit quantization and LF metadata.
+    pub fn new_with_config(
         context: &WgpuContext,
         strategy: VarDctStrategy,
-        lf_metadata: VarDctLfMetadata,
+        config: VarDctConfig,
     ) -> Result<Self, EncodeError> {
-        Self::new_with_topology(
-            context,
-            VarDctTopology::SingleTransform(strategy),
-            lf_metadata,
-        )
+        Self::new_with_topology(context, VarDctTopology::SingleTransform(strategy), config)
     }
 
     /// Creates the bounded tiled-DCT8 profile used by [`TiledVarDctEncoder`].
@@ -118,33 +113,32 @@ impl VarDctBackend {
     /// extent selects the checked block, LF-group, and AC-group grids at
     /// submission time.
     pub fn new_tiled_dct8(context: &WgpuContext) -> Result<Self, EncodeError> {
-        Self::new_tiled_dct8_with_lf_metadata(context, VarDctLfMetadata::default())
+        Self::new_tiled_dct8_with_config(context, VarDctConfig::default())
     }
 
-    /// Creates the tiled DCT8 backend with explicit LF metadata.
-    pub fn new_tiled_dct8_with_lf_metadata(
+    /// Creates the tiled DCT8 backend with explicit quantization and LF metadata.
+    pub fn new_tiled_dct8_with_config(
         context: &WgpuContext,
-        lf_metadata: VarDctLfMetadata,
+        config: VarDctConfig,
     ) -> Result<Self, EncodeError> {
-        Self::new_with_topology(context, VarDctTopology::TiledDct8, lf_metadata)
+        Self::new_with_topology(context, VarDctTopology::TiledDct8, config)
     }
 
     /// Creates an encoder for a validated image-wide transform map.
     pub fn new_with_strategy_map(
         context: &WgpuContext,
         map: VarDctStrategyMap,
-        lf_metadata: VarDctLfMetadata,
+        config: VarDctConfig,
     ) -> Result<Self, EncodeError> {
-        let mut backend =
-            Self::new_with_topology(context, VarDctTopology::StrategyMap, lf_metadata)?;
-        backend.transform_plan = Some(Arc::new(TransformPlan::new(map)?));
+        let mut backend = Self::new_with_topology(context, VarDctTopology::StrategyMap, config)?;
+        backend.transform_plan = Some(Arc::new(TransformPlan::new(map, config.quantization)?));
         Ok(backend)
     }
 
     fn new_with_topology(
         context: &WgpuContext,
         topology: VarDctTopology,
-        lf_metadata: VarDctLfMetadata,
+        config: VarDctConfig,
     ) -> Result<Self, EncodeError> {
         let code = fixed_prefix_code()?;
         let hf_entropy = HfEntropyPlan::single_cluster_prefix()?;
@@ -174,7 +168,7 @@ impl VarDctBackend {
                     TILED_WORKGROUP_STORAGE_BYTES,
                 )
             } else {
-                (FORWARD_KERNEL_KEY, KernelVariant::Lanes64, 0)
+                (FORWARD_KERNEL_KEY, KernelVariant::Lanes64, 4)
             };
         let workgroup_variant = context
             .kernel_policy()
@@ -223,19 +217,22 @@ impl VarDctBackend {
         };
         let transform_plan = if let VarDctTopology::SingleTransform(strategy) = topology {
             let extent = strategy.pixel_extent();
-            Some(Arc::new(TransformPlan::new(VarDctStrategyMap::new(
-                extent.width,
-                extent.height,
-                vec![VarDctTransform {
-                    block_x: 0,
-                    block_y: 0,
-                    strategy,
-                }],
-            )?)?))
+            Some(Arc::new(TransformPlan::new(
+                VarDctStrategyMap::new(
+                    extent.width,
+                    extent.height,
+                    vec![VarDctTransform {
+                        block_x: 0,
+                        block_y: 0,
+                        strategy,
+                        hf_multiplier: None,
+                    }],
+                )?,
+                config.quantization,
+            )?))
         } else {
             None
         };
-        let distance = profile_distance();
         Ok(Self {
             pipelines,
             workgroup_variant,
@@ -243,11 +240,10 @@ impl VarDctBackend {
             hf_entropy,
             topology,
             transform_plan,
-            lf_metadata,
+            config,
             capabilities: EncoderCapabilities {
                 profiles: vec![ProfileCapability::VarDct {
-                    min_distance: distance,
-                    max_distance: distance,
+                    quantization: config.quantization,
                 }],
                 max_progressive_passes: 1,
                 animation: false,
@@ -279,7 +275,7 @@ impl VarDctBackend {
 
     #[must_use]
     pub const fn lf_metadata(&self) -> VarDctLfMetadata {
-        self.lf_metadata
+        self.config.lf_metadata
     }
 
     /// Computes the exact memory admission and source binding before a job is
@@ -390,8 +386,8 @@ impl VarDctBackend {
         })?;
         let blocks_x = frame.blocks_x;
         let blocks_y = frame.blocks_y;
-        let (lf_quantization, lf_correlation) = self.lf_metadata.forward_quantization();
-        let hf_correlation = self.lf_metadata.hf_correlation();
+        let (lf_quantization, lf_correlation) = self.config.lf_metadata.forward_quantization();
+        let hf_correlation = self.config.lf_metadata.hf_correlation();
         let common_strategy = frame.topology.strategy_id();
         let (kernel, mut memory) = {
             let layout = match frame.topology {
@@ -451,8 +447,9 @@ impl VarDctBackend {
                         blocks_x,
                         blocks_y,
                         strategy: common_strategy,
-                        global_scale: GLOBAL_SCALE,
-                        quant_lf: QUANT_LF,
+                        global_scale: self.config.quantization.global_scale(),
+                        quant_lf: self.config.quantization.quant_lf(),
+                        hf_multiplier: self.config.quantization.hf_multiplier().get(),
                         raw_prefix: prefix_entries(&self.code),
                         strategy_offset: layout.strategy_offset,
                         dc_offset: layout.dc_offset,
@@ -479,7 +476,7 @@ impl VarDctBackend {
                         workgroups_x: (frame.blocks_x * frame.blocks_y * 64)
                             .div_ceil(self.workgroup_variant.workgroup_size().0)
                             .min(self.max_compute_workgroups_per_dimension),
-                        padding: [0; 15],
+                        padding: [0; 22],
                     },
                     layout,
                 },
@@ -567,14 +564,10 @@ fn validate_tiled_device_limits(limits: &wgpu::Limits) -> Result<(), EncodeError
     Ok(())
 }
 
-pub(super) fn profile_distance() -> PerceptualDistance {
-    PerceptualDistance::new(PROFILE_DISTANCE)
-        .expect("the fixed VarDCT distance is within the public validated range")
-}
-
 fn validate_vardct_request(
     request: &FrameEncodeRequest,
     frame: VarDctFrameLayout,
+    quantization: VarDctQuantization,
 ) -> Result<(), EncodeError> {
     if request.frame_index != FrameIndex::new(0)
         || !request.is_last
@@ -588,13 +581,9 @@ fn validate_vardct_request(
             "the VarDCT profile requires one full-canvas final transform-sized still frame",
         ));
     }
-    if request.profile
-        != (EncodeProfile::VarDct {
-            distance: profile_distance(),
-        })
-    {
+    if request.profile != (EncodeProfile::VarDct { quantization }) {
         return Err(EncodeError::InvalidConfiguration(
-            "the requested VarDCT distance does not match the fixed quantization profile",
+            "the requested VarDCT quantization does not match the backend configuration",
         ));
     }
     Ok(())
@@ -624,7 +613,7 @@ impl GpuEncodeBackend for VarDctBackend {
             return Err(UnsupportedFeature::InputFormat.into());
         };
         let plan = self.dispatch_plan(&source)?;
-        validate_vardct_request(request, plan.frame)?;
+        validate_vardct_request(request, plan.frame, self.config.quantization)?;
         let memory_permit = context
             .memory_budget()
             .try_reserve(plan.memory.owned_bytes_per_job)?;
@@ -826,7 +815,7 @@ impl GpuEncodeBackend for VarDctBackend {
             completion,
             code: self.code.clone(),
             hf_entropy: self.hf_entropy.clone(),
-            lf_metadata: self.lf_metadata,
+            config: self.config,
             frame_layout: plan.frame,
             transform_plan: self.transform_plan.clone(),
             artifact_layout: job_layout,
@@ -917,9 +906,9 @@ impl Drop for VarDctJobLifetime {
 pub struct VarDctJob {
     lifetime: Option<Arc<VarDctJobLifetime>>,
     completion: Arc<VarDctMapCompletion>,
-    code: PrefixCode,
+    code: VarDctPrefixCode,
     hf_entropy: HfEntropyPlan,
-    lf_metadata: VarDctLfMetadata,
+    config: VarDctConfig,
     frame_layout: VarDctFrameLayout,
     transform_plan: Option<Arc<TransformPlan>>,
     artifact_layout: ArtifactLayout,
@@ -1011,7 +1000,7 @@ impl VarDctJob {
                     &self.code,
                     &self.hf_entropy,
                     self.frame_layout,
-                    self.lf_metadata,
+                    self.config,
                 )?,
                 acceleration: None,
             })
@@ -1055,7 +1044,7 @@ impl GpuEncodeJob for VarDctJob {
 pub(super) fn validate_artifact<'a>(
     mapped: &'a [u8],
     layout: ArtifactLayout,
-    code: &PrefixCode,
+    code: &VarDctPrefixCode,
     hf_entropy: &HfEntropyPlan,
     frame: VarDctFrameLayout,
     transform_plan: Option<&'a TransformPlan>,
@@ -1090,6 +1079,12 @@ pub(super) fn validate_artifact<'a>(
     let lf_group_count = frame
         .lf_group_count()
         .map_err(|_| BackendError::InvalidArtifact("VarDCT LF group count overflow"))?;
+    if matches!(header.status, 0x4000_0000 | 0x8000_0000 | 0xc000_0000) {
+        return Err(BackendError::VarDctQuantizationOverflow {
+            low_frequency: header.status & 0x4000_0000 != 0,
+            high_frequency: header.status & 0x8000_0000 != 0,
+        });
+    }
     if header.status != ARTIFACT_READY
         || header.block_count != block_count
         || header.dc_sample_count != dc_sample_count
@@ -1274,7 +1269,7 @@ pub(super) fn validate_artifact<'a>(
     let block_count_usize = usize::try_from(block_count)
         .map_err(|_| BackendError::InvalidArtifact("VarDCT block count does not fit usize"))?;
     let entries = code.raw_entries();
-    let mut expected_histogram = [0u32; RAW_SYMBOLS];
+    let mut expected_histogram = [0u32; UINT_SYMBOLS];
     let mut bit_offset = 0u32;
     for (group_index, descriptor) in fragment_descriptors.iter().enumerate() {
         let group_index = u32::try_from(group_index)
@@ -1313,7 +1308,7 @@ pub(super) fn validate_artifact<'a>(
                     };
                     let actual = quantized_dc[base + block] as i32;
                     let residual = gradient_residual_i32(actual, top, left, top_left);
-                    let (token, extra_bit_count, extra) = signed_token(residual)?;
+                    let (token, extra_bit_count, extra) = signed_token(residual);
                     let slot = base + block;
                     if raw_tokens[slot] != token || extra_bits[slot] != extra {
                         return Err(BackendError::InvalidArtifact(
@@ -1410,39 +1405,29 @@ fn validate_zero_gap(words: &[u32], start: u32, end: u32) -> Result<(), BackendE
 }
 
 pub(super) fn clamped_gradient_i32(top: i32, left: i32, top_left: i32) -> i32 {
-    top.wrapping_add(left)
-        .wrapping_sub(top_left)
-        .clamp(top.min(left), top.max(left))
+    let lower = top.min(left);
+    let upper = top.max(left);
+    if top_left >= upper {
+        lower
+    } else if top_left <= lower {
+        upper
+    } else {
+        top.wrapping_add(left.wrapping_sub(top_left))
+    }
 }
 
 pub(super) fn gradient_residual_i32(actual: i32, top: i32, left: i32, top_left: i32) -> i32 {
     actual.wrapping_sub(clamped_gradient_i32(top, left, top_left))
 }
 
-pub(super) fn signed_token(value: i32) -> Result<(u32, u32, u32), BackendError> {
-    let packed = if value >= 0 {
-        u64::from(value as u32) * 2
-    } else {
-        u64::try_from(-i64::from(value)).expect("the negated i32 value fits u64") * 2 - 1
-    };
-    let packed = u32::try_from(packed).map_err(|_| {
-        BackendError::InvalidArtifact("VarDCT signed coefficient exceeds the token alphabet")
-    })?;
-    unsigned_token(packed)
-}
-
-fn unsigned_token(value: u32) -> Result<(u32, u32, u32), BackendError> {
+pub(super) fn signed_token(value: i32) -> (u32, u32, u32) {
+    let value = pack_signed_control(value);
     if value == 0 {
-        return Ok((0, 0, 0));
+        return (0, 0, 0);
     }
     let extra_bit_count = 31 - value.leading_zeros();
     let token = extra_bit_count + 1;
-    if token as usize >= RAW_SYMBOLS {
-        return Err(BackendError::InvalidArtifact(
-            "VarDCT token exceeds the fixed entropy alphabet",
-        ));
-    }
-    Ok((token, extra_bit_count, value - (1 << extra_bit_count)))
+    (token, extra_bit_count, value - (1 << extra_bit_count))
 }
 
 /// GPU convenience encoder for one standard transform or an image-wide strategy map.
@@ -1460,16 +1445,16 @@ impl VarDctEncoder {
     /// constructed or the selected device cannot execute the strategy's
     /// checked storage/workgroup/dispatch requirements.
     pub fn new(context: WgpuContext, strategy: VarDctStrategy) -> Result<Self, EncodeError> {
-        Self::new_with_lf_metadata(context, strategy, VarDctLfMetadata::default())
+        Self::new_with_config(context, strategy, VarDctConfig::default())
     }
 
-    /// Creates the profile backend with explicit LF dequantization and channel correlation.
-    pub fn new_with_lf_metadata(
+    /// Creates the profile backend with explicit quantization and LF metadata.
+    pub fn new_with_config(
         context: WgpuContext,
         strategy: VarDctStrategy,
-        lf_metadata: VarDctLfMetadata,
+        config: VarDctConfig,
     ) -> Result<Self, EncodeError> {
-        let backend = VarDctBackend::new_with_lf_metadata(&context, strategy, lf_metadata)?;
+        let backend = VarDctBackend::new_with_config(&context, strategy, config)?;
         Ok(Self {
             encoder: GpuEncoder::new(context, backend),
             frame: VarDctFrameLayout::single(strategy),
@@ -1480,10 +1465,10 @@ impl VarDctEncoder {
     pub fn new_with_strategy_map(
         context: WgpuContext,
         map: VarDctStrategyMap,
-        lf_metadata: VarDctLfMetadata,
+        config: VarDctConfig,
     ) -> Result<Self, EncodeError> {
         let frame = map.frame()?;
-        let backend = VarDctBackend::new_with_strategy_map(&context, map, lf_metadata)?;
+        let backend = VarDctBackend::new_with_strategy_map(&context, map, config)?;
         Ok(Self {
             encoder: GpuEncoder::new(context, backend),
             frame,
@@ -1523,8 +1508,8 @@ impl VarDctEncoder {
     }
 
     #[must_use]
-    pub fn distance(&self) -> PerceptualDistance {
-        profile_distance()
+    pub fn quantization(&self) -> VarDctQuantization {
+        self.encoder.backend().config.quantization
     }
 
     #[must_use]
@@ -1566,7 +1551,7 @@ impl VarDctEncoder {
             frame_index: FrameIndex::new(0),
             is_last: true,
             profile: EncodeProfile::VarDct {
-                distance: profile_distance(),
+                quantization: self.encoder.backend().config.quantization,
             },
             progressive: ProgressivePlan::single(),
             minimum_determinism: Determinism::SameDevice,
@@ -1593,8 +1578,8 @@ impl VarDctEncoder {
 /// partial edge blocks replicated on the GPU. Every block carries quantized
 /// DC and AC, using default matrices, natural order and one prefix distribution.
 /// The frame has every 2,048-pixel LF group and 256-pixel AC group; a single
-/// AC group uses the standard fused packet. Quantization is fixed and does
-/// not yet provide a general distance or rate-control guarantee.
+/// AC group uses the standard fused packet. Exact quantizer settings are configurable;
+/// perceptual distance and rate-control guarantees remain unimplemented.
 pub struct TiledVarDctEncoder {
     encoder: GpuEncoder<VarDctBackend>,
 }
@@ -1607,15 +1592,15 @@ impl TiledVarDctEncoder {
     /// Returns an encoder error if the fixed entropy tree cannot be built or
     /// the device cannot execute the checked tiled kernel ABI.
     pub fn new(context: WgpuContext) -> Result<Self, EncodeError> {
-        Self::new_with_lf_metadata(context, VarDctLfMetadata::default())
+        Self::new_with_config(context, VarDctConfig::default())
     }
 
-    /// Creates the tiled DCT8 backend with explicit LF dequantization and channel correlation.
-    pub fn new_with_lf_metadata(
+    /// Creates the tiled DCT8 backend with explicit quantization and LF metadata.
+    pub fn new_with_config(
         context: WgpuContext,
-        lf_metadata: VarDctLfMetadata,
+        config: VarDctConfig,
     ) -> Result<Self, EncodeError> {
-        let backend = VarDctBackend::new_tiled_dct8_with_lf_metadata(&context, lf_metadata)?;
+        let backend = VarDctBackend::new_tiled_dct8_with_config(&context, config)?;
         Ok(Self {
             encoder: GpuEncoder::new(context, backend),
         })
@@ -1643,8 +1628,8 @@ impl TiledVarDctEncoder {
     }
 
     #[must_use]
-    pub fn distance(&self) -> PerceptualDistance {
-        profile_distance()
+    pub fn quantization(&self) -> VarDctQuantization {
+        self.encoder.backend().config.quantization
     }
 
     #[must_use]
@@ -1692,7 +1677,7 @@ impl TiledVarDctEncoder {
             frame_index: FrameIndex::new(0),
             is_last: true,
             profile: EncodeProfile::VarDct {
-                distance: profile_distance(),
+                quantization: self.encoder.backend().config.quantization,
             },
             progressive: ProgressivePlan::single(),
             minimum_determinism: Determinism::SameDevice,

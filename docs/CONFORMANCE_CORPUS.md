@@ -233,7 +233,8 @@ defaults for the 128x256 matrix family. See the
 all 27 strategies in 37 transforms, 2057×17 spans two LF groups with 130 transforms, and 13×21
 uses DCT16×16 plus DCT8×16 with replicated edges. A fourth 24×16 image places DCT16×16
 at an 8-pixel horizontal offset between DCT8 blocks, exercising a transform origin that is not
-a multiple of its own extent. Every AC coefficient is compared against
+a multiple of its own extent. Two additional 512×512 and 2057×17 cases use global scale 13,000,
+LF quantizer 257 and per-transform HF multipliers 1, 19, 255 and 256. Every AC coefficient is compared against
 independent f64 transforms and the committed native matrices/orders/bases; the first three cases
 contain 176,403, 69,258 and 355 nonzero coefficients. Rust `jxl`, installed `djxl`, and public
 `GpuDecoder` agree within one RGB8 code. Reversed input placement order and all five linear
@@ -253,9 +254,26 @@ cosine sums or native impulse bases, and native matrices/orders within one integ
 All 54 streams agree across Rust `jxl`, `djxl` and the stock GPU decoder within one RGB8 code,
 and their bytes are identical under Scalar/32/64/128/256 lanes. Large-transform decoding now
 accepts the frequency-CfL requirement implemented by the resident renderer, while unknown
-capability bits remain errors. A maximum-magnitude 256x256 fragment uses 4,064,313 bits in its
-127,010-word allocation; invalid lengths/counts are rejected. A 400 KiB storage-binding limit
+capability bits remain errors. A maximum-magnitude 256x256 fragment uses 6,967,356 bits in its
+217,730-word allocation; invalid lengths/counts are rejected. A 500 KiB storage-binding limit
 independently rejects the 524,288-byte matrix/order allocation before any job reservation.
+
+`vardct_encoder/tests/quantization.rs` checks the complete global-scale/LF syntax ranges and
+effective HF multipliers 1–256. Mixed and tiled solid-white images exercise both endpoints,
+including a legal global-scale/LF product larger than `u32::MAX`, with independent Rust/native
+and GPU pixel comparisons. Signed 32-bit prefix tokens round-trip every binary exponent through
+`jxl_coding`, including canonical codes longer than eight bits. GPU integer-boundary probes and
+image-driven LF overflow require explicit errors and released memory instead of coefficient
+clipping. Cropped source bindings produce identical bytes with 256- and 1024-byte alignment.
+
+The decoder artifact suite checks raw HF metadata from `i32::MIN` through `i32::MAX`, including
+negative values and both sides of the upper bound. Effective multipliers follow
+`1 + clamp(raw, 0, 255)`, matching pinned libjxl `DecodeAcMetadata`; the GPU checks both task
+metadata and resulting dequantization scales. These raw metadata limits are distinct from the
+effective encoder control range. Independently authored one-block packets additionally compare
+all nine raw metadata values through Rust, native libjxl and public GPU decoding. Whole input
+and seven-byte transport fragments through 40-byte GPU windows must return identical pixels
+and release their reservations; both packet status and the renderer use the effective multiplier.
 
 The `jxl_wgpu_encode` actual-adapter suite generates its VarDCT inputs in memory rather than
 checking in large duplicate raster files. Odd 257x17, asymmetric 513x259 and 768x513, horizontal

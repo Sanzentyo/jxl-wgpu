@@ -86,7 +86,7 @@ fn map_statuses(
 }
 
 #[test]
-fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
+fn gpu_stages_encoder_packet_entropy_before_general_hf_global() {
     let Some((device, queue)) = device() else {
         eprintln!("skipping VarDCT packet GPU oracle: no adapter");
         return;
@@ -106,7 +106,8 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
         .unwrap();
     let plan = BoundedVarDctPacketPlan::parse(&codestream, &inventory).unwrap();
     let group = plan.groups.first().unwrap();
-    let control = group.packet_control(&plan).unwrap();
+    assert!(plan.requires_hf_global_staging());
+    let control = group.lf_stage_control(&plan).unwrap();
 
     let mut stream_bytes = codestream.clone();
     stream_bytes.resize((stream_bytes.len() + 7) & !3, 0);
@@ -151,7 +152,7 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
     let control_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("VarDCT packet control"),
         contents: bytemuck::bytes_of(&control),
-        usage: wgpu::BufferUsages::UNIFORM,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
     let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("VarDCT packet Modular params"),
@@ -171,20 +172,17 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("VarDCT packet oracle"),
     });
-    pipeline.encode(
-        &device,
-        &mut encoder,
-        VarDctPacketBuffers {
-            codestream: &stream,
-            modular_metadata: &metadata,
-            reconstructed_lf: &lf,
-            raw_hf_metadata: &raw,
-            coefficients: &coefficients,
-            status: &status,
-            control: &control_buffer,
-            modular_params: &params,
-        },
-    );
+    let buffers = || VarDctPacketBuffers {
+        codestream: &stream,
+        modular_metadata: &metadata,
+        reconstructed_lf: &lf,
+        raw_hf_metadata: &raw,
+        coefficients: &coefficients,
+        status: &status,
+        control: &control_buffer,
+        modular_params: &params,
+    };
+    pipeline.encode_lf(&device, &mut encoder, buffers());
     encoder.copy_buffer_to_buffer(
         &status,
         0,
@@ -192,25 +190,43 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
         0,
         std::mem::size_of::<GpuVarDctPacketStatus>() as u64,
     );
-    let submission = queue.submit([encoder.finish()]);
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    staging.map_async(wgpu::MapMode::Read, .., move |result| {
-        sender.send(result).unwrap();
-    });
-    device
-        .poll(wgpu::PollType::Wait {
-            submission_index: Some(submission),
-            timeout: None,
-        })
-        .unwrap();
-    receiver.recv().unwrap().unwrap();
-    let mapped = staging.slice(..).get_mapped_range().unwrap();
-    let status = bytemuck::from_bytes::<GpuVarDctPacketStatus>(&mapped).to_owned();
-    drop(mapped);
-    staging.unmap();
     let block_count = control.geometry[2] * control.geometry[3];
-    status
-        .validate(VarDctPacketValidation {
+    let first_status = map_statuses(&device, &staging, queue.submit([encoder.finish()]))[0];
+    let lf_cursor = first_status
+        .validate_lf_stage(
+            block_count * 3,
+            plan.global_scale,
+            plan.quant_lf,
+            group.extra_precision(),
+        )
+        .unwrap();
+    let continuation = plan
+        .parse_hf_continuation(&codestream, group, lf_cursor)
+        .unwrap();
+    assert_eq!(continuation.modular.metadata, plan.modular_metadata);
+    assert_eq!(
+        continuation.modular.lz77_window_words,
+        group.lz77_window_words
+    );
+    queue.write_buffer(
+        &control_buffer,
+        0,
+        bytemuck::bytes_of(&group.hf_stage_control(&plan, &continuation).unwrap()),
+    );
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("encoder HF metadata stage"),
+    });
+    pipeline.encode_hf_metadata(&device, &mut encoder, buffers());
+    encoder.copy_buffer_to_buffer(
+        &status,
+        0,
+        &staging,
+        0,
+        std::mem::size_of::<GpuVarDctPacketStatus>() as u64,
+    );
+    let status = map_statuses(&device, &staging, queue.submit([encoder.finish()]))[0];
+    let hf_cursor = status
+        .validate_hf_metadata_stage(VarDctPacketValidation {
             expected_strategy: None,
             expected_lf_samples: block_count * 3,
             block_count,
@@ -222,6 +238,10 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
         })
         .unwrap();
     assert_eq!(status.coefficient_words, group.coefficient_words());
+    assert_eq!(status.first_blocks, 1);
+    assert_eq!(status.hf_mul, 6);
+    assert!(hf_cursor > continuation.token_bit_offset);
+    assert!(hf_cursor < group.lf_group.end().unwrap() as u32);
 }
 
 #[test]

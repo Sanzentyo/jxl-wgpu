@@ -8,6 +8,9 @@ use jxl_gpu_bitstream::{BitWriter, PrefixCodeEntry};
 
 use crate::EncodeError;
 
+#[cfg(test)]
+mod tests;
+
 pub(crate) const RAW_SYMBOLS: usize = 19;
 pub(crate) const LZ77_SYMBOLS: usize = 33;
 const MAX_SYMBOLS: usize = LZ77_SYMBOLS;
@@ -30,38 +33,12 @@ const WIDE_MAX_RAW_LENGTH: [u8; RAW_SYMBOLS + 1] =
 
 #[derive(Clone, Debug)]
 pub(crate) struct PrefixCode {
-    raw_nbits: [u8; RAW_SYMBOLS],
-    raw_bits: [u8; RAW_SYMBOLS],
+    raw: RawPrefixCode<RAW_SYMBOLS>,
     lz77_nbits: [u8; LZ77_SYMBOLS],
     lz77_bits: [u16; LZ77_SYMBOLS],
 }
 
 impl PrefixCode {
-    pub(crate) fn from_raw_counts(raw_counts: &[u64; RAW_SYMBOLS]) -> Result<Self, EncodeError> {
-        if raw_counts.contains(&0) {
-            return Err(EncodeError::InvalidConfiguration(
-                "raw-only prefix alphabets must assign every GPU token",
-            ));
-        }
-
-        let mut raw_nbits = [0; RAW_SYMBOLS];
-        compute_code_lengths(
-            raw_counts,
-            RAW_SYMBOLS,
-            &[0; RAW_SYMBOLS],
-            &[15; RAW_SYMBOLS],
-            &mut raw_nbits,
-        );
-        let mut raw_bits = [0; RAW_SYMBOLS];
-        compute_canonical_code(&raw_nbits, &mut raw_bits, &[], &mut []);
-        Ok(Self {
-            raw_nbits,
-            raw_bits,
-            lz77_nbits: [0; LZ77_SYMBOLS],
-            lz77_bits: [0; LZ77_SYMBOLS],
-        })
-    }
-
     pub(crate) fn from_aggregated_counts(
         raw_gpu: &[u64; RAW_SYMBOLS],
         lz77_gpu: &[u64; LZ77_SYMBOLS],
@@ -117,10 +94,17 @@ impl PrefixCode {
     }
 
     pub(crate) fn raw_entries(&self) -> [PrefixCodeEntry; RAW_SYMBOLS] {
-        std::array::from_fn(|index| PrefixCodeEntry {
-            bit_len: self.raw_nbits[index],
-            bits: u16::from(self.raw_bits[index]),
-        })
+        self.raw.raw_entries()
+    }
+
+    pub(crate) fn write_raw(
+        &self,
+        writer: &mut BitWriter,
+        token: u32,
+        nbits: u32,
+        bits: u32,
+    ) -> Result<(), EncodeError> {
+        self.raw.write_raw(writer, token, nbits, bits)
     }
 
     pub(crate) fn lz77_entries(&self) -> [PrefixCodeEntry; LZ77_SYMBOLS] {
@@ -190,8 +174,10 @@ impl PrefixCode {
             &mut lz77_bits,
         );
         Self {
-            raw_nbits,
-            raw_bits,
+            raw: RawPrefixCode {
+                raw_nbits,
+                raw_bits,
+            },
             lz77_nbits,
             lz77_bits,
         }
@@ -200,7 +186,7 @@ impl PrefixCode {
     pub(crate) fn write_tree(&self, writer: &mut BitWriter) -> Result<(), EncodeError> {
         let mut code_length_counts = [0u64; 18];
         code_length_counts[17] = 3 + 2 * (LZ77_SYMBOLS - 1) as u64;
-        for &length in &self.raw_nbits {
+        for &length in &self.raw.raw_nbits {
             code_length_counts[usize::from(length)] += 1;
         }
         for &length in &self.lz77_nbits {
@@ -231,7 +217,7 @@ impl PrefixCode {
 
         let mut code_length_bits = [0u16; 18];
         compute_canonical_code(&[], &mut [], &code_length_nbits, &mut code_length_bits);
-        for &length in &self.raw_nbits {
+        for &length in &self.raw.raw_nbits {
             writer.write_bits(
                 u64::from(code_length_bits[usize::from(length)]),
                 code_length_nbits[usize::from(length)],
@@ -253,6 +239,63 @@ impl PrefixCode {
             )?;
         }
         Ok(())
+    }
+
+    pub(crate) fn write_run(
+        &self,
+        writer: &mut BitWriter,
+        token: u32,
+        nbits: u32,
+        bits: u32,
+    ) -> Result<(), EncodeError> {
+        let token = usize::try_from(token)
+            .map_err(|_| EncodeError::Backend("GPU LZ77 token overflow".into()))?;
+        let expected_nbits = if token < 16 { 0 } else { token - 12 };
+        if token > 27
+            || nbits != u32::try_from(expected_nbits).unwrap_or(u32::MAX)
+            || !extra_bits_are_canonical(nbits, bits)
+        {
+            return Err(EncodeError::Backend(
+                "GPU emitted an invalid LZ77 token".into(),
+            ));
+        }
+        writer.write_bits(u64::from(self.raw.raw_bits[0]), self.raw.raw_nbits[0])?;
+        writer.write_bits(u64::from(self.lz77_bits[token]), self.lz77_nbits[token])?;
+        writer.write_bits(u64::from(bits), nbits as u8)?;
+        Ok(())
+    }
+}
+
+/// A raw hybrid-uint alphabet without the Modular LZ77 extension.
+#[derive(Clone, Debug)]
+pub(crate) struct RawPrefixCode<const N: usize> {
+    raw_nbits: [u8; N],
+    raw_bits: [u16; N],
+}
+
+impl<const N: usize> RawPrefixCode<N> {
+    pub(crate) fn from_counts(raw_counts: &[u64; N]) -> Result<Self, EncodeError> {
+        if !(2..=MAX_SYMBOLS).contains(&N) || raw_counts.contains(&0) {
+            return Err(EncodeError::InvalidConfiguration(
+                "raw-only prefix alphabets must assign every GPU token",
+            ));
+        }
+
+        let mut raw_nbits = [0; N];
+        compute_code_lengths(raw_counts, N, &[0; N], &[15; N], &mut raw_nbits);
+        let mut raw_bits = [0; N];
+        compute_canonical_code(&raw_nbits, &mut raw_bits, &[], &mut []);
+        Ok(Self {
+            raw_nbits,
+            raw_bits,
+        })
+    }
+
+    pub(crate) fn raw_entries(&self) -> [PrefixCodeEntry; N] {
+        std::array::from_fn(|index| PrefixCodeEntry {
+            bit_len: self.raw_nbits[index],
+            bits: self.raw_bits[index],
+        })
     }
 
     /// Writes a prefix histogram containing only the raw hybrid-uint alphabet.
@@ -310,7 +353,7 @@ impl PrefixCode {
         let token = usize::try_from(token)
             .map_err(|_| EncodeError::Backend("GPU raw token overflow".into()))?;
         let expected_nbits = token.saturating_sub(1);
-        if token >= RAW_SYMBOLS
+        if token >= N
             || nbits != u32::try_from(expected_nbits).unwrap_or(u32::MAX)
             || !extra_bits_are_canonical(nbits, bits)
         {
@@ -319,30 +362,6 @@ impl PrefixCode {
             ));
         }
         writer.write_bits(u64::from(self.raw_bits[token]), self.raw_nbits[token])?;
-        writer.write_bits(u64::from(bits), nbits as u8)?;
-        Ok(())
-    }
-
-    pub(crate) fn write_run(
-        &self,
-        writer: &mut BitWriter,
-        token: u32,
-        nbits: u32,
-        bits: u32,
-    ) -> Result<(), EncodeError> {
-        let token = usize::try_from(token)
-            .map_err(|_| EncodeError::Backend("GPU LZ77 token overflow".into()))?;
-        let expected_nbits = if token < 16 { 0 } else { token - 12 };
-        if token > 27
-            || nbits != u32::try_from(expected_nbits).unwrap_or(u32::MAX)
-            || !extra_bits_are_canonical(nbits, bits)
-        {
-            return Err(EncodeError::Backend(
-                "GPU emitted an invalid LZ77 token".into(),
-            ));
-        }
-        writer.write_bits(u64::from(self.raw_bits[0]), self.raw_nbits[0])?;
-        writer.write_bits(u64::from(self.lz77_bits[token]), self.lz77_nbits[token])?;
         writer.write_bits(u64::from(bits), nbits as u8)?;
         Ok(())
     }
@@ -370,7 +389,7 @@ fn bit_reverse(nbits: usize, bits: u16) -> u16 {
 
 fn compute_canonical_code(
     first_nbits: &[u8],
-    first_bits: &mut [u8],
+    first_bits: &mut [u16],
     second_nbits: &[u8],
     second_bits: &mut [u16],
 ) {
@@ -379,6 +398,7 @@ fn compute_canonical_code(
     for &length in first_nbits.iter().chain(second_nbits) {
         counts[usize::from(length)] += 1;
     }
+    counts[0] = 0;
     let mut next_code = [0u16; MAX_CODE_LENGTH + 1];
     let mut code = 0u16;
     for length in 1..=MAX_CODE_LENGTH {
@@ -387,8 +407,10 @@ fn compute_canonical_code(
     }
     for (length, bits) in first_nbits.iter().copied().zip(first_bits) {
         let index = usize::from(length);
-        *bits = bit_reverse(index, next_code[index]) as u8;
-        next_code[index] = next_code[index].wrapping_add(1);
+        if length != 0 {
+            *bits = bit_reverse(index, next_code[index]);
+            next_code[index] = next_code[index].wrapping_add(1);
+        }
     }
     for (length, bits) in second_nbits.iter().copied().zip(second_bits) {
         let index = usize::from(length);

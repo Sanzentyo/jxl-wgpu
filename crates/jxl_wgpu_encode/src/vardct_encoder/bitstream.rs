@@ -2,12 +2,10 @@
 
 use jxl_gpu_bitstream::BitWriter;
 
-use super::entropy::HfEntropyPlan;
-use super::types::{
-    DcFragmentDescriptor, GLOBAL_SCALE, HF_MUL, QUANT_LF, VarDctArtifactData, VarDctFrameLayout,
-    VarDctLfMetadata,
-};
-use crate::prefix::PrefixCode;
+use super::entropy::VarDctPrefixCode;
+use super::entropy::{HfEntropyPlan, write_prefix_config};
+use super::types::{DcFragmentDescriptor, VarDctArtifactData, VarDctFrameLayout};
+use super::{VarDctConfig, VarDctQuantization};
 use crate::{
     BackendError, BitFragment, EncodeError, FrameGroupLayout, FramePacketSet, GroupPacket,
     GroupPacketKind,
@@ -97,71 +95,26 @@ fn write_u32(
 
 fn write_global_ma_config(
     output: &mut BitWriter,
-    codes: &[PrefixCode; 4],
+    code: &VarDctPrefixCode,
 ) -> Result<(), EncodeError> {
-    // A fixed four-cluster MA tree. All four distributions are identical so
-    // stream/channel routing cannot change the GPU token bit representation.
     output.write_bits(1, 1)?; // global MA tree present
-    output.write_bits(0, 1)?;
-    output.write_bits(1, 1)?;
-    output.write_bits(0, 2)?;
-    output.write_bits(1, 1)?;
-    output.write_bits(0, 4)?;
-    output.write_bits(0b100011, 6)?;
-    output.write_bits(1, 2)?;
-    output.write_bits(3, 2)?;
-    for symbol in 0..4 {
-        output.write_bits(symbol, 2)?;
+    write_prefix_config(output, code, 6)?;
+    // One Gradient leaf, offset zero, multiplier one. Both the tree and image
+    // stream use the same raw alphabet; no channel routing or LZ77 state is needed.
+    for value in [0, 5, 0, 0, 0] {
+        write_unsigned_token(output, code, value)?;
     }
-    output.write_bits(0, 1)?;
-
-    const TREE_INDICES: [usize; 26] = [
-        1, 2, 1, 4, 1, 0, 0, 5, 0, 0, 0, 0, 5, 0, 0, 0, 0, 5, 0, 0, 0, 0, 5, 0, 0, 0,
-    ];
-    const SYMBOL_BITS: [u64; 6] = [0b00, 0b10, 0b001, 0b101, 0b0011, 0b0111];
-    const SYMBOL_NBITS: [u8; 6] = [2, 2, 3, 3, 4, 4];
-    for index in TREE_INDICES {
-        output.write_bits(SYMBOL_BITS[index], SYMBOL_NBITS[index])?;
-    }
-
-    output.write_bits(1, 1)?;
-    output.write_bits(0, 2)?;
-    output.write_bits(0b1010, 4)?;
-    output.write_bits(4, 4)?;
-    output.write_bits(0, 3)?;
-    output.write_bits(0, 3)?;
-    output.write_bits(1, 1)?;
-    output.write_bits(3, 2)?;
-    for context in [4, 3, 2, 1, 0] {
-        output.write_bits(context, 3)?;
-    }
-    output.write_bits(1, 1)?;
-    output.write_bits(0, 4)?;
-    for _ in 0..4 {
-        output.write_bits(0, 4)?;
-    }
-    output.write_bits(1, 5)?;
-    for _ in 0..4 {
-        output.write_bits(1, 1)?;
-        output.write_bits(8, 4)?;
-        output.write_bits(0, 8)?;
-    }
-    output.write_bits(1, 2)?;
-    output.write_bits(0, 2)?;
-    output.write_bits(1, 1)?;
-    for code in codes {
-        code.write_tree(output)?;
-    }
-    Ok(())
+    write_prefix_config(output, code, 1)
 }
 
 fn write_lf_global(
     output: &mut BitWriter,
-    code: &PrefixCode,
+    code: &VarDctPrefixCode,
     hf_entropy: &HfEntropyPlan,
     coefficient_payload: bool,
-    lf_metadata: VarDctLfMetadata,
+    config: VarDctConfig,
 ) -> Result<(), EncodeError> {
+    let lf_metadata = config.lf_metadata;
     output.write_bits(u64::from(lf_metadata.has_default_dequantization()), 1)?;
     if !lf_metadata.has_default_dequantization() {
         for value in lf_metadata.lf_dequantization {
@@ -170,10 +123,14 @@ fn write_lf_global(
     }
     write_u32(
         output,
-        GLOBAL_SCALE,
+        config.quantization.global_scale(),
         [(1, 11), (2_049, 11), (4_097, 12), (8_193, 16)],
     )?;
-    write_u32(output, QUANT_LF, [(16, 0), (1, 5), (1, 8), (1, 16)])?;
+    write_u32(
+        output,
+        config.quantization.quant_lf(),
+        [(16, 0), (1, 5), (1, 8), (1, 16)],
+    )?;
     hf_entropy.write_block_context(output, coefficient_payload)?;
     output.write_bits(u64::from(lf_metadata.has_default_correlation()), 1)?;
     if !lf_metadata.has_default_correlation() {
@@ -189,10 +146,7 @@ fn write_lf_global(
             output.write_bits((i16::from(factor) + 128) as u64, 8)?;
         }
     }
-    write_global_ma_config(
-        output,
-        &[code.clone(), code.clone(), code.clone(), code.clone()],
-    )
+    write_global_ma_config(output, code)
 }
 
 fn write_local_modular_header(output: &mut BitWriter) -> Result<(), EncodeError> {
@@ -204,7 +158,7 @@ fn write_local_modular_header(output: &mut BitWriter) -> Result<(), EncodeError>
 
 fn write_unsigned_token(
     output: &mut BitWriter,
-    code: &PrefixCode,
+    code: &VarDctPrefixCode,
     value: u32,
 ) -> Result<(), EncodeError> {
     if value == 0 {
@@ -216,11 +170,7 @@ fn write_unsigned_token(
 }
 
 pub(super) fn pack_signed_control(value: i32) -> u32 {
-    if value < 0 {
-        value.unsigned_abs() * 2 - 1
-    } else {
-        value as u32 * 2
-    }
+    ((value as u32) << 1) ^ ((value >> 31) as u32)
 }
 
 fn append_gpu_dc_fragment(
@@ -282,17 +232,23 @@ pub(super) fn append_gpu_fragment(
 
 fn write_lf_group(
     output: &mut BitWriter,
-    code: &PrefixCode,
+    code: &VarDctPrefixCode,
     artifact: VarDctArtifactData<'_>,
     frame: VarDctFrameLayout,
     group_index: u32,
+    quantization: VarDctQuantization,
 ) -> Result<(), EncodeError> {
     let group = frame.lf_group_blocks(group_index)?;
     let block_count = group.block_count()?;
     let strategies = if let Some(plan) = artifact.transform_plan {
         plan.lf_groups[group_index as usize]
             .iter()
-            .map(|&index| plan.tasks[index].strategy as i32)
+            .map(|&index| {
+                (
+                    plan.tasks[index].strategy as i32,
+                    plan.tasks[index].hf_multiplier as i32 - 1,
+                )
+            })
             .collect::<Vec<_>>()
     } else {
         let count = match frame.topology {
@@ -304,7 +260,13 @@ fn write_lf_group(
                 ));
             }
         };
-        vec![artifact.strategy as i32; count]
+        vec![
+            (
+                artifact.strategy as i32,
+                quantization.hf_multiplier().get() as i32 - 1
+            );
+            count
+        ]
     };
     output.write_bits(0, 2)?; // no extra LF precision
     write_local_modular_header(output)?;
@@ -314,7 +276,7 @@ fn write_lf_group(
         artifact.dc_fragment_descriptor(group_index)?,
     )?;
 
-    // Validated strategy metadata, zero local CfL maps, fixed HF multiplier,
+    // Validated strategy/quantizer metadata, zero local CfL maps,
     // and zero EPF sharpness. All source-dependent entropy is already packed.
     let first_block_bits = block_count.next_power_of_two().trailing_zeros() as u8;
     output.write_bits(
@@ -337,19 +299,27 @@ fn write_lf_group(
     // ACS and HF multipliers form the two rows of one Modular channel.
     // The fixed MA tree uses Gradient on both rows: West on row zero, then
     // the clamped gradient of ACS (North), HF (West), and previous ACS (NW).
-    for (index, &strategy) in strategies.iter().enumerate() {
+    for (index, &(strategy, _)) in strategies.iter().enumerate() {
         let west = index
             .checked_sub(1)
-            .map_or(0, |previous| strategies[previous]);
+            .map_or(0, |previous| strategies[previous].0);
         write_unsigned_token(output, code, pack_signed_control(strategy - west))?;
     }
-    for (index, &north) in strategies.iter().enumerate() {
+    for (index, &(north, hf)) in strategies.iter().enumerate() {
         let prediction = if index == 0 {
             north
         } else {
-            super::dispatch::clamped_gradient_i32(north, HF_MUL - 1, strategies[index - 1])
+            super::dispatch::clamped_gradient_i32(
+                north,
+                strategies[index - 1].1,
+                strategies[index - 1].0,
+            )
         };
-        write_unsigned_token(output, code, pack_signed_control(HF_MUL - 1 - prediction))?;
+        write_unsigned_token(
+            output,
+            code,
+            pack_signed_control(hf.wrapping_sub(prediction)),
+        )?;
     }
     for _ in 0..block_count {
         write_unsigned_token(output, code, 0)?;
@@ -359,24 +329,18 @@ fn write_lf_group(
 
 pub(super) fn build_frame_packet(
     artifact: VarDctArtifactData<'_>,
-    code: &PrefixCode,
+    code: &VarDctPrefixCode,
     hf_entropy: &HfEntropyPlan,
     frame: VarDctFrameLayout,
-    lf_metadata: VarDctLfMetadata,
+    config: VarDctConfig,
 ) -> Result<FramePacketSet, EncodeError> {
     let ac_groups = frame.ac_group_count()?;
     let lf_groups = frame.lf_group_count()?;
     let coefficient_payload = artifact.has_ac_payload();
     if ac_groups == 1 && lf_groups == 1 {
         let mut group = BitWriter::new();
-        write_lf_global(
-            &mut group,
-            code,
-            hf_entropy,
-            coefficient_payload,
-            lf_metadata,
-        )?;
-        write_lf_group(&mut group, code, artifact, frame, 0)?;
+        write_lf_global(&mut group, code, hf_entropy, coefficient_payload, config)?;
+        write_lf_group(&mut group, code, artifact, frame, 0, config.quantization)?;
         hf_entropy.write_global(&mut group, ac_groups, coefficient_payload)?;
         artifact.ac.append_group(&mut group, frame, 0)?;
         group.align_to_byte()?;
@@ -396,7 +360,7 @@ pub(super) fn build_frame_packet(
         code,
         hf_entropy,
         coefficient_payload,
-        lf_metadata,
+        config,
     )?;
     dc_global.align_to_byte()?;
     let mut ac_global = BitWriter::new();
@@ -416,7 +380,14 @@ pub(super) fn build_frame_packet(
     ));
     for group_index in 0..lf_groups {
         let mut dc_group = BitWriter::new();
-        write_lf_group(&mut dc_group, code, artifact, frame, group_index)?;
+        write_lf_group(
+            &mut dc_group,
+            code,
+            artifact,
+            frame,
+            group_index,
+            config.quantization,
+        )?;
         dc_group.align_to_byte()?;
         packets.push(GroupPacket::new(
             GroupPacketKind::DcGroup(group_index),

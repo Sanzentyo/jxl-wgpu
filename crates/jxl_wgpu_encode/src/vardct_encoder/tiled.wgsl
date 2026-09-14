@@ -6,6 +6,11 @@ var<workgroup> block_xyb: array<vec3<f32>, 64>;
 var<workgroup> block_ac: array<vec3<i32>, 64>;
 
 fn serialize_block_ac(block: u32) {
+    let error = atomicLoad(&quantization_error);
+    if error != 0u {
+        artifact_words[params.ac_descriptor_offset + block] = error;
+        return;
+    }
     // Fixed word-sized slots have disjoint writes even when adjacent blocks
     // finish mid-word. All 495 contexts use one prefix distribution, so the
     // complete block token sequences can be joined without entropy state.
@@ -86,16 +91,12 @@ fn quantize_blocks(
             sum += block_xyb[index];
         }
         let mean = sum / 64.0;
-        let dc_scale = f32(params.global_scale * params.quant_lf);
+        let dc_scale = f32(params.global_scale) * f32(params.quant_lf);
         let decorrelated_x = fma(-mean.y, params.lf_correlation[0], mean.x);
         let decorrelated_b = fma(-mean.y, params.lf_correlation[1], mean.z);
-        let quantized_y = i32(round(mean.y * dc_scale * params.lf_quantization[1]));
-        let quantized_x = i32(round(
-            decorrelated_x * dc_scale * params.lf_quantization[0],
-        ));
-        let quantized_b = i32(round(
-            decorrelated_b * dc_scale * params.lf_quantization[2],
-        ));
+        let quantized_y = quantize_checked(mean.y * dc_scale * params.lf_quantization[1], LF_QUANTIZATION_OVERFLOW);
+        let quantized_x = quantize_checked(decorrelated_x * dc_scale * params.lf_quantization[0], LF_QUANTIZATION_OVERFLOW);
+        let quantized_b = quantize_checked(decorrelated_b * dc_scale * params.lf_quantization[2], LF_QUANTIZATION_OVERFLOW);
         artifact_words[params.dc_offset + block] = bitcast<u32>(quantized_y);
         artifact_words[params.dc_offset + block_count + block] = bitcast<u32>(quantized_x);
         artifact_words[params.dc_offset + 2u * block_count + block] = bitcast<u32>(quantized_b);

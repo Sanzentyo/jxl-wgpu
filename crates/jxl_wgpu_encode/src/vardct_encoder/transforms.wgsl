@@ -3,7 +3,7 @@ struct QuantizationEntry { dequant: vec3<f32>, order: u32 }
 struct TransformTask {
     block_x: u32, block_y: u32, coefficient_offset: u32, lf_offset: u32,
     width: u32, height: u32, metadata_offset: u32, ac_word_offset: u32,
-    ac_word_capacity: u32, strategy: u32,
+    ac_word_capacity: u32, strategy: u32, hf_multiplier: u32,
 }
 @group(0) @binding(3) var<storage, read> forward_coefficients: array<f32>;
 @group(0) @binding(4) var<storage, read> forward_lf: array<f32>;
@@ -40,19 +40,24 @@ fn quantize_transforms_ac(@builtin(workgroup_id) group: vec3<u32>, @builtin(loca
     if task_index >= params.ac_descriptor_len { return; }
     let task = tasks[task_index];
     let area = task.width * task.height;
-    for (var index = lane; index < area; index += wg_x) {
+    for (var order = lane; order < area; order += wg_x) {
+        if order < area / 64u { continue; }
+        let index = quantization[task.metadata_offset + order].order;
         let offset = task.coefficient_offset + index;
         let coefficient = vec3<f32>(forward_coefficients[offset],
             forward_coefficients[offset + area], forward_coefficients[offset + 2u * area]);
         let decorrelated = vec3<f32>(fma(-coefficient.y, params.hf_correlation[0], coefficient.x),
             coefficient.y, fma(-coefficient.y, params.hf_correlation[1], coefficient.z));
-        let scale = f32(params.global_scale) * 6.0 / 65536.0;
+        let scale = f32(params.global_scale) * f32(task.hf_multiplier) / 65536.0;
         for (var channel = 0u; channel < 3u; channel += 1u) {
             let value = decorrelated[channel] * scale * params.hf_quantization[channel]
                 / quantization[task.metadata_offset + index].dequant[channel];
-            quantized_coefficients[offset + channel * area] = clamp(i32(round(value)),
-                -MAX_HF_QUANTIZED_MAGNITUDE, MAX_HF_QUANTIZED_MAGNITUDE);
+            quantized_coefficients[offset + channel * area] = quantize_checked(value, HF_QUANTIZATION_OVERFLOW);
         }
+    }
+    workgroupBarrier();
+    if lane == 0u {
+        artifact_words[params.ac_descriptor_offset + task_index] = atomicLoad(&quantization_error);
     }
 }
 
@@ -67,15 +72,19 @@ fn quantize_transforms_lf(@builtin(workgroup_id) group: vec3<u32>, @builtin(loca
     for (var block = lane; block < count; block += wg_x) {
         let offset = task.lf_offset + block;
         let lf = vec3<f32>(forward_lf[offset], forward_lf[offset + count], forward_lf[offset + 2u * count]);
-        let scale = f32(params.global_scale * params.quant_lf);
-        let qy = i32(round(lf.y * scale * params.lf_quantization[1]));
-        let qx = i32(round(fma(-lf.y, params.lf_correlation[0], lf.x) * scale * params.lf_quantization[0]));
-        let qb = i32(round(fma(-lf.y, params.lf_correlation[1], lf.z) * scale * params.lf_quantization[2]));
+        let scale = f32(params.global_scale) * f32(params.quant_lf);
+        let qy = quantize_checked(lf.y * scale * params.lf_quantization[1], LF_QUANTIZATION_OVERFLOW);
+        let qx = quantize_checked(fma(-lf.y, params.lf_correlation[0], lf.x) * scale * params.lf_quantization[0], LF_QUANTIZATION_OVERFLOW);
+        let qb = quantize_checked(fma(-lf.y, params.lf_correlation[1], lf.z) * scale * params.lf_quantization[2], LF_QUANTIZATION_OVERFLOW);
         let destination = (task.block_y + block / width) * params.blocks_x + task.block_x + block % width;
         artifact_words[params.dc_offset + destination] = bitcast<u32>(qy);
         artifact_words[params.dc_offset + canvas_count + destination] = bitcast<u32>(qx);
         artifact_words[params.dc_offset + 2u * canvas_count + destination] = bitcast<u32>(qb);
         artifact_words[params.strategy_offset + destination] = task.strategy | (u32(block == 0u) << 8u);
+    }
+    workgroupBarrier();
+    if lane == 0u {
+        artifact_words[params.ac_descriptor_offset + task_index] |= atomicLoad(&quantization_error);
     }
 }
 
@@ -83,6 +92,7 @@ fn quantize_transforms_lf(@builtin(workgroup_id) group: vec3<u32>, @builtin(loca
 fn serialize_transforms_ac(@builtin(workgroup_id) group: vec3<u32>) {
     let task_index = transform_index(group);
     if task_index >= params.ac_descriptor_len { return; }
+    if artifact_words[params.ac_descriptor_offset + task_index] != 0u { return; }
     let task = tasks[task_index];
     let area = task.width * task.height;
     let llf = area / 64u;

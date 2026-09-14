@@ -19,7 +19,8 @@
 //! [`VarDctStrategyMap`]. Per-strategy GPU batches share resident image/coefficient/LF arenas,
 //! quantize real AC, and pack one bounded entropy fragment per transform. Partial source edges
 //! are replicated on GPU; mixed maps may span multiple LF and AC groups. Quantization uses
-//! fixed parameters; content-adaptive strategy search, distance control and progressive encoding
+//! explicit global/LF controls and per-transform HF multipliers; content-adaptive strategy search,
+//! distance control and progressive encoding
 //! remain incomplete. [`TiledVarDctEncoder`] provides an optimized DCT8 workgroup path.
 //!
 //! Fixed CPU/WGSL ABI records use `#[repr(C)]` plus `bytemuck::Pod`. WGSL defines
@@ -50,8 +51,8 @@ pub use buffer_pool::{
     DEFAULT_ENCODER_BUFFER_POOL_BYTES, EncoderBufferPoolStats, MAX_ENCODER_BUFFER_POOL_IDLE_SETS,
 };
 pub use capability::{
-    Determinism, EncodeProfile, EncoderCapabilities, KernelStage, PerceptualDistance,
-    ProfileCapability, ProgressivePass, ProgressivePlan,
+    Determinism, EncodeProfile, EncoderCapabilities, KernelStage, ProfileCapability,
+    ProgressivePass, ProgressivePlan,
 };
 pub use error::{BackendError, EncodeError, PacketError, UnsupportedFeature};
 pub use gpu::{
@@ -76,7 +77,8 @@ pub use session::{
     GpuAccelerationArtifact, GpuFrameArtifacts, ReferenceSlot, SessionDescriptor,
 };
 pub use vardct_encoder::{
-    TiledVarDctEncoder, TiledVarDctGrid, VarDctBackend, VarDctColorEncoding, VarDctEncoder,
-    VarDctJob, VarDctKernelLayout, VarDctLfMetadata, VarDctMemoryPlan, VarDctStrategy,
-    VarDctStrategyMap, VarDctSubmission, VarDctTransform, VarDctTransformMemoryPlan,
+    TiledVarDctEncoder, TiledVarDctGrid, VarDctBackend, VarDctColorEncoding, VarDctConfig,
+    VarDctEncoder, VarDctHfMultiplier, VarDctJob, VarDctKernelLayout, VarDctLfMetadata,
+    VarDctMemoryPlan, VarDctQuantization, VarDctStrategy, VarDctStrategyMap, VarDctSubmission,
+    VarDctTransform, VarDctTransformMemoryPlan,
 };

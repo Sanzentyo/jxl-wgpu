@@ -27,13 +27,12 @@ const STATUS_BACKEND_REQUIREMENTS: u32 = 8u;
 const STATUS_STRATEGY_MASK: u32 = 9u;
 const BACKEND_REQUIREMENT_FREQUENCY_CFL_GRID: u32 = 1u;
 const ERROR_INVALID_STRATEGY: u32 = 1u;
-const ERROR_NON_POSITIVE_HF_MUL: u32 = 2u;
-const ERROR_BLOCK_INFO_EXHAUSTED: u32 = 3u;
-const ERROR_TRANSFORM_OUTSIDE_LF_GROUP: u32 = 4u;
-const ERROR_PASS_GROUP_CROSSING: u32 = 5u;
-const ERROR_TRANSFORM_OVERLAP: u32 = 6u;
-const ERROR_TASK_CAPACITY: u32 = 7u;
-const ERROR_COEFFICIENT_CAPACITY: u32 = 8u;
+const ERROR_BLOCK_INFO_EXHAUSTED: u32 = 2u;
+const ERROR_TRANSFORM_OUTSIDE_LF_GROUP: u32 = 3u;
+const ERROR_PASS_GROUP_CROSSING: u32 = 4u;
+const ERROR_TRANSFORM_OVERLAP: u32 = 5u;
+const ERROR_TASK_CAPACITY: u32 = 6u;
+const ERROR_COEFFICIENT_CAPACITY: u32 = 7u;
 
 fn status_offset() -> u32 {
     return params.artifact_offsets.x;
@@ -321,11 +320,6 @@ fn lower_hf_metadata() {
                 fail(ERROR_INVALID_STRATEGY, x, y, bitcast<u32>(raw_strategy));
                 return;
             }
-            let raw_hf_mul = raw_metadata[params.source_offsets.y + consumed];
-            if (raw_hf_mul < 0 || raw_hf_mul == 0x7fffffffi) {
-                fail(ERROR_NON_POSITIVE_HF_MUL, x, y, bitcast<u32>(raw_hf_mul));
-                return;
-            }
             let strategy = u32(raw_strategy);
             let extent = block_extent(strategy);
             if (!validate_transform(x, y, extent, strategy)) {
@@ -383,7 +377,8 @@ fn lower_hf_metadata() {
                 continue;
             }
             let strategy = u32(raw_metadata[params.source_offsets.x + consumed]);
-            let hf_mul = u32(raw_metadata[params.source_offsets.y + consumed] + 1);
+            // The raw Modular sample is signed; JPEG XL clamps it before adding one.
+            let hf_mul = u32(clamp(raw_metadata[params.source_offsets.y + consumed], 0i, 255i)) + 1u;
             let extent = block_extent(strategy);
             let task_index = bucket_offsets[strategy] + cursors[strategy];
             write_task(

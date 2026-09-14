@@ -162,7 +162,7 @@ pub(super) fn check_ac(
     bit_len: u32,
     coefficients: &[[f64; 3]],
     oracle: &Oracle,
-    metadata: VarDctLfMetadata,
+    config: VarDctConfig,
 ) -> usize {
     let entropy = HfEntropyPlan::single_cluster_prefix().unwrap();
     let bytes = words
@@ -170,7 +170,8 @@ pub(super) fn check_ac(
         .flat_map(|word| word.to_le_bytes())
         .collect::<Vec<_>>();
     let mut reader = BitReader::new(&bytes);
-    let slopes = metadata
+    let slopes = config
+        .lf_metadata
         .base_correlation()
         .map(|value| f64::from(value.to_f32()));
     let skip = coefficients.len() / 64;
@@ -197,7 +198,11 @@ pub(super) fn check_ac(
                 1 => coefficient[1],
                 _ => coefficient[2] - slopes[1] * coefficient[1],
             };
-            let expected = (decorrelated * (8813.0 * 6.0 / 65536.0) * [1.25, 1.0, 1.0][channel]
+            let expected = (decorrelated
+                * (f64::from(config.quantization.global_scale())
+                    * f64::from(config.quantization.hf_multiplier().get())
+                    / 65536.0)
+                * [1.25, 1.0, 1.0][channel]
                 / oracle.dequant[channel][index])
                 .round() as i32;
             // Fixed f64/native oracle regression bound: at most one quantizer

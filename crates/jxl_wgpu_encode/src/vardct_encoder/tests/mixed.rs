@@ -1,6 +1,6 @@
 //! Mixed-transform AC oracles, group assembly, edge padding and admission.
 
-use super::super::dispatch::{VarDctBackend, profile_distance};
+use super::super::dispatch::VarDctBackend;
 use super::super::strategy_map::{TransformPlan, VarDctStrategyMap, VarDctTransform};
 use super::*;
 use crate::{
@@ -9,11 +9,7 @@ use crate::{
 };
 
 fn placement(x: u32, y: u32, strategy: VarDctStrategy) -> VarDctTransform {
-    VarDctTransform {
-        block_x: x,
-        block_y: y,
-        strategy,
-    }
+    VarDctTransform::new(x, y, strategy)
 }
 
 fn packed_map(width: u32, height: u32, include_all: bool) -> VarDctStrategyMap {
@@ -86,12 +82,12 @@ fn maps_reject_holes_overlap_bounds_and_group_crossing_and_canonicalize_order() 
     let mut reversed = map.transforms().to_vec();
     reversed.reverse();
     assert_eq!(VarDctStrategyMap::new(512, 512, reversed).unwrap(), map);
-    let plan = TransformPlan::new(map).unwrap();
+    let plan = TransformPlan::new(map, VarDctQuantization::default()).unwrap();
     assert_eq!(plan.batches.len(), 27);
     assert_eq!(plan.memory.forward.parameter_bytes, 27 * 64);
     assert_eq!(
         plan.memory.task_metadata_bytes,
-        plan.tasks.len() as u64 * 40
+        plan.tasks.len() as u64 * 44
     );
     assert!(
         plan.ac_words
@@ -126,6 +122,22 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
     let oracles = native::native_oracles();
     let directory = oracle_directory();
     fs::create_dir_all(&directory).unwrap();
+    let quantized_map = |width, height, all| {
+        let map = packed_map(width, height, all);
+        let transforms = map
+            .transforms()
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, task)| match index % 4 {
+                0 => task,
+                which => task.with_hf_multiplier(
+                    crate::VarDctHfMultiplier::new([0, 1, 255, 256][which]).unwrap(),
+                ),
+            })
+            .collect();
+        VarDctStrategyMap::new(width, height, transforms).unwrap()
+    };
     let maps = [
         packed_map(512, 512, true),
         packed_map(2057, 17, false),
@@ -148,26 +160,37 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
             ],
         )
         .unwrap(),
+        quantized_map(512, 512, true),
+        quantized_map(2057, 17, false),
     ];
     let mut streams = Vec::new();
     for (case, map) in maps.into_iter().enumerate() {
         let Extent2d { width, height } = map.extent();
         let (w, h) = (width as usize, height as usize);
         let pixels = reference::pattern(w, h);
-        let plan = TransformPlan::new(map.clone()).unwrap();
         let metadata = if case == 1 {
             custom_lf_metadata()
         } else {
             VarDctLfMetadata::default()
         };
-        let encoder =
-            VarDctBackend::new_with_strategy_map(&context, map.clone(), metadata).unwrap();
+        let config = VarDctConfig {
+            lf_metadata: metadata,
+            quantization: if case >= 4 {
+                VarDctQuantization::new(13000, 257, crate::VarDctHfMultiplier::new(19).unwrap())
+                    .unwrap()
+            } else {
+                VarDctQuantization::default()
+            },
+        };
+        let plan = TransformPlan::new(map.clone(), config.quantization).unwrap();
+        let encoder = VarDctBackend::new_with_strategy_map(&context, map.clone(), config).unwrap();
+
         let source = padded_rgb_source_sized(&context, w, h, &pixels);
         let request = FrameEncodeRequest {
             frame_index: FrameIndex::new(0),
             is_last: true,
             profile: EncodeProfile::VarDct {
-                distance: profile_distance(),
+                quantization: config.quantization,
             },
             progressive: ProgressivePlan::single(),
             minimum_determinism: Determinism::SameDevice,
@@ -208,7 +231,15 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
                 lengths[index],
                 &coefficients,
                 oracle,
-                metadata,
+                VarDctConfig {
+                    quantization: VarDctQuantization::new(
+                        config.quantization.global_scale(),
+                        config.quantization.quant_lf(),
+                        crate::VarDctHfMultiplier::new(task.hf_multiplier).unwrap(),
+                    )
+                    .unwrap(),
+                    ..config
+                },
             );
         }
         assert!(nonzero > 0, "mixed textured images must retain AC");
@@ -224,10 +255,7 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
             .unwrap();
         let frame = session.next_frame().unwrap().unwrap();
         let output = readback.submit(frame.output()).unwrap().wait().unwrap();
-        assert!(
-            max_abs_error(&output.frame.outputs[0].bytes, &rust) <= 1,
-            "GPU/Rust case {case}"
-        );
+        let gpu = output.frame.outputs[0].bytes.clone();
         drop(frame);
         assert!(session.next_frame().unwrap().is_none());
         let input = directory.join(format!("mixed-{case}.jxl"));
@@ -242,15 +270,27 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
                 .unwrap()
                 .success()
         );
+        let native_pixels = read_ppm_rgb8(&output, w, h);
+        eprintln!(
+            "quantizer case {case} {config:?}: GPU/Rust {}, native/Rust {}, GPU/native {}, files {}",
+            max_abs_error(&gpu, &rust),
+            max_abs_error(&native_pixels, &rust),
+            max_abs_error(&gpu, &native_pixels),
+            input.display()
+        );
+        fs::write(input.with_extension("gpu.rgb"), &gpu).unwrap();
+        fs::write(input.with_extension("rust.rgb"), &rust).unwrap();
         assert!(
-            max_abs_error(&read_ppm_rgb8(&output, w, h), &rust) <= 1,
+            max_abs_error(&native_pixels, &rust) <= 1,
             "native/Rust case {case}"
         );
+        assert!(max_abs_error(&gpu, &rust) <= 1, "GPU/Rust case {case}");
+
         eprintln!(
             "mixed {width}x{height}: {} transforms, {nonzero} checked nonzero AC coefficients",
             plan.tasks.len()
         );
-        streams.push((map, metadata, pixels, stream));
+        streams.push((map, config, pixels, stream));
     }
     for variant in [
         KernelVariant::Scalar,
@@ -262,13 +302,13 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
         let context =
             test_context_with_variants(&device, &queue, &info, &[(FORWARD_KERNEL_KEY, variant)])
                 .unwrap();
-        for (map, metadata, pixels, expected) in &streams {
+        for (map, config, pixels, expected) in &streams {
             let extent = map.extent();
             let mut reordered = map.transforms().to_vec();
             reordered.reverse();
             let map = VarDctStrategyMap::new(extent.width, extent.height, reordered).unwrap();
             let encoder =
-                VarDctEncoder::new_with_strategy_map(context.clone(), map, *metadata).unwrap();
+                VarDctEncoder::new_with_strategy_map(context.clone(), map, *config).unwrap();
             let source = padded_rgb_source_sized(
                 &context,
                 extent.width as usize,
@@ -292,8 +332,12 @@ fn mixed_jobs_admit_exact_memory_reject_wrong_extents_and_release_after_cancella
     let map = packed_map(512, 512, true);
     let metadata = VarDctLfMetadata::default();
     let pixels = reference::pattern(512, 512);
-    let encoder =
-        VarDctEncoder::new_with_strategy_map(context.clone(), map.clone(), metadata).unwrap();
+    let encoder = VarDctEncoder::new_with_strategy_map(
+        context.clone(),
+        map.clone(),
+        config_with_lf(metadata),
+    )
+    .unwrap();
     let source = padded_rgb_source_sized(&context, 512, 512, &pixels);
     let memory = encoder.memory_plan(&source).unwrap();
     assert_eq!(memory.kernel_layout, VarDctKernelLayout::StrategyMap);
@@ -309,7 +353,8 @@ fn mixed_jobs_admit_exact_memory_reject_wrong_extents_and_release_after_cancella
     )
     .unwrap();
     let encoder =
-        VarDctEncoder::new_with_strategy_map(insufficient, map.clone(), metadata).unwrap();
+        VarDctEncoder::new_with_strategy_map(insufficient, map.clone(), config_with_lf(metadata))
+            .unwrap();
     assert!(matches!(
         encoder.submit(source.clone()),
         Err(EncodeError::MemoryBackpressure(_))
@@ -321,7 +366,8 @@ fn mixed_jobs_admit_exact_memory_reject_wrong_extents_and_release_after_cancella
         NonZeroU64::new(memory.owned_bytes_per_job).unwrap(),
     )
     .unwrap();
-    let encoder = VarDctEncoder::new_with_strategy_map(exact.clone(), map, metadata).unwrap();
+    let encoder =
+        VarDctEncoder::new_with_strategy_map(exact.clone(), map, config_with_lf(metadata)).unwrap();
     let submission = encoder.submit(source).unwrap();
     assert_eq!(
         encoder.in_flight_memory_stats().reserved_bytes,

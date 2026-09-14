@@ -2859,7 +2859,7 @@ impl GpuVarDctPacketStatus {
                 && self.first_blocks != 0
                 && self.first_blocks <= expected.task_capacity
                 && strategy_matches
-                && self.hf_mul > 0
+                && (1..=256).contains(&self.hf_mul)
                 && self.global_scale == expected.expected_global_scale
                 && self.quant_lf == expected.expected_quant_lf
                 && self.extra_precision == u32::from(expected.expected_extra_precision) =>
@@ -2909,7 +2909,7 @@ impl GpuVarDctPacketStatus {
                 && self.first_blocks != 0
                 && self.first_blocks <= expected.task_capacity
                 && strategy_matches
-                && self.hf_mul > 0
+                && (1..=256).contains(&self.hf_mul)
                 && self.global_scale == expected.expected_global_scale
                 && self.quant_lf == expected.expected_quant_lf
                 && self.extra_precision == u32::from(expected.expected_extra_precision) =>

@@ -10,7 +10,20 @@ const PI: f32 = 3.14159265358979323846;
 const SQRT_TWO: f32 = 1.41421356237309504880;
 const OPSIN_BIAS: f32 = 0.0037930732552754493;
 const NEG_OPSIN_BIAS_CBRT: f32 = -0.15595420054924863;
-const MAX_HF_QUANTIZED_MAGNITUDE: i32 = 131071;
+const LF_QUANTIZATION_OVERFLOW: u32 = 0x40000000u;
+const HF_QUANTIZATION_OVERFLOW: u32 = 0x80000000u;
+var<workgroup> quantization_error: atomic<u32>;
+
+fn quantize_checked(value: f32, error: u32) -> i32 {
+    let rounded = round(value);
+    // The upper endpoint is exclusive: f32(i32::MAX) rounds to 2^31.
+    if !(rounded >= -2147483648.0 && rounded < 2147483648.0) {
+        atomicOr(&quantization_error, error);
+        return 0;
+    }
+    return i32(rounded);
+}
+
 const DCT8_NATURAL_ORDER: array<u32, 64> = array<u32, 64>(
     0u, 1u, 8u, 16u, 9u, 2u, 3u, 10u, 17u, 24u, 32u, 25u, 18u, 11u, 4u, 5u,
     12u, 19u, 26u, 33u, 40u, 48u, 41u, 34u, 27u, 20u, 13u, 6u, 7u, 14u, 21u, 28u,
@@ -94,30 +107,28 @@ fn quantize_dct8_ac(coefficient: vec3<f32>, frequency_x: u32, frequency_y: u32) 
         coefficient.y,
         fma(-coefficient.y, params.hf_correlation[1], coefficient.z),
     );
-    let scale = f32(params.global_scale) * 6.0 / 65536.0;
+    let scale = f32(params.global_scale) * f32(params.hf_multiplier) / 65536.0;
     var quantized = vec3<i32>(0);
     for (var channel = 0u; channel < 3u; channel += 1u) {
         let value = decorrelated[channel]
             * scale
             * params.hf_quantization[channel]
             * dct8_quant_weight(channel, frequency_x, frequency_y);
-        quantized[channel] = clamp(
-            i32(round(value)),
-            -MAX_HF_QUANTIZED_MAGNITUDE,
-            MAX_HF_QUANTIZED_MAGNITUDE,
-        );
+        quantized[channel] = quantize_checked(value, HF_QUANTIZATION_OVERFLOW);
     }
     return quantized;
 }
 
 fn zigzag_signed(value: i32) -> u32 {
-    if value < 0 {
-        return u32(-value) * 2u - 1u;
-    }
-    return u32(value) * 2u;
+    return (bitcast<u32>(value) << 1u) ^ bitcast<u32>(value >> 31u);
 }
 
 fn clamped_gradient(top: i32, left: i32, top_left: i32) -> i32 {
-    return clamp(top + left - top_left, min(top, left), max(top, left));
+    let lower = min(top, left);
+    let upper = max(top, left);
+    if top_left >= upper { return lower; }
+    if top_left <= lower { return upper; }
+    // The mathematical result lies between top and left; intermediate i32
+    // operations wrap, matching the Modular integer predictor.
+    return top + (left - top_left);
 }
-

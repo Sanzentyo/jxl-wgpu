@@ -10,18 +10,14 @@ use jxl_gpu_protocol::Extent2d;
 pub use jxl_gpu_protocol::TransformKind as VarDctStrategy;
 use jxl_wgpu::ForwardVarDctMemoryPlan;
 
-use crate::prefix::{PrefixCode, RAW_SYMBOLS};
+use super::entropy::{UINT_SYMBOLS, VarDctPrefixCode};
 use crate::{EncodeError, UnsupportedFeature};
 
-pub(super) const GLOBAL_SCALE: u32 = 8_813;
-pub(super) const QUANT_LF: u32 = 10;
-pub(super) const HF_MUL: i32 = 6;
-pub(super) const MAX_HF_QUANTIZED_MAGNITUDE: i32 = 131_071;
 pub(super) const HF_QUANTIZATION: [f32; 3] = [1.25, 1.0, 1.0];
 
 pub(super) const AC_GROUP_DIM_PIXELS: u32 = 256;
 pub(super) const LF_GROUP_DIM_PIXELS: u32 = 2_048;
-pub(super) const HEADER_WORDS: u32 = 64;
+pub(super) const HEADER_WORDS: u32 = 68;
 pub(super) const SECTION_ALIGNMENT_WORDS: u32 = 64;
 pub(super) const ARTIFACT_READY: u32 = 0x5644_4354;
 pub(super) const SINGLE_TRANSFORM_TOPOLOGY: u32 = 0;
@@ -365,7 +361,8 @@ pub(super) struct VarDctKernelParams {
     pub(super) strategy: u32,
     pub(super) global_scale: u32,
     pub(super) quant_lf: u32,
-    pub(super) raw_prefix: [GpuPrefixEntry; RAW_SYMBOLS],
+    pub(super) hf_multiplier: u32,
+    pub(super) raw_prefix: [GpuPrefixEntry; UINT_SYMBOLS],
     pub(super) strategy_offset: u32,
     pub(super) dc_offset: u32,
     pub(super) token_offset: u32,
@@ -380,7 +377,7 @@ pub(super) struct VarDctKernelParams {
     pub(super) lf_groups_y: u32,
     pub(super) lf_quantization: [f32; 3],
     pub(super) lf_correlation: [f32; 2],
-    pub(super) hf_prefix: [GpuPrefixEntry; RAW_SYMBOLS],
+    pub(super) hf_prefix: [GpuPrefixEntry; UINT_SYMBOLS],
     pub(super) hf_correlation: [f32; 2],
     pub(super) hf_quantization: [f32; 3],
     pub(super) ac_descriptor_offset: u32,
@@ -389,7 +386,7 @@ pub(super) struct VarDctKernelParams {
     pub(super) ac_words_per_block: u32,
     pub(super) ac_fragment_words: u32,
     pub(super) workgroups_x: u32,
-    pub(super) padding: [u32; 15],
+    pub(super) padding: [u32; 22],
 }
 
 #[repr(C)]
@@ -417,7 +414,7 @@ pub(super) struct VarDctArtifactHeader {
     pub(super) blocks_x: u32,
     pub(super) blocks_y: u32,
     pub(super) topology: u32,
-    pub(super) raw_histogram: [u32; RAW_SYMBOLS],
+    pub(super) raw_histogram: [u32; UINT_SYMBOLS],
     pub(super) fragment_descriptor_offset: u32,
     pub(super) fragment_descriptor_len: u32,
     pub(super) lf_groups_x: u32,
@@ -428,7 +425,7 @@ pub(super) struct VarDctArtifactHeader {
     pub(super) ac_fragment_offset: u32,
     pub(super) ac_words_per_block: u32,
     pub(super) ac_fragment_words: u32,
-    pub(super) padding: [u32; 13],
+    pub(super) padding: [u32; 3],
 }
 
 #[repr(C)]
@@ -441,9 +438,9 @@ pub(super) struct DcFragmentDescriptor {
 const _: () = {
     assert!(std::mem::size_of::<GpuPrefixEntry>() == 8);
     assert!(std::mem::align_of::<GpuPrefixEntry>() == 4);
-    assert!(std::mem::size_of::<VarDctKernelParams>() == 512);
+    assert!(std::mem::size_of::<VarDctKernelParams>() == 768);
     assert!(std::mem::align_of::<VarDctKernelParams>() == 4);
-    assert!(std::mem::size_of::<VarDctArtifactHeader>() == 256);
+    assert!(std::mem::size_of::<VarDctArtifactHeader>() == 272);
     assert!(std::mem::align_of::<VarDctArtifactHeader>() == 4);
     assert!(std::mem::size_of::<DcFragmentDescriptor>() == 8);
     assert!(std::mem::align_of::<DcFragmentDescriptor>() == 4);
@@ -475,7 +472,7 @@ pub(super) struct ArtifactLayout {
 impl ArtifactLayout {
     pub(super) fn for_strategy_map(
         frame: VarDctFrameLayout,
-        code: &PrefixCode,
+        code: &VarDctPrefixCode,
         transforms: u32,
         ac_words: u32,
     ) -> Result<Self, EncodeError> {
@@ -498,7 +495,10 @@ impl ArtifactLayout {
             )?)?;
         Ok(layout)
     }
-    pub(super) fn new(strategy: VarDctStrategy, code: &PrefixCode) -> Result<Self, EncodeError> {
+    pub(super) fn new(
+        strategy: VarDctStrategy,
+        code: &VarDctPrefixCode,
+    ) -> Result<Self, EncodeError> {
         let Extent2d {
             width: blocks_x,
             height: blocks_y,
@@ -516,7 +516,7 @@ impl ArtifactLayout {
         blocks_x: u32,
         blocks_y: u32,
         lf_group_count: u32,
-        code: &PrefixCode,
+        code: &VarDctPrefixCode,
     ) -> Result<Self, EncodeError> {
         let strategy_len =
             blocks_x
@@ -611,7 +611,7 @@ impl ArtifactLayout {
 
     pub(super) fn for_tiled_grid(
         frame: VarDctFrameLayout,
-        code: &PrefixCode,
+        code: &VarDctPrefixCode,
         hf_entropy: &super::entropy::HfEntropyPlan,
     ) -> Result<Self, EncodeError> {
         let layout = Self::for_block_grid(
@@ -633,7 +633,7 @@ impl ArtifactLayout {
         // model maps all contexts to one distribution, so these independently
         // packed Y/X/B fragments can be concatenated in AC-group raster order.
         let entries = hf_entropy.gpu_entries();
-        let token_bits: [u32; RAW_SYMBOLS] =
+        let token_bits: [u32; UINT_SYMBOLS] =
             std::array::from_fn(|token| entries[token].bit_len + token.saturating_sub(1) as u32);
         let max_count_token = 32 - maximum_nonzero.leading_zeros();
         let max_count_bits = token_bits[..=max_count_token as usize]

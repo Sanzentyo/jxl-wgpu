@@ -1,6 +1,6 @@
 // Shared checked artifact ABI and deterministic entropy/control writers.
 
-// Exactly 512 bytes. All artifact offsets and lengths are expressed in u32
+// Exactly 768 bytes. All artifact offsets and lengths are expressed in u32
 // words and are independently checked by the host before dispatch.
 struct Params {
     row_stride: u32,
@@ -12,7 +12,8 @@ struct Params {
     strategy: u32,
     global_scale: u32,
     quant_lf: u32,
-    raw_prefix: array<PrefixEntry, 19>,
+    hf_multiplier: u32,
+    raw_prefix: array<PrefixEntry, 33>,
     strategy_offset: u32,
     dc_offset: u32,
     token_offset: u32,
@@ -27,7 +28,7 @@ struct Params {
     lf_groups_y: u32,
     lf_quantization: array<f32, 3>,
     lf_correlation: array<f32, 2>,
-    hf_prefix: array<PrefixEntry, 19>,
+    hf_prefix: array<PrefixEntry, 33>,
     hf_correlation: array<f32, 2>,
     hf_quantization: array<f32, 3>,
     ac_descriptor_offset: u32,
@@ -36,7 +37,7 @@ struct Params {
     ac_words_per_block: u32,
     ac_fragment_words: u32,
     workgroups_x: u32,
-    padding: array<u32, 15>,
+    padding: array<u32, 22>,
 }
 
 @group(0) @binding(0)
@@ -78,7 +79,7 @@ fn encode_dc_token(slot: u32, signed_value: i32, start: u32) -> u32 {
     }
     artifact_words[params.token_offset + slot] = token;
     artifact_words[params.extra_offset + slot] = extra;
-    if token < 19u {
+    if token < 33u {
         artifact_words[HEADER_HISTOGRAM_OFFSET + token] += 1u;
         let prefix = params.raw_prefix[token];
         let after_prefix = append_fragment_bits(prefix.bits, prefix.bit_len, start);
@@ -107,7 +108,7 @@ fn encode_ac_unsigned(base: u32, capacity: u32, value: u32, start: u32) -> u32 {
         token = extra_count + 1u;
         extra = value - (1u << extra_count);
     }
-    if token >= 19u {
+    if token >= 33u {
         return capacity * 32u + 1u;
     }
     let prefix = params.hf_prefix[token];
@@ -117,6 +118,15 @@ fn encode_ac_unsigned(base: u32, capacity: u32, value: u32, start: u32) -> u32 {
 
 @compute @workgroup_size(1)
 fn serialize_control() {
+    var error = 0u;
+    for (var index = 0u; index < params.ac_descriptor_len; index += 1u) {
+        error |= artifact_words[params.ac_descriptor_offset + index]
+            & (LF_QUANTIZATION_OVERFLOW | HF_QUANTIZATION_OVERFLOW);
+    }
+    if error != 0u {
+        artifact_words[0] = error;
+        return;
+    }
     let block_count = params.blocks_x * params.blocks_y;
     let sample_count = block_count * 3u;
     var bit_offset = 0u;
@@ -208,15 +218,15 @@ fn serialize_control() {
     artifact_words[19] = params.blocks_x;
     artifact_words[20] = params.blocks_y;
     artifact_words[21] = params.topology;
-    artifact_words[41] = params.fragment_descriptor_offset;
-    artifact_words[42] = params.fragment_descriptor_len;
-    artifact_words[43] = params.lf_groups_x;
-    artifact_words[44] = params.lf_groups_y;
-    artifact_words[45] = lf_group_count;
-    artifact_words[46] = params.ac_descriptor_offset;
-    artifact_words[47] = params.ac_descriptor_len;
-    artifact_words[48] = params.ac_fragment_offset;
-    artifact_words[49] = params.ac_words_per_block;
-    artifact_words[50] = params.ac_fragment_words;
+    artifact_words[55] = params.fragment_descriptor_offset;
+    artifact_words[56] = params.fragment_descriptor_len;
+    artifact_words[57] = params.lf_groups_x;
+    artifact_words[58] = params.lf_groups_y;
+    artifact_words[59] = lf_group_count;
+    artifact_words[60] = params.ac_descriptor_offset;
+    artifact_words[61] = params.ac_descriptor_len;
+    artifact_words[62] = params.ac_fragment_offset;
+    artifact_words[63] = params.ac_words_per_block;
+    artifact_words[64] = params.ac_fragment_words;
     artifact_words[0] = ARTIFACT_READY;
 }

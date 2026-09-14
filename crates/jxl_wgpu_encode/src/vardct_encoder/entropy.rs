@@ -3,11 +3,14 @@
 use jxl_gpu_bitstream::{BitWriter, PrefixCodeEntry};
 
 use super::types::GpuPrefixEntry;
-use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS};
+use crate::prefix::RawPrefixCode;
+
+pub(super) const UINT_SYMBOLS: usize = 33;
+pub(super) type VarDctPrefixCode = RawPrefixCode<UINT_SYMBOLS>;
 use crate::{BackendError, EncodeError};
 
-pub(super) fn fixed_prefix_code() -> Result<PrefixCode, EncodeError> {
-    PrefixCode::from_aggregated_counts(&[0; RAW_SYMBOLS], &[0; LZ77_SYMBOLS], RAW_SYMBOLS - 1, true)
+pub(super) fn fixed_prefix_code() -> Result<VarDctPrefixCode, EncodeError> {
+    VarDctPrefixCode::from_counts(&[1; UINT_SYMBOLS])
 }
 
 /// Entropy policy shared by HF-global metadata and the GPU pass-group serializer.
@@ -17,17 +20,17 @@ pub(super) fn fixed_prefix_code() -> Result<PrefixCode, EncodeError> {
 /// its state on the GPU and provide complete group fragments instead.
 #[derive(Clone, Debug)]
 pub(super) struct HfEntropyPlan {
-    pub(super) code: PrefixCode,
+    pub(super) code: VarDctPrefixCode,
 }
 
 impl HfEntropyPlan {
     pub(super) fn single_cluster_prefix() -> Result<Self, EncodeError> {
         Ok(Self {
-            code: PrefixCode::from_raw_counts(&[1; RAW_SYMBOLS])?,
+            code: VarDctPrefixCode::from_counts(&[1; UINT_SYMBOLS])?,
         })
     }
 
-    pub(super) fn gpu_entries(&self) -> [GpuPrefixEntry; RAW_SYMBOLS] {
+    pub(super) fn gpu_entries(&self) -> [GpuPrefixEntry; UINT_SYMBOLS] {
         prefix_entries(&self.code)
     }
 
@@ -72,19 +75,11 @@ impl HfEntropyPlan {
         output.write_bits(0, preset_bits)?; // one HF preset
         output.write_bits(2, 2)?; // used_orders = 0: natural coefficient order
 
-        output.write_bits(0, 1)?; // LZ77 disabled
-        output.write_bits(1, 1)?; // simple distribution clustering
-        output.write_bits(0, 2)?; // all 495 coefficient contexts map to cluster 0
-        output.write_bits(1, 1)?; // prefix code
-        output.write_bits(0, 4)?; // hybrid integer split exponent zero
-        output.write_bits(1, 1)?; // explicit alphabet size
-        output.write_bits(4, 4)?;
-        output.write_bits(2, 4)?; // 1 + 2^4 + 2 = 19 symbols
-        self.code.write_raw_tree(output)
+        write_prefix_config(output, &self.code, 495)
     }
 }
 
-pub(super) fn prefix_entries(code: &PrefixCode) -> [GpuPrefixEntry; RAW_SYMBOLS] {
+pub(super) fn prefix_entries(code: &VarDctPrefixCode) -> [GpuPrefixEntry; UINT_SYMBOLS] {
     code.raw_entries()
         .map(|PrefixCodeEntry { bit_len, bits }| GpuPrefixEntry {
             bits: u32::from(bits),
@@ -152,4 +147,23 @@ pub(super) fn read_fragment_slice(
         value |= ((words[(bit / 32) as usize] >> (bit % 32)) & 1) << index;
     }
     Ok(value)
+}
+
+/// One raw prefix distribution shared by every context, with split exponent zero.
+pub(super) fn write_prefix_config(
+    output: &mut BitWriter,
+    code: &VarDctPrefixCode,
+    contexts: u32,
+) -> Result<(), EncodeError> {
+    output.write_bits(0, 1)?; // LZ77 disabled
+    if contexts > 1 {
+        output.write_bits(1, 1)?; // simple clustering
+        output.write_bits(0, 2)?; // every context uses distribution zero
+    }
+    output.write_bits(1, 1)?; // prefix code
+    output.write_bits(0, 4)?; // hybrid integer split exponent zero
+    output.write_bits(1, 1)?; // explicit alphabet size
+    output.write_bits(5, 4)?;
+    output.write_bits(0, 5)?; // 1 + 2^5 = 33 symbols, covering every u32
+    code.write_raw_tree(output)
 }

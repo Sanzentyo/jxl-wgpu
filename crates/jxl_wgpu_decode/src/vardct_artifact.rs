@@ -95,7 +95,7 @@ pub struct HfMetadataArtifactConfig {
     pub block_info_entries: u32,
     /// Word offset of the strategy row in the generic Modular reconstruction buffer.
     pub strategy_offset_words: u32,
-    /// Word offset of the `hf_mul - 1` row in the reconstruction buffer.
+    /// Word offset of the raw HF multiplier row; clamp each signed sample to `0..=255`, then add one.
     pub hf_mul_offset_words: u32,
     /// Number of words in the reconstruction buffer bound at group 0, binding 0.
     pub raw_metadata_words: u64,
@@ -577,35 +577,30 @@ impl GpuVarDctArtifactStatus {
                 y: self.error_y,
                 value: self.error_value,
             }),
-            2 => Err(GpuVarDctLoweringError::NonPositiveHfMultiplier {
-                x: self.error_x,
-                y: self.error_y,
-                value: self.error_value as i32,
-            }),
-            3 => Err(GpuVarDctLoweringError::BlockInfoExhausted {
+            2 => Err(GpuVarDctLoweringError::BlockInfoExhausted {
                 x: self.error_x,
                 y: self.error_y,
                 consumed: self.error_value,
             }),
-            4 => Err(GpuVarDctLoweringError::TransformOutsideLfGroup {
+            3 => Err(GpuVarDctLoweringError::TransformOutsideLfGroup {
                 x: self.error_x,
                 y: self.error_y,
                 strategy: self.error_value,
             }),
-            5 => Err(GpuVarDctLoweringError::PassGroupCrossing {
+            4 => Err(GpuVarDctLoweringError::PassGroupCrossing {
                 x: self.error_x,
                 y: self.error_y,
                 strategy: self.error_value,
             }),
-            6 => Err(GpuVarDctLoweringError::TransformOverlap {
+            5 => Err(GpuVarDctLoweringError::TransformOverlap {
                 x: self.error_x,
                 y: self.error_y,
                 strategy: self.error_value,
             }),
-            7 => Err(GpuVarDctLoweringError::TaskCapacity {
+            6 => Err(GpuVarDctLoweringError::TaskCapacity {
                 required: self.error_value,
             }),
-            8 => Err(GpuVarDctLoweringError::CoefficientCapacity {
+            7 => Err(GpuVarDctLoweringError::CoefficientCapacity {
                 required_words: self.error_value,
             }),
             code => Err(GpuVarDctLoweringError::UnknownStatus { code }),
@@ -618,8 +613,6 @@ impl GpuVarDctArtifactStatus {
 pub enum GpuVarDctLoweringError {
     #[error("HF varblock at ({x}, {y}) selects invalid strategy {value}")]
     InvalidStrategy { x: u32, y: u32, value: u32 },
-    #[error("HF varblock at ({x}, {y}) has non-positive multiplier source {value}")]
-    NonPositiveHfMultiplier { x: u32, y: u32, value: i32 },
     #[error("HF block-info list is exhausted at ({x}, {y}) after {consumed} entries")]
     BlockInfoExhausted { x: u32, y: u32, consumed: u32 },
     #[error("strategy {strategy} at ({x}, {y}) does not fit in its LF group")]

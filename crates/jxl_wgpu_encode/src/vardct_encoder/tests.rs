@@ -4,6 +4,7 @@ mod ac;
 mod artifact;
 mod mixed;
 mod native;
+mod quantization;
 mod reference;
 mod single;
 
@@ -29,7 +30,7 @@ use jxl_wgpu_decode::{
 };
 use wgpu::util::DeviceExt;
 
-use crate::prefix::PrefixCode;
+use super::entropy::VarDctPrefixCode;
 
 use super::bitstream::{build_frame_packet, image_header};
 use super::dispatch::{
@@ -42,6 +43,7 @@ use super::types::{
     TiledVarDctGrid, VarDctArtifactHeader, VarDctColorEncoding, VarDctFrameLayout,
     VarDctKernelLayout, VarDctKernelParams, VarDctLfMetadata, VarDctStrategy,
 };
+use super::{VarDctConfig, VarDctQuantization};
 use crate::{BufferImageSource, EncodeError, UnsupportedFeature, WgpuContext, assemble_frame};
 
 // Explicit test-only control fragment, independent of GPU artifact layout.
@@ -63,7 +65,7 @@ impl DcFixture {
     }
 }
 
-fn cpu_test_artifact(q_yxb: [i32; 3], code: &PrefixCode) -> DcFixture {
+fn cpu_test_artifact(q_yxb: [i32; 3], code: &VarDctPrefixCode) -> DcFixture {
     let mut fragment = BitWriter::new();
     for value in q_yxb {
         let packed = if value >= 0 {
@@ -101,6 +103,13 @@ fn cpu_test_artifact(q_yxb: [i32; 3], code: &PrefixCode) -> DcFixture {
 
 fn f16(bits: u16) -> FiniteF16 {
     FiniteF16::from_bits(bits).expect("test binary16 value is finite")
+}
+
+fn config_with_lf(lf_metadata: VarDctLfMetadata) -> VarDctConfig {
+    VarDctConfig {
+        lf_metadata,
+        ..VarDctConfig::default()
+    }
 }
 
 fn custom_lf_metadata() -> VarDctLfMetadata {
@@ -342,7 +351,7 @@ fn fixed_control_plane_decodes_as_standard_black_vardct() {
             &code,
             &hf_entropy,
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
-            VarDctLfMetadata::default(),
+            VarDctConfig::default(),
         )
         .unwrap(),
     )
@@ -366,7 +375,7 @@ fn fixed_control_plane_accepts_nonzero_quantized_xyb_dc() {
             &code,
             &hf_entropy,
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
-            VarDctLfMetadata::default(),
+            VarDctConfig::default(),
         )
         .unwrap(),
     )
@@ -393,7 +402,7 @@ fn custom_lf_metadata_roundtrips_through_the_standard_control_plane() {
             &code,
             &hf_entropy,
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
-            metadata,
+            config_with_lf(metadata),
         )
         .unwrap(),
     )
@@ -457,8 +466,8 @@ fn abi_records_are_pod_and_word_aligned() {
     assert_pod::<VarDctKernelParams>();
     assert_pod::<VarDctArtifactHeader>();
     assert_pod::<DcFragmentDescriptor>();
-    assert_eq!(std::mem::size_of::<VarDctKernelParams>(), 512);
-    assert_eq!(std::mem::size_of::<VarDctArtifactHeader>(), 256);
+    assert_eq!(std::mem::size_of::<VarDctKernelParams>(), 768);
+    assert_eq!(std::mem::size_of::<VarDctArtifactHeader>(), 272);
     assert_eq!(std::mem::size_of::<DcFragmentDescriptor>(), 8);
 
     let mut params: VarDctKernelParams = bytemuck::Zeroable::zeroed();
@@ -474,9 +483,9 @@ fn abi_records_are_pod_and_word_aligned() {
     params.workgroups_x = 0x112;
     let params = [params];
     let parameter_words = bytemuck::cast_slice::<VarDctKernelParams, u32>(&params);
-    assert_eq!(&parameter_words[55..59], &[0x55, 0x56, 0x57, 0x58]);
+    assert_eq!(&parameter_words[84..88], &[0x55, 0x56, 0x57, 0x58]);
     assert_eq!(
-        &parameter_words[107..113],
+        &parameter_words[164..170],
         &[0x107, 0x108, 0x109, 0x110, 0x111, 0x112]
     );
 
@@ -493,8 +502,8 @@ fn abi_records_are_pod_and_word_aligned() {
     header.ac_fragment_words = 0x50;
     let headers = [header];
     let header_words = bytemuck::cast_slice::<VarDctArtifactHeader, u32>(&headers);
-    assert_eq!(&header_words[41..46], &[0x41, 0x42, 0x43, 0x44, 0x45]);
-    assert_eq!(&header_words[46..51], &[0x46, 0x47, 0x48, 0x49, 0x50]);
+    assert_eq!(&header_words[55..60], &[0x41, 0x42, 0x43, 0x44, 0x45]);
+    assert_eq!(&header_words[60..65], &[0x46, 0x47, 0x48, 0x49, 0x50]);
 }
 
 #[test]
@@ -515,7 +524,7 @@ fn naga_validates_vardct_shaders() {
                 };
                 use super::strategy_map::TransformTask;
                 assert_eq!(*span, std::mem::size_of::<TransformTask>() as u32);
-                assert_eq!(*span, 40);
+                assert_eq!(*span, 44);
                 assert_eq!(
                     members[2].offset,
                     std::mem::offset_of!(TransformTask, coefficient_offset) as u32
@@ -559,17 +568,7 @@ fn strategy_ir_uses_exact_standard_codestream_order() {
 }
 
 #[test]
-fn artifact_gradient_validation_matches_wgsl_wrapping_without_panicking() {
-    fn wgsl_gradient(top: i32, left: i32, top_left: i32) -> i32 {
-        let wrapped = i32::from_ne_bytes(
-            u32::from_ne_bytes(top.to_ne_bytes())
-                .wrapping_add(u32::from_ne_bytes(left.to_ne_bytes()))
-                .wrapping_sub(u32::from_ne_bytes(top_left.to_ne_bytes()))
-                .to_ne_bytes(),
-        );
-        wrapped.clamp(top.min(left), top.max(left))
-    }
-
+fn gradient_prediction_matches_wide_integer_reference_at_i32_boundaries() {
     for (actual, top, left, top_left) in [
         (i32::MAX, i32::MAX, i32::MAX, i32::MIN),
         (i32::MIN, i32::MIN, i32::MIN, i32::MAX),
@@ -577,11 +576,25 @@ fn artifact_gradient_validation_matches_wgsl_wrapping_without_panicking() {
         (i32::MAX, i32::MIN, 1, i32::MAX),
         (i32::MIN, -1, i32::MAX, i32::MIN),
     ] {
-        let expected = wgsl_gradient(top, left, top_left);
+        let expected = (i64::from(top) + i64::from(left) - i64::from(top_left))
+            .clamp(i64::from(top.min(left)), i64::from(top.max(left)))
+            as i32;
         assert_eq!(clamped_gradient_i32(top, left, top_left), expected);
         let residual = gradient_residual_i32(actual, top, left, top_left);
         assert_eq!(residual, actual.wrapping_sub(expected));
-        assert!(std::panic::catch_unwind(|| signed_token(residual)).is_ok());
+        let (token, bit_count, extra) = signed_token(residual);
+        let packed = if token == 0 {
+            0
+        } else {
+            assert_eq!(token, bit_count + 1);
+            (1u64 << bit_count) + u64::from(extra)
+        };
+        let restored = if packed % 2 == 0 {
+            (packed / 2) as i64
+        } else {
+            -(packed.div_ceil(2) as i64)
+        };
+        assert_eq!(restored, i64::from(residual));
     }
 }
 
@@ -597,7 +610,7 @@ fn large_layout_is_checked_and_preserves_large_orientation() {
     assert_eq!(portrait, landscape);
     assert_eq!(portrait.fragment_descriptor_offset, HEADER_WORDS);
     assert_eq!(portrait.fragment_descriptor_len, 2);
-    assert_eq!(portrait.strategy_offset, 2 * HEADER_WORDS);
+    assert_eq!(portrait.strategy_offset, 2 * SECTION_ALIGNMENT_WORDS);
     assert_eq!(portrait.strategy_offset % SECTION_ALIGNMENT_WORDS, 0);
     assert_eq!(portrait.dc_offset % SECTION_ALIGNMENT_WORDS, 0);
     assert_eq!(portrait.token_offset % SECTION_ALIGNMENT_WORDS, 0);
@@ -610,7 +623,7 @@ fn large_layout_is_checked_and_preserves_large_orientation() {
     assert!(portrait.artifact_bytes() > 25_856 + 3 * 512 * 63 * 2);
     assert_eq!(largest.strategy_len, 1_024);
     assert_eq!(largest.dc_len, 3_072);
-    assert_eq!(largest.fragment_max_bits, 76_800);
+    assert_eq!(largest.fragment_max_bits, 110_592);
     assert_eq!(largest.ac_descriptor_len, 1);
     assert!(largest.artifact_bytes() > 51_200 + 3 * 1_024 * 63 * 2);
 }
@@ -625,10 +638,10 @@ fn gpu_profile_encodes_exact_black_from_padded_rgb() {
     let plan = encoder.memory_plan(&source).unwrap();
     assert_eq!(plan.kernel_layout, VarDctKernelLayout::SingleTransform);
     assert_eq!(plan.source_binding_bytes, 232);
-    assert_eq!(plan.parameter_storage_bytes, 512);
-    assert_eq!(plan.artifact_storage_bytes, 2_560);
-    assert_eq!(plan.readback_bytes, 2_560);
-    assert_eq!(plan.owned_bytes_per_job, 10_384);
+    assert_eq!(plan.parameter_storage_bytes, 768);
+    assert_eq!(plan.artifact_storage_bytes, 3_072);
+    assert_eq!(plan.readback_bytes, 3_072);
+    assert_eq!(plan.owned_bytes_per_job, 11_668);
     assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
 
     let codestream = encoder.encode(source).unwrap();
@@ -758,7 +771,7 @@ fn tiled_dct8_emits_multiple_ac_groups_for_odd_black_extent() {
     let plan = encoder.memory_plan(&source).unwrap();
     let grid = encoder.grid(&source).unwrap();
     assert_eq!(plan.kernel_layout, VarDctKernelLayout::TiledDct8);
-    assert_eq!(plan.parameter_storage_bytes, 512);
+    assert_eq!(plan.parameter_storage_bytes, 768);
     assert_eq!((grid.block_columns, grid.block_rows), (33, 3));
     assert_eq!(grid.block_count().unwrap(), 99);
     assert_eq!((grid.ac_group_columns, grid.ac_group_rows), (2, 1));
@@ -928,7 +941,7 @@ fn abandoned_tiled_job_holds_and_releases_its_exact_budget() {
     assert_eq!(plan.kernel_layout, VarDctKernelLayout::TiledDct8);
     assert_eq!(
         plan.owned_bytes_per_job,
-        512 + 2 * plan.artifact_storage_bytes
+        768 + 2 * plan.artifact_storage_bytes
     );
 
     let limited_context = WgpuContext::with_memory_budget(
@@ -1067,14 +1080,14 @@ fn every_executable_strategy_emits_a_standard_black_codestream() {
 
         let layout = ArtifactLayout::new(strategy, &fixed_prefix_code().unwrap()).unwrap();
         assert_eq!(plan.kernel_layout, VarDctKernelLayout::SingleTransform);
-        assert_eq!(plan.parameter_storage_bytes, 512);
+        assert_eq!(plan.parameter_storage_bytes, 768);
         assert_eq!(plan.artifact_storage_bytes, layout.artifact_bytes());
         assert_eq!(plan.readback_bytes, layout.artifact_bytes());
         let transform = super::types::VarDctTransformMemoryPlan::new(strategy);
         assert_eq!(plan.transform, Some(transform));
         assert_eq!(
             plan.owned_bytes_per_job,
-            512 + 2 * layout.artifact_bytes() + transform.total_bytes
+            768 + 2 * layout.artifact_bytes() + transform.total_bytes
         );
         let codestream = encoder.encode(source).unwrap();
         assert_eq!(
@@ -1185,9 +1198,12 @@ fn custom_lf_metadata_gpu_encoder_and_decoders_agree() {
     .unwrap();
     let context = WgpuContext::from_backend(&backend);
     let metadata = custom_lf_metadata();
-    let encoder =
-        VarDctEncoder::new_with_lf_metadata(context.clone(), VarDctStrategy::Dct8, metadata)
-            .unwrap();
+    let encoder = VarDctEncoder::new_with_config(
+        context.clone(),
+        VarDctStrategy::Dct8,
+        config_with_lf(metadata),
+    )
+    .unwrap();
     assert_eq!(encoder.lf_metadata(), metadata);
     let fixture = std::array::from_fn::<_, 64, _>(|index| {
         let x = index % 8;
@@ -1241,7 +1257,8 @@ fn custom_lf_metadata_gpu_encoder_and_decoders_agree() {
         fs::remove_dir_all(directory).unwrap();
     }
 
-    let tiled = TiledVarDctEncoder::new_with_lf_metadata(context.clone(), metadata).unwrap();
+    let tiled =
+        TiledVarDctEncoder::new_with_config(context.clone(), config_with_lf(metadata)).unwrap();
     let tiled_fixture = vec![[255, 0, 0]; 257];
     let tiled_stream = tiled
         .encode(padded_rgb_source_sized(&context, 257, 1, &tiled_fixture))

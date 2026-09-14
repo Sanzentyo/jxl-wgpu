@@ -4,7 +4,7 @@ use jxl_gpu_bitstream::BitWriter;
 
 use super::bitstream::append_gpu_fragment;
 use super::entropy::{HfEntropyPlan, read_fragment_slice, validate_fragment_padding};
-use super::types::{AC_GROUP_DIM_PIXELS, MAX_HF_QUANTIZED_MAGNITUDE, VarDctFrameLayout};
+use super::types::{AC_GROUP_DIM_PIXELS, VarDctFrameLayout};
 use crate::{BackendError, EncodeError};
 
 #[derive(Clone, Copy)]
@@ -158,11 +158,6 @@ pub(super) fn validate_transform_fragments(
                     break;
                 }
                 let coefficient = unsigned()?;
-                if coefficient > 2 * MAX_HF_QUANTIZED_MAGNITUDE as u32 {
-                    return Err(BackendError::InvalidArtifact(
-                        "VarDCT AC coefficient exceeds quantizer range",
-                    ));
-                }
                 remaining -= u32::from(coefficient != 0);
             }
             if remaining != 0 {

@@ -1,6 +1,6 @@
 use std::num::NonZeroU8;
 
-use crate::{EncodeError, FrameEncodeRequest, UnsupportedFeature};
+use crate::{EncodeError, FrameEncodeRequest, UnsupportedFeature, VarDctQuantization};
 
 /// How widely a backend guarantees repeatable output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -30,30 +30,10 @@ pub enum KernelStage {
     HistogramReduction,
 }
 
-/// Validated JPEG XL perceptual distance.
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
-pub struct PerceptualDistance(f32);
-
-impl PerceptualDistance {
-    pub fn new(value: f32) -> Result<Self, EncodeError> {
-        if !value.is_finite() || value <= 0.0 || value > 25.0 {
-            return Err(EncodeError::InvalidConfiguration(
-                "VarDCT distance must be finite and in (0, 25]",
-            ));
-        }
-        Ok(Self(value))
-    }
-
-    #[must_use]
-    pub const fn get(self) -> f32 {
-        self.0
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EncodeProfile {
     ModularLossless { bits_per_sample: u8 },
-    VarDct { distance: PerceptualDistance },
+    VarDct { quantization: VarDctQuantization },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -63,8 +43,7 @@ pub enum ProfileCapability {
         max_bits_per_sample: u8,
     },
     VarDct {
-        min_distance: PerceptualDistance,
-        max_distance: PerceptualDistance,
+        quantization: VarDctQuantization,
     },
 }
 
@@ -80,12 +59,11 @@ impl ProfileCapability {
                 EncodeProfile::ModularLossless { bits_per_sample },
             ) => (min_bits_per_sample..=max_bits_per_sample).contains(&bits_per_sample),
             (
-                Self::VarDct {
-                    min_distance,
-                    max_distance,
+                Self::VarDct { quantization },
+                EncodeProfile::VarDct {
+                    quantization: requested,
                 },
-                EncodeProfile::VarDct { distance },
-            ) => (min_distance.get()..=max_distance.get()).contains(&distance.get()),
+            ) => quantization == requested,
             _ => false,
         }
     }
