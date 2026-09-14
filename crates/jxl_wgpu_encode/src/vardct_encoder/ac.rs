@@ -9,6 +9,11 @@ use crate::{BackendError, EncodeError};
 
 #[derive(Clone, Copy)]
 pub(super) enum AcFragments<'a> {
+    StrategyMap {
+        words: &'a [u32],
+        bit_lengths: &'a [u32],
+        plan: &'a super::strategy_map::TransformPlan,
+    },
     Empty,
     Single {
         words: &'a [u32],
@@ -32,6 +37,19 @@ impl AcFragments<'_> {
             return Err(BackendError::Invariant("VarDCT AC group is out of range").into());
         }
         match self {
+            Self::StrategyMap {
+                words,
+                bit_lengths,
+                plan,
+            } => {
+                for &index in &plan.ac_groups[group as usize] {
+                    let task = &plan.tasks[index];
+                    let start = task.ac_word_offset as usize;
+                    let end = start + task.ac_word_capacity as usize;
+                    append_gpu_fragment(output, &words[start..end], 0, bit_lengths[index])?;
+                }
+                Ok(())
+            }
             Self::Empty => Ok(()),
             Self::Single { words, bit_len } => {
                 if frame.ac_group_count()? != 1 {

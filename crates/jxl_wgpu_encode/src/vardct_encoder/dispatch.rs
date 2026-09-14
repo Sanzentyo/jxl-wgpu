@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::{KernelVariant, MemoryPermit};
 
 use super::ac::{AcFragments, validate_blocks, validate_transform_fragments};
@@ -16,7 +15,8 @@ use super::entropy::{
     HfEntropyPlan, fixed_prefix_code, prefix_entries, read_fragment_slice,
     validate_fragment_padding,
 };
-use super::single;
+use super::strategy_map::{TransformPlan, VarDctStrategyMap, VarDctTransform};
+use super::transforms;
 use super::types::{
     ARTIFACT_READY, ArtifactLayout, DcFragmentDescriptor, GLOBAL_SCALE, HEADER_WORDS,
     HF_QUANTIZATION, QUANT_LF, TiledVarDctGrid, VarDctArtifactData, VarDctArtifactHeader,
@@ -62,24 +62,25 @@ struct VarDctKernelPlan {
 }
 
 enum VarDctPipelines {
-    Single(single::Pipeline),
+    Transforms(transforms::Pipeline),
     Tiled {
         quantize: Arc<wgpu::ComputePipeline>,
         serialize: Arc<wgpu::ComputePipeline>,
     },
 }
 
-/// GPU backend for one standard VarDCT still-image strategy.
+/// GPU backend for standard VarDCT stills with fixed or mapped transform placement.
 ///
-/// The source extent must equal the selected transform extent. The backend
-/// emits a standards-compliant VarDCT frame and does not route pixels or
-/// coefficients through a CPU codec.
+/// Sources match the selected transform or map extent; the optimized tiled-DCT8
+/// constructor selects geometry at submission time. Pixels and coefficients remain
+/// on the GPU until it has packed their entropy fragments.
 pub struct VarDctBackend {
     pipelines: VarDctPipelines,
     workgroup_variant: KernelVariant,
     code: PrefixCode,
     hf_entropy: HfEntropyPlan,
     topology: VarDctTopology,
+    transform_plan: Option<Arc<TransformPlan>>,
     lf_metadata: VarDctLfMetadata,
     capabilities: EncoderCapabilities,
     max_storage_binding_size: u64,
@@ -128,6 +129,18 @@ impl VarDctBackend {
         Self::new_with_topology(context, VarDctTopology::TiledDct8, lf_metadata)
     }
 
+    /// Creates an encoder for a validated image-wide transform map.
+    pub fn new_with_strategy_map(
+        context: &WgpuContext,
+        map: VarDctStrategyMap,
+        lf_metadata: VarDctLfMetadata,
+    ) -> Result<Self, EncodeError> {
+        let mut backend =
+            Self::new_with_topology(context, VarDctTopology::StrategyMap, lf_metadata)?;
+        backend.transform_plan = Some(Arc::new(TransformPlan::new(map)?));
+        Ok(backend)
+    }
+
     fn new_with_topology(
         context: &WgpuContext,
         topology: VarDctTopology,
@@ -169,8 +182,11 @@ impl VarDctBackend {
         workgroup_variant.validate_for(kernel_key, &limits, workgroup_storage_bytes)?;
         let (workgroup_x, _) = workgroup_variant.workgroup_size();
         let workgroup_constants = [("wg_x", f64::from(workgroup_x))];
-        let pipelines = if matches!(topology, VarDctTopology::SingleTransform(_)) {
-            VarDctPipelines::Single(single::Pipeline::new(context.device(), workgroup_variant)?)
+        let pipelines = if !matches!(topology, VarDctTopology::TiledDct8) {
+            VarDctPipelines::Transforms(transforms::Pipeline::new(
+                context.device(),
+                workgroup_variant,
+            )?)
         } else {
             validate_tiled_device_limits(&limits)?;
             let module = context
@@ -205,6 +221,20 @@ impl VarDctBackend {
                 )),
             }
         };
+        let transform_plan = if let VarDctTopology::SingleTransform(strategy) = topology {
+            let extent = strategy.pixel_extent();
+            Some(Arc::new(TransformPlan::new(VarDctStrategyMap::new(
+                extent.width,
+                extent.height,
+                vec![VarDctTransform {
+                    block_x: 0,
+                    block_y: 0,
+                    strategy,
+                }],
+            )?)?))
+        } else {
+            None
+        };
         let distance = profile_distance();
         Ok(Self {
             pipelines,
@@ -212,6 +242,7 @@ impl VarDctBackend {
             code,
             hf_entropy,
             topology,
+            transform_plan,
             lf_metadata,
             capabilities: EncoderCapabilities {
                 profiles: vec![ProfileCapability::VarDct {
@@ -268,6 +299,18 @@ impl VarDctBackend {
                     ));
                 }
                 frame
+            }
+            VarDctTopology::StrategyMap => {
+                let plan = self
+                    .transform_plan
+                    .as_ref()
+                    .expect("strategy map backend plan");
+                if extent != plan.map.extent() {
+                    return Err(EncodeError::InvalidSource(
+                        "VarDCT source extent differs from strategy map",
+                    ));
+                }
+                plan.map.frame()?
             }
             VarDctTopology::TiledDct8 => {
                 VarDctFrameLayout::tiled_dct8(extent.width, extent.height)?
@@ -349,9 +392,14 @@ impl VarDctBackend {
         let blocks_y = frame.blocks_y;
         let (lf_quantization, lf_correlation) = self.lf_metadata.forward_quantization();
         let hf_correlation = self.lf_metadata.hf_correlation();
-        let common_strategy = u32::from(frame.topology.strategy().codestream_id());
+        let common_strategy = frame.topology.strategy_id();
         let (kernel, mut memory) = {
             let layout = match frame.topology {
+                VarDctTopology::StrategyMap => self
+                    .transform_plan
+                    .as_ref()
+                    .expect("strategy map backend plan")
+                    .artifact_layout(frame, &self.code)?,
                 VarDctTopology::SingleTransform(strategy) => {
                     ArtifactLayout::new(strategy, &self.code)?
                 }
@@ -361,8 +409,8 @@ impl VarDctBackend {
             };
             let required_workgroup_axis = match frame.topology {
                 VarDctTopology::TiledDct8 => blocks_x.max(blocks_y),
-                VarDctTopology::SingleTransform(_) => {
-                    let groups = (extent.width * extent.height)
+                VarDctTopology::SingleTransform(_) | VarDctTopology::StrategyMap => {
+                    let groups = (frame.blocks_x * frame.blocks_y * 64)
                         .div_ceil(self.workgroup_variant.workgroup_size().0);
                     let columns = groups.min(self.max_compute_workgroups_per_dimension);
                     columns.max(groups.div_ceil(columns.max(1)))
@@ -428,7 +476,7 @@ impl VarDctBackend {
                         ac_fragment_offset: layout.ac_fragment_offset,
                         ac_words_per_block: layout.ac_words_per_block,
                         ac_fragment_words: layout.ac_fragment_words,
-                        workgroups_x: (extent.width * extent.height)
+                        workgroups_x: (frame.blocks_x * frame.blocks_y * 64)
                             .div_ceil(self.workgroup_variant.workgroup_size().0)
                             .min(self.max_compute_workgroups_per_dimension),
                         padding: [0; 15],
@@ -442,12 +490,27 @@ impl VarDctBackend {
                 ),
             )
         };
-        if let VarDctTopology::SingleTransform(strategy) = frame.topology {
-            memory = memory.with_transform(strategy);
-            let transform = memory
-                .transform
-                .expect("single-transform memory is populated");
-            for required in transform.storage_sizes() {
+        if let Some(plan) = &self.transform_plan {
+            let transform = plan.memory;
+            memory.owned_bytes_per_job += transform.total_bytes;
+            memory.addressed_bytes_per_job += transform.total_bytes;
+            memory.transform = Some(transform);
+            let sizes = [
+                transform.xyb_bytes,
+                transform.coefficient_bytes,
+                transform.lf_bytes,
+                transform.quantized_bytes,
+                transform.quantization_metadata_bytes,
+                transform.task_metadata_bytes,
+            ];
+            let batch_sizes = plan.batches.iter().flat_map(|batch| {
+                [
+                    batch.memory.basis_bytes,
+                    batch.memory.horizontal_bytes,
+                    batch.memory.task_bytes,
+                ]
+            });
+            for required in sizes.into_iter().chain(batch_sizes) {
                 for (name, available) in [
                     ("max_buffer_size", self.max_buffer_size),
                     (
@@ -638,17 +701,22 @@ impl GpuEncodeBackend for VarDctBackend {
         commands.clear_buffer(&artifact, 0, None);
         let mut transform_scratch = None;
         let job_layout = match (&self.pipelines, plan.kernel) {
-            (VarDctPipelines::Single(pipeline), VarDctKernelPlan { layout, .. }) => {
-                transform_scratch = Some(pipeline.encode(
-                    context.device(),
-                    &mut commands,
-                    single::Inputs {
-                        strategy: plan.frame.topology.strategy(),
-                        source: source_binding,
-                        parameters: &parameters,
-                        artifact: &artifact,
-                    },
-                )?);
+            (VarDctPipelines::Transforms(pipeline), VarDctKernelPlan { layout, .. }) => {
+                transform_scratch = Some(
+                    pipeline.encode(
+                        context.device(),
+                        &mut commands,
+                        transforms::Inputs {
+                            plan: self
+                                .transform_plan
+                                .as_ref()
+                                .expect("general transform plan"),
+                            source: source_binding,
+                            parameters: &parameters,
+                            artifact: &artifact,
+                        },
+                    )?,
+                );
                 layout
             }
             (
@@ -760,6 +828,7 @@ impl GpuEncodeBackend for VarDctBackend {
             hf_entropy: self.hf_entropy.clone(),
             lf_metadata: self.lf_metadata,
             frame_layout: plan.frame,
+            transform_plan: self.transform_plan.clone(),
             artifact_layout: job_layout,
             frame_index: request.frame_index,
             is_last: request.is_last,
@@ -829,7 +898,7 @@ impl VarDctMapCompletion {
 }
 
 struct VarDctJobLifetime {
-    _transform: Option<single::Scratch>,
+    _transform: Option<transforms::Scratch>,
     _parameters: Arc<wgpu::Buffer>,
     _artifact: Arc<wgpu::Buffer>,
     readback: Arc<wgpu::Buffer>,
@@ -852,17 +921,18 @@ pub struct VarDctJob {
     hf_entropy: HfEntropyPlan,
     lf_metadata: VarDctLfMetadata,
     frame_layout: VarDctFrameLayout,
+    transform_plan: Option<Arc<TransformPlan>>,
     artifact_layout: ArtifactLayout,
     frame_index: FrameIndex,
     is_last: bool,
 }
 
 impl VarDctJob {
-    /// Complete once, preserving compressed AC for an independent test oracle.
+    /// Completes once, retaining all GPU-compressed fragments for independent test oracles.
     #[cfg(test)]
-    pub(super) fn wait_with_ac_for_test(
+    pub(super) fn wait_with_ac_fragments_for_test(
         mut self,
-    ) -> Result<(Vec<u32>, u32, GpuFrameArtifacts), EncodeError> {
+    ) -> Result<(Vec<u32>, Vec<u32>, GpuFrameArtifacts), EncodeError> {
         self.completion.wait()?;
         let lifetime = self.lifetime.as_ref().expect("unconsumed test job");
         let mapped = lifetime
@@ -870,20 +940,42 @@ impl VarDctJob {
             .slice(..)
             .get_mapped_range()
             .map_err(BackendError::ArtifactRange)?;
-        let artifact = validate_artifact(
+        validate_artifact(
             &mapped,
             self.artifact_layout,
             &self.code,
             &self.hf_entropy,
             self.frame_layout,
+            self.transform_plan.as_deref(),
         )?;
-        let AcFragments::Single { words, bit_len } = artifact.ac else {
-            return Err(BackendError::Invariant("test requires one transform").into());
-        };
-        let words = words.to_vec();
+        let all_words = bytemuck::cast_slice::<u8, u32>(&mapped);
+        let layout = self.artifact_layout;
+        let words = artifact_words(
+            all_words,
+            layout.ac_fragment_offset,
+            layout.ac_fragment_words,
+        )?
+        .to_vec();
+        let lengths = artifact_words(
+            all_words,
+            layout.ac_descriptor_offset,
+            layout.ac_descriptor_len,
+        )?
+        .to_vec();
         drop(mapped);
         let artifacts = self.finish(Ok(()))?;
-        Ok((words, bit_len, artifacts))
+        Ok((words, lengths, artifacts))
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_with_ac_for_test(
+        self,
+    ) -> Result<(Vec<u32>, u32, GpuFrameArtifacts), EncodeError> {
+        let (words, lengths, artifacts) = self.wait_with_ac_fragments_for_test()?;
+        let [length] = lengths.as_slice() else {
+            return Err(BackendError::Invariant("test requires one transform").into());
+        };
+        Ok((words, *length, artifacts))
     }
 
     fn finish(
@@ -909,6 +1001,7 @@ impl VarDctJob {
                 &self.code,
                 &self.hf_entropy,
                 self.frame_layout,
+                self.transform_plan.as_deref(),
             )?;
             Ok(GpuFrameArtifacts {
                 frame_index: self.frame_index,
@@ -965,6 +1058,7 @@ pub(super) fn validate_artifact<'a>(
     code: &PrefixCode,
     hf_entropy: &HfEntropyPlan,
     frame: VarDctFrameLayout,
+    transform_plan: Option<&'a TransformPlan>,
 ) -> Result<VarDctArtifactData<'a>, BackendError> {
     let expected_bytes = usize::try_from(layout.artifact_bytes())
         .map_err(|_| BackendError::InvalidArtifact("VarDCT artifact size does not fit usize"))?;
@@ -992,14 +1086,14 @@ pub(super) fn validate_artifact<'a>(
         .ok_or(BackendError::InvalidArtifact(
             "VarDCT sample count overflow",
         ))?;
-    let strategy = frame.topology.strategy();
+    let strategy_id = frame.topology.strategy_id();
     let lf_group_count = frame
         .lf_group_count()
         .map_err(|_| BackendError::InvalidArtifact("VarDCT LF group count overflow"))?;
     if header.status != ARTIFACT_READY
         || header.block_count != block_count
         || header.dc_sample_count != dc_sample_count
-        || header.strategy != u32::from(strategy.codestream_id())
+        || header.strategy != strategy_id
         || header.ac_payload != u32::from(layout.ac_descriptor_len != 0)
         || header.strategy_offset != layout.strategy_offset
         || header.strategy_len != layout.strategy_len
@@ -1117,6 +1211,16 @@ pub(super) fn validate_artifact<'a>(
             artifact_words(words, layout.ac_descriptor_offset, layout.ac_descriptor_len)?;
         let ac_words = artifact_words(words, layout.ac_fragment_offset, layout.ac_fragment_words)?;
         match frame.topology {
+            VarDctTopology::StrategyMap => {
+                let plan =
+                    transform_plan.ok_or(BackendError::Invariant("missing transform map"))?;
+                plan.validate_ac(ac_words, bit_lengths, hf_entropy)?;
+                AcFragments::StrategyMap {
+                    words: ac_words,
+                    bit_lengths,
+                    plan,
+                }
+            }
             VarDctTopology::TiledDct8 => {
                 validate_blocks(ac_words, bit_lengths, layout.ac_words_per_block, hf_entropy)?;
                 AcFragments::Dct8Blocks {
@@ -1143,9 +1247,19 @@ pub(super) fn validate_artifact<'a>(
         }
     };
 
-    let expected_strategy = u32::from(strategy.codestream_id());
+    let expected_strategy = strategy_id;
     for (block, &value) in strategy_map.iter().enumerate() {
+        if frame.topology == VarDctTopology::StrategyMap {
+            let plan = transform_plan.ok_or(BackendError::Invariant("missing transform map"))?;
+            if plan.map.block_map.get(block) != Some(&value) {
+                return Err(BackendError::InvalidArtifact(
+                    "VarDCT GPU strategy map differs from plan",
+                ));
+            }
+            continue;
+        }
         let is_first = match frame.topology {
+            VarDctTopology::StrategyMap => unreachable!("validated above"),
             VarDctTopology::SingleTransform(_) => block == 0,
             VarDctTopology::TiledDct8 => true,
         };
@@ -1255,6 +1369,7 @@ pub(super) fn validate_artifact<'a>(
     }
     validate_fragment_padding(fragment_words, header.dc_fragment_bit_len)?;
     Ok(VarDctArtifactData {
+        transform_plan,
         strategy: expected_strategy,
         dc_fragment_words: fragment_words,
         dc_fragment_bit_len: header.dc_fragment_bit_len,
@@ -1330,10 +1445,10 @@ fn unsigned_token(value: u32) -> Result<(u32, u32, u32), BackendError> {
     Ok((token, extra_bit_count, value - (1 << extra_bit_count)))
 }
 
-/// GPU-only convenience encoder for one standard VarDCT transform.
+/// GPU convenience encoder for one standard transform or an image-wide strategy map.
 pub struct VarDctEncoder {
     encoder: GpuEncoder<VarDctBackend>,
-    strategy: VarDctStrategy,
+    frame: VarDctFrameLayout,
 }
 
 impl VarDctEncoder {
@@ -1357,7 +1472,21 @@ impl VarDctEncoder {
         let backend = VarDctBackend::new_with_lf_metadata(&context, strategy, lf_metadata)?;
         Ok(Self {
             encoder: GpuEncoder::new(context, backend),
-            strategy,
+            frame: VarDctFrameLayout::single(strategy),
+        })
+    }
+
+    /// Uses a caller-supplied strategy map across the whole image.
+    pub fn new_with_strategy_map(
+        context: WgpuContext,
+        map: VarDctStrategyMap,
+        lf_metadata: VarDctLfMetadata,
+    ) -> Result<Self, EncodeError> {
+        let frame = map.frame()?;
+        let backend = VarDctBackend::new_with_strategy_map(&context, map, lf_metadata)?;
+        Ok(Self {
+            encoder: GpuEncoder::new(context, backend),
+            frame,
         })
     }
 
@@ -1367,8 +1496,14 @@ impl VarDctEncoder {
     }
 
     #[must_use]
-    pub const fn strategy(&self) -> VarDctStrategy {
-        self.strategy
+    pub fn strategy_map(&self) -> &VarDctStrategyMap {
+        &self
+            .encoder
+            .backend()
+            .transform_plan
+            .as_ref()
+            .expect("VarDCT transform plan")
+            .map
     }
 
     /// Workgroup selected for this encoder's parallel VarDCT pass.
@@ -1426,7 +1561,7 @@ impl VarDctEncoder {
         container: bool,
     ) -> Result<VarDctSubmission, EncodeError> {
         self.memory_plan(&source)?;
-        let Extent2d { width, height } = self.strategy.pixel_extent();
+        let (width, height) = (self.frame.width, self.frame.height);
         let request = FrameEncodeRequest {
             frame_index: FrameIndex::new(0),
             is_last: true,

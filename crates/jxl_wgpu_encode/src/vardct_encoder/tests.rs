@@ -2,6 +2,8 @@
 
 mod ac;
 mod artifact;
+mod mixed;
+mod native;
 mod reference;
 mod single;
 
@@ -51,6 +53,7 @@ struct DcFixture {
 impl DcFixture {
     fn artifact(&self) -> super::types::VarDctArtifactData<'_> {
         super::types::VarDctArtifactData {
+            transform_plan: None,
             strategy: 0,
             dc_fragment_words: &self.words,
             dc_fragment_bit_len: self.bits,
@@ -496,7 +499,7 @@ fn abi_records_are_pod_and_word_aligned() {
 
 #[test]
 fn naga_validates_vardct_shaders() {
-    for source in [TILED_SHADER, include_str!("single.wgsl")] {
+    for source in [TILED_SHADER, include_str!("transforms.wgsl")] {
         let module =
             naga::front::wgsl::parse_str(&shader_source(source)).expect("VarDCT WGSL parses");
         naga::valid::Validator::new(
@@ -505,6 +508,28 @@ fn naga_validates_vardct_shaders() {
         )
         .validate(&module)
         .expect("VarDCT WGSL validates");
+        for (_, ty) in module.types.iter() {
+            if ty.name.as_deref() == Some("TransformTask") {
+                let naga::TypeInner::Struct { members, span } = &ty.inner else {
+                    panic!("transform tasks must be structures");
+                };
+                use super::strategy_map::TransformTask;
+                assert_eq!(*span, std::mem::size_of::<TransformTask>() as u32);
+                assert_eq!(*span, 40);
+                assert_eq!(
+                    members[2].offset,
+                    std::mem::offset_of!(TransformTask, coefficient_offset) as u32
+                );
+                assert_eq!(
+                    members[7].offset,
+                    std::mem::offset_of!(TransformTask, ac_word_offset) as u32
+                );
+                assert_eq!(
+                    members[9].offset,
+                    std::mem::offset_of!(TransformTask, strategy) as u32
+                );
+            }
+        }
     }
 }
 
@@ -603,7 +628,7 @@ fn gpu_profile_encodes_exact_black_from_padded_rgb() {
     assert_eq!(plan.parameter_storage_bytes, 512);
     assert_eq!(plan.artifact_storage_bytes, 2_560);
     assert_eq!(plan.readback_bytes, 2_560);
-    assert_eq!(plan.owned_bytes_per_job, 10_340);
+    assert_eq!(plan.owned_bytes_per_job, 10_384);
     assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
 
     let codestream = encoder.encode(source).unwrap();

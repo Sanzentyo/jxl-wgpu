@@ -289,6 +289,23 @@ fn write_lf_group(
 ) -> Result<(), EncodeError> {
     let group = frame.lf_group_blocks(group_index)?;
     let block_count = group.block_count()?;
+    let strategies = if let Some(plan) = artifact.transform_plan {
+        plan.lf_groups[group_index as usize]
+            .iter()
+            .map(|&index| plan.tasks[index].strategy as i32)
+            .collect::<Vec<_>>()
+    } else {
+        let count = match frame.topology {
+            super::types::VarDctTopology::SingleTransform(_) => 1,
+            super::types::VarDctTopology::TiledDct8 => block_count as usize,
+            super::types::VarDctTopology::StrategyMap => {
+                return Err(EncodeError::InvalidConfiguration(
+                    "mixed VarDCT metadata requires a strategy map",
+                ));
+            }
+        };
+        vec![artifact.strategy as i32; count]
+    };
     output.write_bits(0, 2)?; // no extra LF precision
     write_local_modular_header(output)?;
     append_gpu_dc_fragment(
@@ -297,14 +314,16 @@ fn write_lf_group(
         artifact.dc_fragment_descriptor(group_index)?,
     )?;
 
-    // GPU-selected regular strategies, no chroma-from-luma correction, fixed
-    // HF multiplier, and zero EPF sharpness. Source-dependent DC entropy was
-    // already packed by the GPU; these values describe its control map.
+    // Validated strategy metadata, zero local CfL maps, fixed HF multiplier,
+    // and zero EPF sharpness. All source-dependent entropy is already packed.
     let first_block_bits = block_count.next_power_of_two().trailing_zeros() as u8;
     output.write_bits(
-        u64::from(group.first_block_count.checked_sub(1).ok_or(
-            EncodeError::InvalidConfiguration("VarDCT frame has no first transform block"),
-        )?),
+        (strategies
+            .len()
+            .checked_sub(1)
+            .ok_or(EncodeError::InvalidConfiguration(
+                "VarDCT frame has no first transform block",
+            ))?) as u64,
         first_block_bits,
     )?;
     write_local_modular_header(output)?;
@@ -315,13 +334,22 @@ fn write_lf_group(
     for _ in 0..2 * correlation_samples {
         write_unsigned_token(output, code, 0)?;
     }
-    for _ in 0..group.first_block_count {
-        write_unsigned_token(output, code, pack_signed_control(artifact.strategy as i32))?;
+    // ACS and HF multipliers form the two rows of one Modular channel.
+    // The fixed MA tree uses Gradient on both rows: West on row zero, then
+    // the clamped gradient of ACS (North), HF (West), and previous ACS (NW).
+    for (index, &strategy) in strategies.iter().enumerate() {
+        let west = index
+            .checked_sub(1)
+            .map_or(0, |previous| strategies[previous]);
+        write_unsigned_token(output, code, pack_signed_control(strategy - west))?;
     }
-    let first_quant_residual = (HF_MUL - 1) - artifact.strategy as i32;
-    write_unsigned_token(output, code, pack_signed_control(first_quant_residual))?;
-    for _ in 1..group.first_block_count {
-        write_unsigned_token(output, code, 0)?;
+    for (index, &north) in strategies.iter().enumerate() {
+        let prediction = if index == 0 {
+            north
+        } else {
+            super::dispatch::clamped_gradient_i32(north, HF_MUL - 1, strategies[index - 1])
+        };
+        write_unsigned_token(output, code, pack_signed_control(HF_MUL - 1 - prediction))?;
     }
     for _ in 0..block_count {
         write_unsigned_token(output, code, 0)?;

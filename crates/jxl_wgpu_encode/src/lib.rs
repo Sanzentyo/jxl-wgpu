@@ -15,10 +15,12 @@
 //! runtime-neutral [`Future`], so a caller can keep multiple frames in flight. Multi-batch browser
 //! jobs advance one bounded map callback at a time from that same future and do not require a
 //! specific executor or Web Worker.
-//! [`VarDctEncoder`] executes all 27 standard strategy identifiers. Strategies through 32x32 use a
-//! fixed diagnostic transform artifact; the 64x64 through 256x256 families use a scalable
-//! per-8x8-block GPU DC reduction followed by a bounded GPU control/entropy pass. Its fixed
-//! distance-25 profile retains DC and quantizes AC to zero.
+//! [`VarDctEncoder`] executes all 27 standard strategies singly or in a validated
+//! [`VarDctStrategyMap`]. Per-strategy GPU batches share resident image/coefficient/LF arenas,
+//! quantize real AC, and pack one bounded entropy fragment per transform. Partial source edges
+//! are replicated on GPU; mixed maps may span multiple LF and AC groups. Quantization uses
+//! fixed parameters; content-adaptive strategy search, distance control and progressive encoding
+//! remain incomplete. [`TiledVarDctEncoder`] provides an optimized DCT8 workgroup path.
 //!
 //! Fixed CPU/WGSL ABI records use `#[repr(C)]` plus `bytemuck::Pod`. WGSL defines
 //! host-shareable numeric values as little-endian, so this crate rejects big-endian targets at
@@ -76,5 +78,5 @@ pub use session::{
 pub use vardct_encoder::{
     TiledVarDctEncoder, TiledVarDctGrid, VarDctBackend, VarDctColorEncoding, VarDctEncoder,
     VarDctJob, VarDctKernelLayout, VarDctLfMetadata, VarDctMemoryPlan, VarDctStrategy,
-    VarDctSubmission, VarDctTransformMemoryPlan,
+    VarDctStrategyMap, VarDctSubmission, VarDctTransform, VarDctTransformMemoryPlan,
 };

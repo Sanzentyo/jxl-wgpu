@@ -257,6 +257,8 @@ impl TiledVarDctGrid {
 /// GPU artifact implementation selected for a VarDCT memory plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VarDctKernelLayout {
+    /// A validated image-wide map, batched by strategy with shared resident arenas.
+    StrategyMap,
     /// One complete transform with GPU-resident coefficients and LF.
     SingleTransform,
     /// Runtime-sized artifact where every 8x8 block is an independent DCT8
@@ -290,6 +292,7 @@ pub struct VarDctTransformMemoryPlan {
     pub lf_bytes: u64,
     pub quantized_bytes: u64,
     pub quantization_metadata_bytes: u64,
+    pub task_metadata_bytes: u64,
     pub total_bytes: u64,
 }
 
@@ -309,25 +312,15 @@ impl VarDctTransformMemoryPlan {
             lf_bytes,
             quantized_bytes,
             quantization_metadata_bytes,
+            task_metadata_bytes: std::mem::size_of::<super::strategy_map::TransformTask>() as u64,
             total_bytes: forward.transient_bytes
                 + xyb_bytes
                 + coefficient_bytes
                 + lf_bytes
                 + quantized_bytes
-                + quantization_metadata_bytes,
+                + quantization_metadata_bytes
+                + std::mem::size_of::<super::strategy_map::TransformTask>() as u64,
         }
-    }
-
-    pub(super) const fn storage_sizes(self) -> [u64; 7] {
-        [
-            self.forward.basis_bytes,
-            self.forward.horizontal_bytes,
-            self.xyb_bytes,
-            self.coefficient_bytes,
-            self.lf_bytes,
-            self.quantized_bytes,
-            self.quantization_metadata_bytes,
-        ]
     }
 }
 
@@ -350,14 +343,6 @@ impl VarDctMemoryPlan {
             owned_bytes_per_job,
             addressed_bytes_per_job: source_binding_bytes + owned_bytes_per_job,
         }
-    }
-
-    pub(super) const fn with_transform(mut self, strategy: VarDctStrategy) -> Self {
-        let transform = VarDctTransformMemoryPlan::new(strategy);
-        self.owned_bytes_per_job += transform.total_bytes;
-        self.addressed_bytes_per_job += transform.total_bytes;
-        self.transform = Some(transform);
-        self
     }
 }
 
@@ -488,6 +473,31 @@ pub(super) struct ArtifactLayout {
 }
 
 impl ArtifactLayout {
+    pub(super) fn for_strategy_map(
+        frame: VarDctFrameLayout,
+        code: &PrefixCode,
+        transforms: u32,
+        ac_words: u32,
+    ) -> Result<Self, EncodeError> {
+        let mut layout = Self::for_block_grid(
+            frame.blocks_x,
+            frame.blocks_y,
+            frame.lf_group_count()?,
+            code,
+        )?;
+        layout.ac_descriptor_offset = layout.artifact_words;
+        layout.ac_descriptor_len = transforms;
+        layout.ac_fragment_offset =
+            align_words(layout.ac_descriptor_offset.checked_add(transforms).ok_or(
+                EncodeError::InvalidConfiguration("VarDCT AC descriptor overflow"),
+            )?)?;
+        layout.ac_fragment_words = ac_words;
+        layout.artifact_words =
+            align_words(layout.ac_fragment_offset.checked_add(ac_words).ok_or(
+                EncodeError::InvalidConfiguration("VarDCT AC arena overflow"),
+            )?)?;
+        Ok(layout)
+    }
     pub(super) fn new(strategy: VarDctStrategy, code: &PrefixCode) -> Result<Self, EncodeError> {
         let Extent2d {
             width: blocks_x,
@@ -678,13 +688,15 @@ impl ArtifactLayout {
 pub(super) enum VarDctTopology {
     SingleTransform(VarDctStrategy),
     TiledDct8,
+    StrategyMap,
 }
 
 impl VarDctTopology {
-    pub(super) const fn strategy(self) -> VarDctStrategy {
+    pub(super) const fn strategy_id(self) -> u32 {
         match self {
-            Self::SingleTransform(strategy) => strategy,
-            Self::TiledDct8 => VarDctStrategy::Dct8,
+            Self::SingleTransform(strategy) => strategy.codestream_id() as u32,
+            Self::TiledDct8 => VarDctStrategy::Dct8.codestream_id() as u32,
+            Self::StrategyMap => u32::MAX,
         }
     }
 
@@ -692,6 +704,7 @@ impl VarDctTopology {
         match self {
             Self::SingleTransform(_) => SINGLE_TRANSFORM_TOPOLOGY,
             Self::TiledDct8 => TILED_DCT8_TOPOLOGY,
+            Self::StrategyMap => 2,
         }
     }
 
@@ -699,6 +712,7 @@ impl VarDctTopology {
         match self {
             Self::SingleTransform(_) => VarDctKernelLayout::SingleTransform,
             Self::TiledDct8 => VarDctKernelLayout::TiledDct8,
+            Self::StrategyMap => VarDctKernelLayout::StrategyMap,
         }
     }
 }
@@ -774,15 +788,6 @@ impl VarDctFrameLayout {
                 "VarDCT LF group index is out of range",
             ));
         }
-        if matches!(self.topology, VarDctTopology::SingleTransform(_)) {
-            return Ok(LfGroupBlocks {
-                origin_x: 0,
-                origin_y: 0,
-                width: self.blocks_x,
-                height: self.blocks_y,
-                first_block_count: 1,
-            });
-        }
         let group_x = group % self.lf_groups_x;
         let group_y = group / self.lf_groups_x;
         let origin_x = group_x * (LF_GROUP_DIM_PIXELS / 8);
@@ -794,7 +799,6 @@ impl VarDctFrameLayout {
             origin_y,
             width,
             height,
-            first_block_count: width * height,
         })
     }
 }
@@ -805,7 +809,6 @@ pub(super) struct LfGroupBlocks {
     pub(super) origin_y: u32,
     pub(super) width: u32,
     pub(super) height: u32,
-    pub(super) first_block_count: u32,
 }
 
 impl LfGroupBlocks {
@@ -830,6 +833,7 @@ pub(super) fn align_words(words: u32) -> Result<u32, EncodeError> {
 
 #[derive(Clone, Copy)]
 pub(super) struct VarDctArtifactData<'a> {
+    pub(super) transform_plan: Option<&'a super::strategy_map::TransformPlan>,
     pub(super) strategy: u32,
     pub(super) dc_fragment_words: &'a [u32],
     pub(super) dc_fragment_bit_len: u32,

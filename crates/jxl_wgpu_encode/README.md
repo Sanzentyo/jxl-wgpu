@@ -113,6 +113,14 @@ families. `VarDctStrategy` re-exports the shared protocol `TransformKind`; `ALL`
 standard alphabet and `pixel_extent()` supplies its spatial geometry. Every entry emits its
 exact standard identifier and real AC coefficients.
 
+`VarDctEncoder::new_with_strategy_map` accepts a `VarDctStrategyMap` for the entire image.
+Its `VarDctTransform` placements use 8×8-block coordinates. Construction sorts placements into
+raster order and rejects holes, overlaps, out-of-grid rectangles and AC-group crossings.
+Any standard strategy may appear at an unaligned block origin when its rectangle fits one
+256-pixel AC group. The padded grid is `ceil(width/8) × ceil(height/8)`; the GPU replicates
+partial source edges for every strategy. Dimensions share the checked 16K per-axis bound.
+The map is caller-selected metadata; content-adaptive strategy selection remains unimplemented.
+
 `VarDctEncoder::new_with_lf_metadata` and `TiledVarDctEncoder::new_with_lf_metadata` accept a
 validated `VarDctLfMetadata`. Its LF dequantization and base-correlation fields retain exact finite
 binary16 values, while the colour factor and signed LF factors use their normative integer
@@ -131,12 +139,12 @@ matrices and natural coefficient orders, with one prefix distribution
 for all 495 coefficient contexts and no LZ77. Quantization is fixed at the distance-25 profile's
 parameters; general distance/quality guarantees and rate control remain unimplemented.
 
-Single transforms use the shared `ForwardVarDctPipeline`: regular DCTs run separable horizontal
+Single transforms and image-wide maps share the `ForwardVarDctPipeline` batch path: regular DCTs run separable horizontal
 and vertical passes, while special 8×8 transforms evaluate a constant basis on GPU. A final pass
 extracts LF from the transform's lowest-frequency rectangle using the normative resampling
 factors and inverse small DCT. This replaces the old large-transform approximation by independent
 8×8 means. Raw coefficients, LF and quantized coefficients remain GPU-resident. The host expands
-only bounded strategy constants, dequantization matrices and coefficient orders, shared with the
+only validated placement metadata and bounded strategy constants, dequantization matrices and coefficient orders, shared with the
 decoder; it never evaluates image samples.
 The decoder's direct dependencies on `jxl-vardct`, `jxl-threadpool` and `jxl-oxide-common` now
 serve development oracles. Production defaults no longer instantiate a CPU decoder's matrix
@@ -161,14 +169,20 @@ There is no host transform, quantization, source padding, coefficient re-encodin
 fallback. The independently concatenable block format relies on the single-distribution prefix
 policy; future contextual or ANS encoders must maintain their state on GPU.
 
-`VarDctMemoryPlan::kernel_layout` distinguishes `SingleTransform` and `TiledDct8`. Both use
+`VarDctMemoryPlan::kernel_layout` distinguishes `SingleTransform`, `StrategyMap` and `TiledDct8`. All use
 512-byte parameters and a runtime-sized artifact with a 256-byte header and independently
 256-byte-aligned sections. Single-transform plans additionally report exact XYB, raw coefficient,
-LF, quantized coefficient, matrix/order, and forward scratch allocations in `transform`.
-An 8×8 DCT submission owns 10,340 bytes: 512 parameters, 2,560 artifact, 2,560 readback and
-4,708 resident transform bytes. It no longer allocates a fixed diagnostic coefficient readback.
+LF, quantized coefficient, matrix/order, transform-task and forward scratch allocations in `transform`.
+Mapped plans report their aggregate allocation sizes: basis/uniform storage is shared per strategy,
+while all transforms share image-wide XYB/coefficient/LF/quantized arenas. Each strategy batch
+owns one horizontal scratch allocation and a 20-byte forward task per transform; encoder tasks
+occupy 40 bytes per transform. No GPU allocation is created per individual transform.
+An 8×8 DCT submission owns 10,384 bytes: 512 parameters, 2,560 artifact, 2,560 readback and
+4,752 resident transform bytes. It no longer allocates a fixed diagnostic coefficient readback.
 Single transforms reserve one AC slot for three counts and at most `area - area / 64` coefficients
-per channel; the largest 256×256 slot has 127,010 words. Tiled artifacts add one length word and a
+per channel; the largest 256×256 slot has 127,010 words. Mixed maps reserve the exact
+strategy-specific bound per transform, with one length word each and no maximum-size slot
+for smaller transforms. Tiled artifacts add one length word and a
 125-word AC slot per block, with each section aligned to 256 bytes. The slot bound comes from
 the actual prefix lengths for three counts and at most 63 signed coefficients per channel.
 The complete parameter + artifact + readback + resident transform reservation remains live through validation or
@@ -186,6 +200,10 @@ bases for all ten strategies with an 8×8 footprint. See the
 [native fixture generator](../jxl_wgpu/test-data/forward_vardct_generator/README.md).
 Procedural checkerboards, stripes, impulses, gradients, and colour patterns also exercise
 single-packet images, AC/LF boundaries, custom correlation, and a 2057×2057 four-LF-group image.
+Mixed-map cases cover all 27 strategies in one 512×512 image, a 2057×17 LF-boundary image,
+and 13×21 non-DCT8 edge replication, including native coefficient checks and all three decoders.
+The batched forward primitive separately checks disjoint/reordered source and output ranges for
+all 27 strategies, with poisoned gaps and two transforms per batch under all five variants.
 An independent f64 cosine-sum reference checks AC values within one integer quantizer step;
 this is a numerical regression bound, not ISO precision or perceptual-quality certification.
 Blocking/Future assembly and all supported linear workgroup variants produce identical bytes.
@@ -207,8 +225,8 @@ compaction algorithm.
 #     source_16_by_8: BufferImageSource,
 # ) -> Result<Vec<u8>, jxl_wgpu_encode::EncodeError> {
 let encoder = VarDctEncoder::new(context, VarDctStrategy::Dct8x16)?;
-assert_eq!(encoder.strategy().pixel_extent().width, 16);
-assert_eq!(encoder.strategy().pixel_extent().height, 8);
+assert_eq!(encoder.strategy_map().extent().width, 16);
+assert_eq!(encoder.strategy_map().extent().height, 8);
 encoder.encode(source_16_by_8)
 # }
 ```
@@ -236,6 +254,18 @@ and `djxl` decode the emitted multi-group streams with at most one byte of mutua
 disagreement. The two-LF-group streams also execute through the stock GPU decoder and explicit
 readback within one code of Rust `jxl`. `cjxl` provides a separately decoded distance-25
 development-quality reference for the edge and two-LF-group fixtures.
+
+```rust,no_run
+# use jxl_wgpu_encode::{BufferImageSource, VarDctEncoder, VarDctStrategy, VarDctStrategyMap, VarDctTransform, WgpuContext};
+# fn encode(context: WgpuContext, source_13_by_21: BufferImageSource) -> Result<Vec<u8>, jxl_wgpu_encode::EncodeError> {
+let map = VarDctStrategyMap::new(13, 21, vec![
+    VarDctTransform { block_x: 0, block_y: 0, strategy: VarDctStrategy::Dct16x16 },
+    VarDctTransform { block_x: 0, block_y: 2, strategy: VarDctStrategy::Dct8x16 },
+])?;
+let encoder = VarDctEncoder::new_with_strategy_map(context, map, Default::default())?;
+encoder.encode(source_13_by_21)
+# }
+```
 
 ## Animation sessions
 

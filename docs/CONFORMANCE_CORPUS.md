@@ -229,6 +229,24 @@ match within 3e-6 relative error. The native comparison corrected the previous d
 defaults for the 128x256 matrix family. See the
 [pinned generator, binary schemas and precision limits](../crates/jxl_wgpu/test-data/forward_vardct_generator/README.md).
 
+`vardct_encoder/tests/mixed.rs` exercises caller-selected image-wide maps: 512×512 contains
+all 27 strategies in 37 transforms, 2057×17 spans two LF groups with 130 transforms, and 13×21
+uses DCT16×16 plus DCT8×16 with replicated edges. A fourth 24×16 image places DCT16×16
+at an 8-pixel horizontal offset between DCT8 blocks, exercising a transform origin that is not
+a multiple of its own extent. Every AC coefficient is compared against
+independent f64 transforms and the committed native matrices/orders/bases; the first three cases
+contain 176,403, 69,258 and 355 nonzero coefficients. Rust `jxl`, installed `djxl`, and public
+`GpuDecoder` agree within one RGB8 code. Reversed input placement order and all five linear
+variants emit identical bytes. Tests reject invalid covers, overlaps, out-of-grid rectangles,
+AC-boundary crossings and mismatched source extents, and cover exact/one-byte-deficient memory
+admission and cancellation. Content-adaptive selection and perceptual quality are separate gates.
+
+The forward primitive also checks two transforms per batch for all 27 strategies under all five
+linear variants, including independent strided source crops, reordered output ranges, poisoned
+prefix/gap/tail guards, exact allocations, overlapping outputs and WGSL-u32 overflow. Its
+coefficient/LF tolerances are unchanged from the native single-transform corpus. Shared oracle
+code is in `tests/native.rs`; there are no path-based module remappings.
+
 `vardct_encoder/tests/single.rs` adds textured images for all 27 strategies with default and custom
 LF/HF correlation. Each compressed AC value is checked against independent f64 color conversion,
 cosine sums or native impulse bases, and native matrices/orders within one integer quantizer step.

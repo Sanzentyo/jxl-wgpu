@@ -1,13 +1,13 @@
 //! Resident normalization, forward transform, quantization and AC serialization.
 
 use jxl_wgpu::{
-    ForwardVarDctInputs, ForwardVarDctPipeline, ForwardVarDctScratch, KernelVariant,
+    ForwardVarDctBatchInputs, ForwardVarDctPipeline, ForwardVarDctScratch, KernelVariant,
     ResidentF32Plane, ResidentStorageBinding,
 };
 use wgpu::util::DeviceExt;
 
 use super::dispatch::shader_source;
-use super::types::{VarDctStrategy, VarDctTransformMemoryPlan};
+use super::strategy_map::TransformPlan;
 use crate::EncodeError;
 
 pub(super) struct Pipeline {
@@ -21,7 +21,7 @@ pub(super) struct Pipeline {
 }
 
 pub(super) struct Inputs<'a> {
-    pub(super) strategy: VarDctStrategy,
+    pub(super) plan: &'a TransformPlan,
     pub(super) source: wgpu::BufferBinding<'a>,
     pub(super) parameters: &'a wgpu::Buffer,
     pub(super) artifact: &'a wgpu::Buffer,
@@ -29,8 +29,8 @@ pub(super) struct Inputs<'a> {
 
 /// These handles keep every charged resident allocation alive until completion.
 pub(super) struct Scratch {
-    _buffers: [wgpu::Buffer; 5],
-    _forward: ForwardVarDctScratch,
+    _buffers: [wgpu::Buffer; 6],
+    _forward: Vec<ForwardVarDctScratch>,
 }
 
 fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
@@ -45,7 +45,7 @@ impl Pipeline {
         let forward = ForwardVarDctPipeline::new(device, variant)?;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("jxl-wgpu general VarDCT encoder"),
-            source: wgpu::ShaderSource::Wgsl(shader_source(include_str!("single.wgsl")).into()),
+            source: wgpu::ShaderSource::Wgsl(shader_source(include_str!("transforms.wgsl")).into()),
         });
         let constants = [("wg_x", f64::from(variant.workgroup_size().0))];
         let make = |entry| {
@@ -62,10 +62,10 @@ impl Pipeline {
             })
         };
         Ok(Self {
-            normalize: make("normalize_single"),
-            quantize_ac: make("quantize_single_ac"),
-            quantize_lf: make("quantize_single_lf"),
-            serialize_ac: make("serialize_single_ac"),
+            normalize: make("normalize_image"),
+            quantize_ac: make("quantize_transforms_ac"),
+            quantize_lf: make("quantize_transforms_lf"),
+            serialize_ac: make("serialize_transforms_ac"),
             serialize_lf: make("serialize_control"),
             forward,
             variant,
@@ -78,11 +78,12 @@ impl Pipeline {
         commands: &mut wgpu::CommandEncoder,
         inputs: Inputs<'_>,
     ) -> Result<Scratch, EncodeError> {
-        let memory = VarDctTransformMemoryPlan::new(inputs.strategy);
-        let transform = inputs.strategy;
-        let extent = transform.pixel_extent();
-        let area = extent.width * extent.height;
-        let lf = transform.lf_extent();
+        let memory = inputs.plan.memory;
+        let extent = inputs.plan.map.extent();
+        let width = extent.width.div_ceil(8) * 8;
+        let height = extent.height.div_ceil(8) * 8;
+        let area = width * height;
+        let count = inputs.plan.tasks.len() as u32;
         let buffer = |label, size| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -101,17 +102,14 @@ impl Pipeline {
             "resident encoder quantized coefficients",
             memory.quantized_bytes,
         );
-        let order = transform.natural_order();
-        let metadata = transform
-            .default_dequant_matrix()
-            .scales
-            .into_iter()
-            .zip(order)
-            .map(|([x, y, b], order)| [x.to_bits(), y.to_bits(), b.to_bits(), order])
-            .collect::<Vec<_>>();
         let metadata = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("encoder quantization and order metadata"),
-            contents: bytemuck::cast_slice(&metadata),
+            contents: bytemuck::cast_slice(&inputs.plan.metadata),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let tasks = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("encoder transform tasks"),
+            contents: bytemuck::cast_slice(&inputs.plan.tasks),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let lanes = self.variant.workgroup_size().0;
@@ -122,19 +120,21 @@ impl Pipeline {
                         pipeline: &wgpu::ComputePipeline,
                         entries: &[wgpu::BindGroupEntry<'_>],
                         count: u32,
-                        scalar: bool| {
+                        per_transform: bool| {
             let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("single-transform encoder stage bindings"),
+                label: Some("mapped-transform encoder stage bindings"),
                 layout: &pipeline.get_bind_group_layout(0),
                 entries,
             });
             let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &binding, &[]);
-            if scalar {
-                pass.dispatch_workgroups(1, 1, 1);
-            } else {
-                let groups = count.div_ceil(lanes);
+            {
+                let groups = if per_transform {
+                    count
+                } else {
+                    count.div_ceil(lanes)
+                };
                 pass.dispatch_workgroups(
                     groups.min(workgroups_x),
                     groups.div_ceil(workgroups_x),
@@ -157,28 +157,33 @@ impl Pipeline {
             false,
         );
         let channel_bytes = memory.xyb_bytes / 3;
-        let forward = self.forward.encode(
-            device,
-            commands,
-            ForwardVarDctInputs {
-                transform,
-                sources: std::array::from_fn(|channel| ResidentF32Plane {
-                    storage: ResidentStorageBinding {
-                        buffer: &xyb,
-                        offset: channel as u64 * channel_bytes,
-                        size: std::num::NonZeroU64::new(channel_bytes).unwrap(),
+        let mut forward = Vec::with_capacity(inputs.plan.batches.len());
+        for batch in &inputs.plan.batches {
+            forward.push(
+                self.forward.encode_batch(
+                    device,
+                    commands,
+                    ForwardVarDctBatchInputs {
+                        transform: batch.strategy,
+                        sources: std::array::from_fn(|channel| ResidentF32Plane {
+                            storage: ResidentStorageBinding {
+                                buffer: &xyb,
+                                offset: channel as u64 * channel_bytes,
+                                size: std::num::NonZeroU64::new(channel_bytes).unwrap(),
+                            },
+                            width,
+                            height,
+                            stride: 0,
+                        }),
+                        tasks: &batch.tasks,
+                        coefficients: ResidentStorageBinding::entire(&coefficients)
+                            .map_err(jxl_wgpu::ForwardVarDctError::from)?,
+                        low_frequency: ResidentStorageBinding::entire(&low_frequency)
+                            .map_err(jxl_wgpu::ForwardVarDctError::from)?,
                     },
-                    width: extent.width,
-                    height: extent.height,
-                    stride: 0,
-                }),
-                origins: [0; 3],
-                coefficients: ResidentStorageBinding::entire(&coefficients)
-                    .map_err(jxl_wgpu::ForwardVarDctError::from)?,
-                low_frequency: ResidentStorageBinding::entire(&low_frequency)
-                    .map_err(jxl_wgpu::ForwardVarDctError::from)?,
-            },
-        )?;
+                )?,
+            );
+        }
         dispatch(
             commands,
             &self.quantize_ac,
@@ -187,9 +192,10 @@ impl Pipeline {
                 entry(3, &coefficients),
                 entry(6, &quantized),
                 entry(7, &metadata),
+                entry(8, &tasks),
             ],
-            area,
-            false,
+            count,
+            true,
         );
         dispatch(
             commands,
@@ -198,9 +204,10 @@ impl Pipeline {
                 entry(1, inputs.parameters),
                 entry(2, inputs.artifact),
                 entry(4, &low_frequency),
+                entry(8, &tasks),
             ],
-            lf.width * lf.height,
-            false,
+            count,
+            true,
         );
         dispatch(
             commands,
@@ -210,8 +217,9 @@ impl Pipeline {
                 entry(2, inputs.artifact),
                 entry(6, &quantized),
                 entry(7, &metadata),
+                entry(8, &tasks),
             ],
-            1,
+            count,
             true,
         );
         dispatch(
@@ -222,7 +230,7 @@ impl Pipeline {
             true,
         );
         Ok(Scratch {
-            _buffers: [xyb, coefficients, low_frequency, quantized, metadata],
+            _buffers: [xyb, coefficients, low_frequency, quantized, metadata, tasks],
             _forward: forward,
         })
     }

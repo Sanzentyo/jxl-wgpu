@@ -75,7 +75,7 @@ fn artifact_rejects_missing_ac_writes_and_forged_layout() {
     };
     words[..64].copy_from_slice(bytemuck::cast_slice(std::slice::from_ref(&header)));
     let valid = |words: &[u32]| {
-        validate_artifact(bytemuck::cast_slice(words), layout, &dc, &hf, frame).is_ok()
+        validate_artifact(bytemuck::cast_slice(words), layout, &dc, &hf, frame, None).is_ok()
     };
     assert!(valid(&words));
     // Every new AC header field, its presence marker and final ready status.

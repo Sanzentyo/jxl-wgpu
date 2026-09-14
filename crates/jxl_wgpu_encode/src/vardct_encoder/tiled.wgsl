@@ -17,10 +17,10 @@ fn serialize_block_ac(block: u32) {
         for (var order = 1u; order < 64u; order += 1u) {
             nonzero += u32(block_ac[DCT8_NATURAL_ORDER[order]][channel] != 0);
         }
-        bit_offset = encode_ac_unsigned(base, nonzero, bit_offset);
+        bit_offset = encode_ac_unsigned(base, params.ac_words_per_block, nonzero, bit_offset);
         for (var order = 1u; order < 64u && nonzero != 0u; order += 1u) {
             let value = block_ac[DCT8_NATURAL_ORDER[order]][channel];
-            bit_offset = encode_ac_unsigned(base, zigzag_signed(value), bit_offset);
+            bit_offset = encode_ac_unsigned(base, params.ac_words_per_block, zigzag_signed(value), bit_offset);
             nonzero -= u32(value != 0);
         }
     }

@@ -356,11 +356,13 @@ fn insufficient_pipeline_limits_return_typed_errors() {
     let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
         .expect("actual adapter required for forward pipeline admission");
     for (name, required, available) in [
-        ("max_storage_buffers_per_shader_stage", 5, 4),
-        ("max_uniform_buffer_binding_size", 80, 64),
+        ("max_bindings_per_bind_group", 9, 8),
+        ("max_storage_buffers_per_shader_stage", 6, 5),
+        ("max_uniform_buffer_binding_size", 64, 32),
     ] {
         let mut limits = wgpu::Limits::default().using_resolution(adapter.limits());
         match name {
+            "max_bindings_per_bind_group" => limits.max_bindings_per_bind_group = available as u32,
             "max_storage_buffers_per_shader_stage" => {
                 limits.max_storage_buffers_per_shader_stage = available as u32
             }
@@ -403,11 +405,23 @@ fn shader_abi_and_memory_plan_match_allocations() {
     );
     assert_eq!(
         members[9].offset,
-        std::mem::offset_of!(Params, offsets) as u32
+        std::mem::offset_of!(Params, basis_offsets) as u32
+    );
+    let task = module
+        .types
+        .iter()
+        .find_map(|(_, ty)| (ty.name.as_deref() == Some("Task")).then_some(&ty.inner));
+    let Some(naga::TypeInner::Struct { members, span }) = task else {
+        panic!("missing shader task descriptor");
+    };
+    assert_eq!(*span, size_of::<ForwardVarDctTask>() as u32);
+    assert_eq!(
+        members[1].offset,
+        std::mem::offset_of!(ForwardVarDctTask, coefficient_offset) as u32
     );
     assert_eq!(
-        members[10].offset,
-        std::mem::offset_of!(Params, basis_offsets) as u32
+        members[2].offset,
+        std::mem::offset_of!(ForwardVarDctTask, lf_offset) as u32
     );
     for transform in TransformKind::ALL {
         let memory = ForwardVarDctMemoryPlan::new(transform);
@@ -417,7 +431,10 @@ fn shader_abi_and_memory_plan_match_allocations() {
         );
         assert_eq!(
             memory.transient_bytes,
-            memory.parameter_bytes + memory.basis_bytes + memory.horizontal_bytes
+            memory.parameter_bytes
+                + memory.basis_bytes
+                + memory.horizontal_bytes
+                + memory.task_bytes
         );
         assert_eq!(
             memory.coefficient_bytes,
@@ -428,4 +445,185 @@ fn shader_abi_and_memory_plan_match_allocations() {
             transform.lf_extent().area().unwrap() as u64 * 12
         );
     }
+}
+
+#[test]
+fn batches_match_native_transforms_with_disjoint_reordered_ranges_and_guarded_crops() {
+    let backend = backend();
+    let device = backend.device();
+    let cases = cases()
+        .into_iter()
+        .filter(|case| case.test == 0)
+        .collect::<Vec<_>>();
+    assert_eq!(cases.len(), 27);
+    for variant in [
+        KernelVariant::Scalar,
+        KernelVariant::Lanes32,
+        KernelVariant::Lanes64,
+        KernelVariant::Lanes128,
+        KernelVariant::Lanes256,
+    ] {
+        let pipeline = ForwardVarDctPipeline::new(device, variant).unwrap();
+        for case in &cases {
+            let extent = case.transform.pixel_extent();
+            let memory = ForwardVarDctMemoryPlan::for_batch(case.transform, 2).unwrap();
+            let coefficient_len = memory.coefficient_bytes as usize / 8;
+            let lf_len = memory.lf_bytes as usize / 8;
+            let width = extent.width * 2 + 4;
+            let height = extent.height * 2 + 3;
+            let mut tasks = [
+                ForwardVarDctTask {
+                    origins: [3, 5, 7],
+                    coefficient_offset: coefficient_len as u32 + 7,
+                    lf_offset: lf_len as u32 + 11,
+                },
+                ForwardVarDctTask {
+                    origins: [0; 3],
+                    coefficient_offset: 3,
+                    lf_offset: 5,
+                },
+            ];
+            for channel in 0..3 {
+                let stride = width + channel as u32 + 3;
+                tasks[1].origins[channel] =
+                    tasks[0].origins[channel] + extent.width + 4 + stride * (extent.height + 3);
+            }
+            let sources: [wgpu::Buffer; 3] = std::array::from_fn(|channel| {
+                let stride = width + channel as u32 + 3;
+                let mut values = vec![
+                    POISON;
+                    PREFIX as usize / 4
+                        + tasks[0].origins[channel] as usize
+                        + (stride * height) as usize
+                ];
+                for (task_index, task) in tasks.iter().enumerate() {
+                    for y in 0..extent.height {
+                        for x in 0..extent.width {
+                            let value = sample(case, channel, x as usize, y as usize)
+                                * if task_index == 0 { 1.0 } else { -0.5 };
+                            let address = PREFIX as usize / 4
+                                + (task.origins[channel] + y * stride + x) as usize;
+                            values[address] = value.to_bits();
+                        }
+                    }
+                }
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("batched native oracle crop source"),
+                    contents: bytemuck::cast_slice(&values),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+            });
+            let coefficients = output_buffer(device, (2 * coefficient_len + 7) as u64 * 4);
+            let lf = output_buffer(device, (2 * lf_len + 11) as u64 * 4);
+            let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("batched native oracle readback"),
+                size: coefficients.size() + lf.size(),
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let inputs = ForwardVarDctBatchInputs {
+                transform: case.transform,
+                sources: std::array::from_fn(|channel| ResidentF32Plane {
+                    storage: binding(&sources[channel]),
+                    width,
+                    height,
+                    stride: width + channel as u32 + 3,
+                }),
+                tasks: &tasks,
+                coefficients: binding(&coefficients),
+                low_frequency: binding(&lf),
+            };
+            let mut commands = device.create_command_encoder(&Default::default());
+            let scratch = pipeline
+                .encode_batch(device, &mut commands, inputs)
+                .unwrap();
+            assert_eq!(scratch.memory, memory);
+            assert_eq!(scratch.tasks.size(), 40);
+            assert_eq!(
+                scratch.parameters.size()
+                    + scratch.basis.size()
+                    + scratch.tasks.size()
+                    + scratch.horizontal.as_ref().map_or(0, wgpu::Buffer::size),
+                memory.transient_bytes
+            );
+            commands.copy_buffer_to_buffer(&coefficients, 0, &staging, 0, coefficients.size());
+            commands.copy_buffer_to_buffer(&lf, 0, &staging, coefficients.size(), lf.size());
+            let submission = backend.queue().submit([commands.finish()]);
+            let (send, recv) = std::sync::mpsc::sync_channel(1);
+            staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    send.send(result).unwrap()
+                });
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: None,
+                })
+                .unwrap();
+            recv.recv().unwrap().unwrap();
+            let mapped = staging.slice(..).get_mapped_range().unwrap();
+            let words: &[u32] = bytemuck::cast_slice(&mapped);
+            let mut expected = vec![None; words.len()];
+            for (index, task) in tasks.iter().enumerate() {
+                let scale = if index == 0 { 1.0 } else { -0.5 };
+                for (base, values, tolerance) in [
+                    (
+                        PREFIX as usize / 4 + task.coefficient_offset as usize,
+                        &case.values[..coefficient_len],
+                        2e-6,
+                    ),
+                    (
+                        (coefficients.size() + PREFIX) as usize / 4 + task.lf_offset as usize,
+                        &case.values[coefficient_len..],
+                        2e-5,
+                    ),
+                ] {
+                    for (offset, value) in values.iter().enumerate() {
+                        expected[base + offset] = Some((value * scale, tolerance));
+                    }
+                }
+            }
+            for (word, expected) in words.iter().zip(expected) {
+                if let Some((expected, tolerance)) = expected {
+                    let actual = f32::from_bits(*word);
+                    assert!(
+                        (actual - expected).abs() <= tolerance * (1.0 + expected.abs()),
+                        "{:?}/{variant:?}: actual {actual}, expected {expected}",
+                        case.transform
+                    );
+                } else {
+                    assert_eq!(*word, POISON, "batch escaped its output range");
+                }
+            }
+            drop(mapped);
+            staging.unmap();
+            let mut commands = device.create_command_encoder(&Default::default());
+            for invalid in [
+                vec![],
+                vec![tasks[0], tasks[0]],
+                vec![ForwardVarDctTask {
+                    coefficient_offset: u32::MAX,
+                    ..tasks[0]
+                }],
+                vec![ForwardVarDctTask {
+                    lf_offset: u32::MAX,
+                    ..tasks[0]
+                }],
+            ] {
+                assert!(matches!(
+                    pipeline.encode_batch(
+                        device,
+                        &mut commands,
+                        ForwardVarDctBatchInputs {
+                            tasks: &invalid,
+                            ..inputs
+                        }
+                    ),
+                    Err(ForwardVarDctError::TaskLayout)
+                ));
+            }
+        }
+    }
+    assert!(ForwardVarDctMemoryPlan::for_batch(TransformKind::Dct256x256, u32::MAX).is_err());
 }

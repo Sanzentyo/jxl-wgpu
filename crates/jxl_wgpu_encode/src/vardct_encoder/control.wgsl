@@ -87,10 +87,10 @@ fn encode_dc_token(slot: u32, signed_value: i32, start: u32) -> u32 {
     return params.fragment_word_capacity * 32u + 1u;
 }
 
-fn append_ac_bits(base: u32, value: u32, count: u32, start: u32) -> u32 {
+fn append_ac_bits(base: u32, capacity: u32, value: u32, count: u32, start: u32) -> u32 {
     for (var index = 0u; index < count; index += 1u) {
         let bit_offset = start + index;
-        if bit_offset < params.ac_words_per_block * 32u {
+        if bit_offset < capacity * 32u {
             artifact_words[base + (bit_offset >> 5u)] |=
                 ((value >> index) & 1u) << (bit_offset & 31u);
         }
@@ -98,7 +98,7 @@ fn append_ac_bits(base: u32, value: u32, count: u32, start: u32) -> u32 {
     return start + count;
 }
 
-fn encode_ac_unsigned(base: u32, value: u32, start: u32) -> u32 {
+fn encode_ac_unsigned(base: u32, capacity: u32, value: u32, start: u32) -> u32 {
     var token = 0u;
     var extra_count = 0u;
     var extra = 0u;
@@ -108,11 +108,11 @@ fn encode_ac_unsigned(base: u32, value: u32, start: u32) -> u32 {
         extra = value - (1u << extra_count);
     }
     if token >= 19u {
-        return params.ac_words_per_block * 32u + 1u;
+        return capacity * 32u + 1u;
     }
     let prefix = params.hf_prefix[token];
-    let after_prefix = append_ac_bits(base, prefix.bits, prefix.bit_len, start);
-    return append_ac_bits(base, extra, extra_count, after_prefix);
+    let after_prefix = append_ac_bits(base, capacity, prefix.bits, prefix.bit_len, start);
+    return append_ac_bits(base, capacity, extra, extra_count, after_prefix);
 }
 
 @compute @workgroup_size(1)
@@ -122,7 +122,7 @@ fn serialize_control() {
     var bit_offset = 0u;
     let lf_group_count = params.lf_groups_x * params.lf_groups_y;
 
-    for (var block = 0u; block < block_count; block += 1u) {
+    for (var block = 0u; params.topology != 2u && block < block_count; block += 1u) {
         let is_first = block == 0u || params.topology == 1u;
         artifact_words[params.strategy_offset + block] =
             params.strategy | select(0u, 1u << 8u, is_first);

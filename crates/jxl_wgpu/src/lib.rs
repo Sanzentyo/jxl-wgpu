@@ -66,8 +66,8 @@ pub use display::{
 };
 pub use error::{Error, Result};
 pub use forward_vardct::{
-    ForwardVarDctError, ForwardVarDctInputs, ForwardVarDctMemoryPlan, ForwardVarDctPipeline,
-    ForwardVarDctScratch,
+    ForwardVarDctBatchInputs, ForwardVarDctError, ForwardVarDctInputs, ForwardVarDctMemoryPlan,
+    ForwardVarDctPipeline, ForwardVarDctScratch, ForwardVarDctTask,
 };
 pub use image_output::{
     ALPHA_OUTPUT_SHADER, AlphaConversion, IMAGE_ORIENTATION_SHADER, IMAGE_OUTPUT_SHADER,
