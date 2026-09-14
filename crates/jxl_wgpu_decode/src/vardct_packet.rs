@@ -14,7 +14,7 @@ use crate::codestream_data::CodestreamBitReader;
 use crate::entropy::EntropyStreamParams;
 use crate::entropy_window::GroupStreamSegment;
 use crate::modular_tree::{
-    BitInput, EntropyDecoderIr, MaConfigIr, MaTreeLimits, MaTreeNodeIr, MetadataEntropyCursor,
+    BitInput, EntropyDecoderIr, MaConfigIr, MaTreeLimits, MetadataEntropyCursor,
     PackedModularMetadata, parse_ma_config,
 };
 use crate::vardct_frontend::{
@@ -51,10 +51,6 @@ pub enum UnsupportedVarDctPacketFeature {
         bits_per_sample: u32,
         color_transform: VarDctColorTransform,
     },
-    #[error(
-        "the MA tree uses previous-channel property {property}; the heterogeneous VarDCT metadata layout is not implemented"
-    )]
-    PreviousChannelMaProperty { property: u32 },
 }
 
 /// Host-side failure before image entropy is submitted to the GPU.
@@ -328,7 +324,6 @@ fn parse_ma_config_at_reader(
         }
         .into());
     }
-    validate_ma_config(&config)?;
     Ok((config, descriptor_end))
 }
 
@@ -419,19 +414,6 @@ fn validate_source_packet_end(
 ) -> Result<(), BoundedVarDctPacketError> {
     let codestream_bits = source.logical_bits()?;
     validate_packet_end_bits(codestream_bits, packet_end).map_err(Into::into)
-}
-
-fn validate_ma_config(config: &MaConfigIr) -> Result<(), BoundedVarDctPacketError> {
-    for node in &config.nodes {
-        if let MaTreeNodeIr::Decision { property, .. } = *node
-            && property >= 16
-        {
-            return Err(
-                UnsupportedVarDctPacketFeature::PreviousChannelMaProperty { property }.into(),
-            );
-        }
-    }
-    Ok(())
 }
 
 fn pack_ma_metadata(config: &MaConfigIr) -> Result<Vec<u32>, BoundedVarDctPacketError> {
@@ -2620,7 +2602,7 @@ pub struct VarDctPacketControl {
     pub expected: [u32; 4],
     pub quantization: [u32; 4],
     pub streams: [u32; 4],
-    /// Maximum predictor row width followed by reserved words.
+    /// Maximum predictor row width, then packed `(height << 16) | width` LF channel extents.
     pub scratch: [u32; 4],
 }
 

@@ -166,6 +166,10 @@ Only after entropy completes do inverse transforms and the three-channel matrix 
 Checked global/local-MA raw images, including local LF/HF packet trees, match whole input through
 40-byte windows; cancellation retains the image and frame reservations until the submitted map
 callback completes.
+VarDCT LF and HF metadata now support previous-channel MA properties. GPU reference selection
+matches channel dimensions and Modular shifts, including subsampled LF grids and capacity-strided
+HF metadata. The [native MA corpus](crates/jxl_wgpu_decode/test-data/vardct_ma_generator/README.md)
+covers 41,616 exact reference values and 72 custom-tree images with identical whole/bounded output.
 Checked-in cjpeg-to-cjxl streams now execute complete non-XYB 4:4:4, 4:2:2, 4:4:0, and 4:2:0
 reconstruction on an actual adapter: component-sized LF/AC planes remain resident, and the output
 kernel applies JPEG XL's quarter/three-quarter edge-replicating upsampling and encoded BT.601 YCbCr

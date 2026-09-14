@@ -3,6 +3,8 @@
 //! The caller supplies packed `modular_metadata`, entropy helpers, one raw-i32 `reconstructed`
 //! storage view, `Params`, and the shared decode error constants. `decode_adaptive_channel()`
 //! reconstructs exactly one channel and deliberately performs no color conversion or output IO.
+//! `ma_reference_channel` and `ma_reference_sample` supply the caller's channel geometry and
+//! storage layout for previous-channel properties; an unavailable reference is `0xffffffffu`.
 
 /*__JXL_MODULAR_PREDICT__*/
 
@@ -63,7 +65,6 @@ fn wp_max_weight(component: u32) -> u32 {
 
 fn ma_property(
     property: u32,
-    index: u32,
     x: u32,
     y: u32,
     n: i32,
@@ -94,21 +95,11 @@ fn ma_property(
         default: {}
     }
     let previous_index = (property - 16u) / 4u;
-    var previous_channel = 0u;
-    if modular_descriptor_mode() {
-        if previous_index >= modular_channel_reference_count(current_channel) {
-            return 0i;
-        }
-        previous_channel = modular_metadata[
-            modular_channel_reference_offset(current_channel) + previous_index
-        ];
-    } else {
-        if previous_index >= current_channel {
-            return 0i;
-        }
-        previous_channel = current_channel - previous_index - 1u;
+    let previous_channel = ma_reference_channel(previous_index);
+    if previous_channel == 0xffffffffu {
+        return 0i;
     }
-    let center = sample_at(previous_channel, index, x, y);
+    let center = ma_reference_sample(previous_channel, x, y);
     let kind = (property - 16u) & 3u;
     if kind == 0u {
         return unsigned_abs_i32(center);
@@ -117,16 +108,15 @@ fn ma_property(
         return center;
     }
     var previous_gradient = 0i;
-    let width = modular_current_channel_width(params.width);
     if x == 0u && y != 0u {
-        previous_gradient = sample_at(previous_channel, index - width, x, y - 1u);
+        previous_gradient = ma_reference_sample(previous_channel, x, y - 1u);
     } else if y == 0u && x != 0u {
-        previous_gradient = sample_at(previous_channel, index - 1u, x - 1u, y);
+        previous_gradient = ma_reference_sample(previous_channel, x - 1u, y);
     } else if x != 0u && y != 0u {
         previous_gradient = gradient_i32(
-            sample_at(previous_channel, index - width, x, y - 1u),
-            sample_at(previous_channel, index - 1u, x - 1u, y),
-            sample_at(previous_channel, index - width - 1u, x - 1u, y - 1u),
+            ma_reference_sample(previous_channel, x, y - 1u),
+            ma_reference_sample(previous_channel, x - 1u, y),
+            ma_reference_sample(previous_channel, x - 1u, y - 1u),
         );
     }
     if kind == 2u {
@@ -136,7 +126,6 @@ fn ma_property(
 }
 
 fn ma_leaf(
-    index: u32,
     x: u32,
     y: u32,
     n: i32,
@@ -166,7 +155,7 @@ fn ma_leaf(
         }
         let property = modular_metadata[node + 1u];
         let threshold = bitcast<i32>(modular_metadata[node + 2u]);
-        let value = ma_property(property, index, x, y, n, w, nw, ne, nn, ww, max_error);
+        let value = ma_property(property, x, y, n, w, nw, ne, nn, ww, max_error);
         // MA trees encode the preorder left subtree for values greater than the threshold.
         if value > threshold {
             node_index = modular_metadata[node + 3u];
@@ -229,7 +218,7 @@ fn decode_adaptive_channel(start: u32, may_pause: bool, pause_cursor: u32) -> u3
         if params.needs_self_correcting != 0u {
             weighted = weighted_predict(n, nw, ne, w, nn);
         }
-        let leaf = ma_leaf(decoded, x, y, n, w, nw, ne, nn, ww, weighted.max_error);
+        let leaf = ma_leaf(x, y, n, w, nw, ne, nn, ww, weighted.max_error);
         if decode_error != 0u {
             break;
         }

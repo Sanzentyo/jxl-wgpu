@@ -4314,3 +4314,26 @@ check render byte accounting, exact admission, one-byte pressure/retry, retentio
 The resident filter adds severe crop/strided-view/row-guard and oversized-extent checks. Broader
 declared shifts, unequal factors between extras, quantized output, features, LF and composition
 at extended rates remain conformance work; this is progress toward the full JPEG XL goal.
+
+## VarDCT previous-channel MA properties (2026-09-15)
+
+The [pinned native generator](../crates/jxl_wgpu_decode/test-data/vardct_ma_generator/README.md)
+produces 72 complete custom-tree JPEG XL streams and 70 channel-geometry cases without changing
+libjxl. The codestreams retain properties 16–27, Gradient/Weighted versus Zero-offset leaves,
+single-entry and sectioned TOCs, and odd image dimensions. Each fixture is parsed through the
+public packet plan before both whole and 40-byte-window GPU decoding with seven-byte transport
+fragments. Whole/bounded outputs and outputs that differ only in MA tree are byte-identical.
+Every completed session releases GPU and input reservations.
+
+The native `PrecomputeReferences` oracle supplies 41,616 exact signed-property comparisons across
+all 64 LF dimension triples and six HF geometries. It checks four reference ranks, all four
+previous-channel property kinds, signed endpoints, row edges, mismatched dimensions, coincident
+dimensions with different shifts, eligible sharpness/strategy references and padded strategy rows.
+GPU code selects references in reverse eligible-channel order and shares predictor math with the
+ordinary Modular path; no CPU image entropy is used and no GPU allocation or uniform grows.
+
+Apple M5 public F32 maxAE is `0.000028353184` against Rust `jxl` and `0.00029148534` against native
+libjxl, under the existing respective `1e-4` and `1/1024` budgets. The integer reference test is
+exact. Forced previous-channel trees with local packet descriptors, transformed side images and
+broader frame combinations remain open; this closes the packet feature rejection without claiming
+the full JPEG XL goal is complete.

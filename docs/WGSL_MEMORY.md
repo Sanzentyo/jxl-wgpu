@@ -322,6 +322,15 @@ and HF decoded counts, first-block count, and extra precision. Their range begin
 header, needs no intermediate map, and only the final window validates ANS/padding plus the fixed
 packet tail before sharing the first downstream submission.
 
+VarDCT previous-channel MA properties read these resident LF/HF allocations directly. Candidate
+channels are scanned backwards and must match width, height and both Modular shifts. LF channels
+retain zero Modular shifts and use the existing three packed component extents. HF correlation
+channels use shifts `(3, 3)`; strategy/quantizer and sharpness use `(0, 0)`. The actual first-block
+count determines strategy geometry, while the allocated capacity determines its physical row
+stride. Whole and staged HF entry points initialize the existing first-block state word before
+prediction. The shared reconstruction fragment delegates reference selection/sample access to its
+consumer, leaving Modular descriptor tables and all buffer/uniform/state byte counts unchanged.
+
 When an external LF image removes coefficient entropy but LF-group extras remain, the initial
 submission only clears/copies frame arenas. Its map fences that setup and is never interpreted as
 an LF-success status. The common Modular subimage executor supplies each group's validated extra

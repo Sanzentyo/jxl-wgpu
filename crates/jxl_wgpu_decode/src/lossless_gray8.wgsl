@@ -623,6 +623,28 @@ fn finalize_output() {
     }
 }
 
+fn ma_reference_channel(previous_index: u32) -> u32 {
+    if modular_descriptor_mode() {
+        if previous_index >= modular_channel_reference_count(current_channel) {
+            return 0xffffffffu;
+        }
+        return modular_metadata[
+            modular_channel_reference_offset(current_channel) + previous_index
+        ];
+    }
+    if previous_index >= current_channel {
+        return 0xffffffffu;
+    }
+    return current_channel - previous_index - 1u;
+}
+
+fn ma_reference_sample(channel: u32, x: u32, y: u32) -> i32 {
+    if modular_descriptor_mode() {
+        return bitcast<i32>(modular_descriptor_sample_load(channel, x, y));
+    }
+    return bitcast<i32>(reconstruction_load(channel * params.sample_count + y * params.width + x));
+}
+
 /*__JXL_MODULAR_RESUME__*/
 /*__JXL_MODULAR_RECONSTRUCT__*/
 

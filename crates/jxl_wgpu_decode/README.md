@@ -986,9 +986,17 @@ quant-matrix scale, every normative default or parametric custom dequantization 
 disabled/default/custom Gaborish, disabled/default/custom
 one-to-three-iteration EPF, arbitrary valid HF block-context maps, and per-pass coefficient orders, entropy descriptors, and quantized refinement shifts.
 `global_scale`, `quant_lf`, LF extra precision, the quant field, per-block `hf_mul`, sharpness,
-per-frequency-cell HF chroma correlation, MA
-properties 0 through 15, and weighted self-correcting prediction are read from the stream. The
-sectioned shared-global-tree packet form resumes across the shared bounded-window
+per-frequency-cell HF chroma correlation, every MA property, and weighted self-correcting
+prediction are read from the stream. Previous-channel properties select earlier channels in reverse
+order with matching width, height and Modular shifts. LF references use each component's packed
+extent; HF references distinguish the shifted correlation maps from the strategy/quantizer and
+sharpness planes, including capacity-strided strategy rows. Missing references yield zero.
+The shared prediction kernel uses explicit storage-access functions for ordinary Modular and VarDCT
+packets. No extra descriptor buffer or resume-state allocation is required. Seventy native geometry
+cases produce 41,616 exact GPU property comparisons; 72 libjxl custom-tree streams validate complete
+public output with whole input and seven-byte fragments through 40-byte GPU windows. See the
+[generator and corpus](test-data/vardct_ma_generator/README.md).
+The sectioned shared-global-tree packet form resumes across the shared bounded-window
 planner without an intermediate map. Its 64/128-byte `Pod` state records the active LF/HF phase,
 both decoded counts, first-block count, extra precision, ANS/LZ state, and predictor state. The
 packet frontend also represents an absent LF-global tree, packs each LF-local tree independently,

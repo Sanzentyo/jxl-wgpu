@@ -264,6 +264,53 @@ fn unpack_signed(value: u32) -> i32 {
     return bitcast<i32>(0u - ((value >> 1u) + 1u));
 }
 
+// LF channels retain zero Modular shifts even when JPEG chroma sampling shrinks their extent.
+// HF correlation maps have shifts (3, 3); strategy/quantization and sharpness have (0, 0).
+fn ma_channel_geometry(channel: u32) -> vec4<u32> {
+    if target_kind == 0u {
+        return vec4<u32>(lf_channel_extent(channel), 0u, 0u);
+    }
+    if channel < 2u {
+        return vec4<u32>((control.geometry.xy + vec2<u32>(63u)) / 64u, 3u, 3u);
+    }
+    if channel == 2u {
+        return vec4<u32>(packet_first_blocks, 2u, 0u, 0u);
+    }
+    return vec4<u32>(control.geometry.zw, 0u, 0u);
+}
+
+fn ma_reference_channel(previous_index: u32) -> u32 {
+    let geometry = ma_channel_geometry(current_channel);
+    var remaining = previous_index;
+    var channel = current_channel;
+    while channel != 0u {
+        channel -= 1u;
+        if all(ma_channel_geometry(channel) == geometry) {
+            if remaining == 0u {
+                return channel;
+            }
+            remaining -= 1u;
+        }
+    }
+    return 0xffffffffu;
+}
+
+fn ma_reference_sample(channel: u32, x: u32, y: u32) -> i32 {
+    if target_kind == 0u {
+        let offset = channel * control.geometry.z * control.geometry.w;
+        return bitcast<i32>(reconstructed[offset + y * lf_channel_extent(channel).x + x]);
+    }
+    var offset = control.offsets[channel];
+    var stride = (control.geometry.x + 63u) / 64u;
+    if channel == 2u {
+        stride = control.capacities.w;
+    } else if channel == 3u {
+        offset = control.expected.w;
+        stride = control.geometry.z;
+    }
+    return bitcast<i32>(raw_metadata[offset + y * stride + x]);
+}
+
 /*__JXL_MODULAR_RECONSTRUCT__*/
 
 fn target_load(index: u32) -> i32 {
@@ -335,7 +382,7 @@ fn decode_channel(
         if params.needs_self_correcting != 0u {
             weighted = weighted_predict(n, nw, ne, w, nn);
         }
-        let leaf = ma_leaf(decoded, x, y, n, w, nw, ne, nn, ww, weighted.max_error);
+        let leaf = ma_leaf(x, y, n, w, nw, ne, nn, ww, weighted.max_error);
         if decode_error != 0u { break; }
         let predictor = modular_metadata[leaf + 1u];
         let leaf_offset = modular_metadata[leaf + 2u];
@@ -536,6 +583,7 @@ fn write_lf_status(status_code: u32, lf_decoded: u32) {
 }
 
 fn decode_hf_channels(first_blocks: u32) -> u32 {
+    packet_first_blocks = first_blocks;
     let block_count = control.geometry.z * control.geometry.w;
     let correlation_width = (control.geometry.x + 63u) / 64u;
     let correlation_height = (control.geometry.y + 63u) / 64u;
@@ -586,6 +634,7 @@ fn decode_hf_channels(first_blocks: u32) -> u32 {
 }
 
 fn configure_hf_channels(first_blocks: u32) {
+    packet_first_blocks = first_blocks;
     let block_count = control.geometry.z * control.geometry.w;
     let correlation_width = (control.geometry.x + 63u) / 64u;
     let correlation_height = (control.geometry.y + 63u) / 64u;
