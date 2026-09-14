@@ -6,14 +6,17 @@ dependency or fallback. `CMakeLists.txt` checks these exact source revisions:
 - libjxl `a7a9c787341cf703dede03c2009fa460cae5e5df` (0.12.0), including
   `lib/extras/gain_map.cc` for `JxlGainMapReadBundle` / `JxlGainMapWriteBundle`.
 - libultrahdr `6929c2b087e74120e6de52f361e77b06f07b1441` (2.0.2), for
-  `uhdr_gainmap_metadata_frac`, `bt709ToBt2100` and `applyGain`.
+  `bt709ToBt2100` and `applyGain` only. Its obsolete draft ISO fraction syntax is not used.
+- libavif `b994fe4601c62d6f98dbff295bd5c251940789b0` (1.4.2), for the ISO 21496-1
+  reader/writer and exact rational metadata validation.
 
-Provide CMake, a C++17 compiler and system Highway, Brotli, LittleCMS2 and JPEG development
-libraries. With those checkouts in `reference/libjxl` and `reference/libultrahdr`:
+Provide CMake 3.22+, C11/C++17 compilers and system Highway, Brotli, LittleCMS2 and JPEG development
+libraries. With those checkouts in `reference/libjxl`, `reference/libultrahdr` and `reference/libavif`:
 
 ```sh
 cmake -S crates/jxl_wgpu_decode/test-data/gain_map_oracle -B target/gain-map-oracle \
   -DJXL_SOURCE="$PWD/reference/libjxl" -DUHDR_SOURCE="$PWD/reference/libultrahdr" \
+  -DAVIF_SOURCE="$PWD/reference/libavif" \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build target/gain-map-oracle --target gain_map_oracle --parallel 4
 target/gain-map-oracle/gain_map_oracle generate target/gain-map-generated
@@ -52,6 +55,18 @@ reference library's rounded primary coefficients from the gain-formula tolerance
 decode keeps source primaries to preserve below-black behavior before explicit linear conversion.
 See [the full contract and limits](../../../../docs/GAIN_MAP.md).
 
-`iso INPUT OUTPUT` uses native ISO metadata decode/encode. `bundle INPUT OUTPUT` uses the native
+`iso INPUT OUTPUT` uses libavif's ISO metadata decode/encode. `iso_read.c` and `iso_write.c` compile
+the complete, pristine reference translation units and expose their private ISO entry points.
+These objects supply the corresponding symbols instead of pulling the same objects from the
+static library. The reader receives a single zero wrapper byte for its native `tmap` envelope.
+No AV1 codec, native image conversion, copied parser or modified reference source is needed.
+Compatible future-writer records are accepted by the native reader and rewritten as version zero;
+Rust retains the original writer version and opaque extension bytes. Reserved flags are checked
+strictly by Rust; the native reader ignores them, so shared rejection tests cover version/fraction/
+trailing-data errors rather than asserting identical reserved-bit policy.
+
+`bundle INPUT OUTPUT` uses the native
 JPEG XL bundle reader/writer with exact consumed/written sizes. The Rust interop test invokes
-these on Rust-serialized data and checks preserved bytes and fractions in both directions.
+these on Rust-serialized data and checks preserved bytes and fractions with either headroom order.
+The ISO-format correction changes 21 of the original metadata payloads; all 128 image codestreams,
+256 pixel planes and the manifest are unchanged. The complete regenerated corpus is reproducible.

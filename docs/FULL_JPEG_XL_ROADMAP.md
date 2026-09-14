@@ -985,7 +985,12 @@ presentation surface, including 8-bit sources requested in wide linear F32.
 
 [Gain-map evidence](GAIN_MAP.md) includes 64 native streams, 128 oriented/plain-or-compressed
 reconstructions (78,336 RGBA comparisons), 32 HDR/layout/association outputs (19,584 comparisons),
-64 native bundle rewrites and 128 ISO fraction rewrites. Output lifetime, output/uniform byte
+64 native bundle rewrites and 128 ISO fraction rewrites. Current libavif supplies the ISO oracle;
+the initial libultrahdr draft grammar has been removed. Records use individual denominators and
+derive direction from headroom order. Six compatible-writer reads and 11 invalid-record rejections
+have native agreement; Rust retains compatible opaque extensions within the bundle's 16-bit length.
+Twenty-one fixture metadata payloads are corrected while all 128 codestreams and 256 native pixel
+planes remain exact. Output lifetime, output/uniform byte
 admission, cancellation, exact fractions and portable WGSL layout have separate tests. Reference
 CMS negative extensions and rounded native primary coefficients are isolated explicitly; the
 GPU/F64 and native gain tolerances remain fixed. New fixtures are reproducible from pinned sources.

@@ -303,7 +303,7 @@ fn unsupported_gain_profiles_and_metadata_limits_fail_before_gpu_allocation() {
     // The baseline has alpha. Reusing it as an auxiliary stream is a valid bundle whose
     // rendering profile must be rejected before either image allocates GPU storage.
     let payload = GainMapBundle::new(
-        *bundle.metadata(),
+        bundle.metadata().clone(),
         &[],
         &[],
         parsed.codestream(),
@@ -330,13 +330,9 @@ fn unsupported_gain_profiles_and_metadata_limits_fail_before_gpu_allocation() {
             GainMapDecodeError::Unsupported("auxiliary alpha/extra channels")
         ))
     ));
-    for backward in [false, true] {
-        let mut metadata = *bundle.metadata();
-        if backward {
-            metadata.backward_direction = true;
-        } else {
-            metadata.base_hdr_headroom.numerator = 1;
-        }
+    for base_headroom in [1, 3] {
+        let mut metadata = bundle.metadata().clone();
+        metadata.base_hdr_headroom.numerator = base_headroom;
         let payload =
             GainMapBundle::new(metadata, &[], &[], bundle.codestream(), Default::default())
                 .unwrap()

@@ -4465,7 +4465,8 @@ the new policy selected. All broader profile/HDR/LF/numeric and full JPEG XL gat
 ## Alternate HDR gain-map checkpoint
 
 The [gain-map helper](../crates/jxl_wgpu_decode/test-data/gain_map_oracle/README.md) pins libjxl
-0.12.0 and libultrahdr 2.0.2. Its 64 streams combine four primary/auxiliary coding modes,
+0.12.0 for bundles/images, libavif 1.4.2 for ISO metadata, and libultrahdr 2.0.2 for gain math.
+Its 64 streams combine four primary/auxiliary coding modes,
 Gray/RGB auxiliary images, BT.709/BT.2020 application primaries, four map geometries, all eight
 orientations and unassociated alpha. Native baseline, original gain, working-primary and gain
 result planes are saved as little-endian F32. The helper builds from pristine reference sources;
@@ -4480,9 +4481,13 @@ packing allowance. Native gain math is checked separately at `3e-6 * (1 + abs(re
 saved native working pixels, keeping rounded native primary coefficients out of the GPU oracle.
 
 Sixty-four Rust bundle rewrites and 128 ISO metadata rewrites are consumed by native implementations
-with exact bytes/fractions. Four metadata tests cover all compact layouts, truncation, invalid
-fractions, padding and bounded ICC reconstruction. Additional tests check missing/duplicate boxes,
+with exact bytes/fractions. Six compatible-writer records and 11 malformed records are also read by
+libavif. Five metadata tests cover one/three-channel records with individual denominators, truncation,
+invalid fractions, reserved bits, compatible writer extensions and length bounds, padding and
+bounded ICC reconstruction. Additional tests check missing/duplicate boxes,
 unsupported profiles, metadata limits, portable shader/uniform layout, output/uniform admission
-failure, cancellation, retained outputs and released budgets. No pre-existing source/reference
-asset is modified. [The contract](GAIN_MAP.md) records the supported forward SDR-baseline profile
+failure, cancellation, retained outputs and released budgets. Correcting the obsolete draft metadata
+format changes 21 payloads; all 128 image codestreams, 256 reference planes and the manifest are
+byte-identical to the initial corpus. The complete 321-file corpus reproduces from pinned sources.
+[The contract](GAIN_MAP.md) records the supported forward SDR-baseline profile
 and the remaining `CONT-07` / full JPEG XL requirements.

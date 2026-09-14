@@ -47,7 +47,7 @@ impl Plan {
         request: &GpuOutputRequest,
         image: &ImageHeaderInventory,
         working: RgbColorEncoding,
-        metadata: GainMapMetadata,
+        metadata: &GainMapMetadata,
     ) -> Result<Self> {
         let extent = Extent2d::new(image.width, image.height);
         let orientation = request.orientation_policy().resolve(

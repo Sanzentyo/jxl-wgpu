@@ -4,7 +4,7 @@
 #include <jxl/encode.h>
 #include <jxl/gain_map.h>
 #include "ultrahdr/gainmapmath.h"
-#include "ultrahdr/gainmapmetadata.h"
+#include "iso_reference.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -13,6 +13,7 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -21,10 +22,35 @@ namespace fs = std::filesystem;
 void Check(bool condition, const char* message) {
   if (!condition) { std::cerr << message << '\n'; std::exit(1); }
 }
-void Uhdr(uhdr_error_info_t status) {
-  if (status.error_code != UHDR_CODEC_OK) {
-    std::cerr << status.detail << '\n'; std::exit(1);
+void Avif(avifResult status, const avifDiagnostics& diag) {
+  if (status != AVIF_RESULT_OK) {
+    std::cerr << avifResultToString(status) << ": " << diag.error << '\n'; std::exit(1);
   }
+}
+using GainMap = std::unique_ptr<avifGainMap, decltype(&avifGainMapDestroy)>;
+GainMap Metadata() {
+  GainMap metadata(avifGainMapCreate(), avifGainMapDestroy);
+  Check(metadata != nullptr, "gain metadata allocation");
+  return metadata;
+}
+Bytes EncodeIso(const avifGainMap& metadata) {
+  avifRWData output = AVIF_DATA_EMPTY; avifDiagnostics diag{};
+  Avif(IsoWrite(&metadata, &output, &diag), diag);
+  Bytes bytes(output.data, output.data + output.size);
+  avifRWDataFree(&output); return bytes;
+}
+ultrahdr::uhdr_gainmap_metadata_ext_t Floating(const avifGainMap& metadata) {
+  // Only adapt the ISO rational values to the unmodified gain-math primitive. libultrahdr's
+  // fraction reader/writer still implements a draft grammar and is deliberately not used.
+  ultrahdr::uhdr_gainmap_metadata_ext_t result;
+  for (size_t c = 0; c < 3; ++c) {
+    result.min_content_boost[c] = exp2(float(metadata.gainMapMin[c].n) / metadata.gainMapMin[c].d);
+    result.max_content_boost[c] = exp2(float(metadata.gainMapMax[c].n) / metadata.gainMapMax[c].d);
+    result.gamma[c] = float(metadata.gainMapGamma[c].n) / metadata.gainMapGamma[c].d;
+    result.offset_sdr[c] = float(metadata.baseOffset[c].n) / metadata.baseOffset[c].d;
+    result.offset_hdr[c] = float(metadata.alternateOffset[c].n) / metadata.alternateOffset[c].d;
+  }
+  return result;
 }
 Bytes Read(const fs::path& path) {
   std::ifstream file(path, std::ios::binary); Check(bool(file), "read");
@@ -138,18 +164,19 @@ void Generate(const fs::path& directory) {
         // black. Explicit linear-primary conversion preserves this crate's unbounded contract.
         const auto base_pixels = Decode(base, Color(false, true, false));
         const auto map_pixels = Decode(map, Color(gray, false, false));
-        ultrahdr::uhdr_gainmap_metadata_frac metadata;
-        metadata.useBaseColorSpace = !wide;
-        metadata.alternateHdrHeadroomN = 2;
+        auto metadata = Metadata();
+        metadata->useBaseColorSpace = !wide;
+        metadata->alternateHdrHeadroom.n = 2;
         for (int c = 0; c < 3; ++c) {
-          if (index % 3 == 0) continue; // canonical one-channel/common-denominator records
-          metadata.gainMapMinN[c] = -c; metadata.gainMapMinD[c] = 4;
-          metadata.gainMapMaxN[c] = 4 + c; metadata.gainMapMaxD[c] = 2;
-          metadata.gainMapGammaN[c] = 1 + c; metadata.gainMapGammaD[c] = 2;
-          metadata.baseOffsetN[c] = 1 + c; metadata.baseOffsetD[c] = 64;
-          metadata.alternateOffsetN[c] = 1 + c; metadata.alternateOffsetD[c] = 128;
+          metadata->gainMapMax[c].n = 1;
+          if (index % 3 == 0) continue; // canonical one-channel records
+          metadata->gainMapMin[c] = {-c, 4};
+          metadata->gainMapMax[c] = {4 + c, 2};
+          metadata->gainMapGamma[c] = {uint32_t(1 + c), 2};
+          metadata->baseOffset[c] = {1 + c, 64};
+          metadata->alternateOffset[c] = {1 + c, 128};
         }
-        Bytes iso; Uhdr(ultrahdr::uhdr_gainmap_metadata_frac::encodeGainmapMetadata(&metadata, iso));
+        Bytes iso = EncodeIso(*metadata);
         JxlGainMapBundle bundle{};
         bundle.gain_map_metadata_size = uint16_t(iso.size()); bundle.gain_map_metadata = iso.data();
         bundle.has_color_encoding = JXL_TRUE; bundle.color_encoding = Color(false, false, wide);
@@ -160,8 +187,7 @@ void Generate(const fs::path& directory) {
         Bytes container;
         Box(container, "JXL ", {13, 10, 135, 10}); Box(container, "ftyp", {'j','x','l',' ',0,0,0,0,'j','x','l',' '});
         Box(container, "jhgm", payload); Box(container, "jxlc", base);
-        ultrahdr::uhdr_gainmap_metadata_ext_t floating;
-        Uhdr(ultrahdr::uhdr_gainmap_metadata_frac::gainmapMetadataFractionToFloat(&metadata, &floating));
+        auto floating = Floating(*metadata);
         auto working_pixels = base_pixels;
         auto expected = base_pixels;
         for (uint32_t y = 0; y < 9; ++y) for (uint32_t x = 0; x < 17; ++x) {
@@ -188,9 +214,11 @@ int main(int argc, char** argv) {
   Check(argc == 4, "usage: oracle generate directory | iso/bundle input output");
   const auto bytes = Read(argv[2]); Bytes output;
   if (std::string(argv[1]) == "iso") {
-    ultrahdr::uhdr_gainmap_metadata_frac metadata;
-    Uhdr(ultrahdr::uhdr_gainmap_metadata_frac::decodeGainmapMetadata(bytes, &metadata));
-    Uhdr(ultrahdr::uhdr_gainmap_metadata_frac::encodeGainmapMetadata(&metadata, output));
+    auto metadata = Metadata(); avifDiagnostics diag{};
+    // The native tmap reader checks the version envelope. Its sole wrapper byte precedes ISO.
+    Bytes tmap{0}; tmap.insert(tmap.end(), bytes.begin(), bytes.end());
+    Avif(IsoRead(metadata.get(), tmap.data(), tmap.size(), &diag), diag);
+    output = EncodeIso(*metadata);
   } else if (std::string(argv[1]) == "bundle") {
     JxlGainMapBundle bundle{}; size_t read;
     Check(JxlGainMapReadBundle(&bundle, bytes.data(), bytes.size(), &read) && read == bytes.size(), "bundle read");

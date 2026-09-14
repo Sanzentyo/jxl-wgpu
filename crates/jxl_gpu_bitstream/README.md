@@ -16,6 +16,8 @@ codestream rendering fields. [API, ownership and executed evidence](../../docs/C
 
 The `gain_map` module parses and emits version-zero `jhgm` bundles with exact ISO 21496-1
 rational metadata, optional serialized color/ICC metadata and a borrowed auxiliary codestream.
+ISO fractions always carry individual denominators; there is no direction flag. Compatible newer
+writer versions and opaque extensions are retained within the 65,535-byte ISO record limit.
 Separate payload, codestream and transformed/decoded ICC bounds apply. It validates metadata
 without decoding image samples; alternate rendering belongs to `jxl_wgpu_decode`.
 [Gain-map contract and interoperability](../../docs/GAIN_MAP.md).

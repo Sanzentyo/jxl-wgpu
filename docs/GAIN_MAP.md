@@ -57,8 +57,13 @@ automatic map generation and HDR encoding policy are not implemented.
 `GainMapBundle::parse` borrows the auxiliary codestream and serialized color payloads. Its
 `metadata` contains signed/unsigned 32-bit fractions with nonzero denominators, positive gamma
 and exact checked gain ordering. Single-channel records expand to three equal entries. Writing
-chooses canonical one/three-channel and common/separate-denominator layouts without reducing
-fractions. Version, reserved flags, field lengths, color padding and trailing metadata are checked.
+chooses canonical one/three-channel records without reducing fractions. Every fraction has its own
+denominator; the version-zero records occupy 61 or 141 bytes. The six reserved flag bits must be zero.
+Direction is derived from the ordering of base/alternate headroom, with no separate direction flag.
+The minimum reader version must be zero. A newer writer with that minimum is accepted: its writer
+version and opaque trailing `extensions` are retained when serializing. Version-zero writers may not
+have trailing data. All metadata, including extensions, fits the bundle's 65,535-byte length field.
+Field lengths, color padding, fraction validity and payload bounds are checked before use.
 Raw auxiliary streams must start with the JPEG XL signature; full image validation belongs to
 the decoder.
 
@@ -83,7 +88,7 @@ buffer owns a separate byte reservation. See [GPU memory accounting](WGSL_MEMORY
 ## Independent evidence
 
 The [offline generator](../crates/jxl_wgpu_decode/test-data/gain_map_oracle/README.md) pins libjxl
-for wire/image interoperability and libultrahdr for ISO fractions and gain application. The
+for bundle/image interoperability, libavif for ISO fractions, and libultrahdr for gain application. The
 64 streams cross four baseline modes, four auxiliary modes, Gray/RGB maps and BT.709/BT.2020
 application primaries. They include 1×1, 17×9, 7×5 and 29×13 maps, all eight orientations,
 independent alpha, negative gain minima, positive offsets and unequal channel gamma.
@@ -106,14 +111,26 @@ unbounded output contract. These distinctions preserve the predeclared tolerance
 single native end-to-end `jhgm` renderer used as an oracle.
 
 Native helpers also read and rewrite 64 Rust-serialized bundles and 128 ISO metadata records
-(both directions flags) with byte/fraction equality. Metadata-only tests cover all four fraction
-layouts, truncation at every byte, unsupported versions/flags, exact ordering beyond F32 precision,
+(both headroom orderings) with byte/fraction equality. Six compatible-writer reads and 11 malformed
+record rejections agree with libavif; Rust additionally preserves the compatible extensions.
+Metadata-only tests cover both channel layouts, truncation at every byte, unsupported minimum
+versions/reserved flags, compatible writer versions, exact ordering beyond F32 precision,
 bounded ICC reconstruction, payload limits and borrowed codestream identity. Duplicate/missing
 boxes and unsupported rendering profiles fail before GPU allocation.
+
+The initial implementation used libultrahdr's obsolete draft grammar. Its common-denominator and
+backward-direction flags were not adopted into the published ISO format; libavif records the
+[removal of the direction flag](https://github.com/AOMediaCodec/libavif/commit/4654e63067219d6018caf9f0cbaf6075a0d06052).
+Those fields have been removed from the Rust API and wire format. The 21 affected fixture metadata
+payloads have been regenerated using current libavif; all 128 primary/auxiliary codestreams,
+256 native pixel planes and the manifest remain byte-identical. The other 43 metadata records
+already used separate denominators and remain unchanged. This correction closes a wire-format
+error; HDR-baseline reconstruction remains an open rendering profile.
 
 The [published Part 2 third-edition summary](https://cdn.standards.iteh.ai/samples/iso/iso-iec-18181-2-2026/8fe37de68af84f79a5df779b89a66a83/iso-iec-18181-2-2026.pdf)
 lists the HDR Gain Map box in clause 9.11. The sample contains the contents/revision summary, not
 the complete normative grammar. Concrete wire interoperability here uses the pinned
 [libjxl gain-map implementation](https://github.com/libjxl/libjxl/blob/a7a9c787341cf703dede03c2009fa460cae5e5df/lib/extras/gain_map.cc)
-and [libultrahdr fraction implementation](https://github.com/google/libultrahdr/blob/6929c2b087e74120e6de52f361e77b06f07b1441/lib/src/gainmapmetadata.cpp).
+and current [libavif ISO writer](https://github.com/AOMediaCodec/libavif/blob/b994fe4601c62d6f98dbff295bd5c251940789b0/src/write.c)
+and [reader](https://github.com/AOMediaCodec/libavif/blob/b994fe4601c62d6f98dbff295bd5c251940789b0/src/read.c).
 Official conformance material and the complete normative text remain required to close `CONT-07`.

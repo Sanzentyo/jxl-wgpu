@@ -3,32 +3,30 @@ use super::*;
 #[test]
 fn iso_fraction_layouts_roundtrip_without_reduction() {
     for multi in [false, true] {
-        for common in [false, true] {
-            for backward in [false, true] {
+        for equal_denominators in [false, true] {
+            for descending_headroom in [false, true] {
                 for base in [false, true] {
                     let mut metadata = GainMapMetadata {
-                        backward_direction: backward,
                         use_base_color_space: base,
                         ..Default::default()
                     };
+                    if descending_headroom {
+                        std::mem::swap(
+                            &mut metadata.base_hdr_headroom,
+                            &mut metadata.alternate_hdr_headroom,
+                        );
+                    }
                     metadata.channels[0].min.numerator = -3;
                     metadata.channels = [metadata.channels[0]; 3];
                     if multi {
                         metadata.channels[1].max.numerator = 8;
                     }
-                    if !common {
+                    if !equal_denominators {
                         metadata.alternate_hdr_headroom.denominator = 7;
                     }
                     let bytes = metadata.encode().unwrap();
-                    assert_eq!(
-                        bytes.len(),
-                        match (multi, common) {
-                            (false, true) => 37,
-                            (true, true) => 77,
-                            (false, false) => 61,
-                            (true, false) => 141,
-                        }
-                    );
+                    assert_eq!(bytes.len(), if multi { 141 } else { 61 });
+                    assert_eq!(bytes[4], (u8::from(multi) << 7) | (u8::from(base) << 6));
                     assert_eq!(GainMapMetadata::parse(&bytes).unwrap(), metadata);
                     for length in 0..bytes.len() {
                         assert!(GainMapMetadata::parse(&bytes[..length]).is_err());
@@ -45,13 +43,19 @@ fn iso_fraction_layouts_roundtrip_without_reduction() {
 #[test]
 fn iso_rejects_bad_versions_flags_fractions_and_exact_reversed_ranges() {
     let bytes = GainMapMetadata::default().encode().unwrap();
-    for (index, value) in [(1, 1), (3, 1), (4, bytes[4] | 1), (4, bytes[4] | 0x10)] {
+    for (index, value) in [(0, 1), (1, 1)] {
         let mut invalid = bytes.clone();
         invalid[index] = value;
         assert!(GainMapMetadata::parse(&invalid).is_err());
     }
+    // All six bits are reserved, including the removed draft direction/common-denominator bits.
+    for bit in 0..6 {
+        let mut invalid = bytes.clone();
+        invalid[4] |= 1 << bit;
+        assert!(GainMapMetadata::parse(&invalid).is_err());
+    }
     let mut invalid = bytes.clone();
-    invalid[5..9].fill(0);
+    invalid[9..13].fill(0);
     assert!(GainMapMetadata::parse(&invalid).is_err());
     for channel in 0..3 {
         let mut m = GainMapMetadata::default();
@@ -73,6 +77,48 @@ fn iso_rejects_bad_versions_flags_fractions_and_exact_reversed_ranges() {
         );
         assert!(m.encode().is_err());
     }
+}
+
+#[test]
+fn compatible_writer_extensions_are_preserved_and_bounded_by_the_bundle_length_field() {
+    for version in [1, 255, u16::MAX] {
+        let mut bytes = GainMapMetadata::default().encode().unwrap();
+        bytes[2..4].copy_from_slice(&version.to_be_bytes());
+        for extension in [&[][..], &[13, 0, 255, 7][..]] {
+            let mut record = bytes.clone();
+            record.extend_from_slice(extension);
+            let metadata = GainMapMetadata::parse(&record).unwrap();
+            assert_eq!(metadata.writer_version, version);
+            assert_eq!(metadata.extensions, extension);
+            assert_eq!(metadata.encode().unwrap(), record);
+            let bundle =
+                GainMapBundle::new(metadata, &[], &[], &[0xff, 0x0a], Default::default()).unwrap();
+            let payload = bundle.encode(Default::default()).unwrap();
+            assert_eq!(
+                GainMapBundle::parse(&payload, Default::default())
+                    .unwrap()
+                    .encode(Default::default())
+                    .unwrap(),
+                payload
+            );
+        }
+    }
+    let mut metadata = GainMapMetadata {
+        writer_version: 1,
+        extensions: vec![7; usize::from(u16::MAX) - 61],
+        ..Default::default()
+    };
+    let record = metadata.encode().unwrap();
+    assert_eq!(record.len(), usize::from(u16::MAX));
+    assert_eq!(GainMapMetadata::parse(&record).unwrap(), metadata);
+    metadata.extensions.push(0);
+    assert!(matches!(metadata.encode(), Err(GainMapError::Limit { .. })));
+    assert!(matches!(
+        GainMapMetadata::parse(&vec![0; 65536]),
+        Err(GainMapError::Limit { .. })
+    ));
+    metadata.writer_version = 0;
+    assert!(matches!(metadata.validate(), Err(GainMapError::Invalid(_))));
 }
 
 #[test]

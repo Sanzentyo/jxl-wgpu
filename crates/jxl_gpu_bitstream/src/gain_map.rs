@@ -99,7 +99,7 @@ impl<'a> GainMapBundle<'a> {
             limits.max_codestream_bytes.min(u64::from(u32::MAX)),
         )?;
         let size = 8_u64
-            .checked_add(metadata.encode()?.len() as u64)
+            .checked_add(metadata.encoded_len() as u64)
             .and_then(|n| n.checked_add(color.len() as u64))
             .and_then(|n| n.checked_add(compressed_icc.len() as u64))
             .and_then(|n| n.checked_add(codestream.len() as u64))

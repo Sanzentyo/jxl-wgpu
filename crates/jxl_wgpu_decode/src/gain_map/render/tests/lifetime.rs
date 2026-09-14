@@ -71,7 +71,7 @@ fn completed_cancelled_and_rejected_gain_submissions_release_all_reservations() 
             space: RgbColorSpace::Bt709,
             transfer: jxl_gpu_protocol::TransferFunction::Linear,
         },
-        GainMapMetadata::default(),
+        &GainMapMetadata::default(),
     )
     .unwrap();
     for cancel in [false, true] {

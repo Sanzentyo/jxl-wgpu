@@ -70,8 +70,8 @@ impl GpuDecoder<WgpuDecodeEngine> {
         }
         let bytes = boxes.boxes()[0].decode(limits.metadata)?;
         let bundle = GainMapBundle::parse(&bytes, limits.bundle)?;
-        let metadata = *bundle.metadata();
-        if metadata.backward_direction || metadata.base_hdr_headroom.numerator != 0 {
+        let metadata = bundle.metadata();
+        if metadata.base_hdr_headroom.numerator != 0 {
             return Err(GainMapDecodeError::Unsupported(
                 "requires a forward map with zero base HDR headroom",
             )
