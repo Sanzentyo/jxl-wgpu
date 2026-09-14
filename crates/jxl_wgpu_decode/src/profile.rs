@@ -280,7 +280,7 @@ fn parse_modular_profile(
         || frame
             .extra_channel_upsampling
             .iter()
-            .any(|&factor| !matches!(factor, 1 | 2 | 4 | 8) || factor < frame.upsampling)
+            .any(|&factor| !factor.is_power_of_two() || factor > 64 || factor < frame.upsampling)
         || frame.group_size_shift > 3
         || (purpose == ModularProfilePurpose::Presentation
             && (frame.have_crop
@@ -1514,7 +1514,7 @@ mod tests {
         let bytes: Arc<[u8]> = Arc::from(parsed.codestream());
         let source = GpuCodestream::from_spans([(0, StreamSlice::from_shared(bytes))]).unwrap();
         parse_standard_modular_profile(&source, &inventory).unwrap();
-        inventory.frames[0].extra_channel_upsampling = vec![16];
+        inventory.frames[0].extra_channel_upsampling = vec![128];
         assert!(parse_standard_modular_profile(&source, &inventory).is_err());
         inventory.frames[0].extra_channel_upsampling = vec![1];
         inventory.frames[0].restoration_filter = RestorationFilterInventory::Default;

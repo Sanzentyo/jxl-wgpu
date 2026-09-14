@@ -4204,3 +4204,34 @@ The image window must remain separate from a physical producer's one-frame capac
 numeric output, four patched LF alpha/depth substitutions, selected/unused inverse-profile separation,
 complete device-plus-extra admission, retry and cancellation cover the shared implementation.
 Broader precision/sampling, legal ICC crop/blend cases, profile methods/ranges and HDR remain open.
+
+## Effective extra sampling through 64×
+
+The 139-file `extra_upsampling` corpus contains 68 original RGB12 Modular streams, independently
+checked coded words and two native VarDCT controls. Modular extras combine F32 Depth/Spot,
+unassociated Alpha12 and SelectionMask17, with effective factors 8/16/32/64 and color factors
+1/2/4/8. Shapes include odd canvases, one-pixel axes and LF/pass group boundaries. VarDCT uses
+four F32 extras on exact dyadic source grids; nominal scaling preserves every coded grid and
+entropy section. Standard/custom weights yield 84 Modular and 16 VarDCT test configurations.
+Existing fixtures are unchanged.
+
+The independent F64 reference expands the compact symmetric weights separately, uses repeated
+edge mirroring, propagates primitive-operation intervals through each 5×5 filter and clamps to
+the neighborhood interval. Extended factors retain the complete first 8× grid before the final
+2×/4×/8× stage. A counterexample rejects premature intermediate cropping beyond rounding error.
+CPU and GPU normalization/rounding bounds follow their actual arithmetic contracts, not observed
+pixel differences. See the [generator recipe and precision contract](../crates/jxl_wgpu_decode/test-data/extra_upsampling_generator/README.md).
+
+libjxl validates the 21 Modular and four VarDCT 8× controls. It rejects larger effective factors.
+jxl-render 0.12.4 validates 35 Modular and all 16 VarDCT configurations; its single-sample coded
+axis padding defect excludes it from the remaining thin cases. Those cases retain the independent
+scalar reference, native 8× controls and complete GPU coverage. No absent adapter/oracle is
+treated as success.
+
+Public GPU checks compare 840 Modular outputs (RGBA and four extras) and 128 VarDCT numeric
+outputs across whole and 43-byte fragmented input with 256-byte GPU windows. Outputs remain
+readable after session destruction and transports agree exactly. Separate 40-byte-window tests
+check render byte accounting, exact admission, one-byte pressure/retry, retention and cancellation.
+The resident filter adds severe crop/strided-view/row-guard and oversized-extent checks. Broader
+declared shifts, unequal factors between extras, quantized output, features, LF and composition
+at extended rates remain conformance work; this is progress toward the full JPEG XL goal.

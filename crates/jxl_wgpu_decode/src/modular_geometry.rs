@@ -56,7 +56,7 @@ pub(crate) fn source_topology(
         })
         .collect();
     for &factor in &frame.extra_channel_upsampling {
-        if !matches!(factor, 1 | 2 | 4 | 8) || factor < frame.upsampling {
+        if !factor.is_power_of_two() || factor > 64 || factor < frame.upsampling {
             return Err(Error::EngineContract("invalid Modular extra-channel grid"));
         }
         let shift = (factor.ilog2() - frame.upsampling.ilog2()) as i32;

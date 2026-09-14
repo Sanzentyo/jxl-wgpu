@@ -343,8 +343,9 @@ cursor stages. Eight independent alpha/depth fixtures cover direct and recursive
 Gaborish, two LF groups with Squeeze, bounded fragmented input, ignored-extra corruption and
 cancellation. Full JPEG XL remains an active roadmap goal.
 
-Both decoders reconstruct extras with effective 2×/4×/8× upsampling, including image-header
-`dimension_shift`; Modular color planes also support all three factors. Selected integer planes
+Both decoders reconstruct extras with effective 2×/4×/8×/16×/32×/64× upsampling, including image-header
+`dimension_shift`; color planes support 2×/4×/8×. Larger extra factors apply an 8× stage followed by
+2×/4×/8×, retaining the complete intermediate grid until final cropping. Selected integer planes
 normalize and interpolate on the GPU using the shared standard/custom 5×5 filter before orientation
 and packing. F32 keeps fractional samples; native output rounds once at the declared output depth.
 Twenty libjxl fixtures cover odd and one-sample axes, independent color/alpha rates, dimensions
@@ -355,6 +356,9 @@ lossless. Integer extra-channel composition uses the same normalized/resampled p
 extended values until presentation. Selected native extras clamp and round once at their declared
 depth after composition; scalar F32 preserves the normalized result. Floating sources use the same
 filter and composition pipeline after representation conversion, without integer normalization.
+The [extended sampling corpus](crates/jxl_wgpu_decode/test-data/extra_upsampling_generator/README.md)
+adds independent sample/filter intervals, native 8× controls, both coding modes, custom weights,
+thin images, bounded transport, exact memory admission and retained-output/cancellation checks.
 
 Both modes accept associated integer alpha, including independent depths and resampling.
 `GpuOutputRequest::with_alpha_output_policy` selects `Unassociated` (default), `Preserve`, or

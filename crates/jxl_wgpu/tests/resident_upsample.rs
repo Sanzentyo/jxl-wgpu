@@ -31,7 +31,10 @@ fn strided_scalar_views_match_planar_filtering_for_all_factors_and_mirrored_edge
             .unwrap()
             .upload(device)
             .unwrap();
-        for (width, height) in [(1, 1), (1, 5), (7, 1), (5, 3)] {
+        for (width, height, crop) in [(1, 1), (1, 5), (7, 1), (5, 3)]
+            .into_iter()
+            .flat_map(|(width, height)| [false, true].map(|crop| (width, height, crop)))
+        {
             let planar = (0..width * height)
                 .map(|i| ((i * 17 + 3) % 29) as f32 / 29.0 - 0.4)
                 .collect::<Vec<_>>();
@@ -55,8 +58,16 @@ fn strided_scalar_views_match_planar_filtering_for_all_factors_and_mirrored_edge
             };
             let tight = upload("upsampling planar oracle", &planar);
             let strided = upload("upsampling poisoned strided view", &interleaved);
-            let output_width = width * factor - 1;
-            let output_height = height * factor - 1;
+            let output_width = if crop {
+                (width * factor / 2).max(1)
+            } else {
+                width * factor - 1
+            };
+            let output_height = if crop {
+                (height * factor / 2).max(1)
+            } else {
+                height * factor - 1
+            };
             let output_stride = output_width + 3;
             let output_bytes = u64::from(output_stride * output_height) * 4;
             let allocate_output = || {
@@ -142,6 +153,13 @@ fn strided_scalar_views_match_planar_filtering_for_all_factors_and_mirrored_edge
             assert_eq!(actual, expected, "{factor}x, {width}x{height}");
             for value in actual.as_chunks::<4>().0.iter() {
                 assert!(f32::from_le_bytes(*value).is_finite());
+            }
+            for row in actual.chunks_exact(output_stride as usize * 4) {
+                assert!(
+                    row[output_width as usize * 4..]
+                        .iter()
+                        .all(|&byte| byte == 0)
+                );
             }
             drop(mapped);
             staging.unmap();
@@ -239,6 +257,26 @@ fn invalid_scalar_addressing_is_rejected_before_recording_gpu_work() {
             ),
             Err(ResidentUpsampleError::PlaneGeometry { role: "input" }
                 | ResidentUpsampleError::Binding { role: "input" })
+        ));
+    }
+    for (width, height) in [(5, 3), (3, 5)] {
+        let mut commands = device.create_command_encoder(&Default::default());
+        assert!(matches!(
+            pipeline.encode(
+                device,
+                &mut commands,
+                ResidentUpsampleInputs {
+                    input: valid,
+                    weights: &weights,
+                    output: ResidentF32Plane {
+                        storage: ResidentStorageBinding::entire(&output).unwrap(),
+                        width,
+                        height,
+                        stride: width,
+                    },
+                }
+            ),
+            Err(ResidentUpsampleError::Extent { factor: 2 })
         ));
     }
 }

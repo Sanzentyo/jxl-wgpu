@@ -570,9 +570,19 @@ use the existing entropy/status/parameter ABIs; no pixel or coefficient readback
 
 Selected resampled integer and floating channels use `ModularRenderPlan` in both coding-mode producers.
 It allocates one aligned F32 destination arena, one reusable low-resolution normalization plane
-large enough for the largest selected resampled input, and one weight table per distinct factor.
+large enough for the largest selected resampled input, and one weight table per distinct 2/4/8 filter.
+Effective extra factors 16/32/64 first expand by eight, then by 2/4/8. One separate reusable
+intermediate stores the largest complete first-stage grid: `64 * coded_width * coded_height * 4`
+bytes. It cannot alias the normalization or destination storage. Cropping this grid before the
+second stage changes the mirrored neighborhood. Only the final stage crops to the output extent.
+The resident kernel therefore accepts any nonempty output rectangle no larger than
+`input_extent * factor`, retaining the complete input extent for filtering. This broadens its
+geometry contract without changing its 48-byte uniform or WGSL bindings.
 Destination view offsets satisfy the adapter's storage alignment. Each selected source has a
-32-byte normalization uniform; each factor above one adds the shared 48-byte upsampling uniform.
+32-byte normalization uniform; each actual filter stage adds a 48-byte upsampling uniform.
+Every intermediate binding and dispatch is checked before GPU allocation. `scratch_bytes` is
+the sum of the two distinct reusable buffers, not their maximum. Four channels at factors
+8/16/32/64 share three weight tables and charge seven interpolation uniforms.
 The source representation is decoded before interpolation, so packing performs no intermediate integer
 quantization. Only bounded scalar weight expansion runs on the host.
 
@@ -583,6 +593,11 @@ VarDCT keeps its existing extra arena lease and renders only the first alpha or 
 plane. Render buffers and uniforms remain in the frame lifetime through cancellation and the
 final validation callback. The reconstruction/packing dispatches join the existing output tail;
 they add neither a submission nor a status readback.
+The extended sampling tests check the exact render allocation, one-byte reservation pressure,
+retry, held images after session destruction and cancellation. A thin-image unit case requires
+16,640 intermediate bytes and rejects a 16,636-byte binding limit before allocation. Resident
+tests cover severe final crops, strided poisoned inputs, unchanged row padding and oversized
+destination rejection; independent sample intervals distinguish premature intermediate cropping.
 
 For cross-group DC-global Palette/Squeeze, the Gray8 decoder additionally charges one
 `frame_modular_arena_bytes` allocation containing transformed samples plus its optional LZ77,

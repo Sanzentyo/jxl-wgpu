@@ -149,7 +149,8 @@ impl<'a> From<ResidentF32Plane<'a>> for ResidentUpsampleSource<'a> {
 
 pub struct ResidentUpsampleInputs<'a> {
     pub input: ResidentUpsampleSource<'a>,
-    /// A distinct destination, optionally cropped at the right/bottom edge.
+    /// A distinct destination, optionally cropped at the right/bottom edge. The complete
+    /// input view remains available to the filter even when output rows or columns are omitted.
     pub output: ResidentF32Plane<'a>,
     pub weights: &'a ResidentUpsampleWeights,
 }
@@ -209,8 +210,8 @@ impl ResidentUpsamplePipeline {
         validate_source(device, "input", inputs.input)?;
         validate_source(device, "output", inputs.output.into())?;
         let factor = inputs.weights.factor;
-        if inputs.output.width.div_ceil(factor) != inputs.input.width
-            || inputs.output.height.div_ceil(factor) != inputs.input.height
+        if u64::from(inputs.output.width) > u64::from(inputs.input.width) * u64::from(factor)
+            || u64::from(inputs.output.height) > u64::from(inputs.input.height) * u64::from(factor)
         {
             return Err(ResidentUpsampleError::Extent { factor });
         }

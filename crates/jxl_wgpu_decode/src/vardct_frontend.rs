@@ -1326,7 +1326,7 @@ fn validate_frame(
         || frame
             .extra_channel_upsampling
             .iter()
-            .any(|&value| !matches!(value, 1 | 2 | 4 | 8) || value < frame.upsampling)
+            .any(|&value| !value.is_power_of_two() || value > 64 || value < frame.upsampling)
     {
         return unsupported(UnsupportedVarDctFeature::Upsampling);
     }

@@ -256,7 +256,7 @@ The low-level `WgpuSubmissionEngine` implements a standards-only Modular still p
 - a raw codestream, ordinary `jxlc` container, or reconstructed `jxlp` container with no private
   metadata requirement;
 - one final still frame with Gray or RGB Modular samples and arbitrary extra planes, each with
-  independent 1–31-bit integer or legal JPEG XL floating precision, including 2×/4×/8× color/extra resampling, over a bounded
+  independent 1–31-bit integer or legal JPEG XL floating precision, including 2×/4×/8× color and up to 64× extra resampling, over a bounded
   128/256/512/1024-pixel pass-group grid and one through eleven passes;
 - bounded DC-global, LF-group-local, or pass-group-local MA trees with all JPEG XL Modular predictors, including
   weighted self-correcting prediction, leaf offsets/multipliers/context selection, Prefix or ANS
@@ -397,16 +397,23 @@ let request = GpuOutputRequest::numeric(
 ```
 
 Frame inventory resolves each extra's effective factor, including `dimension_shift`, and validates
-that it is 1, 2, 4 or 8 and at least the color factor. Both producers reconstruct channels on their
+that it is a power of two from 1 through 64 and at least the color factor. Both producers reconstruct channels on their
 own grids. The common GPU render stage normalizes selected integer planes before the normative
 5×5 interpolation, using standard or custom image-header weights. A frame arena retains neighbors
 across Modular group boundaries. Color and extra factors may differ; all three factors also work
 for Modular color. F32 preserves interpolation fractions and signed working ranges. Native output
 rounds after resampling at the requested depth; unresampled native codes stay exact.
+Factors 16/32/64 use 8× followed by 2×/4×/8×. The first stage retains its complete grid: prematurely
+cropping to `ceil(output / remaining_factor)` changes the next filter's mirrored edge samples.
+Only the final stage crops to the requested extent. The [extended sampling corpus](test-data/extra_upsampling_generator/README.md)
+checks independent integer/F32 samples, both producers, standard/custom weights, thin axes and
+cross-group grids. Its native and Rust oracle restrictions are explicit; broader frame-feature,
+LF, composition and precision combinations still require conformance evidence.
 
 `WgpuDecodeMemoryStats::modular_render_bytes` and
 `VarDctDecodeMemoryStats::extra_render_bytes` include output planes, shared normalization scratch,
-deduplicated weights and uniforms. These transient resources are admitted before submission and
+one distinct reusable 8× intermediate for larger extra factors, deduplicated weights and per-stage
+uniforms. These transient resources are admitted before submission and
 retained through cancellation callbacks. `DecodeProfile::Modular` replaces `ModularLossless` so
 the coding-mode name does not imply that resampled reconstruction is lossless.
 

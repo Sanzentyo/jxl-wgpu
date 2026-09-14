@@ -13,4 +13,5 @@ pub mod patch_references;
 pub mod patches;
 pub mod preview;
 pub mod progressive_layers;
+pub mod resampling;
 pub mod splines;

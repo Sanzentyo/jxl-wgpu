@@ -16,9 +16,11 @@ use crate::modular_transform::GpuModularChannelLayout;
 
 mod color;
 mod lf;
+mod resampling;
 pub(crate) use color::ReconstructionPipeline as ModularReconstructionPipeline;
 pub(crate) use color::{ModularColorConfig, ModularReconstructionConfig};
 pub(crate) use lf::{ModularLfBuffers, ModularLfPipelines, ModularLfPlan};
+use resampling::Upsampling;
 
 /// Interpretation of resident Modular output words after inverse transforms or resampling.
 #[repr(u32)]
@@ -80,11 +82,13 @@ const _: () = assert!(std::mem::size_of::<NormalizeParams>() == 32);
 pub(crate) struct ModularRenderPlan {
     color: Option<color::ColorPlan>,
     sources: Vec<ModularOutputPlane>,
-    factors: Vec<u32>,
+    upsampling: Vec<Upsampling>,
     planes: Vec<ModularOutputPlane>,
     kernels: Vec<ResidentUpsampleKernel>,
     pub output_bytes: u64,
     pub scratch_bytes: u64,
+    normalization_bytes: u64,
+    intermediate_bytes: u64,
     pub weight_bytes: u64,
     pub uniform_bytes: u64,
 }
@@ -171,7 +175,9 @@ impl ModularRenderPlan {
             output_bytes = output_bytes.checked_add(bytes).ok_or_else(overflow)?;
             require("output arena bytes", output_bytes, storage_limit)?;
         }
-        let mut scratch_bytes = 0;
+        let mut normalization_bytes = 0;
+        let mut intermediate_bytes = 0;
+        let mut upsampling = Vec::with_capacity(sources.len());
         let mut kernels = Vec::<ResidentUpsampleKernel>::new();
         let mut planes = Vec::new();
         let mut uniform_bytes = 0;
@@ -180,7 +186,8 @@ impl ModularRenderPlan {
         {
             let source = source_info.layout;
             let reconstruct_color = color.is_some() && index < 3;
-            if !matches!(factor, 1 | 2 | 4 | 8)
+            if !factor.is_power_of_two()
+                || factor > if reconstruct_color { 8 } else { 64 }
                 || source.width == 0
                 || source.height == 0
                 || (!reconstruct_color
@@ -200,16 +207,36 @@ impl ModularRenderPlan {
             if !reconstruct_color {
                 uniform_bytes += std::mem::size_of::<NormalizeParams>() as u64;
             }
-            if factor != 1 {
+            let channel =
+                Upsampling::new(Extent2d::new(source.width, source.height), extent, factor)?;
+            if !channel.steps.is_empty() {
                 if !reconstruct_color {
-                    scratch_bytes =
-                        scratch_bytes.max(u64::from(source.width) * u64::from(source.height) * 4);
-                    uniform_bytes += ResidentUpsamplePipeline::UNIFORM_BYTES;
+                    normalization_bytes = normalization_bytes
+                        .max(u64::from(source.width) * u64::from(source.height) * 4);
+                    uniform_bytes +=
+                        channel.steps.len() as u64 * ResidentUpsamplePipeline::UNIFORM_BYTES;
                 }
-                if !kernels.iter().any(|kernel| kernel.factor() == factor) {
-                    kernels.push(upsample_kernel(weights, factor)?);
+                for step in &channel.steps {
+                    if !kernels.iter().any(|kernel| kernel.factor() == step.factor) {
+                        kernels.push(upsample_kernel(weights, step.factor)?);
+                    }
+                }
+                if let Some(intermediate) = channel.intermediate_extent() {
+                    intermediate_bytes = intermediate_bytes
+                        .max(u64::from(intermediate.width) * u64::from(intermediate.height) * 4);
+                    for (resource, dimension) in [
+                        ("intermediate X workgroups", intermediate.width),
+                        ("intermediate Y workgroups", intermediate.height),
+                    ] {
+                        require(
+                            resource,
+                            u64::from(dimension.div_ceil(16)),
+                            u64::from(limits.max_compute_workgroups_per_dimension),
+                        )?;
+                    }
                 }
             }
+            upsampling.push(channel);
             planes.push(ModularOutputPlane::new(
                 GpuModularChannelLayout {
                     width: extent.width,
@@ -224,7 +251,16 @@ impl ModularRenderPlan {
                 source_info.encoding,
             ));
         }
-        require("normalization scratch bytes", scratch_bytes, storage_limit)?;
+        require(
+            "normalization scratch bytes",
+            normalization_bytes,
+            storage_limit,
+        )?;
+        require(
+            "upsampling intermediate bytes",
+            intermediate_bytes,
+            storage_limit,
+        )?;
         let weight_bytes = kernels
             .iter()
             .map(ResidentUpsampleKernel::weight_bytes)
@@ -250,11 +286,13 @@ impl ModularRenderPlan {
         Ok(Self {
             color,
             sources,
-            factors,
+            upsampling,
             planes,
             kernels,
             output_bytes,
-            scratch_bytes,
+            scratch_bytes: normalization_bytes + intermediate_bytes,
+            normalization_bytes,
+            intermediate_bytes,
             weight_bytes,
             uniform_bytes,
         })
@@ -298,8 +336,18 @@ impl ModularRenderPlan {
                 "jxl-wgpu reconstructed Modular render planes",
                 self.output_bytes,
             ),
-            scratch: (self.scratch_bytes != 0)
-                .then(|| create("jxl-wgpu Modular normalization scratch", self.scratch_bytes)),
+            scratch: (self.normalization_bytes != 0).then(|| {
+                create(
+                    "jxl-wgpu Modular normalization scratch",
+                    self.normalization_bytes,
+                )
+            }),
+            intermediate: (self.intermediate_bytes != 0).then(|| {
+                create(
+                    "jxl-wgpu extra upsampling intermediate",
+                    self.intermediate_bytes,
+                )
+            }),
             weights: self
                 .kernels
                 .iter()
@@ -326,6 +374,7 @@ pub(crate) struct ModularRenderBuffers {
     color: Option<color::ReconstructionBuffers>,
     pub output: wgpu::Buffer,
     scratch: Option<wgpu::Buffer>,
+    intermediate: Option<wgpu::Buffer>,
     weights: Vec<ResidentUpsampleWeights>,
 }
 
@@ -401,7 +450,7 @@ impl ModularRenderPipeline {
             let weights = plan
                 .kernels
                 .iter()
-                .position(|kernel| kernel.factor() == plan.factors[0])
+                .position(|kernel| kernel.factor() == plan.upsampling[0].factor())
                 .map(|index| &buffers.weights[index]);
             uniforms.extend(pipeline.encode(
                 device,
@@ -416,7 +465,8 @@ impl ModularRenderPipeline {
                 },
             )?);
         }
-        for (index, (&source_info, &factor)) in sources.iter().zip(&plan.factors).enumerate() {
+        for (index, (&source_info, upsampling)) in sources.iter().zip(&plan.upsampling).enumerate()
+        {
             let source = source_info.layout;
             let expected = plan.sources[index].layout;
             if source.width != expected.width
@@ -451,7 +501,7 @@ impl ModularRenderPipeline {
                     reason: "empty render plane",
                 })?,
             };
-            let normalized = if factor == 1 {
+            let normalized = if upsampling.steps.is_empty() {
                 output_binding
             } else {
                 binding(
@@ -501,36 +551,45 @@ impl ModularRenderPipeline {
                 pass.dispatch_workgroups(source.width.div_ceil(16), source.height.div_ceil(16), 1);
             }
             uniforms.push(uniform);
-            if factor != 1 {
+            let mut filtered = ResidentF32Plane {
+                storage: normalized,
+                width: source.width,
+                height: source.height,
+                stride: source.width,
+            };
+            for (step_index, step) in upsampling.steps.iter().enumerate() {
                 let kernel_index = plan
                     .kernels
                     .iter()
-                    .position(|kernel| kernel.factor() == factor)
+                    .position(|kernel| kernel.factor() == step.factor)
                     .ok_or(ModularRenderError::Invalid {
                         reason: "missing upsampling weights",
                     })?;
-                uniforms.push(
-                    self.upsample.encode(
-                        device,
-                        encoder,
-                        ResidentUpsampleInputs {
-                            input: ResidentF32Plane {
-                                storage: normalized,
-                                width: source.width,
-                                height: source.height,
-                                stride: source.width,
-                            }
-                            .into(),
-                            output: ResidentF32Plane {
-                                storage: output_binding,
-                                width: plane.width,
-                                height: plane.height,
-                                stride: plane.row_stride_words,
+                let last = step_index + 1 == upsampling.steps.len();
+                let destination = ResidentF32Plane {
+                    storage: if last {
+                        output_binding
+                    } else {
+                        binding(buffers.intermediate.as_ref().ok_or(
+                            ModularRenderError::Invalid {
+                                reason: "missing upsampling intermediate",
                             },
-                            weights: &buffers.weights[kernel_index],
-                        },
-                    )?,
-                );
+                        )?)?
+                    },
+                    width: step.extent.width,
+                    height: step.extent.height,
+                    stride: step.extent.width,
+                };
+                uniforms.push(self.upsample.encode(
+                    device,
+                    encoder,
+                    ResidentUpsampleInputs {
+                        input: filtered.into(),
+                        output: destination,
+                        weights: &buffers.weights[kernel_index],
+                    },
+                )?);
+                filtered = destination;
             }
         }
         Ok(uniforms)
@@ -651,6 +710,58 @@ mod tests {
     }
 
     #[test]
+    fn multistage_extra_grids_charge_full_intermediate_storage_and_each_dispatch() {
+        let extent = Extent2d::new(129, 97);
+        let factors = [8, 16, 32, 64];
+        let plan = ModularRenderPlan::new(
+            factors
+                .iter()
+                .map(|&factor| plane(extent, factor, 17))
+                .collect(),
+            factors
+                .iter()
+                .map(|&factor| ChannelResampling { extent, factor })
+                .collect(),
+            &weights(),
+            &wgpu::Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.normalization_bytes, 17 * 13 * 4);
+        assert_eq!(plan.intermediate_bytes, 72 * 56 * 4);
+        assert_eq!(plan.scratch_bytes, (17 * 13 + 72 * 56) * 4);
+        assert_eq!(plan.weight_bytes, (4 + 16 + 64) * 25 * 4);
+        assert_eq!(plan.uniform_bytes, 4 * 32 + 7 * 48);
+        assert_eq!(
+            plan.total_bytes(),
+            plan.output_bytes + plan.scratch_bytes + plan.weight_bytes + plan.uniform_bytes
+        );
+        let stages = &plan.upsampling[3].steps;
+        assert_eq!(stages[0].extent, Extent2d::new(24, 16));
+        assert_eq!(stages[1].extent, extent);
+
+        // On a thin image the complete 8x intermediate is larger than both the
+        // final plane and the kernel table. It needs its own binding admission.
+        let extent = Extent2d::new(1, 1025);
+        let limits = wgpu::Limits {
+            max_storage_buffer_binding_size: 8 * 520 * 4 - 4,
+            ..Default::default()
+        };
+        assert!(matches!(
+            ModularRenderPlan::new(
+                vec![plane(extent, 16, 17)],
+                vec![ChannelResampling { extent, factor: 16 }],
+                &weights(),
+                &limits,
+            ),
+            Err(ModularRenderError::Limit {
+                resource: "upsampling intermediate bytes",
+                required: 16640,
+                available: 16636,
+            })
+        ));
+    }
+
+    #[test]
     fn render_limits_and_geometry_fail_before_gpu_allocation() {
         let extent = Extent2d::new(17, 9);
         let source = plane(extent, 2, 8);
@@ -760,7 +871,13 @@ mod tests {
             &limits,
         )
         .unwrap();
-        assert_eq!(plan.factors, [1, 2, 8]);
+        assert_eq!(
+            plan.upsampling
+                .iter()
+                .map(Upsampling::factor)
+                .collect::<Vec<_>>(),
+            [1, 2, 8]
+        );
         let layouts: Vec<_> = plan.planes().iter().map(|plane| plane.layout).collect();
         assert_eq!(
             (layouts[0].width, layouts[0].height, layouts[0].word_offset),

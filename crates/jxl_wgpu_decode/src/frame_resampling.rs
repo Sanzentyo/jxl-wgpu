@@ -1,4 +1,4 @@
-//! JPEG XL's single-filter resampling schedule around frame features.
+//! Channel resampling placement around JPEG XL frame features.
 
 use jxl_gpu_protocol::Extent2d;
 

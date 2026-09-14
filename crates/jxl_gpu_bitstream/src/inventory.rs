@@ -1571,7 +1571,7 @@ fn resolve_extra_channel_upsampling(
 ) -> Result<u32, InventoryError> {
     encoded
         .checked_shl(shift)
-        .filter(|&factor| matches!(factor, 1 | 2 | 4 | 8) && factor >= color)
+        .filter(|&factor| factor.is_power_of_two() && factor <= 64 && factor >= color)
         .ok_or(InventoryError::InvalidFrame(
             "invalid effective extra-channel upsampling",
         ))
@@ -2577,8 +2577,8 @@ mod tests {
             preview_size: None,
             xyb_encoded: true,
             has_icc: false,
-            num_extra_channels: 4,
-            extra_channel_shifts: vec![0, 1, 2, 3],
+            num_extra_channels: 7,
+            extra_channel_shifts: vec![0, 1, 2, 3, 4, 5, 6],
             have_animation: false,
             have_timecodes: false,
         };
@@ -2590,10 +2590,23 @@ mod tests {
             InventoryLimits::default(),
         )
         .unwrap();
-        assert_eq!(header.extra_channel_upsampling, [1, 2, 4, 8]);
+        assert_eq!(header.extra_channel_upsampling, [1, 2, 4, 8, 16, 32, 64]);
         assert_eq!(reader.bit_offset(), 1);
         assert_eq!(resolve_extra_channel_upsampling(2, 2, 4).unwrap(), 8);
-        for (encoded, shift, color) in [(8, 1, 1), (1, 4, 1), (1, 32, 1), (1, 1, 4), (4, 31, 1)] {
+        for encoded in [1, 2, 4, 8] {
+            for shift in 0..=8 {
+                for color in [1, 2, 4, 8] {
+                    let factor = encoded << shift;
+                    let resolved = resolve_extra_channel_upsampling(encoded, shift, color);
+                    if factor <= 64 && factor >= color {
+                        assert_eq!(resolved.unwrap(), factor);
+                    } else {
+                        assert!(matches!(resolved, Err(InventoryError::InvalidFrame(_))));
+                    }
+                }
+            }
+        }
+        for (encoded, shift, color) in [(8, 4, 1), (1, 7, 1), (1, 32, 1), (1, 1, 4), (4, 31, 1)] {
             assert!(matches!(
                 resolve_extra_channel_upsampling(encoded, shift, color),
                 Err(InventoryError::InvalidFrame(_))
