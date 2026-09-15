@@ -6,7 +6,7 @@ use bytemuck::{Pod, Zeroable};
 use jxl_gpu_bitstream::{ImageHeaderInventory, gain_map::GainMapMetadata};
 use jxl_gpu_formats::ImageLayout;
 use jxl_gpu_protocol::{
-    ChangedRegions, Extent2d, OutputId, Region, RgbColorEncoding, SubmissionToken,
+    ChangedRegions, DisplayIntensity, Extent2d, OutputId, Region, RgbColorEncoding, SubmissionToken,
 };
 use jxl_wgpu::{
     AlphaConversion, GpuBufferLease, GpuImageFrame, GpuImageOutput, ImageOutputParams,
@@ -20,7 +20,7 @@ use crate::{AlphaOutputPolicy, GpuOutputRequest, Result};
 
 use super::GainMapDecodeError;
 
-/// 160 bytes: two base plane vectors, three map geometries and five channel parameter vectors.
+/// 176 bytes: plane geometry, five channel vectors and explicit gain/luminance application.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Params {
@@ -32,6 +32,17 @@ struct Params {
     inverse_gamma: [f32; 4],
     base_offset: [f32; 4],
     alternate_offset: [f32; 4],
+    application: Application,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Application {
+    weight: f32,
+    base_to_reference: f32,
+    reference_to_base: f32,
+    // Uniform structures require a 16-byte stride.
+    padding: u32,
 }
 
 pub(super) struct Plan {
@@ -48,6 +59,8 @@ impl Plan {
         image: &ImageHeaderInventory,
         working: RgbColorEncoding,
         metadata: &GainMapMetadata,
+        weight: f32,
+        reference_white: DisplayIntensity,
     ) -> Result<Self> {
         let extent = Extent2d::new(image.width, image.height);
         let orientation = request.orientation_policy().resolve(
@@ -80,8 +93,27 @@ impl Plan {
             },
         );
         let mut params = Params::zeroed();
+        let ratio = f64::from(image.tone_mapping.intensity_target.to_f32())
+            / f64::from(reference_white.nits());
+        let base_to_reference = ratio as f32;
+        let reference_to_base = ratio.recip() as f32;
+        if !base_to_reference.is_normal() || !reference_to_base.is_normal() {
+            return Err(GainMapDecodeError::Unsupported(
+                "reference-white scaling exceeds portable F32 range",
+            )
+            .into());
+        }
+        params.application = Application {
+            weight,
+            base_to_reference,
+            reference_to_base,
+            padding: 0,
+        };
         for (i, c) in metadata.channels.iter().enumerate() {
-            if c.min.value() < -120.0 || c.max.value() > 120.0 {
+            if [c.min.value(), c.max.value()]
+                .into_iter()
+                .any(|v| (v * f64::from(weight)).abs() > 120.0)
+            {
                 return Err(GainMapDecodeError::Unsupported(
                     "gain exponent exceeds portable F32 range",
                 )

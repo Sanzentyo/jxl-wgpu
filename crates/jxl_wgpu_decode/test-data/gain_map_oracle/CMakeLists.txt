@@ -37,7 +37,7 @@ foreach(codec AOM DAV1D LIBGAV1 RAV1E SVT AVM)
 endforeach()
 add_subdirectory("${AVIF_SOURCE}" libavif EXCLUDE_FROM_ALL)
 
-add_executable(gain_map_oracle main.cpp iso_read.c iso_write.c "${JXL_SOURCE}/lib/extras/gain_map.cc")
+add_executable(gain_map_oracle main.cpp iso_read.c iso_write.c iso_weight.c "${JXL_SOURCE}/lib/extras/gain_map.cc")
 target_compile_features(gain_map_oracle PRIVATE cxx_std_17)
 # Apply our warning policy to our oracle; the pinned reference source keeps its own policy.
 set_source_files_properties(main.cpp PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")

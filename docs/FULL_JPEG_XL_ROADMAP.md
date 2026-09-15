@@ -91,7 +91,7 @@ correctness. Dependencies name other item IDs in this document.
 | `CONT-04` | P1 | **Partial** | Unknown image, frame, and restoration extension selectors now return typed scope/selector errors before an authoritative inventory, including zero-length payloads. Frame/restoration payload lengths retain checked extension-bit limits. Safe auxiliary container events are independent. Selected unknown auxiliary payloads now preserve their original encoded bytes through metadata collection/editing. Completion still requires all current-version compatibility rules and semantic container extensions. | `CONT-01` |
 | `CONT-05` | P1 | **Missing** | Implement `jbrd` parsing/emission and bit-identical JPEG reconstruction, including required JPEG coefficient/marker/metadata state. Verify byte equality on a diverse JPEG corpus, not only decoded pixels. | `VDCT-D03`, `VDCT-E02` |
 | `CONT-06` | P1 | **Partial** | Implement bounded encoder output for ordinary progressive order, seek-back TOC assembly, and out-of-order `jxlp` streaming. Generated fragments must reassemble to the same logical codestream, and partial writes must never be reported as a finished container. | `CONT-01`, encoder packet topology |
-| `CONT-07` | P1 | **Partial** | Version-zero `jhgm` and exact ISO 21496-1 fractions have bounded parsing/emission, color/ICC metadata reconstruction and native bidirectional interoperability. `GpuDecoder::decode_alternate` decodes both images on the GPU and reconstructs exact alternate stills for forward maps with zero baseline headroom and enumerated application/output color. The 64 native sources cover both codecs, original/XYB, Gray/RGB maps, asymmetric resampling, wide primaries, alpha and all orientations; additional transfer/layout and lifetime tests use the shared output/submission contracts. [Contract and evidence](GAIN_MAP.md). Completion still requires backward/HDR-baseline maps, ICC application/output, animated/progressive/streaming delivery, full numeric/profile conformance, requested headroom and alternate tone-mapping policy, and broader native/official coverage. | `CONT-01`, `COLOR-02` |
+| `CONT-07` | P1 | **Partial** | Version-zero `jhgm` and exact ISO 21496-1 fractions have bounded parsing/emission, color/ICC metadata reconstruction and native bidirectional interoperability. GPU still reconstruction supports both headroom directions, HDR baselines, requested display headroom and explicit gain reference white in enumerated application/output color. The 64 gain-map sources and 48 HDR still sources cover both codecs, original/XYB, Gray/RGB maps, asymmetric resampling, wide primaries, alpha, orientations and transfers. Baseline endpoints preserve ordinary output bits; signed-weight and HDR checks retain existing codec/transfer precision contracts. [Contract and evidence](GAIN_MAP.md). Completion still requires ICC application/output, animated/progressive/streaming delivery, full numeric/profile conformance, alternate tone-mapping policy, and broader native/official coverage. | `CONT-01`, `COLOR-02` |
 
 ### B. Global codestream and frame metadata
 
@@ -995,7 +995,29 @@ admission, cancellation, exact fractions and portable WGSL layout have separate 
 CMS negative extensions and rounded native primary coefficients are isolated explicitly; the
 GPU/F64 and native gain tolerances remain fixed. New fixtures are reproducible from pinned sources.
 
-The rendering profile currently requires a forward map with zero baseline headroom and enumerated
-application/output color. Backward/HDR-baseline maps, complete ICC/animation/streaming profiles,
-display-headroom policy, alternate tone mapping, extreme numeric/combined-feature conformance and
-official coverage remain open. The full JPEG XL goal and all other incomplete gates remain active.
+This initial rendering checkpoint required a forward map with zero baseline headroom. The following
+checkpoint extends that profile; complete ICC/animation/streaming support, alternate tone mapping,
+extreme numeric/combined-feature conformance and official coverage remain open.
+
+## Gain-map headroom and HDR-baseline checkpoint
+
+`GpuDecoder::decode_gain_map` now accepts either headroom ordering, an exact alternate or a requested
+display headroom, and explicit gain reference white. Exact rational cross-products and an F64 FMA
+preserve endpoint direction/residuals before lowering the signed weight to F32. Exact baseline
+selection skips the unused auxiliary decode and preserves ordinary output bits. Equal headrooms
+follow libavif's identity policy; positive weights that underflow to F32 zero still apply offsets.
+GPU gain math converts baseline light into the selected reference-white units and back, preserving
+the ordinary output unit and PQ/HLG intensity contract. The fused gain uniform grows to 176 bytes;
+no additional image, binding or dispatch is introduced.
+
+Eighty bidirectional selections check 48,960 values at the earlier fixed linear/alpha bounds.
+Forty-eight unchanged native HDR stills add 384 outputs / 774,656 values across PQ/HLG sources,
+four intensities, original/XYB and both codecs, Gray/RGB, widths 17/257 and three reference whites.
+Both headroom directions have three nonzero weights preceding Linear/PQ/HLG output and an exact
+baseline comparison. The independent oracle propagates pre-existing baseline and auxiliary codec bounds
+through bilinear sampling, inverse gamma, signed gain products and output transfer. Eight direct
+gain-image decodes verify 4,528 original components against those bounds. All 464 headroom selections
+also run pristine libavif weight selection and libultrahdr weighted application on supplied linear
+pixels at the existing native formula tolerance. Earlier fixtures and 160 output checks remain
+unchanged. `CONT-07` and the full JPEG XL goal remain **Partial** pending the remaining profiles,
+numeric/official conformance and all other incomplete decoder/container/encoder/quality gates.

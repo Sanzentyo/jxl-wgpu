@@ -1,3 +1,10 @@
+struct GainApplication {
+    weight: f32,
+    base_to_reference: f32,
+    reference_to_base: f32,
+    padding: u32,
+};
+
 struct GainParams {
     base_offsets: vec4<u32>,
     base_strides: vec4<u32>,
@@ -7,6 +14,7 @@ struct GainParams {
     inverse_gamma: vec4<f32>,
     base_offset: vec4<f32>,
     alternate_offset: vec4<f32>,
+    application: GainApplication,
 };
 
 @group(0) @binding(5) var<uniform> gain_params: GainParams;
@@ -40,7 +48,10 @@ fn source_rgb_words_at(x: u32, y: u32) -> vec3<u32> {
     for (var c = 0u; c < 3u; c += 1u) {
         let value = pow(gain_sample(c, p), gain_params.inverse_gamma[c]);
         let log_gain = mix(gain_params.minimum[c], gain_params.maximum[c], value);
-        mapped[c] = (base[c] + gain_params.base_offset[c]) * exp2(log_gain) - gain_params.alternate_offset[c];
+        let application = gain_params.application;
+        let reference = base[c] * application.base_to_reference;
+        mapped[c] = ((reference + gain_params.base_offset[c]) * exp2(log_gain * application.weight)
+            - gain_params.alternate_offset[c]) * application.reference_to_base;
     }
     return bitcast<vec3<u32>>(mapped);
 }

@@ -15,7 +15,9 @@ use jxl_wgpu_decode::{
     GpuDecoder, GpuOutputRequest, OrientationPolicy, gain_map::GainMapDecodeError,
 };
 
+mod headroom;
 mod interop;
+mod native;
 mod output;
 
 fn directory() -> PathBuf {
@@ -43,9 +45,15 @@ fn format(wide: bool) -> PixelFormat {
     fields.transfer = TransferFunction::Linear;
     PixelFormat::rgb_f32(RgbChannelOrder::Rgba, false, color)
 }
-fn sample(map: &[f64], w: usize, h: usize, x: usize, y: usize, c: usize) -> f64 {
-    let px = ((x as f64 + 0.5) * w as f64 / 17.0 - 0.5).clamp(0.0, (w - 1) as f64);
-    let py = ((y as f64 + 0.5) * h as f64 / 9.0 - 0.5).clamp(0.0, (h - 1) as f64);
+fn sample(
+    map: &[f64],
+    [w, h]: [usize; 2],
+    [bw, bh]: [usize; 2],
+    [x, y]: [usize; 2],
+    c: usize,
+) -> f64 {
+    let px = ((x as f64 + 0.5) * w as f64 / bw as f64 - 0.5).clamp(0.0, (w - 1) as f64);
+    let py = ((y as f64 + 0.5) * h as f64 / bh as f64 - 0.5).clamp(0.0, (h - 1) as f64);
     let x0 = px.floor() as usize;
     let y0 = py.floor() as usize;
     let x1 = (x0 + 1).min(w - 1);
@@ -84,7 +92,7 @@ fn oracle(
             }
             let (x, y) = (index / 4 % 17, index / 4 / 17);
             let channel = metadata.channels[c];
-            let gain = sample(map, w, h, x, y, c).powf(1.0 / channel.gamma.value());
+            let gain = sample(map, [w, h], [17, 9], [x, y], c).powf(1.0 / channel.gamma.value());
             let log_gain = channel.min.value() * (1.0 - gain) + channel.max.value() * gain;
             let pixel = index / 4 * 4;
             let linear: f64 = (0..3).map(|i| matrix[c][i] * base[pixel + i]).sum();
@@ -330,26 +338,21 @@ fn unsupported_gain_profiles_and_metadata_limits_fail_before_gpu_allocation() {
             GainMapDecodeError::Unsupported("auxiliary alpha/extra channels")
         ))
     ));
-    for base_headroom in [1, 3] {
-        let mut metadata = bundle.metadata().clone();
-        metadata.base_hdr_headroom.numerator = base_headroom;
-        let payload =
-            GainMapBundle::new(metadata, &[], &[], bundle.codestream(), Default::default())
-                .unwrap()
-                .encode(Default::default())
-                .unwrap();
-        let bytes = jxl_gpu_bitstream::write_container_with_boxes(
-            parsed.codestream(),
-            &[jxl_gpu_bitstream::ContainerBox {
-                box_type: JHGM,
-                payload: &payload,
-            }],
-        )
-        .unwrap();
+    for headroom in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         assert!(matches!(
-            pollster::block_on(decoder.decode_alternate(&bytes, request(), Default::default())),
+            pollster::block_on(decoder.decode_gain_map(
+                &source,
+                request(),
+                jxl_wgpu_decode::gain_map::GainMapRendering {
+                    rendition: jxl_wgpu_decode::gain_map::GainMapRendition::DisplayHeadroom(
+                        headroom
+                    ),
+                    ..Default::default()
+                },
+                Default::default(),
+            )),
             Err(jxl_wgpu_decode::Error::GainMap(
-                GainMapDecodeError::Unsupported(_)
+                GainMapDecodeError::InvalidRequest(_)
             ))
         ));
     }

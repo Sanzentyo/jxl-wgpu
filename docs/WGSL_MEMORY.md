@@ -1515,20 +1515,25 @@ ICC and spot processing. See [the policy and precision evidence](GAMUT_MAPPING.m
 
 ## Alternate image gain application
 
-The gain kernel adds one 160-byte `Params` uniform: baseline offsets at byte 0 and strides at
+The gain kernel adds one 176-byte `Params` uniform: baseline offsets at byte 0 and strides at
 16; three auxiliary `(offset, stride, width, height)` vectors at 32; minimum, maximum, inverse
-gamma, baseline offset and alternate offset vectors at 80, 96, 112, 128 and 144. All entries have
-16-byte spacing, matching WGSL `vec4` layout. Naga validates the portable shader and every member
-offset. The shared `ImageOutputParams` remains 304 bytes; this submission reserves 464 uniform
+gamma, baseline offset and alternate offset vectors at 80, 96, 112, 128 and 144. The 16-byte
+application structure at 160 holds signed weight, baseline-to-reference-white scale, its inverse
+and padding. All entries have 16-byte spacing, matching WGSL uniform layout. Naga validates the
+portable shader and every member offset. The shared `ImageOutputParams` remains 304 bytes;
+this submission reserves 480 uniform
 bytes, plus the existing four-byte completion fence on WebGPU.
 
 The planar F32 RGBA baseline is bound through the three ordinary source slots. Auxiliary Gray/RGB
 F32 storage adds binding 6; gain parameters use binding 5. Each output word has one owner, including
 U8 packing and odd extents. Bilinear resampling, gain math, primary/transfer conversion, optional
-gamut mapping, orientation and alpha packing execute in the same output dispatch. No intermediate
+gamut mapping, orientation and alpha packing execute in the same output dispatch. Headroom and
+reference-white parameters add no binding or image pass. No intermediate
 alternate image or pixel readback is allocated.
 
-Both ordinary image decodes finish before application. Their existing permits remain live while
+An exact baseline selection skips the unused auxiliary decode and gain dispatch entirely, keeping
+the ordinary baseline output and its reservations. Otherwise both ordinary image decodes finish
+before application. Their existing permits remain live while
 the final output reservation and uniform reservation are admitted separately. Failure at either
 admission point releases any earlier reservation. The shared `gpu_submission` completion retains
 both inputs, output and uniforms after consumer cancellation, then releases temporary bytes before

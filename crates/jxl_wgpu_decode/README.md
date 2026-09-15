@@ -13,12 +13,14 @@ ICC/HDR, animation and preview, preserve 444 progressive/final GPU presentations
 metadata addition, replacement and removal.
 
 `GpuDecoder::decode_alternate` reconstructs an alternate still from `jhgm` using two ordinary GPU
-decodes and fused gain/color/output processing. The supported profile is a forward map with zero
-baseline HDR headroom, one still presentation per image and enumerated application/output color.
-Raw auxiliary values, bilinear resampling, primary orientation, image intensity and alpha retain
-explicit contracts. [Supported forms, limits and native references](../../docs/GAIN_MAP.md).
-Backward/HDR-baseline maps, animation, streaming gain output and full gain-map conformance remain
-open. Existing `open`/`stream` continue to select the baseline image.
+decodes and fused gain/color/output processing. `decode_gain_map` also selects display headroom
+and reference white. Both headroom directions and HDR baselines are supported, with one still
+presentation per image and enumerated application/output color. Raw auxiliary values, bilinear
+resampling, primary orientation, image intensity and alpha retain explicit contracts. Baseline
+endpoints preserve ordinary output bits and skip the unused auxiliary decode.
+[Supported forms, limits and native references](../../docs/GAIN_MAP.md). ICC application/output,
+animation, streaming gain output and full gain-map conformance remain open. Existing `open`/`stream`
+continue to select the baseline image.
 
 ## Executable profile
 

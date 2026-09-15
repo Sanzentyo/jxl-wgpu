@@ -8,7 +8,7 @@ dependency or fallback. `CMakeLists.txt` checks these exact source revisions:
 - libultrahdr `6929c2b087e74120e6de52f361e77b06f07b1441` (2.0.2), for
   `bt709ToBt2100` and `applyGain` only. Its obsolete draft ISO fraction syntax is not used.
 - libavif `b994fe4601c62d6f98dbff295bd5c251940789b0` (1.4.2), for the ISO 21496-1
-  reader/writer and exact rational metadata validation.
+  reader/writer, exact rational metadata validation and display-headroom weight selection.
 
 Provide CMake 3.22+, C11/C++17 compilers and system Highway, Brotli, LittleCMS2 and JPEG development
 libraries. With those checkouts in `reference/libjxl`, `reference/libultrahdr` and `reference/libavif`:
@@ -28,7 +28,7 @@ JXL_GAIN_MAP_ORACLE="$PWD/target/gain-map-oracle/gain_map_oracle" \
 Generate outside the source tree under test, compare all output bytes, then import deliberately.
 Do not modify sources/fixtures while any compiler, generator or test run is using them.
 `JXL_REQUIRE_NATIVE_ORACLES=1` makes an absent native executable an error; ordinary runs without
-the executable report that only the live native roundtrip test was skipped. Stored native image
+the executable report that live native roundtrips and weighted applications were skipped. Stored native image
 references remain mandatory. GPU tests require an actual adapter.
 
 `generate` creates 64 streams and four reference planes per stream, plus `cases.txt` (321 files):
@@ -64,6 +64,21 @@ Compatible future-writer records are accepted by the native reader and rewritten
 Rust retains the original writer version and opaque extension bytes. Reserved flags are checked
 strictly by Rust; the native reader ignores them, so shared rejection tests cover version/fraction/
 trailing-data errors rather than asserting identical reserved-bit policy.
+
+`apply ISO BASE_F32 MAP_F32 BASE_WIDTH BASE_HEIGHT MAP_WIDTH MAP_HEIGHT HEADROOM OUTPUT_F32`
+reads ISO metadata with the same native parser. `iso_weight.c` compiles pristine `src/gainmap.c`
+and exposes its private signed display-headroom weight selection. The helper bilinearly samples
+the map and passes that weight to unmodified libultrahdr `applyGain`; a zero weight copies the
+baseline, without applying offsets. Headroom is in log2 stops. Caller-supplied base RGBA is linear
+in the selected application primaries and gain reference-white units; gain RGBA contains original
+component values. Output retains that linear unit and baseline alpha. This command does not
+perform HDR transfer conversion, choose reference white or decode JPEG XL images.
+
+The Rust tests supply independent F64 working pixels, lowered to F32 at this native boundary.
+Eighty forward/reverse selections and 384 HDR-baseline selections compare the native application
+at the existing `3e-6` normalized bound. The HDR inputs reuse all 48 still streams in the native
+HDR corpus; tests keep original-color and XYB reconstruction uncertainty explicit through the
+gain and output transfer equations. No original fixture needs regeneration for this extension.
 
 `bundle INPUT OUTPUT` uses the native
 JPEG XL bundle reader/writer with exact consumed/written sizes. The Rust interop test invokes

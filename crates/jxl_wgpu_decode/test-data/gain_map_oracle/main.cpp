@@ -56,6 +56,22 @@ Bytes Read(const fs::path& path) {
   std::ifstream file(path, std::ios::binary); Check(bool(file), "read");
   return Bytes(std::istreambuf_iterator<char>(file), {});
 }
+GainMap DecodeIso(const Bytes& bytes) {
+  auto metadata = Metadata(); avifDiagnostics diag{};
+  Bytes tmap{0}; tmap.insert(tmap.end(), bytes.begin(), bytes.end());
+  Avif(IsoRead(metadata.get(), tmap.data(), tmap.size(), &diag), diag);
+  return metadata;
+}
+std::vector<float> ReadFloats(const fs::path& path) {
+  const auto bytes = Read(path); Check(bytes.size() % 4 == 0, "partial F32");
+  std::vector<float> values(bytes.size() / 4);
+  for (size_t i = 0; i < values.size(); ++i) {
+    uint32_t bits = 0;
+    for (size_t c = 0; c < 4; ++c) bits |= uint32_t(bytes[i * 4 + c]) << (8 * c);
+    std::memcpy(&values[i], &bits, 4);
+  }
+  return values;
+}
 void Write(const fs::path& path, const Bytes& bytes) {
   std::ofstream file(path, std::ios::binary); Check(bool(file), "write");
   file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size()); Check(bool(file), "write bytes");
@@ -132,9 +148,10 @@ std::vector<float> Decode(const Bytes& bytes, JxlColorEncoding color) {
   }
   JxlDecoderDestroy(decoder); return output;
 }
-double Sample(const std::vector<float>& map, uint32_t w, uint32_t h, uint32_t x, uint32_t y, uint32_t c) {
-  const double px = std::clamp((double(x) + 0.5) * w / 17 - 0.5, 0.0, double(w - 1));
-  const double py = std::clamp((double(y) + 0.5) * h / 9 - 0.5, 0.0, double(h - 1));
+double Sample(const std::vector<float>& map, uint32_t w, uint32_t h, uint32_t x, uint32_t y, uint32_t c,
+              uint32_t base_width = 17, uint32_t base_height = 9) {
+  const double px = std::clamp((double(x) + 0.5) * w / base_width - 0.5, 0.0, double(w - 1));
+  const double py = std::clamp((double(y) + 0.5) * h / base_height - 0.5, 0.0, double(h - 1));
   const auto x0 = uint32_t(px), y0 = uint32_t(py);
   const auto x1 = std::min(x0 + 1, w - 1), y1 = std::min(y0 + 1, h - 1);
   const auto value = [&](uint32_t a, uint32_t b) { return map[(size_t(b) * w + a) * 4 + c]; };
@@ -211,13 +228,30 @@ void Generate(const fs::path& directory) {
 }
 int main(int argc, char** argv) {
   if (argc == 3 && std::string(argv[1]) == "generate") { Generate(argv[2]); return 0; }
-  Check(argc == 4, "usage: oracle generate directory | iso/bundle input output");
+  if (argc == 11 && std::string(argv[1]) == "apply") {
+    auto metadata = DecodeIso(Read(argv[2]));
+    auto pixels = ReadFloats(argv[3]); const auto map = ReadFloats(argv[4]);
+    const uint32_t bw = std::stoul(argv[5]), bh = std::stoul(argv[6]);
+    const uint32_t mw = std::stoul(argv[7]), mh = std::stoul(argv[8]);
+    Check(bw && bh && mw && mh && pixels.size() == size_t(bw) * bh * 4 && map.size() == size_t(mw) * mh * 4, "apply geometry");
+    const float weight = IsoWeight(std::stof(argv[9]), metadata.get());
+    auto floating = Floating(*metadata);
+    if (weight != 0) {
+      for (uint32_t y = 0; y < bh; ++y) for (uint32_t x = 0; x < bw; ++x) {
+        const size_t p = (size_t(y) * bw + x) * 4;
+        const ultrahdr::Color source{{{pixels[p], pixels[p + 1], pixels[p + 2]}}};
+        const ultrahdr::Color gain{{{float(Sample(map, mw, mh, x, y, 0, bw, bh)),
+            float(Sample(map, mw, mh, x, y, 1, bw, bh)), float(Sample(map, mw, mh, x, y, 2, bw, bh))}}};
+        const auto output = ultrahdr::applyGain(source, gain, &floating, weight);
+        pixels[p] = output.r; pixels[p + 1] = output.g; pixels[p + 2] = output.b;
+      }
+    }
+    Floats(argv[10], pixels); return 0;
+  }
+  Check(argc == 4, "usage: oracle generate directory | iso/bundle input output | apply iso base.f32 map.f32 base_width base_height map_width map_height headroom output.f32");
   const auto bytes = Read(argv[2]); Bytes output;
   if (std::string(argv[1]) == "iso") {
-    auto metadata = Metadata(); avifDiagnostics diag{};
-    // The native tmap reader checks the version envelope. Its sole wrapper byte precedes ISO.
-    Bytes tmap{0}; tmap.insert(tmap.end(), bytes.begin(), bytes.end());
-    Avif(IsoRead(metadata.get(), tmap.data(), tmap.size(), &diag), diag);
+    auto metadata = DecodeIso(bytes);
     output = EncodeIso(*metadata);
   } else if (std::string(argv[1]) == "bundle") {
     JxlGainMapBundle bundle{}; size_t read;

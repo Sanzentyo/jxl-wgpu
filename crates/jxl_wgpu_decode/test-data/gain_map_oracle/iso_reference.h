@@ -7,6 +7,7 @@ extern "C" {
 #endif
 avifResult IsoRead(avifGainMap* metadata, const uint8_t* tmap, size_t size, avifDiagnostics* diag);
 avifResult IsoWrite(const avifGainMap* metadata, avifRWData* output, avifDiagnostics* diag);
+float IsoWeight(float headroom, const avifGainMap* metadata);
 #ifdef __cplusplus
 }
 #endif

@@ -11,8 +11,9 @@ explicit retention, atomic replacement/removal and plain or bounded Brotli outpu
 collector observes decoder transport events independently; image rendering follows codestream
 metadata. Native box/compression interoperability and 444 actual-GPU presentations cover this
 boundary. [HDR gain maps](docs/GAIN_MAP.md) now have bounded `jhgm` parsing/writing and GPU
-alternate-still reconstruction for forward maps with an SDR baseline and enumerated application
-color. Frame indexes, JPEG reconstruction and the remaining gain-map profiles remain incomplete.
+still reconstruction in either headroom direction, including HDR baselines, requested display
+headroom and explicit reference white in enumerated application color. Frame indexes, JPEG
+reconstruction and the remaining gain-map profiles remain incomplete.
 
 ## Crates
 

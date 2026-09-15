@@ -4489,5 +4489,38 @@ unsupported profiles, metadata limits, portable shader/uniform layout, output/un
 failure, cancellation, retained outputs and released budgets. Correcting the obsolete draft metadata
 format changes 21 payloads; all 128 image codestreams, 256 reference planes and the manifest are
 byte-identical to the initial corpus. The complete 321-file corpus reproduces from pinned sources.
-[The contract](GAIN_MAP.md) records the supported forward SDR-baseline profile
-and the remaining `CONT-07` / full JPEG XL requirements.
+[The contract](GAIN_MAP.md) records the current rendering profile and the remaining
+`CONT-07` / full JPEG XL requirements.
+
+## Gain-map headroom and HDR-baseline checkpoint
+
+Eighty selections over the existing auxiliary coding/Gray/RGB cases compare 48,960 values for
+forward/reverse headroom ordering, endpoint clamping and intermediate weights. The earlier fixed
+`2e-4 * (1 + abs(reference))` linear and `2e-7` alpha bounds remain unchanged. Exact baseline
+selections retain ordinary output bits and avoid auxiliary image decoding. Equal headrooms,
+unused incomplete auxiliary codestreams, tiny positive weights, invalid display headroom,
+unrepresentable reference-white scales and nearly coincident rational endpoints have separate
+checks, including output ownership and released budgets.
+
+All 48 unchanged still streams from the HDR corpus add 384 GPU outputs / 774,656 RGBA comparisons.
+PQ/HLG sources cover four intensities, original/XYB, Modular/VarDCT, Gray/RGB and widths 17/257.
+Reference whites of 203, 500 and 100 nits precede Linear, PQ and HLG output respectively, with
+weights ±1, ±1/2 and ±1/4. A fourth selection in each direction compares exact ordinary baseline output.
+For original-color inputs, native original components pass through independent F64 EOTF/OOTF;
+XYB uses the native linear reconstruction. This keeps native CMS below-black policies separate.
+
+Both baseline and auxiliary errors use the pre-existing codec bounds: normalized `1e-5` for
+original Modular, `1/1024` for XYB/VarDCT. The oracle propagates auxiliary texel intervals through
+bilinear sampling, clamp, inverse gamma and signed gain; all product corners account for negative
+baseline-plus-offset values. The existing gain and output arithmetic allowances remain fixed.
+Eight direct auxiliary decodes check 4,528 values against that original-color precision contract.
+Near-zero inverse gamma can amplify small map decode differences, so a flat final-image allowance
+alone would not represent this input uncertainty. Baseline endpoints compare words directly:
+the ordinary HLG same-encoding bypass intentionally does not roundtrip its below-black extension.
+
+The live native helper evaluates all 464 headroom selections using pristine libavif's private
+weight function and unmodified libultrahdr weighted gain application on supplied reference-white
+pixels. The F64/native gain-formula bound remains `3e-6 * (1 + abs(reference))`. This is independent
+gain-primitive evidence, not an end-to-end native HDR `jhgm` renderer. The existing 321 generated
+files, all earlier gain-map/HDR image bytes and native pixel references remain unchanged. Broader
+ICC/animation/streaming, numeric/profile/official conformance and full JPEG XL remain open.

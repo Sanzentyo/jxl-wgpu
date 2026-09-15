@@ -1,9 +1,9 @@
 //! GPU reconstruction of the alternate image in a `jhgm` container box.
 //!
-//! [`GpuDecoder::decode_alternate`] decodes both codestreams through the stock GPU engine,
+//! [`GpuDecoder::decode_gain_map`] decodes both codestreams through the stock GPU engine,
 //! applies the map to linear RGB, and uses the shared color/orientation/output packer. The
-//! initial rendering profile accepts forward maps with an SDR baseline (zero base headroom),
-//! one still presentation per codestream, enumerated application primaries and output color.
+//! rendering profile accepts either headroom direction, one still presentation per codestream,
+//! enumerated application primaries and output color, with explicit display-headroom selection.
 //! Other profiles are explicit errors; the bitstream crate can still preserve their metadata.
 
 use std::sync::Arc;
@@ -23,6 +23,8 @@ use crate::{
 };
 
 mod render;
+mod rendering;
+pub use rendering::{GainMapRendering, GainMapRendition};
 
 /// Independent limits for container metadata and reconstructed color metadata.
 /// Primary/auxiliary image dimensions, inventories and GPU storage use the decoder's limits.
@@ -38,6 +40,8 @@ pub enum GainMapDecodeError {
     BoxCount(usize),
     #[error("unsupported gain-map rendering profile: {0}")]
     Unsupported(&'static str),
+    #[error("invalid gain-map rendering request: {0}")]
+    InvalidRequest(&'static str),
     #[error("gain-map GPU contract: {0}")]
     Contract(&'static str),
 }
@@ -49,17 +53,34 @@ impl GpuDecoder<WgpuDecodeEngine> {
     /// Gain samples use their original component values, independently of their color transfer.
     /// Resampling is bilinear with aligned image edges and clamped borders. Alpha is preserved
     /// from the baseline; map alpha/extra channels are unsupported. Unit linear RGB represents
-    /// the SDR baseline header's intensity target in nits, including for PQ/HLG output.
+    /// the baseline header's intensity target in nits, including for PQ/HLG output.
     ///
-    /// This API requests the exact alternate rendition, not display-headroom interpolation.
-    /// Animation, previews, progressive delivery, HDR baselines/backward maps, ICC application
-    /// spaces and ICC output are currently typed unsupported profiles. Container parsing can
+    /// Uses the default 203-nit gain reference white. For display-headroom selection or a different
+    /// reference white use [`Self::decode_gain_map`]. Animation, previews, progressive delivery,
+    /// ICC application spaces and ICC output are currently typed unsupported profiles. Container parsing can
     /// retain these forms independently. Tone mapping needs an alternate-image luminance model
     /// and is rejected; output gamut mapping remains explicit through `request`.
     pub async fn decode_alternate(
         &self,
         encoded: &[u8],
         request: GpuOutputRequest,
+        limits: GainMapDecodeLimits,
+    ) -> Result<GpuFrameLease<GpuImageFrame>> {
+        self.decode_gain_map(encoded, request, GainMapRendering::default(), limits)
+            .await
+    }
+
+    /// Reconstructs a complete still at the requested display headroom, or the exact alternate.
+    /// The gain equation uses `rendering.reference_white`; its result is converted back to the
+    /// baseline image's linear units before the normal output color/alpha/orientation conversion.
+    /// Zero application returns ordinary baseline output and does not decode the unused gain map.
+    /// Equal headrooms select the baseline. A nonzero application requires the supported auxiliary
+    /// still/color profile described by [`Self::decode_alternate`].
+    pub async fn decode_gain_map(
+        &self,
+        encoded: &[u8],
+        request: GpuOutputRequest,
+        rendering: GainMapRendering,
         limits: GainMapDecodeLimits,
     ) -> Result<GpuFrameLease<GpuImageFrame>> {
         validate_request(&request)?;
@@ -71,16 +92,18 @@ impl GpuDecoder<WgpuDecodeEngine> {
         let bytes = boxes.boxes()[0].decode(limits.metadata)?;
         let bundle = GainMapBundle::parse(&bytes, limits.bundle)?;
         let metadata = bundle.metadata();
-        if metadata.base_hdr_headroom.numerator != 0 {
-            return Err(GainMapDecodeError::Unsupported(
-                "requires a forward map with zero base HDR headroom",
-            )
-            .into());
-        }
+        let weight = rendering.weight(metadata)?;
         let main_selection = crate::SelectedImageInventory::new(
             Arc::new(parsed.codestream_inventory(self.engine().inventory_limits())?),
             ImageSelection::Main,
         )?;
+        let main = main_selection.reconstruction_inventory();
+        validate_still(main)?;
+        let rendering::Weight::Apply(weight) = weight else {
+            return self
+                .decode_gain_map_still(Arc::from(parsed.codestream()), request)
+                .await;
+        };
         let map_selection = crate::SelectedImageInventory::new(
             Arc::new(
                 jxl_gpu_bitstream::parse(bundle.codestream(), self.parse_limits())?
@@ -88,9 +111,7 @@ impl GpuDecoder<WgpuDecodeEngine> {
             ),
             ImageSelection::Main,
         )?;
-        let main = main_selection.reconstruction_inventory();
         let map = map_selection.reconstruction_inventory();
-        validate_still(main)?;
         validate_still(map)?;
         if map.image_header.orientation != 1 {
             return Err(
@@ -140,6 +161,8 @@ impl GpuDecoder<WgpuDecodeEngine> {
             &main.image_header,
             working,
             metadata,
+            weight,
+            rendering.reference_white,
         )?;
         let domain = crate::image_color::original_domain(&map.image_header)?;
         if matches!(
@@ -160,30 +183,12 @@ impl GpuDecoder<WgpuDecodeEngine> {
                 .with_spot_color_policy(request.spot_color_policy())
                 .with_white_point_adaptation(request.white_point_adaptation())
                 .with_icc_rendering_intent(request.icc_rendering_intent());
-        let mut map_session = self.open_shared(Arc::from(bundle.codestream()), map_request)?;
-        let map_frame =
-            map_session
-                .next_frame_async()
-                .await?
-                .ok_or(GainMapDecodeError::Contract(
-                    "missing auxiliary presentation",
-                ))?;
-        if !map_frame.metadata.is_last {
-            return Err(GainMapDecodeError::Unsupported("multiple auxiliary presentations").into());
-        }
-        drop(map_session);
-        let mut base_session = self.open_shared(Arc::from(parsed.codestream()), base_request)?;
-        let base_frame =
-            base_session
-                .next_frame_async()
-                .await?
-                .ok_or(GainMapDecodeError::Contract(
-                    "missing baseline presentation",
-                ))?;
-        if !base_frame.metadata.is_last {
-            return Err(GainMapDecodeError::Unsupported("multiple baseline presentations").into());
-        }
-        drop(base_session);
+        let map_frame = self
+            .decode_gain_map_still(Arc::from(bundle.codestream()), map_request)
+            .await?;
+        let base_frame = self
+            .decode_gain_map_still(Arc::from(parsed.codestream()), base_request)
+            .await?;
         let mut work = plan.submit(
             self.engine().backend(),
             base_frame.output(),
@@ -192,6 +197,22 @@ impl GpuDecoder<WgpuDecodeEngine> {
         let buffer = std::future::poll_fn(|context| work.poll(context)).await?;
         let output = plan.frame(base_frame.output().token, buffer);
         Ok(base_frame.replace_output(output))
+    }
+
+    async fn decode_gain_map_still(
+        &self,
+        code: Arc<[u8]>,
+        request: GpuOutputRequest,
+    ) -> Result<GpuFrameLease<GpuImageFrame>> {
+        let mut session = self.open_shared(code, request)?;
+        let frame = session
+            .next_frame_async()
+            .await?
+            .ok_or(GainMapDecodeError::Contract("missing still presentation"))?;
+        if !frame.metadata.is_last {
+            return Err(GainMapDecodeError::Unsupported("multiple presentations").into());
+        }
+        Ok(frame)
     }
 }
 

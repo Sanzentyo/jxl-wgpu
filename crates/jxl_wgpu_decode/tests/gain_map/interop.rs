@@ -1,50 +1,11 @@
 use super::*;
-use std::process::Command;
-
-struct Scratch(PathBuf);
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 #[test]
 fn libjxl_and_libavif_read_rust_serialized_bundles_and_exact_fractions() {
-    let Some(executable) = std::env::var_os("JXL_GAIN_MAP_ORACLE") else {
-        assert!(
-            std::env::var_os("JXL_REQUIRE_NATIVE_ORACLES").is_none(),
-            "JXL_GAIN_MAP_ORACLE is required"
-        );
-        eprintln!(
-            "skipping native gain-map interoperability; set JXL_GAIN_MAP_ORACLE to the pinned helper"
-        );
+    let Some(oracle) = super::native::Oracle::new() else {
         return;
     };
-    let scratch = Scratch(std::env::temp_dir().join(
-        format!("jxl-gain-map-{}-{}", std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()),
-    ));
-    std::fs::create_dir(&scratch.0).unwrap();
-    let native = |operation: &str, bytes: &[u8]| {
-        let input = scratch.0.join("input");
-        let output = scratch.0.join("output");
-        std::fs::write(&input, bytes).unwrap();
-        Command::new(&executable)
-            .arg(operation)
-            .arg(&input)
-            .arg(&output)
-            .output()
-            .unwrap()
-    };
-    let roundtrip = |operation: &str, bytes: &[u8]| {
-        let result = native(operation, bytes);
-        assert!(
-            result.status.success(),
-            "{operation}: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        std::fs::read(scratch.0.join("output")).unwrap()
-    };
+    let roundtrip = |operation, bytes: &[u8]| oracle.roundtrip(operation, bytes);
     let cases = std::fs::read_to_string(directory().join("cases.txt")).unwrap();
     let mut count = 0;
     for line in cases.lines() {
@@ -105,7 +66,7 @@ fn libjxl_and_libavif_read_rust_serialized_bundles_and_exact_fractions() {
     invalid.push(trailing);
     for bytes in invalid {
         assert!(GainMapMetadata::parse(&bytes).is_err());
-        assert!(!native("iso", &bytes).status.success());
+        assert!(!oracle.run("iso", &bytes).status.success());
     }
     eprintln!(
         "native gain-map: {count} Rust/libjxl bundle roundtrips, {} Rust/libavif ISO roundtrips, 6 compatible-writer reads and 11 shared invalid-record rejections",

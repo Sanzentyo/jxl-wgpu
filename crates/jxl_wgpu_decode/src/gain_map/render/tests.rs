@@ -34,9 +34,33 @@ fn gain_map_shader_has_the_exact_uniform_layout_and_portable_bindings() {
             };
             assert_eq!(
                 members.iter().map(|m| m.offset).collect::<Vec<_>>(),
-                [0, 16, 32, 80, 96, 112, 128, 144]
+                [0, 16, 32, 80, 96, 112, 128, 144, 160]
+            );
+            let application = members
+                .iter()
+                .find(|m| m.name.as_deref() == Some("application"))
+                .unwrap();
+            assert_eq!(
+                layouter[application.ty].size as usize,
+                size_of::<Application>()
+            );
+            let naga::TypeInner::Struct { members, .. } = &module.types[application.ty].inner
+            else {
+                panic!()
+            };
+            assert_eq!(
+                members
+                    .iter()
+                    .map(|m| m.offset as usize)
+                    .collect::<Vec<_>>(),
+                [
+                    std::mem::offset_of!(Application, weight),
+                    std::mem::offset_of!(Application, base_to_reference),
+                    std::mem::offset_of!(Application, reference_to_base),
+                    std::mem::offset_of!(Application, padding),
+                ]
             );
         }
     }
-    assert_eq!(size_of::<Params>(), 160);
+    assert_eq!(size_of::<Params>(), 176);
 }
