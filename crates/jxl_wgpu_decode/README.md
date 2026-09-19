@@ -653,6 +653,16 @@ references preserve the original transfer; unreferenced XYB can retain linear or
 `GpuOutputRequest::with_white_point_adaptation` selects Bradford or absolute XYZ for requested
 color output. Numeric samples retain their original domain regardless of this output policy.
 
+Explicit `PixelFormat::gray8` and `gray_f32` color requests accept full-range enumerated
+target encodings, with optional alpha and planar/interleaved storage. The GPU projects
+target-linear luminance after tone/gamut mapping, then applies the target transfer and
+requested alpha association. U8 quantizes once; F32 preserves extended values. Eight existing
+native RGB/Gray sources cover both codecs and RGB/XYB/YCbCr reconstruction, nonopaque alpha,
+bounded input equality and output leases retained after session destruction. The official
+`grayscale` case separately compares linear Gray against its unchanged published reference.
+Limited-range Gray and unspecified color meaning remain typed unsupported; numeric Gray
+selection and same-profile ICC device Gray retain their separate contracts.
+
 The private surface tag includes both RGB primaries
 and transfer, with a separate codec-component variant. `ColorOutputTransform::Ycbcr` now requires
 an explicit original encoding. Native output with Default/Undefined color meaning uses the original
@@ -677,6 +687,10 @@ That untouched profile has a noncanonical PCS illuminant: numeric output succeed
 request retains the typed ICC error before GPU admission. This does not relax ICC validation or
 allow raw samples to enter a color transform. XYB color reconstruction still requires its actual
 validated original color domain.
+The same twelve-case corpus now includes official blend modes, delta palettes, grayscale,
+LZ77 and lossless patches under the original per-channel RMSE and peak bounds. Its JPEG-derived
+gray pixel comparison does not implement byte-identical JPEG reconstruction, and checking
+the original generated ICC files does not establish exact generated-profile export.
 
 The common `WgpuDecodeEngine` additionally accepts original and XYB ICC color through
 both physical codecs. Private surfaces carry the exact owned profile and one Gray or three RGB

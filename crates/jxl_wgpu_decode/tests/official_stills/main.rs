@@ -2,7 +2,7 @@
 
 use std::{num::NonZeroU64, ops::Range};
 
-use jxl_gpu_formats::{Channel, PixelFormat, RgbChannelOrder, SampleKind};
+use jxl_gpu_formats::{Channel, ColorSpecification, PixelFormat, RgbChannelOrder, SampleKind};
 use jxl_gpu_protocol::Extent2d;
 use jxl_test_support::gpu::planes;
 use jxl_wgpu::WgpuBackend;
@@ -14,7 +14,7 @@ use jxl_wgpu_decode::{
 mod cases;
 mod extended;
 mod reference;
-use reference::Reference;
+use reference::{Reference, ReferenceColor};
 
 fn decode(
     backend: &WgpuBackend,
@@ -108,20 +108,42 @@ fn run_case(name: &str) {
     let reference = case.load();
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
     eprintln!("official still {}", case.name);
-    // An original-profile reference describes component values, not a requested CMS transform.
-    // In particular, spot's untouched v2 profile has a noncanonical PCS illuminant.
-    let original_components = reference.descriptor.original_icc.is_some();
-    let has_alpha = reference.channels > 3;
-    let color_components = if has_alpha { 4 } else { 3 };
-    let format = PixelFormat::rgb_f32(
-        if has_alpha {
-            RgbChannelOrder::Rgba
-        } else {
-            RgbChannelOrder::Rgb
-        },
-        false,
-        jxl_wgpu_decode::vardct_rgb8_format().color_spec,
-    );
+    let original_components = matches!(reference.color, ReferenceColor::OriginalNumeric);
+    let has_alpha = reference.channels > reference.colors;
+    let color_components = reference.colors + usize::from(has_alpha);
+    let mut specification = jxl_wgpu_decode::vardct_rgb8_format().color_spec;
+    match reference.color {
+        ReferenceColor::LinearGray => {
+            assert_eq!(reference.colors, 1);
+            let ColorSpecification::Defined(ref mut color) = specification else {
+                unreachable!()
+            };
+            color.transfer = jxl_gpu_formats::TransferFunction::Linear;
+        }
+        ReferenceColor::Profile => {
+            specification = ColorSpecification::Icc(
+                jxl_gpu_protocol::icc::IccProfile::parse(
+                    reference.profile.clone().into(),
+                    Default::default(),
+                )
+                .unwrap(),
+            );
+        }
+        ReferenceColor::Srgb | ReferenceColor::OriginalNumeric => {}
+    }
+    let format = if reference.colors == 1 {
+        PixelFormat::gray_f32(has_alpha, false, specification)
+    } else {
+        PixelFormat::rgb_f32(
+            if has_alpha {
+                RgbChannelOrder::Rgba
+            } else {
+                RgbChannelOrder::Rgb
+            },
+            false,
+            specification,
+        )
+    };
     let mut whole = Vec::new();
     for window in [None, NonZeroU64::new(16 * 1024)] {
         let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
@@ -151,15 +173,24 @@ fn run_case(name: &str) {
             color_components
         };
         for channel in first_component..reference.channels {
+            let depth = if channel < reference.colors {
+                reference.depths[0]
+            } else {
+                reference.depths[1 + channel - reference.colors]
+            };
             let request = GpuOutputRequest::numeric(
                 PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X]),
-                NumericSampleMapping::NormalizedUnsigned,
+                if matches!(depth, jxl_gpu_bitstream::SampleBitDepth::Float { .. }) {
+                    NumericSampleMapping::NativeFloat
+                } else {
+                    NumericSampleMapping::NormalizedUnsigned
+                },
             )
             .unwrap();
-            let request = if channel < 3 {
+            let request = if channel < reference.colors {
                 request.with_color_channel(channel as u32)
             } else {
-                request.with_extra_channel((channel - 3) as u32)
+                request.with_extra_channel((channel - reference.colors) as u32)
             }
             .unwrap();
             let words = decode(&backend, &decoder, &reference, request, window.is_some());
@@ -243,4 +274,34 @@ fn spot_color_requires_a_valid_profile_before_gpu_admission() {
 #[test]
 fn sunset_logo() {
     run_case("sunset_logo");
+}
+
+#[test]
+fn blendmodes() {
+    run_case("blendmodes");
+}
+
+#[test]
+fn delta_palette() {
+    run_case("delta_palette");
+}
+
+#[test]
+fn grayscale() {
+    run_case("grayscale");
+}
+
+#[test]
+fn grayscale_jpeg_pixels() {
+    run_case("grayscale_jpeg");
+}
+
+#[test]
+fn lz77_flower() {
+    run_case("lz77_flower");
+}
+
+#[test]
+fn patches_lossless() {
+    run_case("patches_lossless");
 }

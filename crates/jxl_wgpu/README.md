@@ -194,6 +194,12 @@ semantics. See [the luminance policy](../../docs/TONE_MAPPING.md).
 `ImageOutputRequest::with_gamut_mapping` and `ImageOutputParams::with_gamut_mapping` select
 target-linear RGB gamut mapping after tone conversion. Its 16-byte vector begins at byte 288;
 protected light takes precedence. See [the gamut contract](../../docs/GAMUT_MAPPING.md).
+Explicit full-range Gray/GrayAlpha U8/F32 output uses the declared target primaries' linear
+luminance after tone/gamut mapping and before the target transfer, alpha association and
+quantization. Both planar and interleaved layouts support all eight orientations. This is a
+color conversion even when RGB source and target encodings match; it cannot copy the red
+component through the identity shortcut. Missing color metadata and limited-range Gray are
+typed unsupported. Same-profile ICC Gray retains its device-sample packing contract.
 `with_alpha_conversion` selects an explicit
 association adjustment after color conversion and before quantization or chroma subsampling.
 The common `ALPHA_OUTPUT_SHADER` uses the JPEG XL finite `2^-26` alpha floor; it never transforms

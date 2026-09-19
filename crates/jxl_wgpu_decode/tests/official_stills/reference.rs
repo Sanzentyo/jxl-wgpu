@@ -1,12 +1,32 @@
 use std::{collections::BTreeMap, io::Read, path::Path};
 
-use jxl_gpu_bitstream::{ExtraChannelTypeInventory, SampleBitDepth};
+use jxl_gpu_bitstream::{
+    ColourEncodingInventory, ColourSpaceInventory, ExtraChannelTypeInventory, PrimariesInventory,
+    RenderingIntentInventory, SampleBitDepth, TransferFunctionInventory, WhitePointInventory,
+};
 use sha2::{Digest, Sha256};
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ReferenceColor {
+    Srgb,
+    LinearGray,
+    OriginalNumeric,
+    Profile,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum OriginalProfile {
+    Unspecified,
+    Embedded,
+    EnumeratedGamma { scaled_gamma: u32, inverted: bool },
+}
 
 pub(super) struct Case {
     pub name: &'static str,
     pub input_sha256: &'static str,
     pub descriptor_sha256: &'static str,
+    pub color: ReferenceColor,
+    pub original: OriginalProfile,
 }
 
 #[derive(serde::Deserialize)]
@@ -38,6 +58,9 @@ pub(super) struct Reference {
     pub width: usize,
     pub height: usize,
     pub channels: usize,
+    pub colors: usize,
+    pub color: ReferenceColor,
+    pub depths: Vec<SampleBitDepth>,
     pub pixels: Vec<f32>,
 }
 
@@ -96,11 +119,15 @@ impl Case {
             .codestream_inventory(Default::default())
             .unwrap();
         let image = &info.image_header;
-        assert!(!image.grayscale);
         assert!(image.animation.is_none());
-        assert_eq!(shape[3], 3 + image.extra_channels.len());
+        let colors = if image.grayscale { 1 } else { 3 };
+        assert_eq!(shape[3], colors + image.extra_channels.len());
         let depths: Vec<_> = std::iter::once(image.bit_depth)
             .chain(image.extra_channels.iter().map(|extra| extra.bit_depth))
+            .collect();
+        let declared_depths: Vec<_> = depths
+            .iter()
+            .copied()
             .map(|depth| match depth {
                 SampleBitDepth::Integer { bits_per_sample } => (bits_per_sample, 0),
                 SampleBitDepth::Float {
@@ -110,11 +137,17 @@ impl Case {
             })
             .collect();
         assert_eq!(
-            depths.iter().map(|depth| depth.0).collect::<Vec<_>>(),
+            declared_depths
+                .iter()
+                .map(|depth| depth.0)
+                .collect::<Vec<_>>(),
             descriptor.bits_per_sample
         );
         assert_eq!(
-            depths.iter().map(|depth| depth.1).collect::<Vec<_>>(),
+            declared_depths
+                .iter()
+                .map(|depth| depth.1)
+                .collect::<Vec<_>>(),
             descriptor.exp_bits_per_sample
         );
         let kinds: Vec<_> = image
@@ -127,6 +160,10 @@ impl Case {
             })
             .collect();
         assert_eq!(kinds, descriptor.extra_channel_type);
+        // These stills have at most one alpha, immediately after the color samples.
+        // Packed color comparison must never silently reorder an independent extra plane.
+        assert!(kinds.is_empty() || kinds[0] == "Alpha");
+        assert!(kinds.iter().skip(1).all(|&kind| kind != "Alpha"));
         assert_eq!(
             image.tone_mapping.intensity_target.to_f32(),
             descriptor.intensity_target
@@ -141,9 +178,43 @@ impl Case {
             descriptor.linear_below
         );
         if let Some(original) = &descriptor.original_icc {
-            let embedded = &image.embedded_icc.as_ref().unwrap().profile;
-            check(embedded, &descriptor.sha256sums[original]);
-            assert_eq!(&**embedded, profile);
+            let original_hash = &descriptor.sha256sums[original];
+            let original_bytes = if original_hash == &descriptor.sha256sums["reference.icc"] {
+                profile.clone()
+            } else {
+                std::fs::read(directory.join(original)).unwrap()
+            };
+            check(&original_bytes, original_hash);
+            match self.original {
+                OriginalProfile::Embedded => {
+                    assert_eq!(
+                        &*image.embedded_icc.as_ref().unwrap().profile,
+                        original_bytes
+                    );
+                }
+                OriginalProfile::EnumeratedGamma {
+                    scaled_gamma,
+                    inverted,
+                } => {
+                    assert!(image.embedded_icc.is_none());
+                    assert_eq!(
+                        image.colour_encoding,
+                        ColourEncodingInventory::Enumerated {
+                            colour_space: ColourSpaceInventory::Rgb,
+                            white_point: WhitePointInventory::D65,
+                            primaries: PrimariesInventory::Srgb,
+                            transfer_function: TransferFunctionInventory::Gamma {
+                                scaled_gamma,
+                                inverted
+                            },
+                            rendering_intent: RenderingIntentInventory::Relative,
+                        }
+                    );
+                }
+                OriginalProfile::Unspecified => panic!("unclassified original profile"),
+            }
+        } else {
+            assert!(matches!(self.original, OriginalProfile::Unspecified));
         }
         Reference {
             name: self.name,
@@ -153,6 +224,9 @@ impl Case {
             width: shape[2],
             height: shape[1],
             channels: shape[3],
+            colors,
+            color: self.color,
+            depths,
             pixels,
         }
     }

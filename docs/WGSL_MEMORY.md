@@ -435,7 +435,13 @@ linear black threshold, and display intensity in nits (zero retains generic tran
 Source luminance/forward-HLG-exponent and target luminance/inverse-HLG-exponent occupy bytes
 208 and 224. Alpha conversion is at byte 176, followed by three reserved
 words. The identity flag bypasses a redundant EOTF/OETF round trip when both transfer and primaries
-match.
+match, except for enumerated Gray output. Stored-channel order 5 selects Gray/Gray-alpha:
+after target-linear tone/gamut mapping, the dot product with the existing luminance vector
+at byte 288 produces a neutral RGB triple for the target transfer. The coefficients exist even
+with gamut mapping disabled. Alpha occupies stored component one. This shares RGB storage
+kinds 0/1, word ownership, checked plane offsets and quantization, without changing any
+uniform size, binding, scratch allocation or submission. ICC device Gray keeps order 4 and its
+word-preserving identity behavior; non-color components keep order 0.
 The codec source fragment adds a 160-byte, 16-byte-aligned `ColorSourceParams` at binding 5:
 component geometry starts at 0, alpha offset/stride/maximum/enabled at 48, inverse matrix rows at
 64/80/96, cube-root/scaled biases at 112/128, intensity scale at 144, and transform mode at 148.
@@ -461,7 +467,7 @@ checks stop at the last row payload instead of treating unused row-tail capacity
 and dispatch padding exits before multiplying a word index into a byte index. The GPU test covers
 both one-pixel axes in all orientations with interleaved and padded RGB/RGBA planes, unaligned
 plane starts, opaque and signed independently normalized alpha, zero internal/tail padding, and unchanged guard bytes outside storage.
-Grayscale luminance stays folded into inverse-matrix metadata. Progressive-DC planes retain their
+Source grayscale XYB luminance stays folded into inverse-matrix metadata. Progressive-DC planes retain their
 unoriented three-channel shape even for gray presentation or a non-RGB output request.
 
 Modular's ordinary and inverse-stage writers use output kinds 5/6 with 32-bit samples for F32 RGB.
@@ -1469,7 +1475,7 @@ scratch allocation changes. Negative BT.709 uses its linear toe; other supported
 transfers preserve the sign of the magnitude conversion.
 
 Same-profile device output without requested tone mapping allocates no ICC program or conversion intermediate. The 304-byte
-output ABI is unchanged: stored-channel order 4 identifies Gray/Gray-alpha; absent planar channels
+output ABI is unchanged: stored-channel order 4 identifies ICC device Gray/Gray-alpha; absent planar channels
 are excluded before accessing their zero stride fields. `surface_color_channels` specializes the
 source to one or three planes, and the alpha index follows that count. Each invocation owns one
 complete output word, including plane gaps and the final padded word. Gray alpha is the independent

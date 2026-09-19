@@ -8,6 +8,7 @@ use jxl_wgpu_decode::{
 };
 use std::num::{NonZeroU64, NonZeroUsize};
 
+mod gray;
 mod icc;
 mod numeric;
 use jxl_test_support::oracles::color as oracle;

@@ -94,7 +94,11 @@ fn target_intensity() -> f32 {
 
 fn target_rgb_at(x: u32, y: u32) -> vec3<f32> {
     if identity_output_color() { return source_rgb_at(x, y); }
-    let linear = target_linear_rgb_at(x, y);
+    var linear = target_linear_rgb_at(x, y);
+    if params.order == 5u {
+        // Gray is target-linear luminance after tone/gamut mapping, not encoded RGB luma.
+        linear = vec3<f32>(dot(linear, params.gamut_mapping.luminance.xyz));
+    }
     return display_from_linear(
         linear, params.target_transfer, params.transfer_parameters.y,
         target_intensity(), params.target_luminance,
@@ -102,7 +106,7 @@ fn target_rgb_at(x: u32, y: u32) -> vec3<f32> {
 }
 
 fn identity_output_color() -> bool {
-    return params.identity_color_transform != 0u
+    return params.order != 5u && params.identity_color_transform != 0u
         && (params.gamut_mapping.luminance.w < 0.0 || params.tone_mapping.range.w == 5.0);
 }
 
@@ -280,7 +284,7 @@ fn rgb_byte_at(x: u32, y: u32, component: u32, byte: u32) -> u32 {
 }
 
 fn stored_rgb_component(position: u32) -> u32 {
-    if params.order == 4u { return select(0u, 3u, position == 1u); }
+    if params.order == 4u || params.order == 5u { return select(0u, 3u, position == 1u); }
     if (params.order == 1u || params.order == 3u) && position < 3u {
         return 2u - position;
     }

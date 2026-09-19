@@ -470,14 +470,23 @@ fn prepare_output(layout: &ImageLayout, gray_device: bool) -> Result<PreparedIma
             sample,
             storage,
             alpha,
-        } if gray_device => {
+        } => {
+            if !gray_device
+                && matches!(layout.format.color_spec, ColorSpecification::Defined(color) if color.range != ColorRange::Full)
+            {
+                return Err(Error::Unsupported(
+                    "Gray image output requires full range".into(),
+                ));
+            }
             Ok(PreparedImageOutput {
                 kind: match storage {
                     ColorStorage::Interleaved => 0,
                     ColorStorage::Planar => 1,
                 },
                 channels: if alpha { 2 } else { 1 },
-                order: 4, // Device gray, with optional alpha in position one.
+                // ICC gray copies its device sample; enumerated gray projects target-linear
+                // RGB to luminance before the target transfer. Alpha occupies position one.
+                order: if gray_device { 4 } else { 5 },
                 matrix: 1,
                 range: 0,
                 siting_x: 1,
@@ -490,9 +499,6 @@ fn prepare_output(layout: &ImageLayout, gray_device: bool) -> Result<PreparedIma
                 plane_strides,
             })
         }
-        ColorFormatClass::Gray { .. } => Err(Error::Unsupported(
-            "gray output requires an explicit gray color conversion and packing stage".into(),
-        )),
         ColorFormatClass::Rgb {
             sample,
             storage,

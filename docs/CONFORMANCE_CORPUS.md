@@ -4558,7 +4558,7 @@ The VPI regression verifies both the original exact bytes and the submission cou
 
 ## Official stills and signed original samples (2026-09-20)
 
-The [six-still corpus](../crates/jxl_wgpu_decode/test-data/official_stills/README.md) imports
+The initial six cases of the [official still corpus](../crates/jxl_wgpu_decode/test-data/official_stills/README.md) import
 unchanged inputs, ICC profiles and descriptors from libjxl/conformance commit
 `b1d0f990b03e57bf6d137c365cd5dc8b470b9191`. Input/descriptor hashes are pinned in the test;
 profile and decompressed NPY hashes are checked against those descriptors. Original limits,
@@ -4583,3 +4583,35 @@ Gray and RGB raw reconstruction tests check one-byte-short admission, retry, can
 retained IEEE words, domain confusion and inverse YCbCr before scalar packing. All official
 outputs survive session destruction before readback and release their reservations afterward.
 No existing fixture, oracle, error bound or reference pixel is replaced.
+
+## Enumerated Gray output and six more official stills (2026-09-20)
+
+Six more unchanged inputs and their original descriptors/profiles/references expand the still
+corpus to twelve. They use the same pinned upstream commit and source/reference hash checks.
+On Apple M5, `delta_palette`, `lz77_flower` and `patches_lossless` have exact component values;
+`blendmodes` has peak error at most 9.537e-7. `grayscale_jpeg` has RMSE 1.364e-7 and peak
+1.848e-6. `grayscale` has RMSE 7.849e-6 and peak 2.286e-4, within its original 1e-4 / 0.004
+limits. Whole and bounded fragmented output agree exactly, with retained output read after
+session destruction and zero reservations after release. All twelve source images are CC0.
+
+The XYB `grayscale` reference requires linear Gray output; its embedded original printer ICC
+is distinct and remains exact in the inventory. The common packer now projects target-linear
+luminance after tone/gamut mapping and before the target transfer and alpha association.
+Generic GPU tests compare 288 U8/F32 Gray/GrayAlpha outputs with independent F64 primary,
+gamut and transfer equations: BT.709/BT.2020/Display-P3, eight transfer functions, signed and
+above-one values, and planar/interleaved storage. Sixteen more outputs cover all eight
+orientations. Missing metadata and limited-range Gray produce typed errors. The F32 arithmetic
+bound is 5e-5 times max(1, abs(reference)); U8 permits one code and opaque alpha is exact.
+
+Eight existing 37×19 native original-color cases add 96 decoder outputs / 112,480 component
+checks across both physical codecs, RGB/XYB/YCbCr, Gray/RGB sources and all three output alpha
+policies. Original native pixels and the unchanged codec bounds feed independent F64 EOTF,
+primary/luminance and OETF equations; intervals also account for alpha association and the
+existing output rounding allowance. Both storage forms, U8/F32 and whole/256-byte entropy
+windows preserve output bytes exactly. Held frames outlive their sessions and release their
+budget only when dropped. Existing ICC device-Gray packing and numeric Gray are separate paths.
+
+`grayscale_jpeg` currently establishes pixel evidence only: its original JPEG reconstruction
+requirement remains open. `lz77_flower` compares normalized original samples under its checked
+enumerated gamma declaration; the retained original/reference ICC files are independently
+hashed but exact generated-ICC export remains open. These additions do not complete `QA-02`.
