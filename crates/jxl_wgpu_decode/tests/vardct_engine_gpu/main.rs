@@ -36,6 +36,7 @@ use wgpu::util::DeviceExt;
 mod color_output;
 use jxl_test_support::corpus;
 mod extra_channels;
+mod packet_contracts;
 mod progression;
 mod raw_matrix;
 
@@ -1621,16 +1622,8 @@ fn combined_single_packet_resumes_across_bounded_gpu_windows() {
     }
     assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
 
-    let group = plan.groups.first().unwrap();
-    let stream_start = u64::from(plan.entropy_bit_offset);
-    let stream_end = group.lf_group.end().unwrap();
-    let damage_bit = stream_start + (stream_end - stream_start) * 17 / 20;
-    let damage_start = usize::try_from(damage_bit / 8).unwrap();
-    let damage_end = (damage_start + 8).min(usize::try_from(stream_end.div_ceil(8)).unwrap());
-    let mut damaged = encoded.clone();
-    for byte in &mut damaged[damage_start..damage_end] {
-        *byte ^= 0xa5;
-    }
+    let damaged = packet_contracts::truncate_lf_coefficients(&encoded, &inventory, &plan);
+    packet_contracts::assert_native_rejection(&damaged);
     let mut damaged_session = decoder
         .open(
             &damaged,
@@ -1701,8 +1694,12 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
             .as_ref()
             .expect("multi-entry VarDCT parses the descriptor-only HF coefficient plan");
         assert_eq!(hf_coefficients.num_hf_presets, 1);
-        assert_eq!(hf_coefficients.passes[0].context_map.len(), 495 * 15);
-        assert_eq!(hf_coefficients.block_context_map.len(), 39);
+        // Coefficient-bearing encoder packets explicitly select one block-context cluster.
+        assert_eq!(hf_coefficients.num_block_clusters, 1);
+        assert!(hf_coefficients.qf_thresholds.is_empty());
+        assert!(hf_coefficients.lf_thresholds.iter().all(Vec::is_empty));
+        assert_eq!(hf_coefficients.passes[0].context_map, vec![0; 495]);
+        assert_eq!(hf_coefficients.block_context_map, vec![0; 39]);
         assert_eq!(
             hf_coefficients.passes[0].pass_groups.len() as u64,
             plan.profile.group_count
