@@ -127,8 +127,8 @@ pub(crate) fn require_original_encoding(
     })
 }
 
-/// Resolve owned ICC metadata once for the selected image. Raw numeric requests can avoid this
-/// entirely; retaining device values only requires a structurally valid profile, not a CMS method.
+/// Resolve a validated color domain for the selected image. Original numeric samples from a
+/// non-XYB image can avoid this entirely: opaque ICC metadata does not give color authority.
 pub(crate) fn original_domain(
     image: &ImageHeaderInventory,
 ) -> crate::Result<crate::frame_surface::FrameSurfaceEncoding> {

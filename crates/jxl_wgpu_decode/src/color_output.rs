@@ -56,8 +56,8 @@ pub enum ColorOutputEncoding {
     Rgb(RgbColorEncoding),
     /// Original RGB or Gray device values owned by this exact profile.
     Icc(jxl_gpu_protocol::icc::IccProfile),
-    /// Three untagged codec components, such as complemented CMY after a JPEG matrix.
-    /// Their image-owned color domain is interpreted by the later ICC connection.
+    /// One or three untagged components, such as original numeric samples or complemented CMY
+    /// after a JPEG matrix. A later color connection requires a separately validated domain.
     Components,
 }
 

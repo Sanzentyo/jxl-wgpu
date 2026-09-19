@@ -202,6 +202,9 @@ the alpha component through an RGB transfer. Producers supply `source_rgb_words_
 VarDCT can fuse XYB/JPEG reconstruction directly into the same word-owned packing entry point.
 Its extra source uniform is separately budgeted; no intermediate RGB image is required. Every
 producer still owns validation of its input bindings and source-specific plane strides.
+`ImageOutputParams::for_components` packs one or three planar F32 components with explicit
+non-color storage. It supports original numeric Gray/RGB reconstruction without assigning a
+surrogate profile; a later color conversion still requires independently validated metadata.
 Unchanged F32 color and all F32 alpha packing retain integer words throughout; floating-point
 evaluation is used only when reconstruction, color conversion or association requires it.
 Plane range checks end at the last row's payload, allowing a following plane inside unused row-tail

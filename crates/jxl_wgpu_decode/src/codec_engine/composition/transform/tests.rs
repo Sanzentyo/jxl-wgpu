@@ -2,6 +2,8 @@ use super::*;
 use crate::GpuOutputRequest;
 use crate::frame_surface::compositor::ColorUsage;
 
+mod original_samples;
+
 fn source(backend: &WgpuBackend, image: &ImageHeaderInventory) -> Surface {
     let layout = FrameSurfaceLayout::with_encoding(
         jxl_gpu_protocol::Extent2d::new(image.width, image.height),
@@ -18,7 +20,9 @@ fn source(backend: &WgpuBackend, image: &ImageHeaderInventory) -> Surface {
         backend.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("XYB reconstruction admission source"),
             size: layout.storage_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }),
         permit,

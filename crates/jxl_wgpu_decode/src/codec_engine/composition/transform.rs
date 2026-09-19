@@ -42,10 +42,13 @@ pub(super) fn convert(
             "inverse color transform extra channel count",
         ));
     }
-    if original.icc_profile().is_some() && !image.xyb_encoded {
+    if (original.icc_profile().is_some()
+        || matches!(original, FrameSurfaceEncoding::OriginalSamples { .. }))
+        && !image.xyb_encoded
+    {
         if encoding != *original {
             return Err(Error::EngineContract(
-                "ICC component reconstruction requires the original device profile",
+                "component reconstruction requires the original sample domain",
             ));
         }
         if !frame.do_ycbcr {
@@ -157,7 +160,8 @@ pub(super) fn convert(
             let encoding = match original {
                 FrameSurfaceEncoding::Rgb(encoding) => ColorOutputEncoding::Rgb(*encoding),
                 FrameSurfaceEncoding::Icc(profile) => ColorOutputEncoding::Icc(profile.clone()),
-                FrameSurfaceEncoding::Cmyk { .. } => ColorOutputEncoding::Components,
+                FrameSurfaceEncoding::Cmyk { .. }
+                | FrameSurfaceEncoding::OriginalSamples { .. } => ColorOutputEncoding::Components,
                 FrameSurfaceEncoding::Device(_) => {
                     return Err(Error::EngineContract(
                         "ICC output devices cannot be original codec components",

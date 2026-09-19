@@ -162,7 +162,20 @@ impl Compositor {
         let extras = &image.extra_channels;
         let grayscale = image.grayscale;
         let sample_bit_depth = image.bit_depth;
-        let original = crate::image_color::original_domain(image)?;
+        let original = if !image.xyb_encoded
+            && image.embedded_icc.is_some()
+            && matches!(request.mapping(), crate::GpuOutputMapping::Numeric(_))
+        {
+            crate::image_color::validate_declaration(image)?;
+            if usage.linear {
+                return Err(Error::EngineContract(
+                    "original numeric components have no linear presentation domain",
+                ));
+            }
+            FrameSurfaceEncoding::OriginalSamples { grayscale }
+        } else {
+            crate::image_color::original_domain(image)?
+        };
         let intensity_target = image.tone_mapping.intensity_target.to_f32();
         let intensity = jxl_gpu_protocol::DisplayIntensity::new(intensity_target)
             .ok_or(crate::color_output::ColorOutputError::InvalidIntensityTarget)?;
@@ -667,7 +680,9 @@ impl Compositor {
             | FrameSurfaceEncoding::Cmyk { .. } => {
                 FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709)
             }
-            FrameSurfaceEncoding::Encoded => unreachable!("original image color domain"),
+            FrameSurfaceEncoding::OriginalSamples { .. } | FrameSurfaceEncoding::Encoded => {
+                unreachable!("validated original color domain required for linear presentation")
+            }
         }
     }
 
@@ -766,7 +781,10 @@ impl Compositor {
     }
 
     pub(crate) fn pack(&self, source: &Surface) -> Result<GpuWork> {
-        if source.encoding != self.original && source.encoding != self.linear_encoding() {
+        if source.encoding != self.original
+            && (matches!(self.original, FrameSurfaceEncoding::OriginalSamples { .. })
+                || source.encoding != self.linear_encoding())
+        {
             return Err(Error::EngineContract(
                 "presentation source is outside its original color domain",
             ));

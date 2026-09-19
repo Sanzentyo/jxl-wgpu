@@ -315,13 +315,9 @@ fn write_native_pixel(x: u32, y: u32, index: u32) {
 
 fn write_float_rgb_pixel(x: u32, y: u32, index: u32) {
     let pixel = reconstructed_rgba(index);
-    if any(pixel < vec4<i32>(0i)) || any(pixel > vec4<i32>(i32(params.source_mask))) {
-        decode_error = ERROR_OUTPUT_MAPPING;
-        return;
-    }
     let rgba = vec4<f32>(
-        target_nonlinear(u32(pixel.r)), target_nonlinear(u32(pixel.g)),
-        target_nonlinear(u32(pixel.b)), f32(pixel.a) / f32(params.source_mask),
+        target_float_nonlinear(pixel.r), target_float_nonlinear(pixel.g),
+        target_float_nonlinear(pixel.b), f32(pixel.a) / f32(params.source_mask),
     );
     let offsets = vec4<u32>(params.plane0_offset, params.plane1_offset, params.plane2_offset, params.plane3_offset);
     let strides = vec4<u32>(params.plane0_stride, params.plane1_stride, params.plane2_stride, params.plane3_stride);
@@ -476,6 +472,17 @@ fn target_nonlinear(value: u32) -> f32 {
         return 4.5 * linear;
     }
     return 1.099 * pow(linear, 0.45) - 0.099;
+}
+
+fn target_float_nonlinear(value: i32) -> f32 {
+    if value >= 0i { return target_nonlinear(u32(value)); }
+    let magnitude = 0u - bitcast<u32>(value);
+    // Match the shared transfer policy: BT.709 extends its linear toe below zero,
+    // while sRGB, linear and BT.2020 preserve the sign of the magnitude conversion.
+    if params.transfer == 1u {
+        return -4.5 * srgb_to_linear(f32(magnitude) / f32(params.source_mask));
+    }
+    return -target_nonlinear(magnitude);
 }
 
 fn color_code(value: u32) -> u32 {

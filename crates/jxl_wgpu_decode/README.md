@@ -324,6 +324,10 @@ transforms. Independent integer alpha precision is rescaled using a two-word pro
 on GPU. `NormalizedUnsigned` and F32 color divide by the declared maximum; wide-source F32
 output agrees with the independent libjxl normalization within one ULP. Native scalar working
 values outside the unsigned range return a typed error, while F32 retains negative/overshoot values.
+The direct RGB/RGBA F32 path also permits signed integer reconstruction before normalization;
+the nominal source depth does not bound the signed working samples. Its sRGB/Linear/BT.2020
+conversions preserve sign, while BT.709 extends its linear toe below zero. The unchanged official
+`alpha_triangles` reference checks color values from approximately -0.503 to 1.501.
 
 Resampling, spots, alpha association and frame composition operate in decoded F32. Native
 presentation rounds that F32 value against the exact requested integer maximum using integer
@@ -658,11 +662,21 @@ Color metadata alone does not introduce F32 conversion for native or numeric Mod
 unfiltered samples retain exact source words, including integer precision above 24 bits.
 
 Embedded ICC inputs support unfiltered original Modular scalar color samples and independently
-selected Modular/VarDCT extra channels in the supported single-frame paths. Numeric outputs keep
+selected Modular/VarDCT extra channels in the supported single-frame paths. Non-XYB numeric
+composition also retains original samples through references, crop/blend and orientation, using
+an explicit non-color post-transform domain with one Gray or three RGB/CMY planes. Exact ICC bytes
+remain in the image inventory; their interpretation is not required for these numeric requests.
+YCbCr still executes its inverse matrix before retaining the original components. Numeric outputs keep
 `ColorSpecification::Undefined`; no ICC transform is needed to return their original sample domain.
 The [embedded ICC corpus](test-data/embedded_icc_generator/README.md) covers RGB/Gray and
 original/XYB input, both common and standalone engines, complete/fragmented transport, exact
 17/31-bit integers and widened IEEE-754 words.
+The [official still corpus](test-data/official_stills/README.md) additionally checks all six
+components of `spot`, including alpha and both inks, against its original profile's reference.
+That untouched profile has a noncanonical PCS illuminant: numeric output succeeds, while a color
+request retains the typed ICC error before GPU admission. This does not relax ICC validation or
+allow raw samples to enter a color transform. XYB color reconstruction still requires its actual
+validated original color domain.
 
 The common `WgpuDecodeEngine` additionally accepts original and XYB ICC color through
 both physical codecs. Private surfaces carry the exact owned profile and one Gray or three RGB

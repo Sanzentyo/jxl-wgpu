@@ -237,8 +237,10 @@ fn decode_adaptive_channel(start: u32, may_pause: bool, pause_cursor: u32) -> u3
             let maximum = i32(params.source_mask);
             let signed_transform_channel = params.source_channels >= 3u
                 && (current_channel == 1u || current_channel == 2u);
-            if (!signed_transform_channel && (sample < 0i || sample > maximum))
-                || (signed_transform_channel && (sample < -maximum || sample > maximum)) {
+            let extended_color = (params.output_kind == 5u || params.output_kind == 6u)
+                && params.bits == 32u;
+            if !extended_color && ((!signed_transform_channel && (sample < 0i || sample > maximum))
+                || (signed_transform_channel && (sample < -maximum || sample > maximum))) {
                 decode_error = ERROR_RAW_TOKEN;
                 break;
             }

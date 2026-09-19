@@ -619,6 +619,10 @@ fn composed_source(
                 .zip(&inventory.frames)
                 .map(|(node, frame)| {
                     if compositor.original.icc_profile().is_some()
+                        || matches!(
+                            compositor.original,
+                            FrameSurfaceEncoding::OriginalSamples { .. }
+                        )
                         || frame.flags & 0x12 != 0
                         || (node.save_reference.is_some() && frame.save_before_color_transform)
                     {

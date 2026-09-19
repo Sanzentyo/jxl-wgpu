@@ -738,9 +738,15 @@ observable in-flight total before the shader is advertised as supported.
 
 `jxl_wgpu_decode::codec_engine::composition` retains an explicitly tagged sample domain followed
 by every extra plane in one F32 allocation. Domains are enumerated RGB, original ICC RGB/Gray,
-linear RGB, and codec components
+linear RGB, original numeric samples, and codec components
 before inverse color conversion. The last domain is carried by the private producer request and
 import contract; it cannot be inferred from a pixel format and cannot be passed to final packing.
+Original numeric samples have a separate post-transform tag: non-XYB ICC scalar requests use one
+Gray or three original planes without granting opaque profile bytes color authority. This tag
+cannot be inferred from its non-color layout or substituted for a codec-component reference.
+YCbCr uses the same 304-byte output record to pack one or three components; direct reconstruction
+uses checked word-preserving copies. Both retain inputs, extras and output leases through
+completion/cancellation and reserve the complete output plus completion fence before submission.
 Blending and post-transform references require the original domain; unreferenced enumerated XYB presentations can keep
 linear RGB until final packing.
 A plane has `width * height` samples and its starting byte
@@ -1442,7 +1448,7 @@ LF component previews use the same checked copy after recursive upsampling. Thei
 reserves no color-packing uniforms; color previews retain the 464-byte conversion plan. Both
 paths retain all recursive stage buffers through completion and copy extras independently.
 
-The common compositor parses the original profile once per selected image. When requested output
+For color interpretation, the common compositor parses the original profile once per selected image. When requested output
 needs a profile transform, it selects one host program and uploads it on its first admitted use.
 The program buffer has its own exact `MemoryPermit`, shared by an image-owned cache and each
 submitted dispatch. Failed initial admission leaves the cache empty; later frames reuse the same
@@ -1454,6 +1460,13 @@ dropped. Dynamic ICC completion maps and checks metadata status before publishin
 failures retain their typed precision error. Successful and failed wait/poll consume output
 ownership, while cancellation leaves submitted resources retained until the callback releases
 them. The Wasm path uses its local map callback and keeps the existing fence accounted.
+
+The direct integer Modular F32 RGB/RGBA finalizer reads signed reconstructed color before
+normalization and target transfer. The legacy Gradient and generic predictor paths no longer
+apply the nominal unsigned source bound to these F32 color requests; integer output retains its
+range checks, and entropy token/cursor/termination checks are unchanged. No record, binding or
+scratch allocation changes. Negative BT.709 uses its linear toe; other supported direct SDR
+transfers preserve the sign of the magnitude conversion.
 
 Same-profile device output without requested tone mapping allocates no ICC program or conversion intermediate. The 304-byte
 output ABI is unchanged: stored-channel order 4 identifies Gray/Gray-alpha; absent planar channels

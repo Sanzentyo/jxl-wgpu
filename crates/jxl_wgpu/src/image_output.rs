@@ -131,21 +131,26 @@ pub struct ImageOutputParams {
     pub(crate) gamut_mapping: crate::GamutMappingParams,
 }
 impl ImageOutputParams {
-    /// Pack three F32 codec components without assigning RGB or ICC meaning to their storage.
+    /// Pack one or three F32 components without assigning RGB or ICC meaning to their storage.
     pub fn for_components(
         layout: &ImageLayout,
         source: ImageOutputGeometry,
         dispatch_width: u32,
     ) -> Result<Self> {
         use jxl_gpu_formats::{Channel, PixelFormat, PlaneFormat, PlaneSampling, SampleKind};
-        let mut expected =
-            PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X, Channel::Y, Channel::Z]);
-        expected.planes = [Channel::X, Channel::Y, Channel::Z]
-            .map(|channel| PlaneFormat::separate_words(PlaneSampling::FULL, 1, &[channel], 32))
-            .into();
+        let channels: &[Channel] = if layout.planes.len() == 1 {
+            &[Channel::X]
+        } else {
+            &[Channel::X, Channel::Y, Channel::Z]
+        };
+        let mut expected = PixelFormat::non_color(SampleKind::Float, 32, channels);
+        expected.planes = channels
+            .iter()
+            .map(|&channel| PlaneFormat::separate_words(PlaneSampling::FULL, 1, &[channel], 32))
+            .collect();
         if layout.format != expected {
             return Err(Error::InvalidPayload(
-                "component packing requires three planar native F32 channels".into(),
+                "component packing requires one or three planar native F32 channels".into(),
             ));
         }
         let validated =
@@ -167,7 +172,7 @@ impl ImageOutputParams {
             dispatch_width,
             PreparedImageOutput {
                 kind: 1,
-                channels: 3,
+                channels: channels.len() as u32,
                 order: 0,
                 matrix: 1,
                 range: 0,

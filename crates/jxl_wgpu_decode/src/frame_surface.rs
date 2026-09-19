@@ -40,6 +40,11 @@ pub(crate) enum FrameSurfaceEncoding {
         profile: IccProfile,
         black_extra: usize,
     },
+    /// Post-transform original samples for numeric output. The image retains its opaque ICC
+    /// metadata; this surface makes no validated color claim and cannot enter a CMS transform.
+    OriginalSamples {
+        grayscale: bool,
+    },
     /// Codec components before the inverse color transform. The private producer contract
     /// carries this tag explicitly; a pixel format alone can never identify this domain.
     Encoded,
@@ -64,14 +69,20 @@ impl FrameSurfaceEncoding {
                 PixelFormat::rgb_f32(RgbChannelOrder::Rgb, true, color)
             };
         }
-        if matches!(self, Self::Encoded | Self::Cmyk { .. }) {
-            let mut format = PixelFormat::non_color(
-                SampleKind::Float,
-                32,
-                &[Channel::X, Channel::Y, Channel::Z],
-            );
-            format.planes = [Channel::X, Channel::Y, Channel::Z]
-                .into_iter()
+        if matches!(
+            self,
+            Self::Encoded | Self::Cmyk { .. } | Self::OriginalSamples { .. }
+        ) {
+            let channels: &[Channel] = if matches!(self, Self::OriginalSamples { grayscale: true })
+            {
+                &[Channel::X]
+            } else {
+                &[Channel::X, Channel::Y, Channel::Z]
+            };
+            let mut format = PixelFormat::non_color(SampleKind::Float, 32, channels);
+            format.planes = channels
+                .iter()
+                .copied()
                 .map(|channel| {
                     jxl_gpu_formats::PlaneFormat::separate_words(
                         jxl_gpu_formats::PlaneSampling::FULL,
@@ -140,7 +151,11 @@ impl FrameSurfaceEncoding {
     pub(crate) const fn rgb_encoding(&self) -> Option<RgbColorEncoding> {
         match self {
             Self::Rgb(encoding) => Some(*encoding),
-            Self::Icc(_) | Self::Device(_) | Self::Cmyk { .. } | Self::Encoded => None,
+            Self::Icc(_)
+            | Self::Device(_)
+            | Self::Cmyk { .. }
+            | Self::OriginalSamples { .. }
+            | Self::Encoded => None,
         }
     }
 
@@ -149,7 +164,7 @@ impl FrameSurfaceEncoding {
             Self::Icc(profile) | Self::Device(profile) | Self::Cmyk { profile, .. } => {
                 Some(profile)
             }
-            Self::Rgb(_) | Self::Encoded => None,
+            Self::Rgb(_) | Self::OriginalSamples { .. } | Self::Encoded => None,
         }
     }
 

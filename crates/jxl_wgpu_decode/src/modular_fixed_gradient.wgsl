@@ -42,6 +42,10 @@ fn decode_adaptive_channel(start: u32, may_pause: bool, pause_cursor: u32) -> u3
     let maximum = i32(params.source_mask);
     let signed_transform_channel = params.source_channels >= 3u
         && (current_channel == 1u || current_channel == 2u);
+    // Declared integer depth is the normalization scale, not a bound on signed working values.
+    // F32 color output retains extended samples; direct integer mappings keep their range checks.
+    let extended_color = (params.output_kind == 5u || params.output_kind == 6u)
+        && params.bits == 32u;
     var decoded = start;
     let initial_decoded = decoded;
     while decoded < params.sample_count && decode_error == 0u
@@ -85,8 +89,8 @@ fn decode_adaptive_channel(start: u32, may_pause: bool, pause_cursor: u32) -> u3
         let residual = unpack_signed(packed);
         let prediction = fixed_gradient_i32(north, west, north_west);
         let sample = bitcast<i32>(bitcast<u32>(residual) + bitcast<u32>(prediction));
-        if (!signed_transform_channel && (sample < 0i || sample > maximum))
-            || (signed_transform_channel && (sample < -maximum || sample > maximum)) {
+        if !extended_color && ((!signed_transform_channel && (sample < 0i || sample > maximum))
+            || (signed_transform_channel && (sample < -maximum || sample > maximum))) {
             decode_error = ERROR_RAW_TOKEN;
             break;
         }

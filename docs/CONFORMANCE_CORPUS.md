@@ -4555,3 +4555,31 @@ The complete-workspace gate also checks the existing Gray8-to-NV12 display path 
 color layouts. The common frontend preserves direct single-submission packing for these SDR
 Gray8 cases; broader Modular output requests still select the shared presentation surface.
 The VPI regression verifies both the original exact bytes and the submission count.
+
+## Official stills and signed original samples (2026-09-20)
+
+The [six-still corpus](../crates/jxl_wgpu_decode/test-data/official_stills/README.md) imports
+unchanged inputs, ICC profiles and descriptors from libjxl/conformance commit
+`b1d0f990b03e57bf6d137c365cd5dc8b470b9191`. Input/descriptor hashes are pinned in the test;
+profile and decompressed NPY hashes are checked against those descriptors. Original limits,
+source-depth/type/tone metadata, shape, output name and extent are independently checked.
+Whole and 16 KiB entropy-window inputs (43-byte transport fragments) must match exactly.
+
+`lossless_pfm` checks every IEEE word under its zero-error requirement. `alpha_nonpremultiplied`,
+`alpha_triangles`, `spot` and `sunset_logo` also produce zero error on Apple M5; associated
+`alpha_premultiplied` has maximum RGB error below 2.504e-6, within its original 3.815e-6 limit,
+and exact alpha. These are six still references, not complete suite coverage.
+
+`alpha_triangles` contains signed integer color outside the nominal range (about -0.503 to
+1.501). The direct F32 path now preserves those values through reconstruction and normalization.
+Independent f64 sRGB-to-Linear/BT.709/BT.2020 equations additionally check requested conversion,
+including BT.709's negative linear toe; official source bounds are not replaced by these checks.
+
+`spot` retains RGB, alpha and two independent spot planes. Its original ProPhoto ICC has a
+noncanonical PCS D50 header illuminant. Numeric composition now uses an explicit post-transform
+sample domain and preserves exact profile bytes in the inventory, without CMS interpretation.
+Color requests still return the precise ICC error even under an exhausted GPU budget. Both
+Gray and RGB raw reconstruction tests check one-byte-short admission, retry, cancellation,
+retained IEEE words, domain confusion and inverse YCbCr before scalar packing. All official
+outputs survive session destruction before readback and release their reservations afterward.
+No existing fixture, oracle, error bound or reference pixel is replaced.

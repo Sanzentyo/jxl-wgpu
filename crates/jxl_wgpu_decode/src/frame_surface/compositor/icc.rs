@@ -275,6 +275,7 @@ impl Presentation {
                         .with_gamut_mapping(request.gamut_mapping())?
                     }
                     FrameSurfaceEncoding::Encoded
+                    | FrameSurfaceEncoding::OriginalSamples { .. }
                     | FrameSurfaceEncoding::Device(_)
                     | FrameSurfaceEncoding::Cmyk { .. } => {
                         unreachable!("resolved presentation color")

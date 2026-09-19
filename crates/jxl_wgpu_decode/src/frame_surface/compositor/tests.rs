@@ -54,7 +54,9 @@ fn native_scalar_packing_preserves_gray_rgb_and_extra_ieee_words() {
         })
         .collect();
         image.extra_channel_count = 2;
-        let encoding = crate::image_color::original_domain(&image).unwrap();
+        let encoding = FrameSurfaceEncoding::OriginalSamples {
+            grayscale: image.grayscale,
+        };
         let layout = FrameSurfaceLayout::with_encoding(
             extent,
             2,
