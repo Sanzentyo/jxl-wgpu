@@ -1,6 +1,6 @@
 use super::*;
 use crate::GpuOutputRequest;
-use crate::codec_engine::composition::gpu::ColorUsage;
+use crate::frame_surface::compositor::ColorUsage;
 
 fn source(backend: &WgpuBackend, image: &ImageHeaderInventory) -> Surface {
     let layout = FrameSurfaceLayout::with_encoding(

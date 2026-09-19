@@ -142,7 +142,7 @@ fn admission(tone_mapping: bool, gamut_mapping: bool) {
             FrameSurfaceEncoding::Rgb(encoding) if encoding.transfer != jxl_gpu_protocol::TransferFunction::Linear));
         dynamic += usize::from(transform.memory.validation_bytes == 4);
         spot_programs += usize::from(presentation.spots.is_some());
-        assert!(super::super::super::lock(&transform.uploaded).is_none());
+        assert!(transform.uploaded.lock().unwrap().is_none());
         assert_eq!(memory.snapshot().reserved_bytes, 0);
         let size = compositor.surface.storage_bytes;
         let buffer = GpuBufferLease::from_tracked(
@@ -179,7 +179,7 @@ fn admission(tone_mapping: bool, gamut_mapping: bool) {
                     matches!(compositor.pack(&source), Err(Error::MemoryBackpressure(jxl_wgpu::MemoryBudgetError::Exhausted { requested_bytes, .. })) if requested_bytes == requested)
                 );
                 assert_eq!(memory.snapshot().reserved_bytes, before);
-                assert!(super::super::super::lock(&transform.uploaded).is_none());
+                assert!(transform.uploaded.lock().unwrap().is_none());
             }
             drop(held);
         }

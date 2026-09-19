@@ -153,7 +153,7 @@ fn spot_metadata_admission_is_exact_retryable_and_completion_owned() {
     let Ok(backend) = pollster::block_on(WgpuBackend::request_default(Default::default())) else {
         return;
     };
-    let hex = include_str!("../../../../test-data/extras_spots_thin.jxl.hex");
+    let hex = include_str!("../../../test-data/extras_spots_thin.jxl.hex");
     let compact = hex.split_whitespace().collect::<String>();
     let data = compact
         .as_bytes()

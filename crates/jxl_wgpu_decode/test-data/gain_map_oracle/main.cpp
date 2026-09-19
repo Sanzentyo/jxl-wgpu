@@ -5,6 +5,7 @@
 #include <jxl/gain_map.h>
 #include "ultrahdr/gainmapmath.h"
 #include "iso_reference.h"
+#include "icc.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -227,6 +228,8 @@ void Generate(const fs::path& directory) {
   std::cerr << "generated " << index << " independent gain-map cases\n";
 }
 int main(int argc, char** argv) {
+  if (argc == 7 && std::string(argv[1]) == "icc")
+    return IccOracle(argv[2], argv[3], std::stoul(argv[4]), argv[5], argv[6]);
   if (argc == 3 && std::string(argv[1]) == "generate") { Generate(argv[2]); return 0; }
   if (argc == 11 && std::string(argv[1]) == "apply") {
     auto metadata = DecodeIso(Read(argv[2]));
@@ -248,7 +251,7 @@ int main(int argc, char** argv) {
     }
     Floats(argv[10], pixels); return 0;
   }
-  Check(argc == 4, "usage: oracle generate directory | iso/bundle input output | apply iso base.f32 map.f32 base_width base_height map_width map_height headroom output.f32");
+  Check(argc == 4, "usage: oracle generate directory | iso/bundle input output | apply iso base.f32 map.f32 base_width base_height map_width map_height headroom output.f32 | icc profile_root target intent input.pcs output.reference");
   const auto bytes = Read(argv[2]); Bytes output;
   if (std::string(argv[1]) == "iso") {
     auto metadata = DecodeIso(bytes);

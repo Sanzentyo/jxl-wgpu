@@ -9,7 +9,8 @@ conformance remain open in [the roadmap](FULL_JPEG_XL_ROADMAP.md).
 
 ## Request and color contract
 
-The caller supplies an ordinary `GpuOutputRequest::color` with explicit enumerated output color.
+The caller supplies an ordinary `GpuOutputRequest::color` with explicit enumerated output color
+or a supported ICC target profile.
 Call `decoder.decode_gain_map(encoded, request, rendering, GainMapDecodeLimits::default()).await`
 to receive a validated `GpuFrameLease<GpuImageFrame>`. `GainMapRendering` contains:
 
@@ -70,9 +71,19 @@ output's linear unit or HLG OOTF intensity. The 203-nit default agrees with
 it is an explicit rendering policy, not inferred from authored headroom metadata or
 claimed to be the only white allowed by ISO.
 
+ICC output first retains the gain result as un-oriented, unassociated planar F32 RGBA in the
+enumerated linear application space. The shared GPU ICC presentation converts it to the target
+profile, then packs orientation, alpha and the requested layout. Supported RGB/Gray and complete
+ICC device outputs use the same profile-method and component-layout contracts as ordinary decode.
+`icc_rendering_intent` selects the profile connection; Bradford adaptation is required. PCS Y=1
+retains the baseline image's unit white, independently of the gain reference white. `Preserve`
+alpha resolves against the primary image's declaration before the straight intermediate is packed.
+ICC uses its profile intent for gamut behavior; the enumerated RGB gamut option is unavailable.
+An exact baseline selection still returns ordinary output directly, including ICC output.
+
 Typed unsupported profiles include animation, preview selection,
 progressive output, nonidentity auxiliary orientation, auxiliary alpha/extra channels, CMYK gain
-samples, ICC application spaces and ICC output. A baseline ICC can use the ordinary GPU CMS when
+samples and ICC application spaces. A baseline ICC can use the ordinary GPU CMS when
 the map explicitly selects an enumerated alternate application space, but expanded ICC pixel
 coverage remains open. Tone mapping is rejected until an alternate-image luminance model is
 provided. Portable F32 application limits weighted log gains to `[-120,120]` and requires normal
@@ -110,6 +121,9 @@ These are logical payload bounds, separate from allocator overhead and decoder/G
 When a gain is selected, the auxiliary decode completes before the baseline decode. Their GPU buffers stay leased through
 gain application. The common completion owner retains both inputs, final output and uniforms
 even if the consumer is cancelled; it releases temporary resources before successful completion.
+For ICC output, a second completion owner retains the gain intermediate, ICC program, conversion
+scratch, final output and packing parameters through validation or cancellation. The gain inputs
+retire before this stage; the gain intermediate retires when ICC completion releases it.
 The returned image keeps the primary frame's metadata and frame-slot permit, while its output
 buffer owns a separate byte reservation. See [GPU memory accounting](WGSL_MEMORY.md).
 
@@ -149,6 +163,17 @@ decodes (4,528 values) verify those codec bounds. This accounts for near-zero ga
 without increasing the fixed bounds used by the earlier image and native-formula tests.
 Equal headrooms, unused truncated auxiliary images, tiny nonzero weights, rejected white scales
 and exact rational endpoints have focused tests.
+
+ICC output adds 160 declared source/rendition pairings: the 64 gain-map streams and both headroom
+directions for all 48 HDR stills. Thirteen target profiles cover matrix/TRC, legacy XYZ/Lab LUTs,
+v2 black-point preparation, identity MPE and 1/2/3/4/5/15 device components. Four intents and
+planar/interleaved U8/F32 output produce 2,560 images and 4,688,736 component comparisons, including
+alpha, orientation and reordered device components. These pairings are not a Cartesian product
+of every source and profile. Independent F64 gain/Bradford equations feed the shared C++ ICC
+interval evaluator and Little CMS 2.19. Existing codec, gain, PCS and profile arithmetic bounds
+are propagated without widening them. Six exact-baseline ICC comparisons skip a truncated unused
+map; separate checks cover primary alpha preservation, pre-image rejection of unsupported
+adaptation, late ICC byte admission, cancellation and immutable retained output.
 
 Native gain application is separately checked at `3e-6 * (1 + abs(reference))`. Its intermediate
 working pixels are saved because libultrahdr's primary matrix uses six-decimal coefficients;

@@ -2012,6 +2012,12 @@ fn indexed_gray8_conforms_to_all_vpi_color_formats_on_gpu() {
             .next_frame()
             .unwrap_or_else(|error| panic!("{} GPU decode failed: {error}", predefined.name()))
             .unwrap_or_else(|| panic!("{} returned no frame", predefined.name()));
+        assert_eq!(
+            session.submission_session().submissions_per_frame(),
+            1,
+            "{} must retain direct Gray8 packing",
+            predefined.name()
+        );
         let output = &frame.output().outputs[0];
         assert_eq!(
             output.layout,

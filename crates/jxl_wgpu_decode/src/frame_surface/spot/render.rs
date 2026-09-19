@@ -6,27 +6,27 @@ use jxl_gpu_bitstream::ExtraChannelInventory;
 use jxl_wgpu::{ResidentStorageBinding, WgpuBackend};
 use wgpu::util::DeviceExt;
 
-use super::super::gpu::{Surface, dispatch, pipeline};
+use super::super::compositor::{Surface, dispatch, pipeline};
 use super::{SpotColor, spot_colors};
 use crate::Result;
 use crate::frame_surface::FrameSurfaceLayout;
 use crate::gpu_submission::validate_size;
 
 #[derive(Debug)]
-pub(in crate::codec_engine::composition) struct Rendering {
+pub(in crate::frame_surface) struct Rendering {
     layout: FrameSurfaceLayout,
     colors: Vec<SpotColor>,
     pipeline: wgpu::ComputePipeline,
     dispatch: [u32; 2],
 }
 
-pub(in crate::codec_engine::composition) struct Rendered {
+pub(in crate::frame_surface) struct Rendered {
     pub buffer: wgpu::Buffer,
     _metadata: wgpu::Buffer,
 }
 
 impl Rendering {
-    pub(in crate::codec_engine::composition) fn new(
+    pub(in crate::frame_surface) fn new(
         backend: &WgpuBackend,
         layout: &FrameSurfaceLayout,
         extras: &[ExtraChannelInventory],
@@ -62,11 +62,11 @@ impl Rendering {
         })
     }
 
-    pub(in crate::codec_engine::composition) fn memory_bytes(&self) -> u64 {
+    pub(in crate::frame_surface) fn memory_bytes(&self) -> u64 {
         self.layout.storage_bytes + std::mem::size_of_val(self.colors.as_slice()) as u64
     }
 
-    pub(in crate::codec_engine::composition) fn encode(
+    pub(in crate::frame_surface) fn encode(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,

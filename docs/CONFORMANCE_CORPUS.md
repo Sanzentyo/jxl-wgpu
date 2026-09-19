@@ -4524,3 +4524,34 @@ pixels. The F64/native gain-formula bound remains `3e-6 * (1 + abs(reference))`.
 gain-primitive evidence, not an end-to-end native HDR `jhgm` renderer. The existing 321 generated
 files, all earlier gain-map/HDR image bytes and native pixel references remain unchanged. Broader
 ICC/animation/streaming, numeric/profile/official conformance and full JPEG XL remain open.
+
+## Gain-map ICC output (2026-09-19)
+
+The existing 64 gain-map streams and two headroom directions for each of the 48 HDR stills form
+160 source/rendition pairings. Thirteen target profiles exercise matrix/TRC, legacy XYZ/Lab LUTs,
+v2 black-point preparation, identity MPE and 1/2/3/4/5/15 device components. Four intents and four
+U8/F32 planar/interleaved configurations yield 2,560 GPU outputs / 4,688,736 component comparisons.
+Configurations alternate alpha association and Apply/Keep orientation, and reverse physical
+component order in generic device layouts. Coverage is the declared pairing, not the full
+source/profile Cartesian product.
+
+Native decoded baseline/auxiliary pixels feed independent F64 gain and Bradford equations.
+The [native helper](../crates/jxl_wgpu_decode/test-data/gain_map_oracle/README.md) evaluates each
+PCS interval through the shared C++ profile equations and separately checks Little CMS 2.19
+at the center, with 640 live profile invocations. Existing codec, gain, PCS and profile bounds
+remain fixed; source uncertainty is propagated through each stage. Native ink-device percentages
+are normalized to unit components at the oracle boundary. The shared evaluator still reproduces
+all 225 HDR-to-ICC and 913 RGB-to-ICC reference files exactly.
+
+Six baseline-endpoint comparisons preserve ordinary ICC output bits while the unused map is
+truncated. Additional tests verify Preserve against both primary alpha declarations, unsupported
+adaptation rejection under a fully occupied GPU budget, late ICC admission failure, cancellation,
+and zero retained bytes after completion. Four held outputs remain byte-identical after later
+submissions. Existing gain-map/HDR streams, pixel references and ICC profiles are unchanged.
+ICC application spaces, broader ICC baseline/target combinations and official gain-map conformance
+remain open in `CONT-07`.
+
+The complete-workspace gate also checks the existing Gray8-to-NV12 display path and all 20 VPI
+color layouts. The common frontend preserves direct single-submission packing for these SDR
+Gray8 cases; broader Modular output requests still select the shared presentation surface.
+The VPI regression verifies both the original exact bytes and the submission count.

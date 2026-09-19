@@ -18,25 +18,25 @@ use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
 use crate::gpu_submission::{GpuWork, Submission, submit, validate_size};
 use crate::{Error, GpuOutputRequest, Result};
 
-mod icc;
+pub(crate) mod icc;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
 
 /// Unrounded color in an explicit domain, followed by independently normalized extra planes.
 #[derive(Clone, Debug)]
-pub(super) struct Surface {
-    pub(super) buffer: GpuBufferLease,
-    pub(super) layout: Arc<FrameSurfaceLayout>,
-    pub(super) encoding: FrameSurfaceEncoding,
+pub(crate) struct Surface {
+    pub(crate) buffer: GpuBufferLease,
+    pub(crate) layout: Arc<FrameSurfaceLayout>,
+    pub(crate) encoding: FrameSurfaceEncoding,
 }
 
 impl Surface {
-    pub(super) fn extent(&self) -> Extent2d {
+    pub(crate) fn extent(&self) -> Extent2d {
         self.layout.color.extent
     }
 
     /// Uniform strides are only valid after channel-specific resampling has finished.
-    pub(super) fn uniform_plane_words(&self) -> Result<u32> {
+    pub(crate) fn uniform_plane_words(&self) -> Result<u32> {
         if !self.layout.has_uniform_extent() {
             return Err(Error::EngineContract(
                 "frame operation requires equal channel extents",
@@ -45,7 +45,7 @@ impl Surface {
         Ok((self.layout.color_plane_bytes / 4) as u32)
     }
 
-    pub(super) fn copy_extras(
+    pub(crate) fn copy_extras(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         output: jxl_wgpu::ResidentStorageBinding<'_>,
@@ -81,7 +81,7 @@ impl Surface {
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
-struct NativeParams {
+pub(crate) struct NativeParams {
     extent: [u32; 4],
     format: [u32; 4],
     output: [u32; 4],
@@ -117,19 +117,19 @@ enum Packing {
 
 /// Color domains actually consumed by this image's presentation and reference plan.
 #[derive(Clone, Copy)]
-pub(super) struct ColorUsage {
-    pub(super) original: bool,
-    pub(super) linear: bool,
-    pub(super) reconstruct_original: bool,
+pub(crate) struct ColorUsage {
+    pub(crate) original: bool,
+    pub(crate) linear: bool,
+    pub(crate) reconstruct_original: bool,
 }
 
 impl ColorUsage {
-    pub(super) const ORIGINAL: Self = Self {
+    pub(crate) const ORIGINAL: Self = Self {
         original: true,
         linear: false,
         reconstruct_original: true,
     };
-    pub(super) const LINEAR: Self = Self {
+    pub(crate) const LINEAR: Self = Self {
         original: false,
         linear: true,
         reconstruct_original: false,
@@ -137,22 +137,22 @@ impl ColorUsage {
 }
 
 #[derive(Debug)]
-pub(super) struct Compositor {
+pub(crate) struct Compositor {
     backend: WgpuBackend,
     canvas: Extent2d,
-    pub(super) original: FrameSurfaceEncoding,
-    pub(super) reconstruction: Option<Arc<super::icc_transform::Transform>>,
+    pub(crate) original: FrameSurfaceEncoding,
+    pub(crate) reconstruction: Option<Arc<super::icc_transform::Transform>>,
     extras: Vec<ExtraChannelInventory>,
     surface: FrameSurfaceLayout,
     blend: wgpu::ComputePipeline,
     packing: Packing,
-    pub(super) layout: ImageLayout,
+    pub(crate) layout: ImageLayout,
     blend_dispatch: [u32; 2],
     output_dispatch: [u32; 2],
 }
 
 impl Compositor {
-    pub(super) fn new(
+    pub(crate) fn new(
         backend: WgpuBackend,
         canvas: Extent2d,
         image: &jxl_gpu_bitstream::ImageHeaderInventory,
@@ -611,11 +611,11 @@ impl Compositor {
     }
 
     #[cfg(test)]
-    pub(super) fn import(&self, outputs: Vec<GpuImageOutput>) -> Result<Surface> {
+    pub(crate) fn import(&self, outputs: Vec<GpuImageOutput>) -> Result<Surface> {
         self.import_with_encoding(outputs, None)
     }
 
-    pub(super) fn import_with_encoding(
+    pub(crate) fn import_with_encoding(
         &self,
         mut outputs: Vec<GpuImageOutput>,
         domain: Option<FrameSurfaceEncoding>,
@@ -657,7 +657,7 @@ impl Compositor {
         })
     }
 
-    pub(super) fn linear_encoding(&self) -> FrameSurfaceEncoding {
+    pub(crate) fn linear_encoding(&self) -> FrameSurfaceEncoding {
         match &self.original {
             FrameSurfaceEncoding::Rgb(original) => {
                 FrameSurfaceEncoding::Rgb(crate::image_color::linear_encoding(*original))
@@ -671,7 +671,7 @@ impl Compositor {
         }
     }
 
-    pub(super) fn completed_surface(&self, buffer: GpuBufferLease) -> Surface {
+    pub(crate) fn completed_surface(&self, buffer: GpuBufferLease) -> Surface {
         Surface {
             buffer,
             layout: Arc::new(self.surface.clone()),
@@ -679,7 +679,7 @@ impl Compositor {
         }
     }
 
-    pub(super) fn blend(
+    pub(crate) fn blend(
         &self,
         foreground: &Surface,
         references: &[Option<Surface>; 4],
@@ -765,7 +765,7 @@ impl Compositor {
         )
     }
 
-    pub(super) fn pack(&self, source: &Surface) -> Result<GpuWork> {
+    pub(crate) fn pack(&self, source: &Surface) -> Result<GpuWork> {
         if source.encoding != self.original && source.encoding != self.linear_encoding() {
             return Err(Error::EngineContract(
                 "presentation source is outside its original color domain",
@@ -854,7 +854,7 @@ fn native_shader(spot_source: &str) -> String {
     )
 }
 
-pub(super) fn pipeline(
+pub(crate) fn pipeline(
     device: &wgpu::Device,
     label: &str,
     source: &str,
@@ -891,7 +891,7 @@ fn aligned(size: u64) -> Result<u64> {
         .ok_or_else(address_error)
 }
 
-pub(super) fn dispatch(device: &wgpu::Device, elements: u64) -> Result<[u32; 2]> {
+pub(crate) fn dispatch(device: &wgpu::Device, elements: u64) -> Result<[u32; 2]> {
     let limit = u64::from(device.limits().max_compute_workgroups_per_dimension);
     if elements == 0 || limit == 0 {
         return Err(Error::EngineContract(

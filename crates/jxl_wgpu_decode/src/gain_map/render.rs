@@ -53,6 +53,10 @@ pub(super) struct Plan {
 }
 
 impl Plan {
+    pub(super) fn layout(&self) -> &ImageLayout {
+        &self.output
+    }
+
     pub(super) fn new(
         backend: &WgpuBackend,
         request: &GpuOutputRequest,

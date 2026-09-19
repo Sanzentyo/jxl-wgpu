@@ -15,10 +15,12 @@ metadata addition, replacement and removal.
 `GpuDecoder::decode_alternate` reconstructs an alternate still from `jhgm` using two ordinary GPU
 decodes and fused gain/color/output processing. `decode_gain_map` also selects display headroom
 and reference white. Both headroom directions and HDR baselines are supported, with one still
-presentation per image and enumerated application/output color. Raw auxiliary values, bilinear
+presentation per image, enumerated application primaries, and enumerated or ICC output. Raw auxiliary values, bilinear
 resampling, primary orientation, image intensity and alpha retain explicit contracts. Baseline
 endpoints preserve ordinary output bits and skip the unused auxiliary decode.
-[Supported forms, limits and native references](../../docs/GAIN_MAP.md). ICC application/output,
+[Supported forms, limits and native references](../../docs/GAIN_MAP.md). ICC output reuses the shared
+GPU profile connection and supports RGB/Gray and complete device components, requested intent,
+orientation and alpha association. ICC application spaces,
 animation, streaming gain output and full gain-map conformance remain open. Existing `open`/`stream`
 continue to select the baseline image.
 
@@ -1545,7 +1547,9 @@ Every color request requires a defined transfer and range. Linear, sRGB/sYCC, an
 transfer conversion runs in WGSL. Gray is replicated into RGB/BGR, alpha is opaque, and YCbCr
 chroma is the exact neutral code. Full/limited luma quantization, native 16-bit luma words,
 four-byte YUYV/UYVY pairs, odd-width tail duplication, and all plane writes happen directly in the
-GPU output buffer. PQ and other unimplemented transfers return `UnsupportedOutputFormat`.
+GPU output buffer. The common frontend keeps this direct path for SDR Gray8 requests, including
+NV12 display, while HDR, wider primaries and other layouts use the shared presentation surface.
+Unsupported conversions still return typed errors.
 
 Generic outputs use `classify_pixel_format`; the exact native Modular descriptor is recognized
 separately because sub-8/sub-16 valid-bit padding is part of its contract. `NormalizedGray8` maps

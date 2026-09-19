@@ -37,10 +37,15 @@ foreach(codec AOM DAV1D LIBGAV1 RAV1E SVT AVM)
 endforeach()
 add_subdirectory("${AVIF_SOURCE}" libavif EXCLUDE_FROM_ALL)
 
-add_executable(gain_map_oracle main.cpp iso_read.c iso_write.c iso_weight.c "${JXL_SOURCE}/lib/extras/gain_map.cc")
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GAIN_MAP_LCMS2 REQUIRED IMPORTED_TARGET lcms2)
+add_executable(gain_map_oracle main.cpp icc.cpp iso_read.c iso_write.c iso_weight.c "${JXL_SOURCE}/lib/extras/gain_map.cc")
 target_compile_features(gain_map_oracle PRIVATE cxx_std_17)
 # Apply our warning policy to our oracle; the pinned reference source keeps its own policy.
 set_source_files_properties(main.cpp PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
+set_source_files_properties(icc.cpp PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror;-ffp-contract=off")
 target_include_directories(gain_map_oracle SYSTEM PRIVATE
-  "${JXL_SOURCE}" "${UHDR_SOURCE}/lib/include" "${AVIF_SOURCE}")
-target_link_libraries(gain_map_oracle PRIVATE jxl-internal core JPEG::JPEG avif)
+  "${JXL_SOURCE}" "${UHDR_SOURCE}/lib/include" "${AVIF_SOURCE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../../tools/jxl_test_support/native"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../jxl_wgpu/test-data/icc_generator")
+target_link_libraries(gain_map_oracle PRIVATE jxl-internal core JPEG::JPEG avif PkgConfig::GAIN_MAP_LCMS2)

@@ -32,7 +32,7 @@ pub(super) struct LfPreview {
     pub(super) layout: ImageLayout,
     pub(super) surface: Option<crate::frame_surface::FrameSurfaceLayout>,
     pub(super) surface_encoding: Option<crate::frame_surface::FrameSurfaceEncoding>,
-    pub(super) compositor: Option<Arc<super::gpu::Compositor>>,
+    pub(super) compositor: Option<Arc<crate::frame_surface::compositor::Compositor>>,
     extra_count: usize,
     output_storage_bytes: u64,
     kernel: Arc<ResidentUpsampleKernel>,
@@ -74,7 +74,7 @@ impl LfPreview {
         backend: WgpuBackend,
         image: &ImageHeaderInventory,
         request: &GpuOutputRequest,
-        compositor: Option<Arc<super::gpu::Compositor>>,
+        compositor: Option<Arc<crate::frame_surface::compositor::Compositor>>,
     ) -> Result<Self> {
         let compositor = if let Some(compositor) = compositor {
             Some(compositor)
@@ -82,12 +82,12 @@ impl LfPreview {
             || !image.extra_channels.is_empty()
             || request.mapping() != crate::GpuOutputMapping::Color
         {
-            Some(Arc::new(super::gpu::Compositor::new(
+            Some(Arc::new(crate::frame_surface::compositor::Compositor::new(
                 backend.clone(),
                 Extent2d::new(image.width, image.height),
                 image,
                 request,
-                super::gpu::ColorUsage::LINEAR,
+                crate::frame_surface::compositor::ColorUsage::LINEAR,
             )?))
         } else {
             None

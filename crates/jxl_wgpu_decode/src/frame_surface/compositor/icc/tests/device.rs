@@ -1,5 +1,5 @@
 use super::*;
-use crate::codec_engine::composition::{gpu::Packing, lock};
+use crate::frame_surface::compositor::Packing;
 use jxl_gpu_formats::{ColorSample, ColorStorage, PixelFormat};
 
 #[test]
@@ -155,7 +155,7 @@ fn exercise(backend: &WgpuBackend, compositor: Compositor) {
             );
             assert_eq!(memory.snapshot().reserved_bytes, before);
             if let Some(t) = &presentation.transform {
-                assert!(lock(&t.uploaded).is_none());
+                assert!(t.uploaded.lock().unwrap().is_none());
             }
         }
         drop(held);

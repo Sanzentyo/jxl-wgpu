@@ -55,6 +55,56 @@ impl Oracle {
         std::fs::read(self.directory.join("output")).unwrap()
     }
 
+    pub(super) fn icc(&self, target: &str, intent: u32, pcs: &[[[f64; 2]; 3]]) -> Vec<[f32; 6]> {
+        let input = self.directory.join("pcs");
+        let output = self.directory.join("icc-output");
+        std::fs::write(
+            &input,
+            pcs.iter()
+                .flatten()
+                .flatten()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../jxl_wgpu/test-data/icc");
+        let status = Command::new(&self.executable)
+            .arg("icc")
+            .arg(root)
+            .arg(target)
+            .arg(intent.to_string())
+            .arg(input)
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            status.status.success(),
+            "native ICC {target}: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let bytes = std::fs::read(output).unwrap();
+        let (records, tail) = bytes.as_chunks::<28>();
+        assert!(tail.is_empty());
+        records
+            .iter()
+            .map(|record| {
+                let values: [f32; 6] = std::array::from_fn(|c| {
+                    f32::from_le_bytes(record[c * 4..c * 4 + 4].try_into().unwrap())
+                });
+                let [native, exact, low, high, native_low, native_high] = values;
+                assert!(values.iter().all(|v| v.is_finite()));
+                assert!(
+                    low <= exact && exact <= high && native_low <= native && native <= native_high
+                );
+                assert!(matches!(
+                    u32::from_le_bytes(record[24..].try_into().unwrap()),
+                    0 | 32 | 64 | 96
+                ));
+                values
+            })
+            .collect()
+    }
+
     pub(super) fn apply(
         &self,
         iso: &[u8],

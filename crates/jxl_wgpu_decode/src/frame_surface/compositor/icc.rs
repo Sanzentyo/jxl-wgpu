@@ -25,7 +25,7 @@ use crate::{Error, GpuOutputRequest, Result};
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
 
-pub(super) enum Output<'a> {
+pub(crate) enum Output<'a> {
     Color(&'a GpuOutputRequest),
     Numeric {
         request: &'a GpuOutputRequest,
@@ -34,16 +34,16 @@ pub(super) enum Output<'a> {
     },
 }
 
-pub(super) struct ImageMetadata<'a> {
-    pub(super) orientation: OutputOrientation,
-    pub(super) intensity: jxl_gpu_protocol::DisplayIntensity,
-    pub(super) tone_mapping: Option<jxl_gpu_protocol::ToneMapping>,
-    pub(super) extras: &'a [ExtraChannelInventory],
+pub(crate) struct ImageMetadata<'a> {
+    pub(crate) orientation: OutputOrientation,
+    pub(crate) intensity: jxl_gpu_protocol::DisplayIntensity,
+    pub(crate) tone_mapping: Option<jxl_gpu_protocol::ToneMapping>,
+    pub(crate) extras: &'a [ExtraChannelInventory],
 }
 
 #[derive(Debug)]
-pub(super) struct Presentation {
-    pub(super) source_encoding: FrameSurfaceEncoding,
+pub(crate) struct Presentation {
+    pub(crate) source_encoding: FrameSurfaceEncoding,
     transform: Option<Arc<Transform>>,
     spots: Option<Rendering>,
     working: FrameSurfaceLayout,
@@ -56,7 +56,11 @@ pub(super) struct Presentation {
 }
 
 impl Presentation {
-    pub(super) fn new(
+    pub(crate) fn layout(&self) -> &ImageLayout {
+        &self.output
+    }
+
+    pub(crate) fn new(
         backend: &WgpuBackend,
         source: &FrameSurfaceLayout,
         source_encoding: FrameSurfaceEncoding,
@@ -339,7 +343,7 @@ impl Presentation {
         })
     }
 
-    pub(super) fn pack(&self, backend: &WgpuBackend, source: &Surface) -> Result<GpuWork> {
+    pub(crate) fn pack(&self, backend: &WgpuBackend, source: &Surface) -> Result<GpuWork> {
         if source.encoding != self.source_encoding {
             return Err(Error::EngineContract(
                 "color presentation received an unplanned source encoding",

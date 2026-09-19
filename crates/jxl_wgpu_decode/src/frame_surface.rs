@@ -9,7 +9,11 @@ use jxl_gpu_protocol::{
 };
 use jxl_wgpu::{GpuBufferLease, GpuImageOutput, UnvalidatedGpuImageOutput};
 
+mod blend;
+pub(crate) mod compositor;
 pub(crate) mod copy;
+pub(crate) mod icc_transform;
+mod spot;
 
 /// A component surface can leave the producer before or after frame features. This is
 /// independent of its sample domain: saved encoded references have completed all features.

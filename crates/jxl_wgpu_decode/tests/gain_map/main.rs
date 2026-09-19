@@ -16,9 +16,11 @@ use jxl_wgpu_decode::{
 };
 
 mod headroom;
+mod icc;
 mod interop;
 mod native;
 mod output;
+mod reference;
 
 fn directory() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-data/gain_map/generated")

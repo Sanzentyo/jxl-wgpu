@@ -3,8 +3,8 @@ use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::{GpuBufferLease, WgpuBackend};
 use wgpu::util::DeviceExt;
 
-use super::super::gpu::{Surface, dispatch, pipeline};
 use super::Dictionary;
+use crate::frame_surface::compositor::{Surface, dispatch, pipeline};
 use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
 use crate::gpu_submission::{GpuWork, completion_fence_bytes, submit_recorded, validate_size};
 use crate::progressive_dc::{

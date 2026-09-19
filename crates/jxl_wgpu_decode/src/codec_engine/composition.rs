@@ -24,11 +24,8 @@ use crate::{
     SubmittedGpuUpdate,
 };
 
-mod blend;
 mod entropy_program;
 mod features;
-mod gpu;
-mod icc_transform;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod lf_tests;
 mod patches;
@@ -38,12 +35,11 @@ mod refinement_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod spline_tests;
 mod splines;
-mod spot;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod test_support;
 mod transform;
+use crate::frame_surface::compositor::{ColorUsage, Compositor, Surface};
 use crate::gpu_submission::GpuWork;
-use gpu::{Compositor, Surface};
 use progression::LfPreview;
 
 /// Keep producer selection and sequence dispatch consistent about presentation-only conversion.
@@ -56,28 +52,63 @@ pub(super) fn needs_surface(
         ColorFormatClass, ColorRange, ColorSample, ColorSpace, ColorSpecification,
         PixelFormatClass, TransferFunction, classify_pixel_format,
     };
-    let direct_float = matches!(
-        classify_pixel_format(request.format()),
-        Ok(PixelFormatClass::Color(ColorFormatClass::Rgb {
-            sample: ColorSample::F32,
-            ..
-        }))
-    ) && matches!(request.format().color_spec, ColorSpecification::Defined(spec)
-            if spec.space == ColorSpace::Bt709 && spec.range == ColorRange::Full
-                && matches!(spec.transfer, TransferFunction::Srgb | TransferFunction::Sycc
-                    | TransferFunction::Linear | TransferFunction::Bt709 | TransferFunction::Bt2020));
+    let class = classify_pixel_format(request.format()).ok();
+    let direct_sdr = matches!(request.format().color_spec, ColorSpecification::Defined(spec)
+        if spec.space == ColorSpace::Bt709
+            && matches!(spec.transfer, TransferFunction::Srgb | TransferFunction::Sycc
+                | TransferFunction::Linear | TransferFunction::Bt709 | TransferFunction::Bt2020));
+    let direct_float = direct_sdr
+        && matches!(
+            class,
+            Some(PixelFormatClass::Color(ColorFormatClass::Rgb {
+                sample: ColorSample::F32,
+                ..
+            }))
+        )
+        && matches!(request.format().color_spec, ColorSpecification::Defined(spec)
+            if spec.range == ColorRange::Full);
     let image = &inventory.image_header;
+    // The single-channel Gray8 finalizer also packs SDR integer RGB/luma/YUV directly.
+    // Keep that path; RGB/alpha sources, HDR, wide primaries and other layouts need a surface.
+    let direct_gray8 = direct_sdr
+        && image.grayscale
+        && image.extra_channels.is_empty()
+        && image.bit_depth == (jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample: 8 })
+        && matches!(
+            class,
+            Some(PixelFormatClass::Color(
+                ColorFormatClass::Rgb {
+                    sample: ColorSample::U8,
+                    ..
+                } | ColorFormatClass::Luma {
+                    bits: 8,
+                    storage_bits: 8
+                } | ColorFormatClass::Luma {
+                    bits: 16,
+                    storage_bits: 16
+                } | ColorFormatClass::YuvPlanar {
+                    bits: 8,
+                    storage_bits: 8,
+                    ..
+                } | ColorFormatClass::YuvSemiplanar {
+                    bits: 8,
+                    storage_bits: 8,
+                    ..
+                } | ColorFormatClass::Yuv422Packed { .. }
+            ))
+        );
     let original_conversion = !request.uses_original_sample_domain()
         && crate::image_color::original_encoding(image)
             != Some(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709);
     let native = crate::model::native_modular_format(request.format());
-    // The direct Modular finalizer supports native integers and a narrow RGB F32 profile.
+    // The direct Modular finalizer supports native integers, Gray8 SDR and a narrow RGB F32 profile.
     // Requested color outside that profile requires the shared presentation graph even when
     // the source happens to be an ordinary eight-bit sRGB image.
     let modular_output_conversion = !request.retains_frame_surface()
         && request.mapping() == crate::GpuOutputMapping::Color
         && native.is_none()
         && !direct_float
+        && !direct_gray8
         && inventory
             .frames
             .iter()
@@ -544,7 +575,7 @@ fn composed_source(
     validate(inventory, plan)?;
     let image = &inventory.image_header;
     let usage = if !image.xyb_encoded {
-        gpu::ColorUsage::ORIGINAL
+        ColorUsage::ORIGINAL
     } else {
         let linear: Vec<_> = plan
             .nodes
@@ -552,7 +583,7 @@ fn composed_source(
             .zip(&inventory.frames)
             .map(|(node, frame)| uses_linear(image, node, frame))
             .collect();
-        let mut usage = gpu::ColorUsage {
+        let mut usage = ColorUsage {
             original: false,
             linear: false,
             reconstruct_original: linear.iter().any(|linear| !linear),

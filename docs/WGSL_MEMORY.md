@@ -133,10 +133,10 @@ name shown in parentheses.
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | entropy prefix/window, group geometry, sample/channel counts, channel-layout offset, output kind/transfer/range, channels/order/depth, 4 plane offset/stride pairs, chroma geometry/size/mapping, status/stream/fixed-leaf/weighted-predictor fields; canvas width/height and orientation | 256 | 4 | read-only storage element |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `DecodeStatus` / `status[0..4]` | `code, decoded_samples, cursor, expected_cursor` | 16 | 4 | storage/readback record |
 | `jxl_wgpu_decode/vardct_raw_matrix.wgsl` | `RawMatrixParams` / `RawMatrixParams` | denominator, raster width/height, target count, then padded four-lane source offsets, source strides, and resident resource target offsets | 64 | 16 | uniform |
-| `jxl_wgpu_decode/codec_engine/composition/blend.wgsl` | `BlendParams` / `Params` | canvas, intersection, source, dispatch, four reference geometry/presence records | 128 | 16 | uniform |
-| `jxl_wgpu_decode/codec_engine/composition/blend.wgsl` | `BlendChannel` / `Channel` | mode, background slot, alpha plane, clamp/association flags, alpha-background slot, three pads | 32 | 16 | read-only storage element |
-| `jxl_wgpu_decode/codec_engine/composition/native.wgsl` | `NativeParams` / `Params` | extent, format, output, original transfer/reserved, source (plane words, first alpha, scalar plane, flags: F32/linear-original RGB) | 80 | 16 | uniform |
-| `jxl_wgpu_decode/codec_engine/composition/spot.wgsl` | `SpotColor` | absolute plane word offset and three pads; declared RGBA | 32 | 16 | read-only storage element, presentation binding 7 |
+| `jxl_wgpu_decode/frame_surface/blend.wgsl` | `BlendParams` / `Params` | canvas, intersection, source, dispatch, four reference geometry/presence records | 128 | 16 | uniform |
+| `jxl_wgpu_decode/frame_surface/blend.wgsl` | `BlendChannel` / `Channel` | mode, background slot, alpha plane, clamp/association flags, alpha-background slot, three pads | 32 | 16 | read-only storage element |
+| `jxl_wgpu_decode/frame_surface/native.wgsl` | `NativeParams` / `Params` | extent, format, output, original color/intensity, source (plane words, first alpha, scalar plane, flags: F32/linear-original RGB), target luminance/OOTF | 96 | 16 | uniform |
+| `jxl_wgpu_decode/frame_surface/spot.wgsl` | `SpotColor` | absolute plane word offset and three pads; declared RGBA | 32 | 16 | read-only storage element, presentation binding 7 |
 
 The Modular finalizer has its own 176-byte, 16-byte-aligned `ModularFinalizeParams` uniform at
 binding 2. Eleven `vec4<u32>` records contain the source extent, region/status, four source offsets,
@@ -816,7 +816,7 @@ storage and precedes target color conversion, association and chroma filtering. 
 and Preserve compile a no-op presentation helper and allocate/bind no ink table. The complete table
 is checked against storage limits and charged with the output uniform for the submission lifetime.
 Raster packing fuses the ink equation without another image buffer. ICC presentation instead
-records `composition/spot/render.wgsl` before the selected ICC connection. Its one-pixel dispatch
+records `frame_surface/spot/render.wgsl` before the selected ICC connection. Its one-pixel dispatch
 reads the all-channel source at binding 0, writes color to a private all-channel copy at binding 3,
 and reads the ink table at binding 7. Compile-time overrides carry the actual color-plane count,
 plane word stride, pixel count and dispatch row width; it allocates no uniform. Extra planes use
@@ -828,8 +828,8 @@ numeric requests omit the copy and table; no image samples are read back in prod
 
 Each job reserves a native poll slot before submission, takes GPU access guards on every input,
 and retains source/reference/output leases, operation-table bytes and uniforms through completion
-or error callbacks. `gpu_submission` owns this common lifetime; `composition::blend`
-lowers the per-channel metadata, while `composition::gpu` handles surfaces and output pipelines.
+or error callbacks. `gpu_submission` owns this common lifetime; `frame_surface::blend`
+lowers the per-channel metadata, while `frame_surface::compositor` handles surfaces and output pipelines.
 Cancellation drops unsubmitted input immediately; submitted reservations survive until callbacks
 release them. Presentation completes only after every physical status check and final packing.
 Unvalidated output is unavailable until packing is submitted. Initial admission can be retried
@@ -1528,8 +1528,8 @@ The planar F32 RGBA baseline is bound through the three ordinary source slots. A
 F32 storage adds binding 6; gain parameters use binding 5. Each output word has one owner, including
 U8 packing and odd extents. Bilinear resampling, gain math, primary/transfer conversion, optional
 gamut mapping, orientation and alpha packing execute in the same output dispatch. Headroom and
-reference-white parameters add no binding or image pass. No intermediate
-alternate image or pixel readback is allocated.
+reference-white parameters add no binding or image pass. Enumerated output allocates no intermediate
+alternate image or pixel readback.
 
 An exact baseline selection skips the unused auxiliary decode and gain dispatch entirely, keeping
 the ordinary baseline output and its reservations. Otherwise both ordinary image decodes finish
@@ -1541,3 +1541,19 @@ waking a successful waiter. Replacing the baseline lease's output preserves its 
 and metadata; the returned buffer keeps only its own output-byte reservation. Tests cover exact
 admission failure, completion, cancellation, immutable held results and zero released budgets.
 Host bundle/Brotli/ICC limits remain independent. [API and evidence](GAIN_MAP.md).
+
+ICC output selects the same gain kernel with a packed planar F32 RGBA intermediate, Keep
+orientation and unassociated alpha. Its color and alpha views retain the original byte offsets;
+the standalone alpha view has plane index zero. The ICC dispatch binds the whole source
+allocation at offset zero, and extra-plane copies require four-byte alignment. No shader ABI
+changes are needed. The shared `frame_surface::compositor::icc::Presentation` owns the existing
+profile conversion and output packing used by ordinary frame composition.
+
+The gain completion validates before ICC submission. Baseline and auxiliary allocations can then
+retire, while the gain buffer stays leased through ICC conversion, validation and final packing.
+The ICC stage separately admits its output, target-component/alpha scratch, program, dispatch and
+packing parameters under the backend budget. Failed admission releases the intermediate; consumer
+cancellation retains submitted resources until completion. A successful returned frame keeps only
+the final output reservation and the primary metadata/slot. Tests check both alpha declarations,
+success, rejection, cancellation and exact release; existing shared ICC admission tests cover each
+program/scratch/dispatch reservation.

@@ -7,12 +7,12 @@ use jxl_gpu_bitstream::{FrameInventory, ImageHeaderInventory};
 use jxl_gpu_protocol::OutputOrientation;
 use jxl_wgpu::{GpuBufferLease, ResidentStorageBinding, WgpuBackend};
 
-use super::gpu::{Compositor, Surface};
-use super::icc_transform::ColorBinding;
 use crate::color_output::{
     ColorOutputConfig, ColorOutputEncoding, ColorOutputInputs, ColorOutputPacker, ColorOutputPlan,
     ColorOutputPlane, ColorOutputTransform, InverseOpsin,
 };
+use crate::frame_surface::compositor::{Compositor, Surface};
+use crate::frame_surface::icc_transform::ColorBinding;
 use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
 use crate::gpu_submission::{
     GpuWork, IccWork, completion_fence_bytes, submit_icc_recorded, submit_recorded,

@@ -3,8 +3,7 @@ use jxl_gpu_protocol::DisplayIntensity;
 use jxl_test_support::{fixtures::hdr as corpus, oracles::hdr};
 use jxl_wgpu_decode::gain_map::{GainMapRendering, GainMapRendition};
 
-mod reference;
-use reference::{Map, Reference};
+use super::reference::{Map, Reference};
 
 #[test]
 fn gain_samples_keep_the_existing_original_color_precision() {

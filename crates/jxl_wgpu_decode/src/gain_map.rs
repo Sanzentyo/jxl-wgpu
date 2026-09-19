@@ -3,7 +3,8 @@
 //! [`GpuDecoder::decode_gain_map`] decodes both codestreams through the stock GPU engine,
 //! applies the map to linear RGB, and uses the shared color/orientation/output packer. The
 //! rendering profile accepts either headroom direction, one still presentation per codestream,
-//! enumerated application primaries and output color, with explicit display-headroom selection.
+//! enumerated application primaries and either enumerated or ICC output color, with explicit
+//! display-headroom selection.
 //! Other profiles are explicit errors; the bitstream crate can still preserve their metadata.
 
 use std::sync::Arc;
@@ -22,6 +23,7 @@ use crate::{
     GpuSubmissionEngine, ImageSelection, OrientationPolicy, Result, WgpuDecodeEngine,
 };
 
+mod output;
 mod render;
 mod rendering;
 pub use rendering::{GainMapRendering, GainMapRendition};
@@ -57,8 +59,9 @@ impl GpuDecoder<WgpuDecodeEngine> {
     ///
     /// Uses the default 203-nit gain reference white. For display-headroom selection or a different
     /// reference white use [`Self::decode_gain_map`]. Animation, previews, progressive delivery,
-    /// ICC application spaces and ICC output are currently typed unsupported profiles. Container parsing can
-    /// retain these forms independently. Tone mapping needs an alternate-image luminance model
+    /// and ICC application spaces are currently typed unsupported profiles. Container parsing can
+    /// retain these forms independently. ICC output uses the shared GPU profile connection, including
+    /// Gray and device components. Tone mapping needs an alternate-image luminance model
     /// and is rejected; output gamut mapping remains explicit through `request`.
     pub async fn decode_alternate(
         &self,
@@ -155,7 +158,7 @@ impl GpuDecoder<WgpuDecodeEngine> {
             transfer: TransferFunction::Linear,
         };
         // Plan the output before either image is submitted.
-        let plan = render::Plan::new(
+        let plan = output::Plan::new(
             self.engine().backend(),
             &request,
             &main.image_header,
@@ -189,14 +192,16 @@ impl GpuDecoder<WgpuDecodeEngine> {
         let base_frame = self
             .decode_gain_map_still(Arc::from(parsed.codestream()), base_request)
             .await?;
-        let mut work = plan.submit(
+        let mut work = plan.gain.submit(
             self.engine().backend(),
             base_frame.output(),
             map_frame.output(),
         )?;
         let buffer = std::future::poll_fn(|context| work.poll(context)).await?;
-        let output = plan.frame(base_frame.output().token, buffer);
-        Ok(base_frame.replace_output(output))
+        drop(map_frame);
+        let output = plan.gain.frame(base_frame.output().token, buffer);
+        plan.finish(self.engine().backend(), base_frame.replace_output(output))
+            .await
     }
 
     async fn decode_gain_map_still(
@@ -224,11 +229,15 @@ fn validate_request(request: &GpuOutputRequest) -> Result<()> {
         .into());
     }
     if request.mapping() != GpuOutputMapping::Color
-        || !matches!(request.format().color_spec, ColorSpecification::Defined(_))
+        || !matches!(
+            request.format().color_spec,
+            ColorSpecification::Defined(_) | ColorSpecification::Icc(_)
+        )
     {
-        return Err(
-            GainMapDecodeError::Unsupported("alternate output requires enumerated color").into(),
-        );
+        return Err(GainMapDecodeError::Unsupported(
+            "gain output requires enumerated color or an ICC profile",
+        )
+        .into());
     }
     if request.tone_mapping_target().is_some() {
         return Err(GainMapDecodeError::Unsupported(

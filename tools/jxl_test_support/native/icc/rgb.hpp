@@ -79,10 +79,9 @@ struct Target {
                cmsCloseProfile),
         channels(0) {
     Check(bool(handle), "open target profile");
-    Check(cmsGetColorSpace(handle.get()) == cmsSigGrayData ||
-              cmsGetColorSpace(handle.get()) == cmsSigRgbData,
-          "RGB/Gray target color model");
-    channels = cmsGetColorSpace(handle.get()) == cmsSigGrayData ? 1 : 3;
+    const auto count = cmsChannelsOfColorSpace(cmsGetColorSpace(handle.get()));
+    Check(count > 0 && count <= 15, "ICC target device channel count");
+    channels = static_cast<unsigned>(count);
     if (const auto *recipe = std::get_if<Recipe>(&spec.method)) {
       lut = std::make_unique<Profile>(Build(*recipe));
       Check(lut->bytes == bytes,
@@ -96,9 +95,11 @@ struct Target {
                             unsigned intent) const {
     Handle xyz(cmsCreateXYZProfile(), cmsCloseProfile);
     Check(bool(xyz), "native XYZ endpoint");
+    const auto format = cmsFormatterForColorspaceOfProfile(handle.get(), 4, TRUE);
+    Check(format != 0, "native target device formatter");
     const std::unique_ptr<void, decltype(&cmsDeleteTransform)> transform(
         cmsCreateTransform(xyz.get(), TYPE_XYZ_DBL, handle.get(),
-                           channels == 1 ? TYPE_GRAY_FLT : TYPE_RGB_FLT, intent,
+                           format, intent,
                            cmsFLAGS_NOOPTIMIZE | cmsFLAGS_NOCACHE),
         cmsDeleteTransform);
     Check(bool(transform), "native XYZ-to-target transform");
@@ -109,6 +110,11 @@ struct Target {
     std::vector<float> output(pixels.size() * channels);
     cmsDoTransform(transform.get(), input.data(), output.data(),
                    static_cast<cmsUInt32Number>(pixels.size()));
+    // Little CMS ink-space F32 formatters use percentages (CMYK and 5CLR..FCLR).
+    // Our profile evaluator and GPU device API both use unit component values.
+    if (channels >= 4)
+      for (auto &value : output)
+        value /= 100;
     // Matrix/TRC device output has the established unit-domain contract. The
     // independent native LUT model separately retains the CMM's unbounded
     // stages.

@@ -9,8 +9,9 @@ dependency or fallback. `CMakeLists.txt` checks these exact source revisions:
   `bt709ToBt2100` and `applyGain` only. Its obsolete draft ISO fraction syntax is not used.
 - libavif `b994fe4601c62d6f98dbff295bd5c251940789b0` (1.4.2), for the ISO 21496-1
   reader/writer, exact rational metadata validation and display-headroom weight selection.
+- Little CMS 2.19, checked at runtime by the ICC command, for native target-profile evaluation.
 
-Provide CMake 3.22+, C11/C++17 compilers and system Highway, Brotli, LittleCMS2 and JPEG development
+Provide CMake 3.22+, C11/C++17 compilers and system Highway, Brotli, Little CMS 2.19 and JPEG development
 libraries. With those checkouts in `reference/libjxl`, `reference/libultrahdr` and `reference/libavif`:
 
 ```sh
@@ -28,7 +29,7 @@ JXL_GAIN_MAP_ORACLE="$PWD/target/gain-map-oracle/gain_map_oracle" \
 Generate outside the source tree under test, compare all output bytes, then import deliberately.
 Do not modify sources/fixtures while any compiler, generator or test run is using them.
 `JXL_REQUIRE_NATIVE_ORACLES=1` makes an absent native executable an error; ordinary runs without
-the executable report that live native roundtrips and weighted applications were skipped. Stored native image
+the executable report that live native roundtrips, weighted applications and ICC comparisons were skipped. Stored native image
 references remain mandatory. GPU tests require an actual adapter.
 
 `generate` creates 64 streams and four reference planes per stream, plus `cases.txt` (321 files):
@@ -79,6 +80,21 @@ Eighty forward/reverse selections and 384 HDR-baseline selections compare the na
 at the existing `3e-6` normalized bound. The HDR inputs reuse all 48 still streams in the native
 HDR corpus; tests keep original-color and XYB reconstruction uncertainty explicit through the
 gain and output transfer equations. No original fixture needs regeneration for this extension.
+
+`icc PROFILE_ROOT TARGET INTENT PCS_F64 OUTPUT` evaluates a declared target profile from the
+resident ICC corpus. Each input pixel contains three little-endian F64 `(center, radius)` PCS
+components. The helper checks the exact profile bytes against the shared independent recipe,
+evaluates its interval equations, and separately invokes Little CMS on the center. Each output
+component is the shared 28-byte record: six little-endian F32 values (native, independent center,
+lower/upper propagated bounds and lower/upper native-model bounds) plus U32 model flags. Little
+CMS ink-space percentages are divided by 100 to obtain unit device components. The native-model
+bounds account for documented CMM behavior independently of the GPU comparison bounds.
+
+The ICC tests reuse all original gain-map/HDR pixels and the existing 13 selected profile files.
+They perform 640 live native profile comparisons and 2,560 GPU outputs, preserving the established
+gain, PCS and profile uncertainty contracts. The RGB/Gray and multi-component C++ reference code
+lives in `tools/jxl_test_support/native/icc`; production Rust/WGSL is not included. Changes to that
+shared evaluator must also reproduce the stored RGB-to-ICC and HDR-to-ICC corpora unchanged.
 
 `bundle INPUT OUTPUT` uses the native
 JPEG XL bundle reader/writer with exact consumed/written sizes. The Rust interop test invokes

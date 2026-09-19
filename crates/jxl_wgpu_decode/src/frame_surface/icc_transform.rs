@@ -12,12 +12,12 @@ use crate::{Error, Result};
 
 /// A planning-time registry. Executable connections retain shared ownership after planning.
 #[derive(Default)]
-pub(super) struct Transforms {
+pub(crate) struct Transforms {
     connections: Vec<Arc<Transform>>,
 }
 
 impl Transforms {
-    pub(super) fn select(
+    pub(crate) fn select(
         &mut self,
         backend: &WgpuBackend,
         selected: IccTransform,
@@ -36,24 +36,24 @@ impl Transforms {
 }
 
 #[derive(Debug)]
-pub(super) struct Transform {
+pub(crate) struct Transform {
     selected: IccTransform,
-    pub(super) memory: ResidentIccMemoryPlan,
+    pub(crate) memory: ResidentIccMemoryPlan,
     pipeline: ResidentIccPipeline,
     // Failed admissions leave this empty. Each submitted use retains its own program Arc.
-    pub(super) uploaded: Mutex<Option<Arc<Program>>>,
+    pub(crate) uploaded: Mutex<Option<Arc<Program>>>,
 }
 
 #[derive(Debug)]
-pub(super) struct Program {
+pub(crate) struct Program {
     resident: ResidentIccProgram,
     _permit: MemoryPermit,
 }
 
-pub(super) struct ColorBinding<'a> {
-    pub(super) storage: ResidentStorageBinding<'a>,
-    pub(super) layout: &'a crate::frame_surface::FrameSurfaceLayout,
-    pub(super) encoding: &'a crate::frame_surface::FrameSurfaceEncoding,
+pub(crate) struct ColorBinding<'a> {
+    pub(crate) storage: ResidentStorageBinding<'a>,
+    pub(crate) layout: &'a crate::frame_surface::FrameSurfaceLayout,
+    pub(crate) encoding: &'a crate::frame_surface::FrameSurfaceEncoding,
 }
 
 impl Transform {
@@ -66,8 +66,11 @@ impl Transform {
         })
     }
 
-    pub(super) fn resident(&self, backend: &WgpuBackend) -> Result<Arc<Program>> {
-        let mut cached = super::lock(&self.uploaded);
+    pub(crate) fn resident(&self, backend: &WgpuBackend) -> Result<Arc<Program>> {
+        let mut cached = self
+            .uploaded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(program) = &*cached {
             return Ok(Arc::clone(program));
         }
@@ -82,7 +85,7 @@ impl Transform {
         Ok(program)
     }
 
-    pub(super) fn encode(
+    pub(crate) fn encode(
         &self,
         backend: &WgpuBackend,
         encoder: &mut wgpu::CommandEncoder,
