@@ -2,14 +2,28 @@
 
 Portable, GPU-required JPEG XL encode/decode building blocks for Rust.
 
-**Work in progress: this is not a complete JPEG XL implementation.** Production
-codec execution requires a compatible `wgpu` adapter. Unsupported features and
-device limits produce typed errors; there is no CPU image-codec fallback.
+## Project phase
+
+This is a maintainer-directed implementation and conformance-development repository,
+not a complete or production-ready JPEG XL codec. APIs and supported feature
+combinations are still evolving. **Third-party contributions are not being accepted
+at this stage.** Development notes describe the maintainer's work and authorized
+agent tasks, not a public contribution process.
+
+The immediate work is completing the GPU codec paths and their correctness,
+resource-lifetime, and interoperability evidence. Encoder syntax coverage and
+production encoder quality are separate goals in the
+[full JPEG XL roadmap](docs/FULL_JPEG_XL_ROADMAP.md).
+
+In the technical documentation, “production path” distinguishes the real library
+codec from test oracles; it does not claim production readiness. That path requires
+a compatible `wgpu` adapter and has no CPU image-codec fallback. Unsupported
+features and device limits produce typed errors.
 
 ## Build and validate
 
-Use **Rust 1.98 or later**, as declared in [Cargo.toml](Cargo.toml), and a
-compatible GPU for codec execution. From a checkout of this repository:
+Use **Rust 1.98 or later**, as declared in [Cargo.toml](Cargo.toml), and a compatible
+GPU for codec execution. From a checkout of this repository:
 
 ```console
 cargo run --locked -p jxl_gpu_harness -- adapters
@@ -18,56 +32,81 @@ cargo run --locked -p jxl_gpu_harness -- codec fixtures/gpu_gray8_lossless.jxl \
 ```
 
 The second command decodes a checked-in fixture on the GPU and explicitly reads
-back its output. `cpu-readback` is a transport choice, not CPU decoding.
-Adapter enumeration alone does not establish codec compatibility.
+back its output. `cpu-readback` is transport, not CPU decoding. Adapter enumeration
+alone does not establish codec compatibility.
 
-For library integration, start with the [decoder](crates/jxl_wgpu_decode/README.md)
-or [encoder](crates/jxl_wgpu_encode/README.md) API examples. The
-[harness guide](tools/jxl_gpu_harness/README.md) covers other commands and their
-measurement contracts. See [CONTRIBUTING.md](CONTRIBUTING.md) for focused checks,
-reference-only validation, and capability-change gates. GitHub Actions is
-[intentionally disabled](.github/workflows/README.md).
+The [decoder](crates/jxl_wgpu_decode/README.md) and
+[encoder](crates/jxl_wgpu_encode/README.md) document the library APIs. The
+[harness guide](tools/jxl_gpu_harness/README.md) describes the CLI's own supported
+workloads; it is not a capability specification for every library API.
+[Internal development notes](docs/DEVELOPMENT.md) contain validation commands and
+evidence gates. GitHub Actions is [intentionally disabled](.github/workflows/README.md).
 
 ## Implemented codec slice
 
-The [full JPEG XL roadmap](docs/FULL_JPEG_XL_ROADMAP.md) is authoritative for
-supported variants, remaining work, and the evidence required to mark a feature
-complete. This table is an overview, not a conformance claim.
+The [roadmap](docs/FULL_JPEG_XL_ROADMAP.md) owns supported variants, remaining work,
+and the evidence required to mark a feature complete. This is only an overview;
+individual kernels, fixtures, or passing tests do not establish full conformance.
 
 | Area | Available building blocks | Important limits |
 |---|---|---|
-| Decode | A common GPU frontend for Modular and VarDCT; stills, animation/composition, embedded previews, and validated progressive output in supported paths. | Both coding modes and their feature combinations remain partially implemented or incompletely covered. |
-| Encode | Lossless Modular Gray/RGB/RGBA at 1–16-bit integer depth, including supported animation; experimental GPU VarDCT with all 27 transform strategies. | VarDCT does not provide general perceptual-quality guarantees, adaptive rate control, or progressive encoding. |
-| Transport and metadata | Bounded raw/`jxlc`/`jxlp` scanning, fragmented input, explicit opaque metadata retention and writing. | Full container policy, frame indexes, and JPEG bitstream reconstruction remain incomplete. |
+| Decode | A common GPU frontend for Modular and VarDCT; stills, animation/composition, embedded previews, and validated progressive output in supported paths. | Both coding modes and their feature combinations remain partially implemented or incompletely covered. Progressive output does not imply incomplete-main-input decoding. |
+| Encode | Lossless Modular Gray/RGB/RGBA at 1–16-bit integer depth, including supported animation; experimental GPU VarDCT with all 27 transform strategies. | VarDCT lacks general perceptual-quality guarantees, adaptive rate control, and progressive encoding. |
+| Transport and metadata | Bounded raw/`jxlc`/`jxlp` scanning, fragmented input, explicit opaque metadata retention and writing. | Full container policy and frame indexes remain incomplete; JPEG bitstream reconstruction (`jbrd`) is not implemented. |
 | Color and rendering | GPU restoration, resampling, composition, enumerated SDR/HDR and supported ICC connections; explicit tone/gamut mapping and still gain-map reconstruction. | Profile, rendering, gain-map, and cross-feature conformance are not complete. |
-| Output and scheduling | GPU-resident pitch-linear buffers, explicit readback, display textures, runtime-neutral async APIs, and budgeted resource leases. | Output support depends on the selected codec path and format. Host-thread concurrency is not coalesced codec GPU batching. |
+| Output and scheduling | GPU-resident pitch-linear buffers, explicit readback, display textures, runtime-neutral async APIs, and budgeted resource leases. | Output support depends on the codec path and format. Host-thread concurrency is not coalesced codec GPU batching. |
 
 ## Execution contract
 
 Image-domain prediction, transforms, coefficient/residual processing, filtering,
 color conversion, and supported entropy jobs execute on the GPU. Bounded host
 parsing, scheduling, validation, deterministic bit writing, and container assembly
-are allowed. Published CPU codecs and native tools are development-only oracles,
-not production dependencies or fallback paths.
+are allowed. CPU image codecs and native oracle tools stay in development support;
+see the [upstream boundary](docs/UPSTREAM_BOUNDARY.md).
 
-Output becomes authoritative only after validation. Explicit unvalidated GPU
-handoff is a separate contract, and downstream results must be discarded if
-validation fails. Memory leases keep accounted resources alive through submitted
-work, cancellation, and retained output. See [GPU architecture](docs/GPU_ARCHITECTURE.md)
-and the [upstream boundary](docs/UPSTREAM_BOUNDARY.md) when changing these contracts.
+Standard decoding does not require private acceleration metadata. The optional
+single-group `jwgp` box is not a substitute for the ordinary JPEG XL codestream.
+Decoding an image transcoded from JPEG is also distinct from reconstructing the
+original JPEG byte stream, which remains unimplemented.
+
+`GpuDecoder::open` and `stream(...).finish()` require complete input. A complete
+embedded preview can be taken earlier with `take_preview`, while the same stream
+continues receiving the main image. Opt-in progressive updates refine a presentation;
+only its final update advances animation time, and `next_frame` remains final-only.
+Preview/main selection and incremental-input ownership are specified in the
+[decoder guide](crates/jxl_wgpu_decode/README.md#executable-profile); pass and LF
+updates have their own [completion contract](crates/jxl_wgpu_decode/README.md#intermediate-lf-and-pass-images).
+
+Output is authoritative only after the applicable codec validation succeeds.
+Explicit unvalidated handoff is separate: completion of downstream display or
+readback does not validate the codec result, and derived results must be discarded
+if codec validation fails. Accounted leases retain resources through submitted
+work, cancellation, and retained output. Raw `wgpu` handle clones do not retain
+those accounting guarantees; custom submissions also obey the backend's submission
+guard contract. See [backend ownership](crates/jxl_wgpu/README.md#render-plan-execution)
+and [same-queue submission](crates/jxl_wgpu/README.md#same-queue-display).
 
 ## Formats and display
 
-The format model separates sample semantics, numeric representation, plane packing,
-color encoding, and subsampling. Portable pitch-linear layouts are in scope;
-CUDA-specific block-linear surfaces are not. Numeric output is not implicitly a
-color image. See [format coverage](docs/VPI_FORMAT_COVERAGE.md) and
-[format APIs](crates/jxl_gpu_formats/README.md) for path-specific support and
-precision policies.
+Sample semantics, numeric representation, packing, color encoding, and subsampling
+are separate. Portable pitch-linear layouts are in scope; CUDA-specific block-linear
+surfaces are not. Source bit depth alone does not promise lossless precision after
+filtering, composition, or lossy reconstruction. See
+[format coverage](docs/VPI_FORMAT_COVERAGE.md),
+[format APIs](crates/jxl_gpu_formats/README.md), and the decoder's
+[integer precision contract](crates/jxl_wgpu_decode/README.md#integer-source-samples).
 
-Same-queue display conversion and explicit readback are different output paths;
-neither implies end-to-end presentation timing. See the
-[benchmark guide](docs/GPU_BENCHMARKS.md) before interpreting performance results.
+Numeric buffers are not implicitly color images. The backend's explicit numeric
+display APIs require a `NumericDisplayContract`. Color display produces linear
+BT.709 textures; wide-gamut/HDR and F32 input use `Rgba16Float` to preserve extended
+values. Decoder/output tone and gamut mapping are explicit requests, not automatic
+monitor or surface negotiation. See the
+[display contract](crates/jxl_wgpu/README.md#same-queue-display),
+[tone mapping](docs/TONE_MAPPING.md), and [gamut mapping](docs/GAMUT_MAPPING.md).
+
+GPU-resident output, same-queue display, and explicit readback are different paths.
+A queued display conversion is not an end-to-end presentation measurement. Use the
+[benchmark methodology](docs/GPU_BENCHMARKS.md) when interpreting performance results.
 
 ## Crates
 
@@ -84,13 +123,10 @@ neither implies end-to-end presentation timing. See the
 
 ## Documentation
 
-Use the [documentation index](docs/README.md) to select a topic,
-[CONTRIBUTING.md](CONTRIBUTING.md) for development and validation, and
-[AGENTS.md](AGENTS.md) for repository-specific agent guidance.
-
-The previous [detailed README](README.legacy.md) is preserved as a historical
-snapshot. Its incremental status statements and testing instructions are not the
-current capability or contribution policy; use the roadmap and contributor guide.
+Use the [topic index](docs/README.md) for API and implementation references,
+[internal development notes](docs/DEVELOPMENT.md) for validation, and
+[AGENTS.md](AGENTS.md) for repository-specific agent boundaries. Detailed capability
+status and corpus results belong in their owning documents, not in this overview.
 
 ## License
 
