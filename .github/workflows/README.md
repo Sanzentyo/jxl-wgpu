@@ -1,9 +1,14 @@
 # Disabled workflows
 
-GitHub Actions is intentionally disabled while the GPU codec is under active bring-up. The
-portable workflow is retained as `ci.yml.disabled`, which GitHub does not recognize as a workflow
-definition. Rename it to `ci.yml` to re-enable push, pull-request, and manual runs after the CI
-resource policy is decided.
+GitHub Actions is intentionally disabled during GPU codec implementation and
+conformance development. `ci.yml.disabled` is a reference, not an active workflow.
 
-Until then, capability commits must run the equivalent formatting, workspace check, Clippy, test,
-documentation, WebAssembly, reference-harness, Metal-harness, and codec-readback gates locally.
+Use [internal validation by change](../../docs/DEVELOPMENT.md#validation-by-change)
+for task-specific checks. Capability changes retain the full
+[local gates](../../docs/DEVELOPMENT.md#capability-change-gates), including the
+portable/minimum-Rust matrix and applicable actual-GPU/Metal evidence.
+Missing local tools or hardware are unverified gates, not successful CI.
+
+Re-enabling CI is a separate maintainer decision: select the runner/resource policy,
+reconcile the retained workflow with current manifests and validation commands,
+then rename `ci.yml.disabled` to `ci.yml`. Do not enable it as incidental cleanup.
