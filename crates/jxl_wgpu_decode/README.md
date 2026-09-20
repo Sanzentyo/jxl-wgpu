@@ -646,12 +646,22 @@ mode-specific bindings and pipeline caches while sharing the backend byte budget
 ### Original SDR color encodings
 
 Both decoders accept standard or custom RGB chromaticities with D65/E/DCI/custom white points,
-Linear/sRGB/BT.709 or parameterized Gamma/DCI transfer, and gray. Non-D65 white points currently
-require relative rendering intent; broader ICC/HDR conformance remains incomplete. XYB inverse
+Linear/sRGB/BT.709 or parameterized Gamma/DCI transfer, and gray. All four original enumerated
+rendering intents are accepted with these white points. Broader ICC/HDR conformance remains
+incomplete. XYB inverse
 matrices carry their linear RGB chromaticities explicitly. Original RGB/YCbCr and post-transform
 references preserve the original transfer; unreferenced XYB can retain linear original RGB.
 `GpuOutputRequest::with_white_point_adaptation` selects Bradford or absolute XYZ for requested
 color output. Numeric samples retain their original domain regardless of this output policy.
+
+The original declaration's intent does not select the requested output's adaptation or ICC
+intent. Analytic XYB reconstruction uses the declared primaries, Bradford white adaptation and
+original transfer before reference storage and blending. The
+[intent corpus](../../docs/CONFORMANCE_CORPUS.md#enumerated-original-rendering-intents)
+checks 320 declarations against native libjxl and unchanged frozen references, including both
+codecs, RGB/Gray/XYB/YCbCr, integer/F32, composition and progressive output. Independent F64
+conversion checks both requested white policies, and 156 metadata variants retain exact native
+17/31-bit color and independent alpha. Unknown transfers and invalid geometry remain rejected.
 
 Explicit `PixelFormat::gray8` and `gray_f32` color requests accept full-range enumerated
 target encodings, with optional alpha and planar/interleaved storage. The GPU projects

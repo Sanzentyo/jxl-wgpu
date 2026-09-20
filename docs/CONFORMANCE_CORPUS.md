@@ -3914,7 +3914,7 @@ and independently decoded by libjxl before reference storage. There are 332 fixt
 | Requested output | Linear BT.709 F32, sRGB8, original RGBA12, selected original color F32 and independent alpha F32 for every case |
 | Exact native samples | 27 color-metadata variants of existing integer fixtures preserve byte-identical physical frames and exact 17/31-bit RGB and 5/24/31-bit alpha through native RGB and scalar selection, with whole and bounded fragmented input |
 | Colorimetry | Independent f64 primary matrices from CIE xy and a common D65; fixed source-error intervals propagated through signed matrices and piecewise transfer functions |
-| Color-output rejection | Unknown transfers, singular RGB/white geometry, invalid gamma, non-relative non-D65 profiles and inconsistent Gray/RGB inventories are rejected by shared color-output admission. Later ICC and enumerated HDR checkpoints extend this original corpus's admission boundary. |
+| Color-output rejection | Unknown transfers, singular RGB/white geometry, invalid gamma and inconsistent Gray/RGB inventories are rejected by shared color-output admission. Later ICC and enumerated HDR checkpoints extend this original corpus's admission boundary. |
 
 Source reconstruction uses normalized error `1e-5` for original Modular and `1/1024` for
 XYB/VarDCT; alpha is checked separately at `2e-6`. Conversion adds `5e-6*(1+abs(reference))` and one
@@ -3923,7 +3923,7 @@ libjxl and jxl-oxide; Rust jxl 0.6.0's reflected negative curve is not substitut
 Unchanged generic transfer tests check the other sign-reflected functions. Primary matrices now
 use the same exact D65 white in image output and display. See the
 [generator notes](../crates/jxl_wgpu_decode/test-data/original_color_generator/README.md) for pinned
-sources and reproduction. ICC, complete rendering intents, HDR luminance mapping, wide-gamut feature/LF
+sources and reproduction. ICC, broader rendering policies, HDR luminance mapping, wide-gamut feature/LF
 combinations and full conformance remain roadmap work.
 
 ## Custom white points, primaries and Gamma/DCI
@@ -3950,8 +3950,35 @@ metadata without changing physical frame bytes or rounding native 17/31-bit samp
 The [generator notes](../crates/jxl_wgpu_decode/test-data/original_color_generator/README.md)
 explain native ICC-calibrated XYB RGB primaries, the original Gamma/DCI black floor, separate CMS
 negative extensions, and independent pre-OETF references for non-invertible original curves.
-ICC/LUT/CMYK, complete original rendering intents, HDR luminance mapping and wide-gamut feature/LF
+Broader ICC/LUT/CMYK, HDR luminance mapping and wide-gamut feature/LF
 cross-products remain incomplete.
+
+## Enumerated original rendering intents
+
+The original-color integration target assembles 320 declarations from the unchanged 80 analytic
+sources and all four original intents. E/DCI/custom D50/D65 whites, standard/custom RGB primaries,
+Gray, sRGB/Linear/Gamma/DCI, both codecs, RGB/XYB/YCbCr, integer/F32 and still/composed sequences
+remain explicit case properties. Only the intent enum changes; every physical frame byte and
+other image field is checked, and an independent jxl-oxide header read verifies the new enum.
+
+Native libjxl 0.12.0 redecodes every variant in its verified original encoding. All 800 native
+presentations must match the existing frozen F32 words exactly, including alpha. Actual GPU tests
+check whole/bounded progressive output, held-image immutability, final-only identity and released
+reservations with the original normalized error bounds: `1e-5` original Modular, `1/1024` XYB/VarDCT,
+and `2e-6` alpha. An additional 1,600 GPU presentations compare requested Bradford and absolute XYZ
+linear output against independent F64 matrices, transfers and propagated source intervals; the
+existing `5e-6*(1+abs(reference))` packing allowance is unchanged. Output words for each policy
+must agree across original intents. Gamma/DCI XYB stills retain independent pre-OETF references.
+
+The exact-word regression now covers 156 profile/source/intent combinations through native RGB
+and each scalar selection, under whole and bounded fragmented input. Original 17/31-bit RGB and
+independent 5/24/31-bit alpha remain exact. Invalid white geometry is rejected under every intent;
+unknown transfers, invalid gamma, singular primaries and inconsistent declarations retain their
+existing negative tests. The native oracle is mandatory and checks runtime version 12000.
+
+See the [recipe and primary implementation reference](../crates/jxl_wgpu_decode/test-data/original_color_generator/README.md#original-intent-variants).
+No fixture/reference replacement, tolerance change or GPU ABI change is involved. Arbitrary ICC
+rendering methods, wider color/feature combinations and full decoder conformance remain open.
 
 ## Resident ICC matrix/TRC corpus
 

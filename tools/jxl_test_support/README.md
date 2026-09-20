@@ -64,6 +64,13 @@ item as `expect(..., reason = "...")`; a stale expectation must produce a warnin
 retained until GPU completion can be necessary even when it is never read explicitly. Such
 ownership should be expressed in its containing type and explained at that boundary.
 
+`fixtures::original_color::intents` rewrites only the final intent enum of explicit RGB/Gray
+metadata. It checks unchanged image fields and physical frame bytes, and an independent header
+reader verifies the new intent. The extra-channel native oracle's `--original` mode requires
+libjxl 0.12.0, requests the declared encoding and verifies the actual output color fields. Tests
+require this oracle; missing tools or version mismatches fail. Existing fixtures and references
+are read without replacement. See the [intent recipe](../../crates/jxl_wgpu_decode/test-data/original_color_generator/README.md#original-intent-variants).
+
 Run the workspace checks from the repository root with Rust 1.98 or later:
 
 ```sh

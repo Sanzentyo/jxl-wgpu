@@ -84,7 +84,7 @@ now use the linear negative extension for interoperability. BT.709 itself specif
 nonnegative range; the negative extension is an explicit implementation contract. sRGB, PQ,
 HLG and BT.2020 retain their existing sign-reflected extensions.
 
-This corpus covers original color plumbing and frame composition. ICC, complete rendering intents,
+This corpus covers original color plumbing and frame composition. ICC, broader rendering policies,
 HDR luminance mapping, wide-gamut spot/patch/spline/LF combinations and full ISO
 conformance remain separate roadmap work.
 
@@ -131,6 +131,34 @@ independent F64 colorimetry, and the original OETF/black floor. Requested linear
 unreferenced Gamma/DCI XYB stills uses independent pre-OETF values: the original zeroed samples
 cannot reconstruct their negative linear values. Sequence references remain native due to the
 extra-channel source-selector defect described above. An additional absolute-XYZ output is checked
-for all 80 new cases; this is an output policy and does not claim support for non-relative intents
-in non-D65 original metadata. ICC/LUT/CMYK, those intents, HDR luminance mapping and wide-gamut
+for all 80 new cases; this is an explicit output policy. The intent variants below extend original
+metadata admission. Wider ICC/LUT/CMYK, HDR luminance mapping and wide-gamut
 feature/LF combinations remain open in the full JPEG XL roadmap.
+
+## Original intent variants
+
+`tests/original_color/intents.rs` changes only the rendering-intent enum in each of the 80 analytic
+sources to Perceptual, Relative, Saturation and Absolute (320 declarations). The shared helper
+reparses the image, checks every other field, preserves the exact physical frame bytes and checks
+the new enum with jxl-oxide's independent header reader. No checked-in stream or reference is rewritten.
+
+The native extra-channel oracle's `--original` option requires runtime version 12000, installs
+the native CMS, requests the original encoding and verifies the resulting color fields. As in
+the generator above, original non-D65 Gray keeps its already-original default; XYB Gray receives
+an explicit original request. Every resulting F32 word must equal the frozen original reference,
+including alpha. The GPU then runs the existing whole/bounded progressive, retained-image and
+final-only checks with their unchanged bounds. Missing native tools fail the test.
+
+This follows pinned libjxl's
+[`OutputEncodingInfo::SetColorEncoding`](https://github.com/libjxl/libjxl/blob/a7a9c787341cf703dede03c2009fa460cae5e5df/lib/jxl/dec_xyb.cc):
+analytic original XYB reconstruction derives its matrix from primaries and Bradford-adapted white,
+independently of the enum intent. Requested output remains a separate policy. Another test checks
+all 320 variants against independent F64 conversion for both Bradford and absolute XYZ linear
+BT.709 output, including pre-OETF references where Gamma/DCI loses information. Each selected
+policy must also produce identical words across the four original intents. Existing source
+intervals and `5e-6*(1+abs(reference))` output packing error remain unchanged.
+
+The exact-word integer test applies all four intents to its 39 profile/source combinations,
+yielding 156 variants with unchanged 17/31-bit color and independent 5/24/31-bit alpha through
+native RGB and scalar output under whole/bounded input. This is enumerated intent admission and
+reconstruction evidence; arbitrary ICC gamut methods and full JPEG XL conformance remain open.

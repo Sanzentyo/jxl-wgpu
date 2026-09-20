@@ -2,7 +2,7 @@
 
 use jxl_gpu_bitstream::{
     ChromaticityInventory, ColourEncodingInventory, ColourSpaceInventory, ImageHeaderInventory,
-    PrimariesInventory, RenderingIntentInventory, TransferFunctionInventory, WhitePointInventory,
+    PrimariesInventory, TransferFunctionInventory, WhitePointInventory,
 };
 use jxl_gpu_protocol::{
     Chromaticity, GammaExponent, RgbChromaticities, RgbColorEncoding, RgbColorSpace,
@@ -45,7 +45,7 @@ pub(crate) fn enumerated_encoding(
         white_point,
         primaries,
         transfer_function,
-        rendering_intent,
+        ..
     } = encoding
     else {
         return None;
@@ -56,10 +56,10 @@ pub(crate) fn enumerated_encoding(
         WhitePointInventory::Dci => Chromaticity::DCI,
         WhitePointInventory::Custom(value) => chromaticity(value),
     };
-    // Non-D65 intent policies need their own reference-white and gamut conformance.
-    if white != Chromaticity::D65 && rendering_intent != RenderingIntentInventory::Relative {
-        return None;
-    }
+    // The original declaration's intent does not change its RGB/gray sample domain.
+    // Analytic XYB reconstruction uses the declared primaries, Bradford white adaptation
+    // and transfer (libjxl 0.12.0 OutputEncodingInfo::SetColorEncoding). Presentation
+    // separately selects white adaptation or an ICC rendering intent from the request.
     let mut coordinates = match (colour_space, grayscale, primaries) {
         // Replicated luminance represents the declared white, not an assumed D65 gray.
         (ColourSpaceInventory::Grey, true, _) => RgbChromaticities::BT709,
@@ -122,7 +122,7 @@ pub(crate) fn require_original_encoding(
     original_encoding(image).ok_or_else(|| {
         crate::UnsupportedProfile::new(
             crate::UnsupportedCodestreamFeature::ColorEncoding,
-            "image color requires a nonsingular enumerated RGB/gray profile; non-D65 whites currently require relative intent",
+            "image color requires a nonsingular enumerated RGB/gray profile with a known transfer",
         )
     })
 }
@@ -210,7 +210,9 @@ pub(crate) fn reconstruction_black_threshold(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jxl_gpu_bitstream::{ChromaticityInventory, EmbeddedIccInventory};
+    use jxl_gpu_bitstream::{
+        ChromaticityInventory, EmbeddedIccInventory, RenderingIntentInventory,
+    };
 
     #[test]
     fn cmyk_domain_owns_its_profile_and_requires_an_unambiguous_black_plane() {
@@ -415,7 +417,15 @@ mod tests {
         };
         *white_point = WhitePointInventory::E;
         *rendering_intent = RenderingIntentInventory::Absolute;
-        assert!(original_encoding(&image).is_none());
+        assert_eq!(
+            require_original_encoding(&image)
+                .unwrap()
+                .space
+                .chromaticities()
+                .unwrap()
+                .white,
+            Chromaticity::E,
+        );
         image.colour_encoding = ColourEncodingInventory::Enumerated {
             colour_space: ColourSpaceInventory::Rgb,
             white_point: WhitePointInventory::E,
@@ -435,5 +445,41 @@ mod tests {
         assert_eq!(coordinates.red, Chromaticity::new(1.0, 0.0).unwrap());
         assert_eq!(coordinates.blue, Chromaticity::new(0.0, 0.0).unwrap());
         assert_eq!(coordinates.white, Chromaticity::E);
+    }
+
+    #[test]
+    fn original_intent_does_not_change_domain_or_admit_invalid_color_geometry() {
+        for case in jxl_test_support::fixtures::original_color::analytic_cases()
+            .into_iter()
+            .filter(|case| !case.sequence && !case.floating)
+        {
+            let mut image = jxl_gpu_bitstream::parse(&case.bytes(), Default::default())
+                .unwrap()
+                .codestream_inventory(Default::default())
+                .unwrap()
+                .image_header;
+            let expected = require_original_encoding(&image).unwrap();
+            for intent in jxl_test_support::fixtures::original_color::intents::ALL {
+                let ColourEncodingInventory::Enumerated {
+                    rendering_intent, ..
+                } = &mut image.colour_encoding
+                else {
+                    unreachable!()
+                };
+                *rendering_intent = intent;
+                assert_eq!(require_original_encoding(&image).unwrap(), expected);
+                let mut invalid = image.clone();
+                let ColourEncodingInventory::Enumerated { white_point, .. } =
+                    &mut invalid.colour_encoding
+                else {
+                    unreachable!()
+                };
+                *white_point = WhitePointInventory::Custom(ChromaticityInventory { x: 1, y: 0 });
+                assert_eq!(
+                    require_original_encoding(&invalid).unwrap_err().feature,
+                    crate::UnsupportedCodestreamFeature::ColorEncoding
+                );
+            }
+        }
     }
 }

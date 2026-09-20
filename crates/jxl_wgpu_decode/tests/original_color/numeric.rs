@@ -176,7 +176,7 @@ fn sdr_metadata_preserves_native_modular_integer_samples() {
             .split_whitespace()
             .map(|v| u32::from_str_radix(v, 16).unwrap())
             .collect();
-        for case in corpus::cases()
+        for (case, intent) in corpus::cases()
             .into_iter()
             .chain(corpus::analytic_cases())
             .filter(|c| {
@@ -185,8 +185,10 @@ fn sdr_metadata_preserves_native_modular_integer_samples() {
                     && !c.sequence
                     && !c.floating
             })
+            .flat_map(|case| corpus::intents::ALL.map(|intent| (case.clone(), intent)))
         {
             let data = with_profile(&data, &case);
+            let data = corpus::intents::replace(&data, intent);
             let image = jxl_gpu_bitstream::parse(&data, Default::default())
                 .unwrap()
                 .codestream_inventory(Default::default())
@@ -260,7 +262,7 @@ fn sdr_metadata_preserves_native_modular_integer_samples() {
                         .collect();
                     assert_eq!(
                         actual, expected,
-                        "{name}/{}/{selection}/bounded{bounded}",
+                        "{name}/{}/{intent:?}/{selection}/bounded{bounded}",
                         case.name
                     );
                     drop((frame, session));

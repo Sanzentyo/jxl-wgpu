@@ -12,6 +12,7 @@ use jxl_gpu_formats::{
 use super::frame_features;
 
 mod analytic;
+pub mod intents;
 pub use analytic::cases as analytic_cases;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
