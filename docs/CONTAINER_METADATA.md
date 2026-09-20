@@ -162,5 +162,7 @@ multiple compression settings and malformed inputs. No CPU image/entropy/coeffic
 enters production. The separate [GPU coefficient API](../crates/jxl_wgpu_decode/README.md#gpu-jpeg-reconstruction-inputs)
 now binds actual decoded quantizers and integer LF/AC to checked padded JPEG component grids.
 It validates and leases those GPU integers without interpreting ICC or applying orientation.
-Complete scan/progression and required external-metadata compatibility, GPU JPEG entropy and
-budget-owned original-byte assembly remain required before authoritative JPEG bytes can be published.
+The separate [original-byte API](../crates/jxl_wgpu_decode/README.md#gpu-original-jpeg-byte-output)
+binds the qualified scan/progression and external-metadata profile, generates GPU JPEG entropy,
+and validates budget-owned assembly before publishing bytes. Metadata parsing/emission alone
+still grants no image or JPEG-byte authority; broader legal reconstruction variants remain open.

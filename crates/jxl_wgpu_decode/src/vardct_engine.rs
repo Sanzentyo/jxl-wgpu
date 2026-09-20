@@ -8,6 +8,7 @@
 
 mod execution;
 mod jpeg;
+mod jpeg_output;
 mod output;
 mod pipeline;
 mod restoration;
@@ -22,6 +23,10 @@ pub use execution::jpeg::JpegCoefficientPending;
 pub use jpeg::{
     GpuJpegCoefficients, JpegCoefficientError, JpegCoefficientLayout, JpegCoefficientLimits,
     JpegCoefficientPlane, JpegCoefficientSession,
+};
+pub use jpeg_output::{
+    GpuJpegFrame, JpegReconstructionError, JpegReconstructionLimits, JpegReconstructionPending,
+    JpegReconstructionSession,
 };
 pub use pipeline::VarDctSubmissionEngine;
 pub use staging::{VarDctDecodeSession, VarDctGlobalModularMemoryStats, VarDctPendingFrame};

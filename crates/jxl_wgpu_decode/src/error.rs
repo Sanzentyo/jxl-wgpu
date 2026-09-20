@@ -171,6 +171,8 @@ impl FrontendIncomplete {
 #[derive(Debug, Error)]
 pub enum Error {
     #[error(transparent)]
+    JpegReconstruction(#[from] crate::JpegReconstructionError),
+    #[error(transparent)]
     ContainerMetadata(#[from] jxl_gpu_bitstream::metadata::MetadataError),
     #[error(transparent)]
     GainMapMetadata(#[from] jxl_gpu_bitstream::gain_map::GainMapError),

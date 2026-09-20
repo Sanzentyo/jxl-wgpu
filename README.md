@@ -52,7 +52,7 @@ individual kernels, fixtures, or passing tests do not establish full conformance
 |---|---|---|
 | Decode | A common GPU frontend for Modular and VarDCT; stills, animation/composition, embedded previews, and validated progressive output in supported paths. | Both coding modes and their feature combinations remain partially implemented or incompletely covered. Progressive output does not imply incomplete-main-input decoding. |
 | Encode | Lossless Modular Gray/RGB/RGBA at 1–16-bit integer depth, including supported animation; experimental GPU VarDCT with all 27 transform strategies. | VarDCT lacks general perceptual-quality guarantees, adaptive rate control, and progressive encoding. |
-| Transport and metadata | Bounded raw/`jxlc`/`jxlp` scanning, fragmented input, opaque metadata retention/writing, bounded `jbrd` metadata parsing/emission, and validated GPU JPEG quantizer/coefficient output. | Full container policy, frame indexes and GPU JPEG byte reconstruction remain incomplete. |
+| Transport and metadata | Bounded raw/`jxlc`/`jxlp` scanning, fragmented input, opaque metadata retention/writing, bounded `jbrd` metadata parsing/emission, and validated GPU original-JPEG byte reconstruction for a qualified still profile. | Full container policy, frame indexes and broader JPEG reconstruction variants remain incomplete. |
 | Color and rendering | GPU restoration, resampling, composition, enumerated SDR/HDR and supported ICC connections; explicit tone/gamut mapping and still gain-map reconstruction with enumerated or ICC output. | Profile, rendering, gain-map, and cross-feature conformance are not complete. |
 | Output and scheduling | GPU-resident pitch-linear buffers, explicit readback, display textures, runtime-neutral async APIs, and budgeted resource leases. | Output support depends on the codec path and format. Host-thread concurrency is not coalesced codec GPU batching. |
 
@@ -60,7 +60,8 @@ The [official conformance corpus](crates/jxl_wgpu_decode/test-data/official_conf
 checks the published per-channel pixel bounds of all 40 descriptors across 27 unique inputs
 in its pinned upstream revision. It includes three animations, signed F32 samples, both alpha
 associations, noise, splines, patches, original ICC components and a 4064×2704 progressive image.
-Byte-identical JPEG reconstruction and exact generated ICC export remain open.
+A separate GPU byte-output target reproduces all three published original JPEGs exactly.
+Exact generated ICC export and broader conformance requirements remain open.
 
 ## Execution contract
 
@@ -72,11 +73,12 @@ see the [upstream boundary](docs/UPSTREAM_BOUNDARY.md).
 
 Standard decoding does not require private acceleration metadata. The optional
 single-group `jwgp` box is not a substitute for the ordinary JPEG XL codestream.
-Decoding an image transcoded from JPEG is also distinct from reconstructing the
-original JPEG byte stream, which remains unimplemented. The separate
-[JPEG coefficient API](crates/jxl_wgpu_decode/README.md#gpu-jpeg-reconstruction-inputs)
-now restores bounded quantizers and padded integer coefficients from actual GPU decode;
-JPEG scan entropy and authoritative byte output remain required.
+The [JPEG reconstruction API](crates/jxl_wgpu_decode/README.md#gpu-original-jpeg-byte-output)
+restores quantizers and coefficients from actual GPU JXL decoding, generates sequential or
+progressive JPEG entropy on the GPU, and publishes a validated, budget-owned byte lease.
+All 36 pinned original JPEGs agree byte for byte, including the three official sources.
+The bounded still DCT8 profile remains Partial; broader legal variants and GPU JPEG ingestion
+remain required.
 
 `GpuDecoder::open` and `stream(...).finish()` require complete input. A complete
 embedded preview can be taken earlier with `take_preview`, while the same stream

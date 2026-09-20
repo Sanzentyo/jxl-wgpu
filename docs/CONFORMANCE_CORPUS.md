@@ -4611,8 +4611,8 @@ existing output rounding allowance. Both storage forms, U8/F32 and whole/256-byt
 windows preserve output bytes exactly. Held frames outlive their sessions and release their
 budget only when dropped. Existing ICC device-Gray packing and numeric Gray are separate paths.
 
-`grayscale_jpeg` currently establishes pixel evidence only: its original JPEG reconstruction
-requirement remains open. `lz77_flower` compares normalized original samples under its checked
+`grayscale_jpeg` also has separate original-byte evidence in the GPU JPEG reconstruction family
+below. `lz77_flower` compares normalized original samples under its checked
 enumerated gamma declaration; the retained original/reference ICC files are independently
 hashed but exact generated-ICC export remains open. These additions do not complete `QA-02`.
 
@@ -4665,9 +4665,9 @@ joined before original-NPY hash validation. Source-image credits and permissions
 in the fixture README and original source notice.
 
 The target uses explicit 2 GiB fixture transient/shared budgets for its larger images; these
-are admission limits, not measured peak usage, and do not change production defaults. JPEG-origin
-pixels and retained generated ICC references leave their original-byte output requirements
-open. `QA-02` and the full JPEG XL goal remain **Partial**; this is pixel and metadata evidence
+are admission limits, not measured peak usage, and do not change production defaults. The GPU
+JPEG reconstruction family below separately matches all three original JPEGs exactly; exact
+generated ICC export remains open. `QA-02` and the full JPEG XL goal remain **Partial**; this target is pixel and metadata evidence
 for the pinned suite, not a claim that every ISO/IEC 18181-3 acceptance requirement is complete.
 
 ## Bounded JPEG reconstruction metadata
@@ -4698,10 +4698,9 @@ Huffman and marker groups, selectors, native metadata block endpoints, zero head
 and duplicate or forbidden `brob`-wrapped `jbrd`. The shared strict Brotli implementation retains
 its existing 180 native bidirectional parameter comparisons and six raw-box extractions.
 
-This evidence advances `CONT-05` to **Partial** for bounded metadata parsing/emission. It does
-not close the official original-JPEG output requirement: production still lacks complete
-frame/metadata compatibility checks, GPU JPEG entropy and
-authoritative byte-output ownership. `ENC-05` and exact generated ICC output remain open.
+These metadata checks provide no coefficient or JPEG-byte output authority. The GPU families
+below supply those separate production checks. `CONT-05` remains **Partial** for the bounded
+profile; `ENC-05` and exact generated ICC output remain open.
 
 ## GPU JPEG quantizer and coefficient binding
 
@@ -4739,7 +4738,41 @@ uniform's 48 bytes are included in the observed late reservation. WGSL parsing/v
 Rust offset/size/alignment checks cover both 48-byte capture and 192-byte restoration ABIs.
 
 This qualifies the bounded integer input stage under `CONT-05`, which remains **Partial**.
-It does not implement JPEG scan entropy or authoritative original-byte assembly, does not
-replace the original-JPEG byte acceptance gate, and does not advance GPU JPEG ingestion in
-`ENC-05`. Ratios above 524287, coefficients outside -2047..=2047, broader sampling/frame/global
-prefix combinations and complete external-metadata/scan compatibility remain unsupported.
+The original-byte family below exercises the connected entropy/assembly path. Ratios above
+524287, coefficients outside -2047..=2047 and broader sampling/frame/global-prefix combinations
+remain unsupported; GPU JPEG ingestion in `ENC-05` remains open.
+
+## GPU original JPEG byte reconstruction
+
+The decoder's [`jpeg_reconstruction` target](../crates/jxl_wgpu_decode/tests/jpeg_reconstruction/main.rs)
+feeds the same 36 pinned JXL sources into `open_jpeg_reconstruction`. All quantizers and
+coefficients come from the actual GPU JXL decoder; no oracle coefficient upload or expected
+JPEG/scan length enters production. Sequential/progressive entropy, EOB/refinement bits,
+restart/reset/ZRL handling, shared preserved padding, escaping and byte assembly run on the GPU.
+On Apple M5 / Metal, all 36 original JPEG files / 140 scans match byte for byte, including the
+published Bench oriented BRG, Cafe and grayscale originals. No fixture or reference was replaced.
+Five more complete comparisons use 40-byte entropy windows with `poll_complete`: gray restart,
+progressive RGB, progressive 4:2:0/4:4:0 and multi-LF-group long EOB. Storage padding is zero and
+cloned output retains exactly its rounded reservation through session drop and explicit readback.
+
+The same fixed corpus covers opaque ICC chunks, plain/compressed Exif/XMP, comments, marker fill,
+tail bytes, custom/merged/empty table markers, unused/16-bit quantization tables, extra initial
+ZRL runs and mixed/zero padding shared across scans. Original ICC bytes are preserved without
+color interpretation; the oriented BRG profile is not reclassified as valid ICC. Independent
+libjxl metadata interoperability and libjpeg-turbo coefficient comparisons remain separate gates.
+
+Host tests reject AC-before-DC, duplicated scans, missing refinement predecessors, sequential
+scans in progressive frames, invalid spectral/components/reset/ZRL declarations, zero task/plan/
+output/metadata limits, duplicate external Exif and missing required Exif. GPU fault tests reject
+missing Huffman codes, invalid previous-DC pointers, excessive ZRL, invalid restart/scan/reset
+values, truncated/trailing padding, refinement extra ZRL, omitted coefficient bits, inconsistent
+shared quantizers and out-of-precision quantizers. Exact and one-byte-short raw/final output
+limits are checked. One- and seven-column rectangular dispatches exercise prefix carry and
+partial-row guards, with complete original-byte comparison for the long-EOB case.
+
+Lifetime tests cancel coefficient/count/emit/pack/final-assembly stages, exhaust late raw/output/
+assembly memory and the native submission poller, and verify all reservations return after GPU
+completion. Initial memory admission can retry the same session. A large private opaque-tail
+plan exercises final assembly admission without changing corpus references. Broader legal
+sampling/frame/global-prefix/range variants and refinement extra-ZRL preservation remain open;
+`CONT-05` is **Partial**, `ENC-05` **Missing**, and full JPEG XL acceptance is not complete.

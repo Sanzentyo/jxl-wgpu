@@ -1086,9 +1086,55 @@ descriptors and raw side images retain their existing separate late admissions.
 
 The [coefficient corpus](../../docs/CONFORMANCE_CORPUS.md#gpu-jpeg-quantizer-and-coefficient-binding)
 compares actual GPU output with independent libjpeg-turbo extraction from original JPEGs.
-This is an input stage for reconstruction. JPEG scan/progression and external-metadata
-compatibility, GPU JPEG entropy, complete original-byte assembly and a leased JPEG byte API
+This coefficient-only API also supplies the original-byte API below. Broader JPEG variants
 remain open under `CONT-05`; lossless JPEG ingestion remains `ENC-05`.
+
+### GPU original JPEG byte output
+
+`VarDctSubmissionEngine::open_jpeg_reconstruction(bytes, JpegReconstructionLimits)` returns a
+`JpegReconstructionSession` implementing `GpuSubmissionSession<Frame = GpuJpegFrame>`. Its pending
+value supports native `wait` and runtime-neutral `poll_complete`. Only final validated bytes are
+published: `buffer()` is a retained GPU lease and `byte_len()` excludes its zero-filled storage
+rounding to four bytes. There is no pixel layout or unvalidated handoff. Explicit readback is
+optional and must retain the lease through the GPU copy.
+
+The API uses the coefficient profile above and requires its raw extent/origin to match the
+original image canvas. It binds immutable `jbrd` scans to actual padded component grids, validates
+component IDs, marker order, spectral/refinement progression and restart/reset/ZRL schedules,
+and constructs bounded canonical Huffman metadata. Sequential and progressive DC/AC, EOB runs,
+correction bits, byte stuffing, restarts and preserved zero/mixed padding execute on GPU
+coefficients. Refinement extra-ZRL preservation remains explicitly unsupported. GPU validation
+also rejects coefficient bits omitted by the declared progression and inconsistent shared or
+out-of-precision quantizers. Opaque marker/fill/tail bytes are preserved; ICC bytes are copied
+without profile interpretation or orientation application. Unique external Exif/XMP boxes may be
+plain or `brob`, decoded under independent encoded/decoded/expansion limits. Their required
+lengths and ICC chunk consumption must match the reconstruction records.
+
+Each scan has three validated submissions: count raw bits, admit exact raw storage and count
+escaped bytes, then admit exact output and pack. The shared padding cursor commits only on a
+successful scan. The host reads only 16-byte status summaries, never coefficients or entropy-sized
+prefix arrays. Metadata-only framing contains zero quantizer placeholders and scan insertion
+positions; the GPU assembles all bytes and patches quantizers. Aggregate copy, quantizer and
+coefficient-coverage counts gate final authority. No original-JPEG reference size is an API input.
+
+Defaults permit 2²⁰ total block tasks, 64 MiB of logical host planning storage, 16 MiB of raw entropy
+per scan and 64 MiB of final JPEG bytes. The coefficient API's transport/inventory/`jbrd` limits
+remain independent. Planning admission includes retained `jbrd`, decoded ICC, task/Huffman plans,
+padding copies, selected encoded/decoded metadata and framing, including temporary quantizer
+records. Retained `jbrd` and ICC limits are tightened before allocation; compressed input and
+ICC-transform scratch keep their separate transport/inventory limits. Checked u32 addressing and
+device buffer/binding/dispatch limits can reject below these caller caps.
+
+All buffers, uniforms, status copies, shared padding and simultaneous old/new stage allocations
+use the engine's shared `MemoryBudget`. Initial coefficient submission backpressure preserves the
+session for retry. A late memory/poller failure ends that pending reconstruction without byte
+output; a new session can retry. Cancellation submits no successor stage and mapping callbacks
+retain current GPU resources until completion. Completed output clones retain exactly their
+rounded byte reservation after the session is dropped. The
+[original-byte corpus](../../docs/CONFORMANCE_CORPUS.md#gpu-original-jpeg-byte-reconstruction)
+compares all 36 unchanged sources / 140 scans with their independently pinned original JPEGs,
+plus five 40-byte-window asynchronous cases. These results retain `CONT-05` as **Partial** and
+leave `ENC-05` **Missing**; they do not establish every legal JPEG/JXL reconstruction variant.
 
 ### Bounded standard VarDCT engine
 

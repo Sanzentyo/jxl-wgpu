@@ -548,6 +548,30 @@ duplicate, failed or partial capture/restoration cannot publish an authoritative
 lease. No image layout is assigned to this allocation. Explicit external readback must retain
 its lease; only the final clone releases its output reservation.
 
+The original-JPEG continuation binds a 48-byte entropy uniform, read-only coefficient/Huffman/
+task buffers, writable work/raw/output buffers, a 16-byte prefix-scan uniform and a shared
+16-byte padding state: seven storage bindings. Each block task is twelve u32 words. Huffman
+storage starts with 2048 canonical code words, followed by LSB-packed preserved padding bits.
+For B blocks, the count arena has four status words, 5B count/offset words, 4B progressive/EOB
+words and hierarchical scratch (two words per group at each 64-lane level). After validated raw
+size discovery, a second arena retains those 4+9B words and adds two N-word byte count/prefix
+arrays plus scratch for N = rounded raw storage bytes. The old and new arenas are both charged
+through their GPU copy. Exact raw and escaped output buffers are admitted in separate stages;
+only 16-byte summaries are mapped. Prefix-group stores guard rectangular over-dispatch, including
+an incomplete last row. The packed scan commits the shared padding cursor only with zero errors,
+and the last preserved-padding scan must consume exactly its declared bits.
+
+Final assembly binds a 32-byte uniform, source bytes, the original coefficient lease, component/
+progression metadata, private output and 16-byte status. Copy and quantizer-patch passes use
+atomic OR for unaligned adjacent bytes in zero-initialized storage. Quantizer placeholders are
+zero; precision and shared-component equality are checked before publication. Coefficient-bit
+coverage is checked against the declared spectral/refinement masks. Status must equal
+`[0, logical_jpeg_bytes, patched_quantizer_bytes, coefficient_words]`. Logical byte length excludes
+four-byte storage padding. Every storage/uniform/staging allocation and simultaneously retained
+scan output uses the shared budget. Mapping callbacks retain leases through GPU completion;
+only explicit pending advancement can submit a successor. Pipeline objects remain outside
+buffer accounting. No GPU coefficient or entropy array is read to the host for reconstruction.
+
 The common `ModularSideImagePlan` separates image geometry, transformed meta-channel count,
 MA/channel descriptors, original plane views, inverse jobs and entropy bounds from the raw-matrix
 denominator and targets. `wgpu_engine::side_image::modular` records entropy into an initial encoder

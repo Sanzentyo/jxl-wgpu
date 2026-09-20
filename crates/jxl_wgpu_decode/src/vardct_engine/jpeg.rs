@@ -282,12 +282,35 @@ impl VarDctSubmissionEngine {
         limits: JpegCoefficientLimits,
     ) -> crate::Result<JpegCoefficientSession> {
         let parsed = jxl_gpu_bitstream::parse(bytes, limits.parse)?;
+        self.open_jpeg_coefficients_parsed(&parsed, limits, None)
+            .map(|(session, _)| session)
+    }
+
+    pub(super) fn open_jpeg_coefficients_parsed(
+        &self,
+        parsed: &jxl_gpu_bitstream::ParsedJxl<'_>,
+        mut limits: JpegCoefficientLimits,
+        host_plan_limit: Option<u64>,
+    ) -> crate::Result<(
+        JpegCoefficientSession,
+        jxl_gpu_bitstream::CodestreamInventory,
+    )> {
+        if let Some(limit) = host_plan_limit {
+            limits.metadata.max_owned_bytes = limits.metadata.max_owned_bytes.min(limit);
+        }
         let metadata = parsed
             .jpeg_reconstruction(limits.metadata)
             .map_err(JpegCoefficientError::from)
             .map_err(VarDctDecodeError::from)?
             .ok_or(JpegCoefficientError::MissingMetadata)
             .map_err(VarDctDecodeError::from)?;
+        if let Some(limit) = host_plan_limit {
+            // Bound retained ICC before allocation. Inventory scratch has independent limits.
+            limits.inventory.max_decoded_icc_bytes = limits
+                .inventory
+                .max_decoded_icc_bytes
+                .min(limit.saturating_sub(metadata.logical_owned_bytes()));
+        }
         let inventory = parsed.codestream_inventory(limits.inventory)?;
         if inventory.frames.len() != 1
             || inventory.image_header.animation.is_some()
@@ -365,18 +388,21 @@ impl VarDctSubmissionEngine {
                 source.packet_window_batches(super::window_plan::PacketStage::Hf),
             ),
         });
-        Ok(JpegCoefficientSession {
-            inner: FrameDecodeSession {
-                backend: self.backend.clone(),
-                pipelines: Arc::clone(&self.pipelines),
-                memory_stats: source.memory,
-                runtime_stats,
-                source: Some(source),
-                memory: self.memory.clone(),
+        Ok((
+            JpegCoefficientSession {
+                inner: FrameDecodeSession {
+                    backend: self.backend.clone(),
+                    pipelines: Arc::clone(&self.pipelines),
+                    memory_stats: source.memory,
+                    runtime_stats,
+                    source: Some(source),
+                    memory: self.memory.clone(),
+                },
+                layout,
+                metadata,
             },
-            layout,
-            metadata,
-        })
+            inventory,
+        ))
     }
 }
 

@@ -219,9 +219,15 @@ both quantizers and coefficients. Capture and restoration counts/errors join pac
 validation; only their combined success publishes `GpuJpegCoefficients`. Its distinct pending
 type exposes no unvalidated image handoff. Shared permits and map callbacks keep the output and
 late raw-image scratch alive through cancellation, then release transient state independently
-of retained output clones. JPEG scan entropy and byte assembly are subsequent, unimplemented
-stages; [the decoder contract](../crates/jxl_wgpu_decode/README.md#gpu-jpeg-reconstruction-inputs)
-defines this bounded coefficient profile.
+of retained output clones. The `open_jpeg_reconstruction` continuation generates JPEG scan
+entropy from this validated lease. Hierarchical GPU prefix sums first determine raw bit sizes,
+then escaped byte sizes; the host admits each exact allocation after a 16-byte status map.
+Only a successful packed scan advances the shared padding cursor. Metadata-only framing and
+GPU scans are copied into one private byte buffer; GPU quantizer patches and coefficient-bit
+coverage checks join aggregate byte/count validation before publishing `GpuJpegFrame`.
+Every stage uses the shared memory and native poller admission, and no callback submits a
+successor after cancellation. See [the byte-output contract](../crates/jxl_wgpu_decode/README.md#gpu-original-jpeg-byte-output)
+for the qualified profile and limits.
 
 An unsupported profile rejects during capability negotiation or header validation. A CPU oracle
 may decode the result in tests, but oracle code cannot be reached from a production encode/decode

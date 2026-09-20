@@ -15,8 +15,8 @@ This directory has 25 unique inputs and 37 directly compared descriptors, includ
 `_5` variants. Three additional descriptors are pinned to the existing
 [spline](../splines/README.md) and [CMYK](../cmyk/README.md) GPU families. Together they
 represent all 40 upstream descriptors across 27 unique inputs. This coverage does not
-establish full JPEG XL conformance: original-JPEG reconstruction and exact generated ICC
-export remain separate requirements.
+establish full JPEG XL conformance. The separate GPU JPEG byte-output target now matches the
+three published original JPEGs exactly; exact generated ICC export remains open.
 
 The test pins each input and descriptor hash before reading reference pixels, then checks
 all loaded ICC and uncompressed NPY hashes. Storage compression uses `gzip -n` without
@@ -88,8 +88,9 @@ profiles are not weakened or replaced to make a color conversion pass.
 
 The generated ICC files for enumerated gamma, BT.709 and Gray remain unchanged reference
 objects; inventory checks verify the original declarations. They are not evidence of an
-exact-byte generated-profile export. The three JPEG-origin cases currently compare pixels;
-byte-identical reconstruction of their published original JPEG objects is a separate gate.
+exact-byte generated-profile export. The three JPEG-origin cases compare pixels in this target;
+[GPU original-JPEG reconstruction](../../../../docs/CONFORMANCE_CORPUS.md#gpu-original-jpeg-byte-reconstruction)
+separately checks every byte of their published original JPEG objects.
 
 ## Source-image credits
 
