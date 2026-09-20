@@ -52,6 +52,7 @@ fn analytic_profiles_preserve_color_and_progressive_reference_frames() {
 
 fn check_original_profiles(cases: Vec<corpus::Case>) {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
+    let decoders = original_profile_decoders(&backend);
     for case in cases {
         eprintln!("original profile {}", case.name);
         let data = case.bytes();
@@ -64,28 +65,37 @@ fn check_original_profiles(cases: Vec<corpus::Case>) {
             assert_eq!(case.encode_ycbcr(), data);
         }
         let reference = case.reference();
-        check_original_profile(&backend, &case, &data, &reference);
+        check_original_profile(&decoders, &case, &data, &reference);
     }
 }
 
+fn original_profile_decoders(backend: &WgpuBackend) -> [GpuDecoder<WgpuDecodeEngine>; 2] {
+    // Reuse pipelines within this test's fixture matrix, with separate caches for each input mode.
+    // Every case still owns its sessions/outputs and checks that all reservations are released.
+    [None, NonZeroU64::new(256)].map(|limit| {
+        let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
+        if let Some(limit) = limit {
+            engine = engine.with_stream_window_limit(limit);
+        }
+        GpuDecoder::new(engine)
+    })
+}
+
 fn check_original_profile(
-    backend: &WgpuBackend,
+    decoders: &[GpuDecoder<WgpuDecodeEngine>; 2],
     case: &corpus::Case,
     data: &[u8],
     reference: &[f32],
 ) {
+    let [whole, bounded] = decoders;
+    let backend = whole.engine().backend();
     let inventory = jxl_gpu_bitstream::parse(data, Default::default())
         .unwrap()
         .codestream_inventory(Default::default())
         .unwrap();
     let tolerance = tolerance(case);
     let mut baseline = None;
-    for limit in [None, NonZeroU64::new(256)] {
-        let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-        if let Some(limit) = limit {
-            engine = engine.with_stream_window_limit(limit);
-        }
-        let decoder = GpuDecoder::new(engine);
+    for (decoder, fragmented) in [(whole, false), (bounded, true)] {
         let request = GpuOutputRequest::color(case.format())
             .unwrap()
             .with_alpha_output_policy(AlphaOutputPolicy::Preserve)
@@ -101,15 +111,15 @@ fn check_original_profile(
                 .unwrap(),
             )
             .with_progressive_output(true);
-        let mut session = if limit.is_some() {
-            planes::open_fragmented(&decoder, data, request)
+        let mut session = if fragmented {
+            planes::open_fragmented(decoder, data, request)
         } else {
             decoder.open(data, request).unwrap()
         };
         let mut snapshots = Vec::new();
         let mut images = Vec::new();
         let mut final_count = 0;
-        while let Some(update) = if limit.is_some() {
+        while let Some(update) = if fragmented {
             pollster::block_on(session.next_update_async()).unwrap()
         } else {
             session.next_update().unwrap()
@@ -144,12 +154,11 @@ fn check_original_profile(
         drop((images, session));
         assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
     }
-    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let request = GpuOutputRequest::color(case.format())
         .unwrap()
         .with_alpha_output_policy(AlphaOutputPolicy::Preserve)
         .with_orientation_policy(OrientationPolicy::Keep);
-    let mut session = decoder.open(data, request).unwrap();
+    let mut session = whole.open(data, request).unwrap();
     for (_, words) in baseline
         .unwrap()
         .iter()
@@ -165,5 +174,5 @@ fn check_original_profile(
     }
     assert!(session.next_frame().unwrap().is_none());
     drop(session);
-    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+    assert_eq!(whole.engine().in_flight_memory_stats().reserved_bytes, 0);
 }

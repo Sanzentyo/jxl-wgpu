@@ -136,6 +136,37 @@ and 10 readback submissions. Each readback submission aggregated at most four so
 reported staging bytes were 8,960. The report correctly retained
 `coalesced_gpu_batching=false`: readback work was aggregated, while codec work was not.
 
+## Validation setup measurement (2026-09-21)
+
+The `original_color` integration target reuses two decoder engines per reconstruction test,
+one for whole input and one for bounded fragmented input. Its three reconstruction matrices
+cover 148 SDR cases, 80 analytic cases and 320 intent variants. Reusing the whole-input engine
+for final-only output reduces engine construction from 1,644 to six. Each case still opens
+fresh sessions, compares native references and retained/progressive/final-only output, and
+requires zero reserved bytes after releasing its sessions and images. GPU tests remain serial.
+
+A before/after run on 2026-09-21, 04:40–05:06 JST used Apple M5 / Metal, macOS 26.6.2
+(25G83), Rust 1.98.1 and `wgpu` 30.0.1. The adapter reports empty driver/version strings.
+Both runs used the repository's optimized test profile (`opt-level=1`), ordinary `target/`,
+`CARGO_BUILD_JOBS=4` and `JXL_REQUIRE_NATIVE_ORACLES=1`:
+
+```console
+cargo test --locked --workspace --all-features --test original_color -- --test-threads=1
+```
+
+| Revision/setup | Tests passed / ignored | Test execution (s) |
+| --- | ---: | ---: |
+| `2a387d026b21d8bbcf2f110df23b2e2872ceff78`, engines per case | 12 / 0 | 736.43 |
+| Engines reused within each reconstruction test | 12 / 0 | 675.64 |
+
+These are libtest elapsed times: one fresh test process per setup, no separate warmup run,
+including device/pipeline initialization, fixture/oracle work and GPU readback, excluding Cargo
+compilation. The changed matrices decode 37×19 original RGBA F32 into GPU buffers and explicitly
+stage-copy/map their outputs. Their precision bounds, input variants and ownership assertions,
+and the other nine tests, are unchanged. The observed reduction is 60.79 seconds (8.25%) for this
+target. This single pair does not establish a portable speedup or a new whole-workspace timing;
+the full suite was not rerun for this test-setup-only change.
+
 ## Report lifecycle
 
 Checked-in tuning data must contain an adapter fingerprint and the codec profile, shader, format

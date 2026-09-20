@@ -23,6 +23,7 @@ required checks. Never clean an output directory while a build or test still use
 |---|---|
 | Prose, links, or navigation only | Check Markdown, paths/anchors, and claims against current owning documents/source. Check for stale references after moving or deleting files. No full GPU suite is needed for prose-only changes. |
 | Executable documentation examples | Compile/run affected examples when the toolchain and hardware are available; shell syntax alone is not runtime validation. |
+| Test setup or helper changes only | Run affected test targets with their required adapters/oracles and unchanged case matrices, tolerances, and ownership checks. Use the same workload before and after for runtime comparisons. |
 | Host parsing, metadata, or format logic | Affected crate/target tests, malformed-input and limit cases, plus downstream checks for affected codec contracts. |
 | WGSL, codec/output behavior, or GPU ownership | Serial tests on an actual adapter, applicable independent oracles, precision/invalid-input checks, budget admission, cancellation, and retained-output lifetime. |
 | Advertised capability or cross-workspace contract | The full gates below plus the relevant roadmap acceptance evidence. Focused passing tests do not replace these gates. |

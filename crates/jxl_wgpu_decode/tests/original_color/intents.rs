@@ -30,6 +30,7 @@ fn native(data: &[u8], case: &corpus::Case) -> Vec<f32> {
 #[test]
 fn all_original_intents_preserve_native_reconstruction_and_composed_progression() {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
+    let decoders = super::original_profile_decoders(&backend);
     let cases = corpus::analytic_cases();
     assert_eq!(cases.len(), 80);
     for case in cases {
@@ -47,7 +48,7 @@ fn all_original_intents_preserve_native_reconstruction_and_composed_progression(
             let mut named = case.clone();
             named.name = format!("{}_{intent:?}", case.name);
             eprintln!("intent profile {}", named.name);
-            super::check_original_profile(&backend, &named, &data, &reference);
+            super::check_original_profile(&decoders, &named, &data, &reference);
         }
     }
 }
