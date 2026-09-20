@@ -681,16 +681,22 @@ YCbCr still executes its inverse matrix before retaining the original components
 The [embedded ICC corpus](test-data/embedded_icc_generator/README.md) covers RGB/Gray and
 original/XYB input, both common and standalone engines, complete/fragmented transport, exact
 17/31-bit integers and widened IEEE-754 words.
-The [official still corpus](test-data/official_stills/README.md) additionally checks all six
+The [official conformance corpus](test-data/official_conformance/README.md) additionally checks all six
 components of `spot`, including alpha and both inks, against its original profile's reference.
 That untouched profile has a noncanonical PCS illuminant: numeric output succeeds, while a color
 request retains the typed ICC error before GPU admission. This does not relax ICC validation or
 allow raw samples to enter a color transform. XYB color reconstruction still requires its actual
 validated original color domain.
-The same twelve-case corpus now includes official blend modes, delta palettes, grayscale,
-LZ77 and lossless patches under the original per-channel RMSE and peak bounds. Its JPEG-derived
-gray pixel comparison does not implement byte-identical JPEG reconstruction, and checking
-the original generated ICC files does not establish exact generated-profile export.
+The common target directly compares 37 published descriptors across 25 inputs, including
+48-frame and 36-frame animations, noise, upsampling, patches and a 4064×2704 progressive image.
+The existing 60-frame spline and five-channel CMYK GPU families cover the remaining three
+descriptors, with checked input/reference/metadata identities. Together they cover all 40
+descriptors across 27 unique inputs in the pinned upstream revision. Every original per-channel
+RMSE/peak bound remains unchanged, including distinct alternate references. Whole and fragmented
+16 KiB entropy-window output agree exactly, and retained frames survive session destruction.
+Oriented BRG's noncanonical ICC also has a typed color-request rejection before GPU admission.
+The three JPEG-origin pixel comparisons do not implement byte-identical JPEG reconstruction;
+retained generated ICC references do not establish exact generated-profile export.
 
 The common `WgpuDecodeEngine` additionally accepts original and XYB ICC color through
 both physical codecs. Private surfaces carry the exact owned profile and one Gray or three RGB

@@ -56,12 +56,11 @@ individual kernels, fixtures, or passing tests do not establish full conformance
 | Color and rendering | GPU restoration, resampling, composition, enumerated SDR/HDR and supported ICC connections; explicit tone/gamut mapping and still gain-map reconstruction with enumerated or ICC output. | Profile, rendering, gain-map, and cross-feature conformance are not complete. |
 | Output and scheduling | GPU-resident pitch-linear buffers, explicit readback, display textures, runtime-neutral async APIs, and budgeted resource leases. | Output support depends on the codec path and format. Host-thread concurrency is not coalesced codec GPU batching. |
 
-Twelve additional [official still references](crates/jxl_wgpu_decode/test-data/official_stills/README.md)
-cover floating lossless samples, alpha association, extended signed color, spot components and
-layered orientation, blend modes, delta palettes, LZ77, lossless patches and grayscale output.
-Direct Modular F32 output preserves signed color; numeric non-XYB ICC composition preserves
-original components without requiring an ICC color transform. Explicit Gray/GrayAlpha U8/F32
-output projects target-linear luminance before the requested transfer and alpha association.
+The [official conformance corpus](crates/jxl_wgpu_decode/test-data/official_conformance/README.md)
+checks the published per-channel pixel bounds of all 40 descriptors across 27 unique inputs
+in its pinned upstream revision. It includes three animations, signed F32 samples, both alpha
+associations, noise, splines, patches, original ICC components and a 4064×2704 progressive image.
+Byte-identical JPEG reconstruction and exact generated ICC export remain open.
 
 ## Execution contract
 

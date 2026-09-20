@@ -4558,7 +4558,7 @@ The VPI regression verifies both the original exact bytes and the submission cou
 
 ## Official stills and signed original samples (2026-09-20)
 
-The initial six cases of the [official still corpus](../crates/jxl_wgpu_decode/test-data/official_stills/README.md) import
+The initial six cases of the [official conformance corpus](../crates/jxl_wgpu_decode/test-data/official_conformance/README.md) import
 unchanged inputs, ICC profiles and descriptors from libjxl/conformance commit
 `b1d0f990b03e57bf6d137c365cd5dc8b470b9191`. Input/descriptor hashes are pinned in the test;
 profile and decompressed NPY hashes are checked against those descriptors. Original limits,
@@ -4615,3 +4615,57 @@ budget only when dropped. Existing ICC device-Gray packing and numeric Gray are 
 requirement remains open. `lz77_flower` compares normalized original samples under its checked
 enumerated gamma declaration; the retained original/reference ICC files are independently
 hashed but exact generated-ICC export remains open. These additions do not complete `QA-02`.
+
+## Official conformance descriptor coverage (2026-09-20)
+
+The renamed `official_conformance` target adds thirteen unchanged inputs and the remaining
+published descriptors from the same pinned upstream revision. Its 30 tests directly cover
+37 descriptors across 25 inputs; identity checks connect the remaining three descriptors to
+the existing 60-frame spline and five-channel CMYK GPU families. All 40 upstream descriptors
+and 27 unique input identities are accounted for. Input/descriptor hashes, original/reference
+ICC objects, uncompressed NPY identities, shapes, channel depths and rendering metadata are
+checked before comparison. No original error bound or reference pixel is replaced.
+
+The direct comparisons exercise 166 reference frames and 416,201,550 components across
+whole input and fragmented 16 KiB entropy windows, including alternate references. Both modes
+produce identical output words. The two added animations check all 48 and 36 frames, names,
+durations, timestamps, final flags, timebase and looping metadata. All output frames are held
+past session destruction, then release their frame and shared GPU reservations after readback.
+On Apple M5/Metal, the new primary references have these maximum per-channel/frame errors:
+
+| Input | Maximum RMSE | Maximum absolute peak |
+|---|---:|---:|
+| `animation_icos4d` | 8.660e-7 | 4.280e-5 |
+| `animation_newtons_cradle` | 0 | 0 |
+| `bench_oriented_brg` | 2.685e-7 | 1.908e-6 |
+| `bicycles` | 1.404e-7 | 2.480e-5 |
+| `bike` | 7.714e-7 | 2.484e-4 |
+| `cafe` | 4.637e-7 | 5.126e-6 |
+| `grayscale_public_university` | 5.112e-8 | 8.345e-7 |
+| `mul_no_extra_channels` | 0 | 0 |
+| `noise` | 7.539e-7 | 4.888e-5 |
+| `opsin_inverse` | 1.890e-5 | 6.868e-4 |
+| `patches` | 1.452e-7 | 7.749e-6 |
+| `progressive` | 5.630e-7 | 2.027e-5 |
+| `upsampling` | 1.395e-6 | 4.159e-5 |
+
+Twelve `_5` descriptors compare the same decoded output against their own original limits.
+Three have distinct published NPY pixels: `animation_icos4d_5` reaches RMSE 0.001126 / peak
+0.055727, `patches_5` 0.000255 / 0.024074, and `upsampling_5` 0.000258 / 0.016346. Each remains
+within its unchanged published bounds. The spline alternate has identical reference objects
+and metadata; the existing tighter RMSE 0.0001 / peak 0.004 comparison also satisfies it.
+
+Oriented BRG, Cafe and public-university Gray request their original numeric components;
+Bike requests BT.709, and Patches/Progressive request linear RGB. BRG's original ICC retains
+nonzero reserved header bytes at offset 84. Its independent color-request negative preserves
+typed ICC rejection before GPU admission even under complete memory pressure. No ICC validation
+rule is weakened. The original Multiply NPY is an independently pinned 844-byte upstream Git
+blob. Progressive's gzip stream is stored in three consecutive parts of at most 48 MiB and
+joined before original-NPY hash validation. Source-image credits and permissions are retained
+in the fixture README and original source notice.
+
+The target uses explicit 2 GiB fixture transient/shared budgets for its larger images; these
+are admission limits, not measured peak usage, and do not change production defaults. JPEG-origin
+pixels and retained generated ICC references leave their original-byte output requirements
+open. `QA-02` and the full JPEG XL goal remain **Partial**; this is pixel and metadata evidence
+for the pinned suite, not a claim that every ISO/IEC 18181-3 acceptance requirement is complete.
