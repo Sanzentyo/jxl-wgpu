@@ -22,6 +22,13 @@ Separate payload, codestream and transformed/decoded ICC bounds apply. It valida
 without decoding image samples; alternate rendering belongs to `jxl_wgpu_decode`.
 [Gain-map contract and interoperability](../../docs/GAIN_MAP.md).
 
+The `jpeg_reconstruction` module parses bounded `jbrd` marker, table, scan and preservation
+metadata into an immutable owned model. `ParsedJxl::jpeg_reconstruction` rejects duplicate and
+forbidden `brob`-wrapped records after complete transport validation. Canonical emission preserves
+decoded metadata contents under simultaneous input/temporary/output byte limits. This is a host
+metadata boundary; it does not establish JPEG frame or coefficient validity or produce JPEG image
+bytes. [API limits and reconstruction boundary](../../docs/CONTAINER_METADATA.md#jpeg-reconstruction-metadata).
+
 `ContainerStreamScanner` is the non-accumulating transport path. It accepts owned `Arc<[u8]>`
 chunks at arbitrary byte boundaries and emits raw/`jxlc`/`jxlp` codestream slices in logical order.
 Except for the two-byte codestream signature reconstructed inline across arbitrary chunk

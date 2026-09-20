@@ -16,6 +16,7 @@ mod acceleration;
 pub mod gain_map;
 mod inventory;
 mod inventory_stream;
+pub mod jpeg_reconstruction;
 pub mod metadata;
 mod stream;
 

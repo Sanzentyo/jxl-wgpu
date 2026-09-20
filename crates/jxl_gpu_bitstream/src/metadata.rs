@@ -32,6 +32,7 @@ use crate::{ContainerBox, ContainerBoxRef, ParsedJxl};
 mod codec;
 mod collector;
 
+pub(crate) use codec::{compress_with_prefix, decompress as decompress_body};
 pub use collector::MetadataCollector;
 
 pub const EXIF: [u8; 4] = *b"Exif";

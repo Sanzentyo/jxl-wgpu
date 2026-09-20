@@ -42,7 +42,7 @@ not as a prerequisite reading sequence for every edit.
 | Fixture families, reproduction, and numerical bounds | [Conformance corpus](CONFORMANCE_CORPUS.md) |
 | Measured performance and workload semantics | [GPU benchmarks](GPU_BENCHMARKS.md) |
 | Portable formats and precision policies | [VPI format coverage](VPI_FORMAT_COVERAGE.md) / [format APIs](../crates/jxl_gpu_formats/README.md) |
-| Opaque metadata ownership, limits, and writing | [Container metadata](CONTAINER_METADATA.md) |
+| Opaque metadata ownership and typed `jbrd` limits/writing | [Container metadata](CONTAINER_METADATA.md) |
 | ICC profiles, device output, and supported connections | [ICC color](ICC_COLOR.md) |
 | Explicit luminance adaptation | [Tone mapping](TONE_MAPPING.md) |
 | Requested RGB gamut mapping | [Gamut mapping](GAMUT_MAPPING.md) |

@@ -52,7 +52,7 @@ individual kernels, fixtures, or passing tests do not establish full conformance
 |---|---|---|
 | Decode | A common GPU frontend for Modular and VarDCT; stills, animation/composition, embedded previews, and validated progressive output in supported paths. | Both coding modes and their feature combinations remain partially implemented or incompletely covered. Progressive output does not imply incomplete-main-input decoding. |
 | Encode | Lossless Modular Gray/RGB/RGBA at 1–16-bit integer depth, including supported animation; experimental GPU VarDCT with all 27 transform strategies. | VarDCT lacks general perceptual-quality guarantees, adaptive rate control, and progressive encoding. |
-| Transport and metadata | Bounded raw/`jxlc`/`jxlp` scanning, fragmented input, explicit opaque metadata retention and writing. | Full container policy and frame indexes remain incomplete; JPEG bitstream reconstruction (`jbrd`) is not implemented. |
+| Transport and metadata | Bounded raw/`jxlc`/`jxlp` scanning, fragmented input, opaque metadata retention/writing, and bounded `jbrd` metadata parsing/emission. | Full container policy, frame indexes and GPU JPEG byte reconstruction remain incomplete. |
 | Color and rendering | GPU restoration, resampling, composition, enumerated SDR/HDR and supported ICC connections; explicit tone/gamut mapping and still gain-map reconstruction with enumerated or ICC output. | Profile, rendering, gain-map, and cross-feature conformance are not complete. |
 | Output and scheduling | GPU-resident pitch-linear buffers, explicit readback, display textures, runtime-neutral async APIs, and budgeted resource leases. | Output support depends on the codec path and format. Host-thread concurrency is not coalesced codec GPU batching. |
 

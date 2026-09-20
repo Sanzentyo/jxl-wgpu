@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use super::{BrotliOptions, MetadataError, MetadataLimits, MetadataResource, append, check};
 
-pub(super) fn decompress(input: &[u8], limits: MetadataLimits) -> Result<Vec<u8>, MetadataError> {
+pub(crate) fn decompress(input: &[u8], limits: MetadataLimits) -> Result<Vec<u8>, MetadataError> {
     check_window(input, limits)?;
     let mut state = brotli::BrotliState::new_strict(
         brotli::HeapAlloc::<u8>::default(),
@@ -74,6 +74,16 @@ pub(super) fn compress(
     options: BrotliOptions,
     limits: MetadataLimits,
 ) -> Result<Vec<u8>, MetadataError> {
+    compress_with_prefix(&box_type, input, options, limits)
+}
+
+/// Internal metadata-body primitive; callers retain their own wire-type validation.
+pub(crate) fn compress_with_prefix(
+    prefix: &[u8],
+    input: &[u8],
+    options: BrotliOptions,
+    limits: MetadataLimits,
+) -> Result<Vec<u8>, MetadataError> {
     check(
         MetadataResource::BrotliWindowBits,
         u64::from(options.window_bits),
@@ -92,15 +102,19 @@ pub(super) fn compress(
     };
     append(
         &mut writer.bytes,
-        &box_type,
+        prefix,
         limits.max_encoded_box_bytes,
         MetadataResource::EncodedBoxBytes,
     )?;
     if brotli::BrotliCompress(&mut &input[..], &mut writer, &params).is_err() {
         return Err(writer.error.unwrap_or(MetadataError::CompressionFailed));
     }
-    check_window(&writer.bytes[4..], limits)?;
-    check_expansion(input.len() as u64, (writer.bytes.len() - 4) as u64, limits)?;
+    check_window(&writer.bytes[prefix.len()..], limits)?;
+    check_expansion(
+        input.len() as u64,
+        (writer.bytes.len() - prefix.len()) as u64,
+        limits,
+    )?;
     Ok(writer.bytes)
 }
 

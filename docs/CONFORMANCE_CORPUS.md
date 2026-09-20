@@ -4669,3 +4669,36 @@ are admission limits, not measured peak usage, and do not change production defa
 pixels and retained generated ICC references leave their original-byte output requirements
 open. `QA-02` and the full JPEG XL goal remain **Partial**; this is pixel and metadata evidence
 for the pinned suite, not a claim that every ISO/IEC 18181-3 acceptance requirement is complete.
+
+## Bounded JPEG reconstruction metadata
+
+The bitstream crate's [`jpeg_reconstruction` target](../crates/jxl_gpu_bitstream/tests/jpeg_reconstruction/main.rs)
+adds 36 pinned original JPEG/JXL pairs and 140 scan declarations. Three reuse the official
+Bench oriented BRG, Cafe and grayscale inputs; their original JPEG objects match the published
+descriptor hashes. The remaining sources cover gray/RGB/YCbCr, sequential and progressive scans,
+4:4:4/4:2:0/4:4:0 sampling, odd dimensions, restarts, empty/merged Huffman markers, unused and
+16-bit quantization tables, custom selectors, ICC chunks, Exif, XMP, binary comments, fill and
+tail bytes, extra ZRL symbols, long EOB runs and zero/mixed padding across multiple scans.
+The [fixture recipe and source identities](../crates/jxl_gpu_bitstream/test-data/jpeg_reconstruction/README.md)
+retain the original JPEG as the independent byte oracle. Noncanonical preservation inputs do
+not establish normative JPEG syntax acceptance.
+
+On libjxl 0.12.0, strict JPEG-only decoding must match the original bytes for each unchanged
+source and for Rust-emitted `jbrd` at three Brotli quality/window settings: 144 complete-JPEG
+comparisons. The image codestream and all other auxiliary payloads remain exact. Eighteen native
+negatives cover absent reconstruction metadata (no pixel fallback), empty metadata, two
+truncations and two trailing-byte variants on the official sources. The native executable is
+development-only; missing native tools fail the test. No source or reference in an existing
+corpus is replaced.
+
+Portable checks cover every payload truncation, exact record/body preservation, canonical
+stability, immutable public access, all declared host bounds, exact simultaneous metadata/
+compression/output accounting, one-byte-short admission with successful retry, malformed
+Huffman and marker groups, selectors, native metadata block endpoints, zero header padding,
+and duplicate or forbidden `brob`-wrapped `jbrd`. The shared strict Brotli implementation retains
+its existing 180 native bidirectional parameter comparisons and six raw-box extractions.
+
+This evidence advances `CONT-05` to **Partial** for bounded metadata parsing/emission. It does
+not close the official original-JPEG output requirement: production still lacks actual GPU
+quantization/LF/AC binding, complete frame/metadata compatibility checks, GPU JPEG entropy and
+authoritative byte-output ownership. `ENC-05` and exact generated ICC output remain open.

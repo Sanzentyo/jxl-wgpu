@@ -1,4 +1,4 @@
-# Opaque JPEG XL container metadata
+# JPEG XL container metadata
 
 `jxl_gpu_bitstream::metadata` exposes Exif, XMP (`xml `), JUMBF (`jumb`) and unknown auxiliary
 payloads. Retention and decompression are separate operations. `MetadataBox` retains the complete
@@ -109,6 +109,56 @@ On Rust 1.98.1 / Apple M5 Metal, the focused tests passed:
 
 See the [native oracle recipe](../crates/jxl_gpu_bitstream/test-data/metadata_oracle/README.md).
 No existing source image or reference asset changes. Full container ordering/compatibility,
-`jxli`, `jbrd`, full `jhgm` conformance, encoder quality and the remaining full JPEG XL gates remain
+`jxli`, JPEG byte reconstruction, full `jhgm` conformance, encoder quality and the remaining full JPEG XL gates remain
 open. [Gain-map interpretation](GAIN_MAP.md) now has a separate bounded metadata and GPU
 alternate-still API; opaque metadata retention alone does not invoke it.
+
+## JPEG reconstruction metadata
+
+`jxl_gpu_bitstream::jpeg_reconstruction` is a separate typed metadata boundary for `jbrd`.
+`JpegReconstructionMetadata::parse` accepts one complete payload; the convenience method
+`ParsedJxl::jpeg_reconstruction` first inventories every auxiliary box in transport-validated
+input. It returns `None` when absent, and typed `DuplicateBox` or `WrappedBox` errors before
+parsing an ambiguous or `brob`-wrapped record. Incremental transport events alone cannot establish
+this complete-container condition. Opaque collection and this parser do not execute one another.
+
+The immutable owned result exposes borrowed marker, component, quantization/Huffman table and
+scan records; restart intervals, reset points and redundant zero-run records; packed preserved
+entropy-padding bits; APP classifications and body ranges; exact COM/intermarker/tail contents.
+Known ICC/Exif/XMP APP records declare required sizes but refer to separately supplied metadata.
+Quantization values, sampling grids and coefficients belong to the image frame, not `jbrd`.
+The initial gray hint and per-scan last-pass metadata are preserved without granting image
+authority. Noncanonical byte-preservation records are not a JPEG syntax-conformance assertion.
+
+Parsing validates field ranges, selectors, table groups/use, Huffman uniqueness/terminal/DC
+alphabet/prefix space, marker lengths, native metadata block-index bounds, zero header alignment,
+and exact decoded-body size. Strict standard Brotli rejects truncated, trailing and excess output.
+Declared block indices and scan schedules still require actual frame-grid and progression checks
+before use. Errors distinguish bit input, invalid metadata, allocation failure, resource limits
+and the shared strict Brotli errors; an error returns no partial metadata or output.
+
+`JpegReconstructionLimits` defaults to 64 MiB encoded input, 64 MiB logical owned storage,
+16,384 markers, 1,048,576 total vector entries and 64 MiB decoded opaque body. The marker grammar
+also has an intrinsic 16,384 ceiling. Entries include nested symbols, scan/reset/ZRL arrays and
+packed padding bytes. Owned storage counts vector elements, including their inline record
+fields, and the decoded body once. Borrowed input, the enclosing inline object, allocator capacity
+and overhead, fixed scratch and Brotli state are separate. The 4096-byte decoder scratch,
+standard window limit (default 24 bits) and expansion ratio (default 1024×) bound their respective
+work; logical owned storage is not total allocator/RSS usage. Ratio excludes the `jbrd` header.
+
+`encode(JpegReconstructionEncodeOptions)` emits canonical metadata field encodings and a new
+Brotli body. It preserves the logical metadata, not the original compressed `jbrd` byte sequence.
+The resulting `EncodedJpegReconstruction` reports header/body lengths and simultaneous logical
+peak ownership. The default 128 MiB owned limit covers existing metadata, compressed temporary
+body and final encoded payload together; encoded output defaults to 64 MiB. The header is counted
+without allocating, and compression is bounded by the remaining output and ownership allowances
+before final allocation. Failed admission leaves the input reusable. Individual emissions do not
+reserve bytes against a shared session budget; callers retaining multiple models/results account
+for those separately. Pass `as_bytes()` to a `ContainerBox` of type `JBRD` when assembling a container.
+
+The [JPEG metadata corpus](../crates/jxl_gpu_bitstream/test-data/jpeg_reconstruction/README.md)
+verifies original-JPEG byte identity through the independent libjxl JPEG-only API, including
+multiple compression settings and malformed inputs. No CPU image/entropy/coefficient decoding
+enters production. A future GPU JPEG path must bind actual decoded quantization and integer LF/AC,
+validate frame geometry and required external metadata, execute JPEG entropy, and retain budget
+ownership through completion/cancellation/readback before publishing authoritative JPEG bytes.
