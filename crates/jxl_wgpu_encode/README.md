@@ -19,13 +19,13 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
 
 - Extents are `1..2^30` on each axis, further bounded by the selected WebGPU device's storage
   binding, buffer, and dispatch limits.
-- Valid sample depths are every integer in `1..=16`. `1..=8` use one native `u8` word per
-  component; `9..=16` use one native `u16` word per component. The valid sample occupies the low
+- Valid sample depths are every integer in `1..=31`. `1..=8` use one native `u8` word per
+  component; `9..=16` use `u16`, and `17..=31` use `u32`. The valid sample occupies the low
   bits and high padding bits are ignored. `LosslessModularFormat::pixel_format` constructs this
-  explicit storage/valid-bits contract, including native-U16 10- and 12-bit layouts.
+  explicit storage/valid-bits contract, including native-U16 10/12-bit and native-U32 24/31-bit layouts.
 - Gray uses one unsigned `X` plane. RGB and RGBA use one unsigned interleaved plane in canonical
   RGB/RGBA order. Row pitch and plane offset may contain arbitrary padding. Planar RGB, BGR/BGRA,
-  MSB-aligned sub-16-bit words, and explicitly defined non-sRGB color specifications are rejected.
+  MSB-aligned partial words, and explicitly defined non-sRGB color specifications are rejected.
 - `Default` and `Undefined` RGB color specifications are interpreted as sRGB, matching the compact
   all-default JPEG XL color header. RGBA is written as one unassociated alpha extra channel at the
   same declared integer depth as RGB.
@@ -83,7 +83,7 @@ let encoder = LosslessModularEncoder::with_tree_mode(
 );
 let plan = encoder.memory_plan(&source)?;
 assert_eq!(plan.group_grid.groups, plan.group_grid.columns * plan.group_grid.rows);
-assert!((1..=16).contains(&plan.bits_per_sample));
+assert!((1..=31).contains(&plan.bits_per_sample));
 
 // Use this descriptor when constructing a packed native-U16 RGB10 source layout.
 let _rgb10 = LosslessModularFormat::Rgb.pixel_format(10)?;
@@ -103,12 +103,21 @@ let jxl_container = submission.wait()?;
 Single-group Gray8 containers additionally carry the optional private `jwgp` acceleration index.
 Its current schema represents one contiguous 8-bit single-channel token span, so other depths,
 RGB(A), and multi-group containers intentionally omit that private box; all remain ordinary
-interoperable JPEG XL containers. Conformance tests cover every depth `1..=16`, the
+interoperable JPEG XL containers. Conformance tests cover every depth `1..=31`, the
 1/255/256/257 group boundaries, and extreme aspect ratios. A streamed 16,384×1 RGB8 case is exact
 through both the published Rust `jxl` decoder and reference `djxl`, with identical blocking and
 runtime-neutral Future codestreams. Browser/WASM compilation covers that same multi-batch state
 machine; browser execution still requires a WebGPU-capable page and executor/event-loop integration
 provided by the application.
+
+The [wide-integer matrix](../../docs/CONFORMANCE_CORPUS.md#wide-integer-modular-encoding)
+checks all 17–31-bit depths with shared and local trees. Original integer planes from jxl-oxide
+must match every source word exactly; native libjxl independently checks normalized output.
+Whole and bounded fragmented GPU decoding also preserve every source word, including values
+beyond F32's exact integer range. Full-canvas Replace animations cover 17/24/31-bit timing and
+retained output; streamed 16K×1 and resident RGBA31 cases cover exact budget admission,
+cancellation and reuse.
+This exact-word claim does not extend to floating-point animation composition.
 
 ## Experimental VarDCT profile
 

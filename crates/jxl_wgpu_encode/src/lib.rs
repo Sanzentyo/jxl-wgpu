@@ -6,7 +6,7 @@
 //! JPEG XL bitstream/container assembly.
 //!
 //! [`LosslessModularEncoder`] implements standard multi-group lossless Modular Gray, RGB, and RGBA
-//! for every unsigned integer depth in `1..=16`. Samples remain GPU-resident through reversible
+//! for every unsigned integer depth in `1..=31`. Samples remain GPU-resident through reversible
 //! color transform, prediction, residual tokenization, and histogram collection. The generic
 //! [`GpuEncoder`] advertises only profiles implemented by its backend.
 //! [`LosslessModularAnimationSession`] adds standard timebases, exact frame durations and

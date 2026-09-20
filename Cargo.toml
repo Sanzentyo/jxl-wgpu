@@ -27,6 +27,7 @@ jxl-image = { version = "=0.13.0" }
 jxl-modular = { version = "=0.11.3" }
 jxl-oxide = { version = "=0.12.6", default-features = false }
 jxl-oxide-common = { version = "=1.0.0" }
+jxl-render = { version = "=0.12.4" }
 jxl-threadpool = { version = "=1.0.0" }
 jxl-vardct = { version = "=0.11.1" }
 jxl_gpu_bitstream = { path = "crates/jxl_gpu_bitstream", version = "=0.1.0" }

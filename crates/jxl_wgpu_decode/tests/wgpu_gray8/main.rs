@@ -750,7 +750,27 @@ fn indexed_gray8_direct_maps_the_tracked_output_on_supported_uma() {
         })
         .unwrap();
 
-    let completed = readback.submit(frame.output()).unwrap();
+    // The native poll worker may already be executing the map callback when the
+    // queue-index wait returns. Reuse requires that callback to finish unmapping
+    // and release its tracked direct-map permit, not just GPU completion.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let completed = loop {
+        match readback.submit(frame.output()) {
+            Ok(completed) => break completed,
+            Err(jxl_wgpu::Error::ImageReadbackDirectMapBusy {
+                frame: 0,
+                output: 0,
+            }) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "abandoned direct map did not release its tracked access"
+                );
+                backend.device().poll(wgpu::PollType::Poll).unwrap();
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("direct readback reuse failed: {error}"),
+        }
+    };
     assert!(completed.stats().direct_mapped);
     assert_eq!(completed.stats().logical_bytes, 17 * 13);
     assert_eq!(completed.stats().staging_bytes, 0);

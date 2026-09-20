@@ -538,8 +538,8 @@ pub(super) fn build_prefix_codes(
     for channel in 0..channels {
         let transformed_extra_token = u8::from(format != LosslessModularFormat::Gray);
         let wide_samples = bits_per_sample > 14;
-        let max_raw_token = if wide_samples {
-            RAW_SYMBOLS - 1
+        let max_raw_token = if (15..=16).contains(&bits_per_sample) {
+            18
         } else {
             usize::from(
                 bits_per_sample
@@ -719,7 +719,7 @@ impl ModularPacketAssembler {
                     height: self.height,
                     token_bit_offset_in_group: self.token_bit_offset_in_group,
                     token_bit_len,
-                    raw_prefix: self.codes[0].raw_entries(),
+                    raw_prefix: std::array::from_fn(|index| self.codes[0].raw_entries()[index]),
                     lz77_prefix: self.codes[0].lz77_entries(),
                 });
             return Ok((packets, acceleration));
@@ -1202,9 +1202,9 @@ pub(super) fn write_animation_header(
 }
 
 fn write_integer_bit_depth(output: &mut BitWriter, bits_per_sample: u8) -> Result<(), EncodeError> {
-    if !(1..=16).contains(&bits_per_sample) {
+    if !(1..=31).contains(&bits_per_sample) {
         return Err(EncodeError::InvalidConfiguration(
-            "lossless Modular integer depth must be in 1..=16",
+            "lossless Modular integer depth must be in 1..=31",
         ));
     }
     output.write_bits(0, 1)?; // integer samples

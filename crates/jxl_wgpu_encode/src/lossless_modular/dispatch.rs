@@ -61,10 +61,10 @@ pub(super) struct ModularDispatchPlan {
     pub(super) memory: LosslessModularMemoryPlan,
 }
 
-/// GPU lossless 1-16-bit integer Modular encoding with row-major 256x256 pass groups.
+/// GPU lossless 1-31-bit integer Modular encoding with row-major 256x256 pass groups.
 ///
 /// It never reads source pixels on the CPU. The source buffer may contain packed Gray, RGB, or
-/// RGBA unsigned samples in canonical native `u8`/`u16` storage. RGB samples use the normative
+/// RGBA unsigned samples in canonical native `u8`/`u16`/`u32` storage. RGB samples use the normative
 /// reversible YCoCg transform in WGSL before prediction. The GPU emits predictor
 /// residual tokens and histograms; the host only serializes those artifacts.
 pub struct LosslessModularBackend {
@@ -111,7 +111,7 @@ impl LosslessModularBackend {
             capabilities: EncoderCapabilities {
                 profiles: vec![ProfileCapability::ModularLossless {
                     min_bits_per_sample: 1,
-                    max_bits_per_sample: 16,
+                    max_bits_per_sample: 31,
                 }],
                 max_progressive_passes: 1,
                 animation: true,

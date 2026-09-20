@@ -54,7 +54,7 @@ pub(super) const EVENT_WORDS: usize = std::mem::size_of::<ModularEvent>() / 4;
 const _: () = {
     assert!(std::mem::size_of::<ModularParams>() == 256);
     assert!(std::mem::align_of::<ModularParams>() == 4);
-    assert!(std::mem::size_of::<ModularArtifactHeader>() == 53 * 4);
+    assert!(std::mem::size_of::<ModularArtifactHeader>() == 67 * 4);
     assert!(std::mem::align_of::<ModularArtifactHeader>() == 4);
     assert!(std::mem::size_of::<ModularEvent>() == 16);
     assert!(std::mem::align_of::<ModularEvent>() == 4);
@@ -100,15 +100,15 @@ impl LosslessModularFormat {
     /// Constructs the canonical pitch-linear source format for an unsigned integer depth.
     ///
     /// Depths `1..=8` use one native-endian `u8` word per component. Depths `9..=16` use one
-    /// native-endian `u16` word per component. Sub-byte and sub-16-bit values occupy the low bits;
+    /// native-endian `u16` word per component, and `17..=31` use `u32`. Samples occupy the low bits;
     /// the high padding bits are outside the valid sample and are ignored by the encoder.
     pub fn pixel_format(self, bits_per_sample: u8) -> Result<PixelFormat, EncodeError> {
-        if !(1..=16).contains(&bits_per_sample) {
+        if !(1..=31).contains(&bits_per_sample) {
             return Err(EncodeError::InvalidConfiguration(
-                "lossless Modular integer depth must be in 1..=16",
+                "lossless Modular integer depth must be in 1..=31",
             ));
         }
-        let storage_bits = if bits_per_sample <= 8 { 8 } else { 16 };
+        let storage_bits = bits_per_sample.next_power_of_two().max(8);
         let (model, color_spec, swizzle, channels): (_, _, _, &[Channel]) = match self {
             Self::Gray => (
                 ColorModel::NonColor,
@@ -221,10 +221,9 @@ pub(super) fn lossless_modular_source_spec(
         let word_bits = padding
             .checked_add(channel_bits)
             .ok_or(UnsupportedFeature::InputFormat)?;
-        let expected_storage_bits = if channel_bits <= 8 { 8 } else { 16 };
         if channel != *expected_channel
-            || !(1..=16).contains(&channel_bits)
-            || word_bits != expected_storage_bits
+            || !(1..=31).contains(&channel_bits)
+            || word_bits != channel_bits.next_power_of_two().max(8)
             || bits_per_sample.is_some_and(|bits| bits != channel_bits)
             || storage_bits.is_some_and(|bits| bits != word_bits)
         {

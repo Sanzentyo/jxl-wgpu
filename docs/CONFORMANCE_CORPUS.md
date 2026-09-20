@@ -241,6 +241,47 @@ Attempting the same wide/HDR inputs with the default `Rgba8Unorm` descriptor mus
 error before submission. Naga semantically validates both generated storage-texture variants; the
 160-byte display uniform fixes matrix-row offsets 96, 112, and 128.
 
+## Wide integer Modular encoding
+
+[`jxl_wgpu_encode/tests/lossless_wide`](../crates/jxl_wgpu_encode/tests/lossless_wide/main.rs)
+generates 90 containers: Gray/RGB/RGBA × every 17–31-bit depth × shared/local MA trees. Its
+1×257, 255×3, 256×2 and 257×9 extents cover thin and partial groups. U32 sources use a five-byte
+offset, unaligned padded rows and all-one high padding bits. Deterministic samples include both
+endpoints, adjacent low bits beyond F32 precision, zero runs and signed chroma residuals reaching
+`i32::MIN`, which requires raw token 32 and 31 extra bits.
+
+For every container, jxl-oxide 0.12.6 must retain original integer planes and match all source
+words exactly. The development-only jxl-render 0.12.4 plane interface rejects an F32 result;
+rounding normalized pixels back to integer is not exact-word evidence. Native libjxl 0.12.0 is
+also required and checks normalized original RGBA and independent alpha within 2e-7 absolute
+error. Whole and 43-byte-fragmented input through 256-byte GPU windows produce 180 exact native
+U32 frame comparisons. Output remains valid after the decode session is dropped, and its final
+owner releases the decoder reservation.
+
+Nine three-frame animations cover Gray/RGB/RGBA at 17/24/31 bits, full-canvas Replace, exact
+durations/timecodes, and reversed completion/insertion through mixed blocking/Future calls.
+Both independent oracles check all 27 presentations; whole and bounded GPU runs check 54
+presentations, retaining them through session teardown. These exact-word checks do not claim
+integer precision through floating-point blend/composition paths.
+
+A 16,384×1 RGBA31 image with local trees forces multiple artifact batches. Blocking and Future
+codestreams must be identical and satisfy both independent oracles. A one-byte-deficient budget
+fails on worker-side batch admission before leasing buffers; the exact budget succeeds and reuses
+the pool. A resident 257×9 RGBA31 case separately checks synchronous one-byte-deficient admission,
+concurrent-job backpressure, abandoned completion releasing the reservation and pool lease, and
+successful encoder reuse with both oracles.
+Unit tests reject noncanonical token-32 bit counts/high bits, token 33 and histogram values outside
+the configured depth. Existing 1–16-bit tests and the unchanged 609-byte Gray8 fixture remain gates.
+
+Focused command (GPU tests remain serial):
+
+```console
+cargo test --locked -p jxl_wgpu_encode --test lossless_wide -- --test-threads=1
+```
+
+This target isolates high-depth development checks; advertised changes still require the
+[full capability gates](DEVELOPMENT.md#capability-change-gates).
+
 ## Procedural VarDCT encoder matrix
 
 All 27 single-transform strategies now emit real AC. The shared forward primitive has 667

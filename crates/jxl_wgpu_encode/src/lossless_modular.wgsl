@@ -14,8 +14,8 @@ struct Params {
 @group(0) @binding(0)
 var<storage, read> source_words: array<u32>;
 
-// Word 0 is the event count, words 1..20 are raw-token counts, words
-// 20..53 are LZ77-token counts, and the remaining words are four-word events
+// Word 0 is the event count, words 1..34 are raw-token counts, words
+// 34..67 are LZ77-token counts, and the remaining words are four-word events
 // (kind, token, extra-bit count, extra bits).
 @group(0) @binding(1)
 var<storage, read_write> output_words: array<u32>;
@@ -23,7 +23,7 @@ var<storage, read_write> output_words: array<u32>;
 @group(0) @binding(2)
 var<storage, read> group_params: array<Params>;
 
-const OUTPUT_HEADER_WORDS: u32 = 53u;
+const OUTPUT_HEADER_WORDS: u32 = 67u;
 const EVENT_WORDS: u32 = 4u;
 const EVENT_OVERFLOW: u32 = 0xffffffffu;
 
@@ -38,8 +38,12 @@ fn source_component(params: Params, x: u32, y: u32, component: u32) -> i32 {
     let byte_index = params.byte_offset + y * params.row_stride
         + sample_index * params.bytes_per_sample;
     var value = source_byte(byte_index);
-    if params.bytes_per_sample == 2u {
+    if params.bytes_per_sample >= 2u {
         value |= source_byte(byte_index + 1u) << 8u;
+    }
+    if params.bytes_per_sample == 4u {
+        value |= source_byte(byte_index + 2u) << 16u;
+        value |= source_byte(byte_index + 3u) << 24u;
     }
     return i32(value & params.sample_mask);
 }
@@ -120,7 +124,7 @@ fn emit_run(params: Params, count: u32) {
         nbits = n;
         bits = value - (1u << n);
     }
-    output_words[output_base + 20u + token] = output_words[output_base + 20u + token] + 1u;
+    output_words[output_base + 34u + token] = output_words[output_base + 34u + token] + 1u;
     append_event(params, 1u, token, nbits, bits);
 }
 
@@ -146,17 +150,15 @@ fn packed_residual(params: Params, x: u32, y: u32) -> u32 {
         }
     }
 
-    let ac = left - top_left;
-    let ab = left - top;
-    let bc = top - top_left;
-    let gradient = ac + top;
-    let clamped = select(left, top, (ab ^ bc) < 0i);
-    let prediction = select(clamped, gradient, (ac ^ bc) < 0i);
-    let residual = pixel - prediction;
-    if residual < 0i {
-        return u32(-residual * 2i - 1i);
-    }
-    return u32(residual * 2i);
+    // Compare before subtracting: high-depth chroma differences can overflow i32.
+    // When northwest is inside the interval the mathematical gradient fits i32;
+    // intermediate and residual arithmetic explicitly retain the low 32 bits.
+    let low = min(left, top);
+    let high = max(left, top);
+    let gradient = bitcast<i32>(bitcast<u32>(left) + bitcast<u32>(top) - bitcast<u32>(top_left));
+    let prediction = select(select(gradient, high, top_left < low), low, top_left > high);
+    let residual = bitcast<u32>(pixel) - bitcast<u32>(prediction);
+    return (residual << 1u) ^ (0u - (residual >> 31u));
 }
 
 @compute @workgroup_size(1)

@@ -33,7 +33,7 @@ implementation audits.
 |---|---|
 | Coding mode | Modular lossless |
 | Color models | Gray (one NonColor `X000` plane), RGB (`Rgb`/`XYZ1`), RGBA (`Rgb`/`XYZW`); RGBA alpha is one unassociated extra channel |
-| Sample depths | every integer `1..=16` (`1..=8` in `u8` words, `9..=16` in `u16` words) |
+| Sample depths | every integer `1..=31` (`1..=8` in `u8` words, `9..=16` in `u16`, `17..=31` in `u32`) |
 | Input | pitch-linear `wgpu::Buffer`; single-plane, unsigned, native byte order, `ChromaSubsampling::None` |
 | Extent | `1..2^30` per axis, further bounded by device limits |
 | Frame/group layout | standard 256x256 PassGroups, multi-group, row-major TOC |
@@ -42,18 +42,18 @@ implementation audits.
 | Progressive passes | `max_progressive_passes = 1` |
 | Implemented stages | `ColorTransform`, `ModularTransform`, `ModularPrediction`, `ModularResidualTokenization`, `HistogramReduction` |
 | Predictor | JPEG XL Gradient predictor |
-| Modular transforms | none |
+| Modular transforms | fixed reversible YCoCg for RGB(A); none for Gray |
 | Entropy | JPEG XL prefix code with LZ77 distance 1, not ANS; fixed MA tree |
 | Filters | Gaborish off, EPF zero iterations |
 | Output | raw codestream or standard `jxlc` container; private `jwgp` index emitted only for single-group Gray8 containers |
 
 The backend rejects textures, planar RGB, BGR/BGRA, non-native byte order, chroma subsampling,
-YUV/NV12, MSB-aligned sub-16-bit words, explicit non-sRGB color specifications, and progressive
+YUV/NV12, MSB-aligned partial words, explicit non-sRGB color specifications, and progressive
 passes > 1. YUV/NV12 ingestion is not implemented.
 
 ### GPU artifact ABI
 
-The token kernel is still `@compute @workgroup_size(1)` (`lossless_modular.wgsl:162`).
+The token kernel is still `@compute @workgroup_size(1)` in `lossless_modular.wgsl`.
 Parallelism comes only from the number of (PassGroup, channel) pairs in the dispatch; one
 invocation scans its whole group serially. Streamed multi-batch jobs use two submissions per batch
 (one histogram pass, one serialization pass). This remains a correctness milestone, not the
@@ -61,9 +61,9 @@ eventual performance topology. Its readback buffer consists of little-endian `u3
 
 ```text
 word 0       event_count
-word 1..19   raw hybrid-token counts (19 entries)
-word 20..52  LZ77 hybrid-token counts (33 entries)
-word 53..    event_count records of:
+word 1..33   raw hybrid-token counts (33 entries)
+word 34..66  LZ77 hybrid-token counts (33 entries)
+word 67..    event_count records of:
               kind, token, extra_bit_count, extra_bits
 ```
 
@@ -114,25 +114,30 @@ returned safely even when a Future is abandoned. Idle retention defaults to 32 M
 256-set object cap; `buffer_pool_stats`, `set_buffer_pool_limit`, and `clear_buffer_pool` expose
 reuse and control. Caller-owned source bindings are neither copied into nor retained by this pool.
 
-The predictor is computed in signed integer arithmetic:
+The predictor compares signed sample values without overflowing the comparison differences:
 
 ```text
-ac = left - top_left
-ab = left - top
-bc = top - top_left
-gradient = ac + top
-clamped = (ab xor bc) < 0 ? top : left
-prediction = (ac xor bc) < 0 ? gradient : clamped
+low = min(left, top)
+high = max(left, top)
+gradient = bitcast_i32(bitcast_u32(left) + bitcast_u32(top) - bitcast_u32(top_left))
+prediction = top_left < low ? high : (top_left > high ? low : gradient)
 ```
 
 The first row predicts from the left; the first sample of later rows predicts from the first sample
-of the previous row. Residuals use the JPEG XL packed-signed mapping. Eight-sample chunks turn a run
+of the previous row. Residual subtraction and packed-signed mapping use modulo-32-bit arithmetic,
+including the full signed range of high-depth chroma differences. Eight-sample chunks turn a run
 longer than seven zeros into the configured LZ77 form.
 
 Raw tokens use hybrid configuration `000`: token zero represents zero; for token `t > 0`, read
 `t - 1` extra bits and add `2^(t - 1)`. LZ77 uses configuration `400`: values below 16 are direct;
 otherwise token `t` reads `t - 12` bits and adds `2^(t - 12)`. The decoded run length is that value
 plus eight and the configured distance is one.
+
+The raw alphabet includes tokens 0–32; token 32 carries 31 extra bits. High-depth trees use at
+most eight bits at the first prefix level, leaving at least seven for the nested LZ77 tree and
+keeping combined lengths within 15 bits. The LZ77 alphabet still starts at symbol 224. Existing
+1–16-bit prefix policies and the private Gray8 index retain their original 19-entry alphabet;
+the checked 609-byte Gray8 fixture is unchanged.
 
 ## Public API and state model
 
@@ -318,7 +323,7 @@ cargo clippy -p jxl_wgpu_encode --all-targets -- -D warnings
 
 - **Multi-group Modular (Slice 3)**: Standard 256x256 PassGroups, multi-group row-major TOC layout,
   two-pass streaming with global histogram aggregation, and out-of-order group completion.
-- **Lossless RGB and RGBA (Slice 4 half)**: Interleaved unsigned RGB and RGBA at depths `1..=16`
+- **Lossless RGB and RGBA (Slice 4 half)**: Interleaved unsigned RGB and RGBA at depths `1..=31`
   with GPU-side reversible color transform (YCoCg) and unassociated alpha extra-channel support.
 - **Lossless Modular animation (Slice 6)**: Multi-frame `LosslessModularAnimationSession` supporting
   standard timebases, exact durations and timecodes, signed crop rectangles, all 5 blend modes,

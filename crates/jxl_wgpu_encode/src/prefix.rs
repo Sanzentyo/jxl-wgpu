@@ -11,25 +11,30 @@ use crate::EncodeError;
 #[cfg(test)]
 mod tests;
 
-pub(crate) const RAW_SYMBOLS: usize = 19;
+pub(crate) const RAW_SYMBOLS: usize = 33;
 pub(crate) const LZ77_SYMBOLS: usize = 33;
-const MAX_SYMBOLS: usize = LZ77_SYMBOLS;
+const MAX_SYMBOLS: usize = RAW_SYMBOLS + 1;
+const NARROW_RAW_SYMBOLS: usize = 19;
 
 const BASE_RAW_COUNTS: [u64; RAW_SYMBOLS] = [
-    3843, 852, 1270, 1214, 1014, 727, 481, 300, 159, 51, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3843, 852, 1270, 1214, 1014, 727, 481, 300, 159, 51, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 const BASE_LZ77_COUNTS: [u64; LZ77_SYMBOLS] = [
     29, 27, 25, 23, 21, 21, 19, 18, 21, 17, 16, 15, 15, 14, 13, 13, 137, 98, 61, 34, 1, 1, 1, 1, 1,
     1, 1, 1, 0, 0, 0, 0, 0,
 ];
 const MIN_RAW_LENGTH: [u8; RAW_SYMBOLS + 1] = [0; RAW_SYMBOLS + 1];
-const MAX_RAW_LENGTH: [u8; RAW_SYMBOLS + 1] = [
+const MAX_RAW_LENGTH: [u8; NARROW_RAW_SYMBOLS + 1] = [
     7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 10, 15, 15, 15, 15, 15, 15, 15, 15,
 ];
-const WIDE_MIN_RAW_LENGTH: [u8; RAW_SYMBOLS + 1] =
+const WIDE_MIN_RAW_LENGTH: [u8; NARROW_RAW_SYMBOLS + 1] =
     [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 8, 8, 7];
-const WIDE_MAX_RAW_LENGTH: [u8; RAW_SYMBOLS + 1] =
+const WIDE_MAX_RAW_LENGTH: [u8; NARROW_RAW_SYMBOLS + 1] =
     [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 10];
+// At most 33 raw symbols plus the aggregate LZ77 node fit in eight bits. The
+// second level still has at least seven bits, keeping every combined code <= 15.
+const FULL_MAX_RAW_LENGTH: [u8; RAW_SYMBOLS + 1] = [8; RAW_SYMBOLS + 1];
 
 #[derive(Clone, Debug)]
 pub(crate) struct PrefixCode {
@@ -58,6 +63,11 @@ impl PrefixCode {
             ));
         }
         let mut base_raw_counts = BASE_RAW_COUNTS;
+        let alphabet_size = if max_raw_token < NARROW_RAW_SYMBOLS {
+            NARROW_RAW_SYMBOLS
+        } else {
+            RAW_SYMBOLS
+        };
         for (token, count) in base_raw_counts
             .iter_mut()
             .enumerate()
@@ -66,7 +76,7 @@ impl PrefixCode {
         {
             // Keep the high-depth tree stable even when a small image does not exercise every
             // legal hybrid-uint magnitude. The measured GPU counts still dominate after scaling.
-            *count = u64::try_from(RAW_SYMBOLS - token).unwrap_or(1);
+            *count = u64::try_from(alphabet_size - token).unwrap_or(1);
         }
         let mut raw_counts = [0u64; RAW_SYMBOLS];
         let mut lz77_counts = [0u64; LZ77_SYMBOLS];
@@ -133,7 +143,9 @@ impl PrefixCode {
         level1_counts[num_raw] = lz77_counts.iter().sum();
 
         let mut level1_nbits = [0; RAW_SYMBOLS + 1];
-        let (min_raw_length, max_raw_length) = if wide_samples {
+        let (min_raw_length, max_raw_length): (&[u8], &[u8]) = if num_raw > NARROW_RAW_SYMBOLS {
+            (&MIN_RAW_LENGTH, &FULL_MAX_RAW_LENGTH)
+        } else if wide_samples {
             (&WIDE_MIN_RAW_LENGTH, &WIDE_MAX_RAW_LENGTH)
         } else {
             (&MIN_RAW_LENGTH, &MAX_RAW_LENGTH)
@@ -184,9 +196,19 @@ impl PrefixCode {
     }
 
     pub(crate) fn write_tree(&self, writer: &mut BitWriter) -> Result<(), EncodeError> {
+        // Preserve the existing low-depth trees and private Gray8 index exactly.
+        // The additional raw symbols precede the unchanged LZ77 alphabet at 224.
+        let raw_symbols = if self.raw.raw_nbits[NARROW_RAW_SYMBOLS..]
+            .iter()
+            .any(|&length| length != 0)
+        {
+            RAW_SYMBOLS
+        } else {
+            NARROW_RAW_SYMBOLS
+        };
         let mut code_length_counts = [0u64; 18];
         code_length_counts[17] = 3 + 2 * (LZ77_SYMBOLS - 1) as u64;
-        for &length in &self.raw.raw_nbits {
+        for &length in &self.raw.raw_nbits[..raw_symbols] {
             code_length_counts[usize::from(length)] += 1;
         }
         for &length in &self.lz77_nbits {
@@ -217,7 +239,7 @@ impl PrefixCode {
 
         let mut code_length_bits = [0u16; 18];
         compute_canonical_code(&[], &mut [], &code_length_nbits, &mut code_length_bits);
-        for &length in &self.raw.raw_nbits {
+        for &length in &self.raw.raw_nbits[..raw_symbols] {
             writer.write_bits(
                 u64::from(code_length_bits[usize::from(length)]),
                 code_length_nbits[usize::from(length)],
@@ -228,9 +250,16 @@ impl PrefixCode {
         while self.lz77_nbits[num_lz77 - 1] == 0 {
             num_lz77 -= 1;
         }
-        for repeated_bits in [0b010, 0b000, 0b010] {
+        let mut zero_run = 224 - raw_symbols;
+        let mut repeats = Vec::new();
+        while zero_run > 10 {
+            repeats.push((zero_run - 3) % 8);
+            zero_run = (zero_run - 3) / 8 + 2;
+        }
+        repeats.push(zero_run - 3);
+        for repeated_bits in repeats.into_iter().rev() {
             writer.write_bits(u64::from(code_length_bits[17]), code_length_nbits[17])?;
-            writer.write_bits(repeated_bits, 3)?;
+            writer.write_bits(repeated_bits as u64, 3)?;
         }
         for &length in &self.lz77_nbits[..num_lz77] {
             writer.write_bits(

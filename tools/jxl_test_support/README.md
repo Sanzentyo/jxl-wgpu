@@ -1,7 +1,7 @@
 # JPEG XL test support
 
 This unpublished workspace crate owns helpers shared by codec integration tests and offline
-fixture generators. The decoder selects it only as a development dependency. Its CPU references
+fixture generators. The codecs select it only as a development dependency. Its CPU references
 and native oracle processes are absent from the production codec dependency graph.
 
 The module tree follows the source tree:
@@ -33,6 +33,13 @@ original-color tests, resident ICC tests and the offline RGB-to-ICC exporter. It
 provides unbounded pre-OETF XYB stills; the codec's Gamma/DCI black floor makes inversion of an
 already encoded original image unsuitable for that reference. These helpers use ordinary module
 imports and stay outside production dependencies.
+
+`oracles::modular_integer` requests the declared original encoding from jxl-oxide 0.12.6 and
+copies its retained integer planes through jxl-render 0.12.4. It rejects F32 planes rather than
+rounding them back to integers, so exact 17–31-bit encoder checks include the low sample bits.
+The [wide-integer encoder matrix](../../docs/CONFORMANCE_CORPUS.md#wide-integer-modular-encoding)
+also requires the libjxl 0.12.0 original-component oracle for independent normalized output.
+Neither oracle is a production dependency or a fallback.
 
 `fixtures::icc_spots` reads a typed manifest for native ICC/enumerated RGB/Gray sources, both
 codecs and original/XYB stills or reference sequences. Behavior follows the manifest fields and

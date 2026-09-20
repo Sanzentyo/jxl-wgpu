@@ -7,9 +7,9 @@ use crate::EncodeError;
 pub struct LosslessModularMemoryPlan {
     pub group_grid: LosslessModularGroupGrid,
     pub format: LosslessModularFormat,
-    /// Valid low bits in every unsigned integer component (`1..=16`).
+    /// Valid low bits in every unsigned integer component (`1..=31`).
     pub bits_per_sample: u8,
-    /// Native storage bytes occupied by every component (`1` or `2`).
+    /// Native storage bytes occupied by every component (`1`, `2`, or `4`).
     pub bytes_per_sample: u8,
     /// Number of independently tokenized Modular channels (1, 3, or 4).
     pub channel_count: u32,

@@ -14,6 +14,7 @@ jxl-bitstream.workspace = true
 jxl-image.workspace = true
 jxl-oxide.workspace = true
 jxl-oxide-common.workspace = true
+jxl-render.workspace = true
 jxl_gpu_bitstream.workspace = true
 jxl_gpu_formats = { workspace = true, features = ["cpu-reference"] }
 jxl_gpu_protocol.workspace = true

@@ -202,7 +202,7 @@ mod native_tests {
 
     #[test]
     fn modular_artifact_records_are_word_aligned_and_ordered() {
-        assert_eq!(std::mem::size_of::<ModularArtifactHeader>(), 53 * 4);
+        assert_eq!(std::mem::size_of::<ModularArtifactHeader>(), 67 * 4);
         assert_eq!(std::mem::align_of::<ModularArtifactHeader>(), 4);
         assert_eq!(std::mem::size_of::<ModularEvent>(), 4 * 4);
         assert_eq!(std::mem::align_of::<ModularEvent>(), 4);
@@ -212,10 +212,10 @@ mod native_tests {
             raw_counts: std::array::from_fn(|index| 100 + index as u32),
             lz77_counts: std::array::from_fn(|index| 200 + index as u32),
         };
-        let words = bytemuck::cast::<ModularArtifactHeader, [u32; 53]>(header);
+        let words = bytemuck::cast::<ModularArtifactHeader, [u32; 67]>(header);
         assert_eq!(words[0], 7);
-        assert_eq!(words[1..20], header.raw_counts);
-        assert_eq!(words[20..53], header.lz77_counts);
+        assert_eq!(words[1..34], header.raw_counts);
+        assert_eq!(words[34..67], header.lz77_counts);
 
         let event = ModularEvent {
             kind: 1,
@@ -236,12 +236,15 @@ mod native_tests {
             LosslessModularFormat::Rgb,
             LosslessModularFormat::Rgba,
         ] {
-            for bits_per_sample in 1..=16 {
+            for bits_per_sample in 1..=31 {
                 let pixel_format = format.pixel_format(bits_per_sample).unwrap();
                 let spec = lossless_modular_source_spec(&pixel_format).unwrap();
                 assert_eq!(spec.format, format);
                 assert_eq!(spec.bits_per_sample, bits_per_sample);
-                assert_eq!(spec.bytes_per_sample, u8::from(bits_per_sample > 8) + 1);
+                assert_eq!(
+                    spec.bytes_per_sample,
+                    bits_per_sample.next_power_of_two().max(8) / 8
+                );
                 let word = &pixel_format.planes[0].words[0];
                 assert_eq!(word.bits(), u32::from(spec.bytes_per_sample) * 8);
                 assert!(matches!(
@@ -251,7 +254,7 @@ mod native_tests {
             }
         }
         assert!(LosslessModularFormat::Gray.pixel_format(0).is_err());
-        assert!(LosslessModularFormat::Gray.pixel_format(17).is_err());
+        assert!(LosslessModularFormat::Gray.pixel_format(32).is_err());
         assert!(
             lossless_modular_source_spec(&PixelFormat::rgb8(
                 RgbChannelOrder::Rgb,
@@ -509,6 +512,68 @@ mod native_tests {
             }],
         );
         assert!(parse_group_artifact(2, 1, 1, &bytes).is_err());
+    }
+
+    #[test]
+    fn full_width_residual_artifacts_require_canonical_tokens_and_depth_bounds() {
+        let mut header = ModularArtifactHeader {
+            event_count: 1,
+            raw_counts: [0; RAW_SYMBOLS],
+            lz77_counts: [0; LZ77_SYMBOLS],
+        };
+        header.raw_counts[32] = 1;
+        let maximum = ModularEvent {
+            kind: 0,
+            token: 32,
+            extra_bit_count: 31,
+            extra_bits: 0x7fff_ffff,
+        };
+        let bytes = artifact_bytes(header, &[maximum]);
+        assert!(parse_group_artifact(1, 1, 1, &bytes).is_ok());
+        for invalid in [
+            ModularEvent {
+                token: 33,
+                ..maximum
+            },
+            ModularEvent {
+                extra_bit_count: 32,
+                ..maximum
+            },
+            ModularEvent {
+                extra_bit_count: 30,
+                ..maximum
+            },
+            ModularEvent {
+                extra_bits: 0x8000_0000,
+                ..maximum
+            },
+        ] {
+            let bytes = artifact_bytes(header, &[invalid]);
+            assert!(matches!(
+                parse_group_artifact(1, 1, 1, &bytes),
+                Err(EncodeError::Backend(_))
+            ));
+        }
+        let raw = [header.raw_counts.map(u64::from); 4];
+        let runs = [[0; LZ77_SYMBOLS]; 4];
+        assert!(
+            super::super::serializer::build_prefix_codes(
+                LosslessModularFormat::Rgba,
+                31,
+                &raw,
+                &runs
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            super::super::serializer::build_prefix_codes(
+                LosslessModularFormat::Rgba,
+                29,
+                &raw,
+                &runs
+            ),
+            Err(EncodeError::Backend(_))
+        ));
     }
 
     /// Mirrors only the event-admission control flow in `encode` WGSL. A

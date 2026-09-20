@@ -12,6 +12,11 @@ GPU-kernel execution requires a compatible adapter. WebAssembly checks require t
 CPU/native image-codec oracles remain development-only under the
 [upstream boundary](UPSTREAM_BOUNDARY.md).
 
+Use the repository's default `target/` directory for Cargo builds and validation. Do not create
+per-task Cargo output directories under `.git` or elsewhere. When disk space runs low, stop the
+active builds and validation jobs, run `cargo clean` from the repository root, then restart the
+required checks. Never clean an output directory while a build or test still uses it.
+
 ## Validation by change
 
 | Change | Required evidence |
