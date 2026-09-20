@@ -109,6 +109,36 @@ defaults to relative colorimetric; non-Bradford conversion and unsupported selec
 Exact same-profile packing does not select a CMS method and therefore does not require an
 executable matrix/TRC or inverse curve.
 
+## Original profile export
+
+`ImageHeaderInventory::original_icc_profile(IccProfileLimits)` returns the original declared
+profile as `Cow<[u8]>`, independently of requested pixel output or CMS admission. Embedded ICC
+is borrowed from the inventory's shared bytes, without rewriting tags or rejecting a profile
+merely because the CMS cannot execute it. An inconsistent declaration/embedded-byte binding is
+an error. Enumerated RGB/Gray and perceptual XYB produce an owned ICCv4 profile; a standalone
+enumerated declaration can use `ColourEncodingInventory::generate_icc_profile` directly.
+
+The serializer follows pinned [libjxl 0.12.0 profile metadata](https://github.com/libjxl/libjxl/blob/a7a9c787341cf703dede03c2009fa460cae5e5df/lib/jxl/cms/jxl_cms_internal.h):
+descriptions, fixed date/header, CICP, Bradford adaptation, shared transfer tags, scaled XYB and
+fixed HDR tables, and the MD5 profile ID. SDR curves, explicit gamma, PQ and HLG, standard/custom
+white points and primaries, and all four RGB/Gray intents are supported. XYB uses its implicit
+color fields and requires perceptual intent. Unknown color/transfer declarations, invalid gamma
+or coordinates, singular primaries and unrepresentable ICC fixed-point values return typed errors.
+Image and gain-map parsers share the same implicit-XYB grammar and validate serialized gamma.
+
+The exact final byte count is checked against `max_profile_bytes` (default 16 MiB, also bounded
+by the ICC 32-bit length) before allocation. A fixed tag plan and 256-byte description buffer
+bound metadata scratch; the HDR and XYB grids are fixed at 9³ and 2³. One fallible output
+allocation holds the generated profile, including its in-place digest. Borrowed profiles obey
+the same output limit and remain tied to the inventory lifetime. This is bounded host metadata
+generation and consumes no image samples. Export alone confers neither image nor CMS validity.
+
+The [profile corpus](CONFORMANCE_CORPUS.md#original-icc-profile-export) compares 761 native
+declarations and all 27 official input identities byte-for-byte, including exact/one-short limits.
+All 19 official descriptors with original ICC objects additionally compare those immutable
+objects after hash validation. These checks close the pinned suite's original-profile export
+gap; wider color/image conformance and the remaining full JPEG XL requirements remain open.
+
 ## XYB reference validity
 
 ISO/IEC 18181-1:2024, F.2 excludes post-transform reference storage when both XYB and an

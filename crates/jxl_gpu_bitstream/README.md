@@ -2,6 +2,14 @@
 
 Bounded JPEG XL transport and codestream inventory for GPU codec front ends.
 
+`ImageHeaderInventory::original_icc_profile` exports original color metadata under
+`icc_profile::IccProfileLimits`: embedded ICC bytes are borrowed unchanged; enumerated RGB,
+Gray and perceptual XYB generate owned ICCv4 bytes compatible with libjxl 0.12.0.
+`ColourEncodingInventory::generate_icc_profile` serves standalone enumerated declarations.
+Exact output size is admitted before allocation, and profile tables use fixed bounded metadata
+scratch. Export does not authorize CMS conversion or decode pixels.
+[Profile contract and evidence](../../docs/ICC_COLOR.md#original-profile-export).
+
 `parse` validates transport framing for raw codestreams, `jxlc` containers, and ordered or indexed
 `jxlp` fragment sequences. Raw and single-`jxlc` codestreams remain borrowed; only fragmented
 streams are joined.
@@ -81,6 +89,10 @@ Embedded ICC streams are reconstructed with bounded `jxl-color` primitives and r
 their exact compressed bit range. Neither path decodes Modular, VarDCT, or pixel data. Returned
 section ranges are relative to the contiguous standard codestream, so the same inventory applies
 to raw, `jxlc`, and reconstructed `jxlp` input.
+
+Image and gain-map color declarations share the local outer grammar. XYB omits white-point,
+primary and transfer-function payloads and supplies their implicit values; the following intent
+and metadata retain their exact bit positions. Serialized gamma must lie in `[1/8192, 1]`.
 
 Preview width is read only when its aspect-ratio selector is zero; all eight ratios and both
 dimension encodings preserve the following metadata bit position. Explicit and derived preview

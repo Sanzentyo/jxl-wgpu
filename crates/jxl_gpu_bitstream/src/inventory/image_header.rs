@@ -6,7 +6,7 @@
 use jxl_bitstream::{Bitstream, U};
 use jxl_image::{
     AnimationHeader, BitDepth, ExtraChannelInfo, ImageMetadata, SizeHeader,
-    color::{ColourEncoding, OpsinInverseMatrix, ToneMapping},
+    color::{OpsinInverseMatrix, ToneMapping},
 };
 use jxl_oxide_common::{Bundle, BundleDefault};
 
@@ -70,7 +70,7 @@ pub(super) fn parse(reader: &mut Bitstream<'_>) -> Result<HeaderFields, HeaderEr
             metadata.ec_info.push(ExtraChannelInfo::parse(reader, ())?);
         }
         metadata.xyb_encoded = reader.read_bool()?;
-        metadata.colour_encoding = ColourEncoding::parse(reader, ())?;
+        metadata.colour_encoding = crate::colour_encoding::parse(reader)?;
         if extra_fields {
             metadata.tone_mapping = ToneMapping::parse(reader, ())?;
         }

@@ -21,6 +21,13 @@ JPEGs, including sampling-aligned virtual-array padding verified against upstrea
 Missing or mismatched native tools fail the test. No JPEG pixel decode or JXL implementation
 supplies these coefficient references.
 
+`oracles::icc_profile` compiles [`test-data/icc_profile.cpp`](test-data/icc_profile.cpp) with
+C++17 and `pkg-config libjxl`, requiring libjxl 0.12.0 at build and runtime. The public encoder
+creates tiny color-declaration inputs; the public decoder exports `JXL_COLOR_PROFILE_TARGET_ORIGINAL`
+at its color event without requesting pixel decode. Tests compare every profile byte, including
+the ICC ID, against the production metadata writer and unchanged official inputs. Missing tools,
+version mismatches or native failure fail the test. No production dependency links this oracle.
+
 `oracles::color` owns independent f64 transfer, CIE/Bradford and interval calculations shared by
 original-color tests, resident ICC tests and the offline RGB-to-ICC exporter. Its jxl-oxide path
 provides unbounded pre-OETF XYB stills; the codec's Gamma/DCI black floor makes inversion of an

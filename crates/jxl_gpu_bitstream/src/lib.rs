@@ -13,7 +13,9 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 mod acceleration;
+mod colour_encoding;
 pub mod gain_map;
+pub mod icc_profile;
 mod inventory;
 mod inventory_stream;
 pub mod jpeg_reconstruction;

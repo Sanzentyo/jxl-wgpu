@@ -7,6 +7,9 @@ references were adapted into focused GPU-codec code and bounded metadata expansi
   equations at commit `a7a9c787341cf703dede03c2009fa460cae5e5df`. The affected modules and
   copyright notices are recorded in `crates/jxl_gpu_protocol/THIRD_PARTY.md` and
   `crates/jxl_wgpu/THIRD_PARTY.md`; BSD-3-Clause terms are included in each crate's `LICENSE`.
+  The same revision's bounded ICC metadata serialization is adapted in
+  `crates/jxl_gpu_bitstream/src/icc_profile.rs` and its child modules, with source attribution
+  and BSD-3-Clause terms in that crate's `THIRD_PARTY.md` and `LICENSE`.
 
 - `zune-jpegxl` 0.5.2 fast-lossless prefix-code and JPEG XL header construction. Adapted portions
   are identified in `crates/jxl_gpu_bitstream/src/acceleration.rs`,

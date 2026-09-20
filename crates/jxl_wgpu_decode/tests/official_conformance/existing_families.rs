@@ -48,8 +48,21 @@ fn metadata_and_objects(
         descriptor["sha256sums"]["reference.icc"].as_str().unwrap(),
     );
     if descriptor.get("original_icc").is_some() {
+        hash(
+            &profile,
+            descriptor["sha256sums"][descriptor["original_icc"].as_str().unwrap()]
+                .as_str()
+                .unwrap(),
+        );
         assert_eq!(
             image.embedded_icc.as_ref().unwrap().profile.as_ref(),
+            profile
+        );
+        assert_eq!(
+            image
+                .original_icc_profile(Default::default())
+                .unwrap()
+                .as_ref(),
             profile
         );
     }

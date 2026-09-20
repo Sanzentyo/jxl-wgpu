@@ -7,8 +7,6 @@
 use std::sync::Arc;
 
 use jxl_bitstream::Bitstream;
-use jxl_image::color::ColourEncoding;
-use jxl_oxide_common::Bundle;
 
 use crate::{ColourEncodingInventory, InventoryLimits};
 
@@ -114,7 +112,7 @@ impl<'a> GainMapBundle<'a> {
             None
         } else {
             let mut reader = Bitstream::new(color);
-            let encoding = ColourEncoding::parse(&mut reader, ())
+            let encoding = crate::colour_encoding::parse(&mut reader)
                 .map_err(|error| GainMapError::Color(error.to_string()))?;
             finish_bits(color, reader.num_read_bits() as u64)?;
             Some(crate::inventory::colour_encoding_inventory(&encoding))

@@ -262,6 +262,15 @@ impl Case {
                 std::fs::read(directory.join(original)).unwrap()
             };
             check(&original_bytes, original_hash);
+            assert_eq!(
+                image
+                    .original_icc_profile(Default::default())
+                    .unwrap()
+                    .as_ref(),
+                original_bytes,
+                "exact official original ICC: {}",
+                self.name
+            );
             match self.original {
                 OriginalProfile::Embedded => {
                     assert_eq!(

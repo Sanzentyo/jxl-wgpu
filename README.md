@@ -61,7 +61,8 @@ checks the published per-channel pixel bounds of all 40 descriptors across 27 un
 in its pinned upstream revision. It includes three animations, signed F32 samples, both alpha
 associations, noise, splines, patches, original ICC components and a 4064×2704 progressive image.
 A separate GPU byte-output target reproduces all three published original JPEGs exactly.
-Exact generated ICC export and broader conformance requirements remain open.
+Bounded original ICC export preserves embedded bytes and generates enumerated RGB/Gray/XYB
+profiles, with exact official-object and native comparisons. Broader conformance remains open.
 
 ## Execution contract
 

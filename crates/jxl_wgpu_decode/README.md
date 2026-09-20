@@ -695,8 +695,11 @@ descriptors across 27 unique inputs in the pinned upstream revision. Every origi
 RMSE/peak bound remains unchanged, including distinct alternate references. Whole and fragmented
 16 KiB entropy-window output agree exactly, and retained frames survive session destruction.
 Oriented BRG's noncanonical ICC also has a typed color-request rejection before GPU admission.
-The three JPEG-origin pixel comparisons do not implement byte-identical JPEG reconstruction;
-retained generated ICC references do not establish exact generated-profile export.
+The separate GPU byte-output target checks all three official original JPEGs. The bitstream
+inventory's `original_icc_profile` now matches every declared original ICC object exactly,
+including generated profiles; a public libjxl comparison also covers all 27 input identities.
+Profile export preserves noncanonical embedded bytes independently of CMS admission.
+[Profile contract](../../docs/ICC_COLOR.md#original-profile-export).
 
 The common `WgpuDecodeEngine` additionally accepts original and XYB ICC color through
 both physical codecs. Private surfaces carry the exact owned profile and one Gray or three RGB

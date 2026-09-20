@@ -17,6 +17,7 @@ use jxl_wgpu_decode::{
 mod cases;
 mod existing_families;
 mod extended;
+mod profiles;
 mod reference;
 use reference::{Reference, ReferenceColor};
 

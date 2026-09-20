@@ -4614,7 +4614,7 @@ budget only when dropped. Existing ICC device-Gray packing and numeric Gray are 
 `grayscale_jpeg` also has separate original-byte evidence in the GPU JPEG reconstruction family
 below. `lz77_flower` compares normalized original samples under its checked
 enumerated gamma declaration; the retained original/reference ICC files are independently
-hashed but exact generated-ICC export remains open. These additions do not complete `QA-02`.
+hashed and now compared against exact exported bytes in the profile family below. These additions do not complete `QA-02`.
 
 ## Official conformance descriptor coverage (2026-09-20)
 
@@ -4666,8 +4666,8 @@ in the fixture README and original source notice.
 
 The target uses explicit 2 GiB fixture transient/shared budgets for its larger images; these
 are admission limits, not measured peak usage, and do not change production defaults. The GPU
-JPEG reconstruction family below separately matches all three original JPEGs exactly; exact
-generated ICC export remains open. `QA-02` and the full JPEG XL goal remain **Partial**; this target is pixel and metadata evidence
+JPEG reconstruction family below separately matches all three original JPEGs exactly. Original
+ICC export also has the exact-byte evidence below. `QA-02` and the full JPEG XL goal remain **Partial**; this target is pixel and metadata evidence
 for the pinned suite, not a claim that every ISO/IEC 18181-3 acceptance requirement is complete.
 
 ## Bounded JPEG reconstruction metadata
@@ -4700,7 +4700,7 @@ its existing 180 native bidirectional parameter comparisons and six raw-box extr
 
 These metadata checks provide no coefficient or JPEG-byte output authority. The GPU families
 below supply those separate production checks. `CONT-05` remains **Partial** for the bounded
-profile; `ENC-05` and exact generated ICC output remain open.
+profile; `ENC-05` remains open. Original ICC export has separate evidence below.
 
 ## GPU JPEG quantizer and coefficient binding
 
@@ -4776,3 +4776,30 @@ completion. Initial memory admission can retry the same session. A large private
 plan exercises final assembly admission without changing corpus references. Broader legal
 sampling/frame/global-prefix/range variants and refinement extra-ZRL preservation remain open;
 `CONT-05` is **Partial**, `ENC-05` **Missing**, and full JPEG XL acceptance is not complete.
+
+## Original ICC profile export
+
+The bitstream `icc_profile` target compares 761 enumerated declarations against the public
+libjxl 0.12.0 encoder/decoder API. Its 700-case matrix combines RGB/Gray, D65/E/DCI/two custom
+white points, sRGB/BT.2020/P3/custom RGB primaries, seven transfer declarations and four
+rendering intents. Forty-eight more cases cover the gamma range and native normalization;
+twelve cover Adobe RGB/ProPhoto aliases and signed/scientific custom coordinates. The last
+case checks perceptual XYB and the omitted transfer-field grammar. Every generated ICC byte
+and exact/one-byte-short output limit is checked, including profile IDs, padded tags, shared
+TRCs, RGB HDR LUTs, Gray/custom-primary HDR curves and XYB tables. Native tools are required;
+a missing or mismatched oracle fails instead of skipping.
+
+The official target independently exports ORIGINAL profiles for all 27 unchanged input
+identities and compares public native bytes and output limits. Its descriptor readers also
+compare all 19 declared original ICC objects exactly after their original hash checks,
+including the seven alternate descriptors and CMYK. Enumerated gamma/BT.709/Gray files and
+noncanonical embedded profiles remain unchanged. This comparison is independent of the
+requested output profile used for pixel conformance.
+
+Unit tests cover borrowed embedded identity and retention, inconsistent profile bindings,
+invalid/unknown declarations, gamma and coordinate boundaries, singular primaries, ICC
+fixed-point overflow, exact admission and implicit-XYB bit consumption/truncation/padding in
+image/gain-map metadata. Existing official GPU pixel bounds and CMS negative tests remain
+mandatory. The [bounded host metadata contract](ICC_COLOR.md#original-profile-export) does
+not add CPU pixel processing or establish wider XYB/ICC/image conformance. `META-01`,
+`COLOR-01`, `QA-02` and the full JPEG XL goal remain **Partial**.
