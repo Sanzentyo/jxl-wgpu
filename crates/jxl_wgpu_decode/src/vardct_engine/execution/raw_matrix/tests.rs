@@ -12,6 +12,8 @@ use crate::{
     GpuCodestream, GpuOutputRequest, GpuPendingFrame, GpuSubmissionSession, vardct_rgb8_format,
 };
 
+mod jpeg;
+
 fn session(
     backend: &WgpuBackend,
     pipelines: &Arc<VarDctPipelines>,
@@ -63,11 +65,11 @@ fn session(
     let end = source.packet.pending_raw_hf_dequant_packet_end().unwrap();
     let minimal = pipelines
         .raw_hf_dequant
-        .plan_source(&source.codestream, plan, end, 40)
+        .plan_source_with_capture(&source.codestream, plan, end, 40, false)
         .unwrap();
     let whole = pipelines
         .raw_hf_dequant
-        .plan_source(&source.codestream, plan, end, u64::MAX)
+        .plan_source_with_capture(&source.codestream, plan, end, u64::MAX, false)
         .unwrap();
     assert!(whole.memory_bytes > minimal.memory_bytes);
     let capacity = source.memory.total_frame_bytes + minimal.memory_bytes - shortage;

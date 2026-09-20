@@ -17,5 +17,8 @@ jxl-oxide-common = "=1.0.0"
 sha2.workspace = true
 thiserror = "2.0.20"
 
+[dev-dependencies]
+jxl_test_support.workspace = true
+
 [lints]
 workspace = true

@@ -1,3 +1,4 @@
+pub mod jpeg_reconstruction;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 

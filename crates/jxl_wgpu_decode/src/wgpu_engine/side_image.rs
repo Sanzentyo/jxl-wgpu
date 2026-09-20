@@ -1,4 +1,5 @@
 //! Raw matrix overlay around the shared resident Modular substream executor.
+mod jpeg;
 mod modular;
 
 use bytemuck::{Pod, Zeroable};
@@ -10,6 +11,7 @@ use super::types::STATUS_OK;
 use crate::vardct_resource::{VarDctResourceLayout, hf_matrix_param_index};
 use crate::vardct_side_image::RawHfDequantSideImagePlan;
 use crate::{Error, Result};
+pub(crate) use jpeg::JpegQuantizationCapture;
 pub(crate) use modular::{
     ModularSideImageJob, ModularSideImagePipeline, ModularSideImageStatus,
     ModularSideImageStreamPlan,
@@ -17,6 +19,12 @@ pub(crate) use modular::{
 
 const OVERLAY_SHADER: &str = include_str!("../vardct_raw_matrix.wgsl");
 const ERROR_RAW_MATRIX_VALUE: u32 = 15;
+
+pub(crate) struct RawHfDequantTarget<'a> {
+    pub(crate) resources: &'a wgpu::Buffer,
+    pub(crate) layout: VarDctResourceLayout,
+    pub(crate) jpeg: Option<JpegQuantizationCapture<'a>>,
+}
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -39,6 +47,7 @@ pub(crate) struct RawHfDequantSideImagePipeline {
     image: ModularSideImagePipeline,
     overlay: wgpu::ComputePipeline,
     variant: KernelVariant,
+    jpeg_capture: std::sync::OnceLock<jpeg::JpegQuantizationCapturePipeline>,
 }
 impl RawHfDequantSideImagePipeline {
     pub(crate) fn modular(&self) -> &ModularSideImagePipeline {
@@ -69,14 +78,14 @@ impl RawHfDequantSideImagePipeline {
             image: ModularSideImagePipeline::new(backend, variant),
             overlay,
             variant,
+            jpeg_capture: std::sync::OnceLock::new(),
         }
     }
     pub(crate) fn prepare(
         &self,
         backend: &WgpuBackend,
         codestream: &crate::GpuCodestream,
-        resources: &wgpu::Buffer,
-        resource_layout: VarDctResourceLayout,
+        target: RawHfDequantTarget<'_>,
         plan: &RawHfDequantSideImagePlan,
         stream: &ModularSideImageStreamPlan,
     ) -> Result<ModularSideImageJob> {
@@ -84,7 +93,7 @@ impl RawHfDequantSideImagePipeline {
         let mut recording = self
             .image
             .record_source(backend, codestream, &plan.image, stream)?;
-        let params = overlay_params(resource_layout, plan)?;
+        let params = overlay_params(target.layout, plan)?;
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("jxl-wgpu raw HF dequant overlay parameters"),
             contents: bytemuck::bytes_of(&params),
@@ -95,7 +104,7 @@ impl RawHfDequantSideImagePipeline {
             layout: &self.overlay.get_bind_group_layout(0),
             entries: &[
                 entry(0, recording.arena()),
-                entry(1, resources),
+                entry(1, target.resources),
                 entry(2, recording.status()),
                 entry(3, &uniform),
             ],
@@ -116,14 +125,31 @@ impl RawHfDequantSideImagePipeline {
             pass.dispatch_workgroups(samples.div_ceil(self.variant.workgroup_size().0), 1, 1);
         }
         recording.retain_uniform(uniform)?;
+        if let Some(capture) = target.jpeg {
+            let arena = recording.arena().clone();
+            let status = recording.status().clone();
+            let pipeline = self
+                .jpeg_capture
+                .get_or_init(|| jpeg::JpegQuantizationCapturePipeline::new(device));
+            let uniform = pipeline.encode(
+                device,
+                recording.completion_encoder(device),
+                &arena,
+                &status,
+                plan,
+                capture,
+            )?;
+            recording.retain_uniform(uniform)?;
+        }
         Ok(recording.finish())
     }
-    pub(crate) fn plan_source(
+    pub(crate) fn plan_source_with_capture(
         &self,
         source: &crate::GpuCodestream,
         plan: &RawHfDequantSideImagePlan,
         packet_end: u32,
         stream_limit: u64,
+        capture: bool,
     ) -> Result<ModularSideImageStreamPlan> {
         let mut stream = self
             .image
@@ -132,6 +158,12 @@ impl RawHfDequantSideImagePipeline {
             .memory_bytes
             .checked_add(std::mem::size_of::<RawMatrixParams>() as u64)
             .ok_or_else(|| Error::backend("raw HF dequant memory bytes overflow"))?;
+        if capture {
+            stream.memory_bytes = stream
+                .memory_bytes
+                .checked_add(jpeg::JPEG_QUANTIZATION_CAPTURE_BYTES)
+                .ok_or_else(|| Error::backend("JPEG quantization capture bytes overflow"))?;
+        }
         Ok(stream)
     }
 }

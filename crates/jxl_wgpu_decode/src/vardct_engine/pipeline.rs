@@ -31,6 +31,7 @@ use super::staging::VarDctDecodeSession;
 use super::types::{VAR_DCT_PARSE_LIMIT_BYTES, VarDctDecodeError};
 
 pub(super) struct VarDctPipelines {
+    pub(super) jpeg: std::sync::OnceLock<super::execution::jpeg::JpegRestorePipeline>,
     pub(super) noise: std::sync::OnceLock<
         std::result::Result<jxl_wgpu::ResidentNoisePipeline, jxl_wgpu::ResidentNoiseError>,
     >,
@@ -78,6 +79,7 @@ impl VarDctPipelines {
         }
         let device = backend.device();
         Ok(Self {
+            jpeg: std::sync::OnceLock::new(),
             packet: VarDctPacketPipeline::new(device),
             noise: std::sync::OnceLock::new(),
             resource: VarDctResourcePipeline::with_variant(device, resource_variant)?,
@@ -275,7 +277,7 @@ impl VarDctSubmissionEngine {
         &self,
         source: VarDctSource,
     ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
-        let extent = source.layout.extent;
+        let extent = source.image_layout()?.extent;
         let profile = DecodeProfile::VarDct {
             sample_bit_depth: source.packet.profile.sample_bit_depth,
         };

@@ -45,14 +45,26 @@ fn decode_matrix(
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let stream = pipeline.plan_source(source, plan, packet_end, cap).unwrap();
+    let stream = pipeline
+        .plan_source_with_capture(source, plan, packet_end, cap, false)
+        .unwrap();
     assert!(stream.stream_bytes <= cap);
     let permit = backend
         .transient_memory_budget()
         .try_reserve(stream.memory_bytes)
         .unwrap();
     let mut job = pipeline
-        .prepare(backend, source, &resources, layout, plan, &stream)
+        .prepare(
+            backend,
+            source,
+            crate::wgpu_engine::RawHfDequantTarget {
+                resources: &resources,
+                layout,
+                jpeg: None,
+            },
+            plan,
+            &stream,
+        )
         .unwrap();
     assert_eq!(job.memory_bytes(), stream.memory_bytes);
     let mut commands = job.take_commands().unwrap();

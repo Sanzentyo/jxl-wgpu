@@ -3,7 +3,9 @@
 These 36 paired inputs test `jbrd` metadata parsing and canonical emission. The original JPEG
 is the byte oracle; pixel equality is insufficient. Tests use the immutable identities and
 explicit scan/padding expectations in
-[`cases.rs`](../../tests/jpeg_reconstruction/cases.rs). The corpus contains 140 scans.
+[`corpus::jpeg_reconstruction`](../../../../tools/jxl_test_support/src/corpus/jpeg_reconstruction.rs).
+The corpus contains 140 scans and also supplies unchanged originals to the
+[GPU coefficient checks](../../../../docs/CONFORMANCE_CORPUS.md#gpu-jpeg-quantizer-and-coefficient-binding).
 
 ## Sources and reproduction
 

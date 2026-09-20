@@ -61,7 +61,7 @@ pub(super) struct VarDctSource {
     pub(super) epf: Option<VarDctEpfPlan>,
     pub(super) frame_upsample: Option<ResidentUpsampleKernel>,
     pub(super) output: VarDctFrameOutput,
-    pub(super) layout: ImageLayout,
+    pub(super) layout: Option<ImageLayout>,
     pub(super) surface: Option<Arc<crate::frame_surface::FrameSurfaceLayout>>,
     pub(super) quant_biases: [f32; 4],
     pub(super) frame_name: String,
@@ -75,6 +75,11 @@ pub(super) struct VarDctSource {
 }
 
 impl VarDctSource {
+    pub(super) fn image_layout(&self) -> Result<&ImageLayout, VarDctDecodeError> {
+        self.layout
+            .as_ref()
+            .ok_or(VarDctDecodeError::UnsupportedOutput)
+    }
     pub(super) fn packet_window_batches(&self, stage: PacketStage) -> usize {
         self.packet_windows
             .as_ref()
@@ -167,28 +172,74 @@ pub(super) fn prepare_packet_source(
     options: VarDctPrepareOptions,
     packet: BoundedVarDctPacketPlan,
 ) -> Result<VarDctSource, VarDctDecodeError> {
+    prepare_packet_output(
+        backend,
+        codestream,
+        Some(request),
+        inventory,
+        options,
+        packet,
+        None,
+    )
+}
+
+pub(super) fn prepare_jpeg_source(
+    backend: &WgpuBackend,
+    codestream: GpuCodestream,
+    inventory: &jxl_gpu_bitstream::CodestreamInventory,
+    options: VarDctPrepareOptions,
+    packet: BoundedVarDctPacketPlan,
+    layout: Arc<super::jpeg::JpegCoefficientLayout>,
+) -> Result<VarDctSource, VarDctDecodeError> {
+    prepare_packet_output(
+        backend,
+        codestream,
+        None,
+        inventory,
+        options,
+        packet,
+        Some(layout),
+    )
+}
+
+fn prepare_packet_output(
+    backend: &WgpuBackend,
+    codestream: GpuCodestream,
+    request: Option<&GpuOutputRequest>,
+    inventory: &jxl_gpu_bitstream::CodestreamInventory,
+    options: VarDctPrepareOptions,
+    packet: BoundedVarDctPacketPlan,
+    jpeg: Option<Arc<super::jpeg::JpegCoefficientLayout>>,
+) -> Result<VarDctSource, VarDctDecodeError> {
     let frame = inventory
         .frames
         .first()
         .ok_or(VarDctDecodeError::MissingFrame)?;
-    let VarDctPresentation {
-        output,
-        layout,
-        quant_biases,
-        surface,
-    } = prepare_presentation(
-        backend,
-        inventory,
-        request,
-        &packet.profile,
-        options.output_variant,
-    )?;
+    let (output, layout, quant_biases, surface) = match (request, jpeg) {
+        (Some(request), None) => {
+            let VarDctPresentation {
+                output,
+                layout,
+                quant_biases,
+                surface,
+            } = prepare_presentation(
+                backend,
+                inventory,
+                request,
+                &packet.profile,
+                options.output_variant,
+            )?;
+            (output, Some(layout), quant_biases, surface)
+        }
+        (None, Some(jpeg)) => (VarDctFrameOutput::Jpeg(jpeg), None, [0.0; 4], None),
+        _ => return Err(VarDctDecodeError::UnsupportedOutput),
+    };
     let render_color = output.requires_reconstruction();
     let base_color_correlation = packet.lf_correlation.base;
     let noise_parameters = packet
         .noise
         .and_then(|noise| noise.parameters(frame, packet.lf_correlation.base));
-    let noise = if render_color && !request.defers_frame_features() {
+    let noise = if render_color && request.is_some_and(|request| !request.defers_frame_features()) {
         packet
             .noise
             .map(|noise| {
@@ -349,46 +400,51 @@ pub(super) fn prepare_packet_source(
         .iter()
         .map(|group| group.artifact_layout)
         .collect::<Vec<_>>();
-    let frame_upsample =
-        if !render_color || request.defers_frame_features() || packet.profile.upsampling == 1 {
-            None
-        } else {
-            let weights = &inventory.image_header.upsampling_weights;
-            let compact = match packet.profile.upsampling {
-                2 => weights
-                    .up2
-                    .iter()
-                    .map(|value| value.to_f32())
-                    .collect::<Vec<_>>(),
-                4 => weights
-                    .up4
-                    .iter()
-                    .map(|value| value.to_f32())
-                    .collect::<Vec<_>>(),
-                8 => weights
-                    .up8
-                    .iter()
-                    .map(|value| value.to_f32())
-                    .collect::<Vec<_>>(),
-                _ => unreachable!("frame profile validates upsampling factors"),
-            };
-            Some(ResidentUpsampleKernel::from_compact(
-                packet.profile.upsampling,
-                &compact,
-            )?)
+    let frame_upsample = if !render_color
+        || request.is_some_and(GpuOutputRequest::defers_frame_features)
+        || packet.profile.upsampling == 1
+    {
+        None
+    } else {
+        let weights = &inventory.image_header.upsampling_weights;
+        let compact = match packet.profile.upsampling {
+            2 => weights
+                .up2
+                .iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>(),
+            4 => weights
+                .up4
+                .iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>(),
+            8 => weights
+                .up8
+                .iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>(),
+            _ => unreachable!("frame profile validates upsampling factors"),
         };
-    let extra_indices = super::output::selected_extra_indices(
-        request,
-        &inventory.image_header.extra_channels,
-        &packet.profile,
-    );
+        Some(ResidentUpsampleKernel::from_compact(
+            packet.profile.upsampling,
+            &compact,
+        )?)
+    };
+    let extra_indices = request.map_or_else(Vec::new, |request| {
+        super::output::selected_extra_indices(
+            request,
+            &inventory.image_header.extra_channels,
+            &packet.profile,
+        )
+    });
     let extra_render = (!extra_indices.is_empty()
         && (surface.is_some()
-            || request.retains_lf_extras()
+            || request.is_some_and(GpuOutputRequest::retains_lf_extras)
             || extra_indices
                 .iter()
                 .any(|&index| frame.extra_channel_upsampling[index] != 1)))
     .then(|| {
+        let request = request.ok_or(VarDctDecodeError::UnsupportedOutput)?;
         let topology = crate::modular_geometry::source_topology(&inventory.image_header, frame, 0)
             .map_err(|source| VarDctDecodeError::ModularExtra {
                 source: Box::new(source),
@@ -443,7 +499,7 @@ pub(super) fn prepare_packet_source(
         .filter(|_| render_color)
         .map(|group| ResidentVarDctMemoryPlan::new(group.coefficient_words()))
         .collect::<Result<Vec<_>, _>>()?;
-    let intermediate_outputs = if request.progressive_output()
+    let intermediate_outputs = if request.is_some_and(GpuOutputRequest::progressive_output)
         && output.requires_reconstruction()
         && frame.frame_type == jxl_gpu_bitstream::FrameType::Regular
     {
@@ -513,9 +569,11 @@ pub(super) fn prepare_packet_source(
             let memory = VarDctDecodeMemoryStats::plan(VarDctDecodeMemoryInputs {
                 noise: noise.as_ref(),
                 frame_upsample: frame_upsample.is_some(),
-                encoded_surface: request.retains_frame_surface()
-                    && request.frame_surface_encoding()
-                        == crate::frame_surface::FrameSurfaceEncoding::Encoded,
+                encoded_surface: request.is_some_and(|request| {
+                    request.retains_frame_surface()
+                        && request.frame_surface_encoding()
+                            == crate::frame_surface::FrameSurfaceEncoding::Encoded
+                }),
                 stream_limit,
                 codestream_len,
                 packet: &packet,

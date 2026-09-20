@@ -127,8 +127,10 @@ pub use session::{
     SubmittedGpuFrame, SubmittedGpuUpdate,
 };
 pub use vardct_engine::{
-    VarDctDecodeError, VarDctDecodeMemoryStats, VarDctDecodeSession,
-    VarDctGlobalModularMemoryStats, VarDctPendingFrame, VarDctSubmissionEngine, vardct_rgb8_format,
+    GpuJpegCoefficients, JpegCoefficientError, JpegCoefficientLayout, JpegCoefficientLimits,
+    JpegCoefficientPending, JpegCoefficientPlane, JpegCoefficientSession, VarDctDecodeError,
+    VarDctDecodeMemoryStats, VarDctDecodeSession, VarDctGlobalModularMemoryStats,
+    VarDctPendingFrame, VarDctSubmissionEngine, vardct_rgb8_format,
 };
 pub use wgpu_engine::{
     F64OutputPath, ModularEntropyCoding, ModularOutputSpecialization,

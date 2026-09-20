@@ -3686,10 +3686,20 @@ mod tests {
         });
         let pipeline = RawHfDequantSideImagePipeline::new(&backend, KernelVariant::Lanes64);
         let stream = pipeline
-            .plan_source(&source, &plan, packet_end, u64::MAX)
+            .plan_source_with_capture(&source, &plan, packet_end, u64::MAX, false)
             .unwrap();
         let mut job = pipeline
-            .prepare(&backend, &source, &resources, layout, &plan, &stream)
+            .prepare(
+                &backend,
+                &source,
+                crate::wgpu_engine::RawHfDequantTarget {
+                    resources: &resources,
+                    layout,
+                    jpeg: None,
+                },
+                &plan,
+                &stream,
+            )
             .unwrap();
         assert_eq!(job.memory_bytes(), stream.memory_bytes);
         let mut copy = backend

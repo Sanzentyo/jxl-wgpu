@@ -7,6 +7,7 @@
 //! entropy fallback runs on the CPU.
 
 mod execution;
+mod jpeg;
 mod output;
 mod pipeline;
 mod restoration;
@@ -17,6 +18,11 @@ mod tests;
 mod types;
 mod window_plan;
 
+pub use execution::jpeg::JpegCoefficientPending;
+pub use jpeg::{
+    GpuJpegCoefficients, JpegCoefficientError, JpegCoefficientLayout, JpegCoefficientLimits,
+    JpegCoefficientPlane, JpegCoefficientSession,
+};
 pub use pipeline::VarDctSubmissionEngine;
 pub use staging::{VarDctDecodeSession, VarDctGlobalModularMemoryStats, VarDctPendingFrame};
 pub use types::{VarDctDecodeError, VarDctDecodeMemoryStats, vardct_rgb8_format};

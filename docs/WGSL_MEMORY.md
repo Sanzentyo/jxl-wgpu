@@ -133,6 +133,9 @@ name shown in parentheses.
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | entropy prefix/window, group geometry, sample/channel counts, channel-layout offset, output kind/transfer/range, channels/order/depth, 4 plane offset/stride pairs, chroma geometry/size/mapping, status/stream/fixed-leaf/weighted-predictor fields; canvas width/height and orientation | 256 | 4 | read-only storage element |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `DecodeStatus` / `status[0..4]` | `code, decoded_samples, cursor, expected_cursor` | 16 | 4 | storage/readback record |
 | `jxl_wgpu_decode/vardct_raw_matrix.wgsl` | `RawMatrixParams` / `RawMatrixParams` | denominator, raster width/height, target count, then padded four-lane source offsets, source strides, and resident resource target offsets | 64 | 16 | uniform |
+| `jxl_wgpu_decode/wgpu_engine/side_image/jpeg.wgsl` | `CaptureParams` / `Params` | geometry/count, source offsets and row strides, each a four-word lane | 48 | 16 | uniform |
+| `jxl_wgpu_decode/vardct_engine/execution/jpeg.wgsl` | `RestoreParams` / `Params` | three LF geometry, output layout and shift lanes each; group geometry, artifact offsets/capacities and RGB/CfL/precision/dispatch lane | 192 | 16 | uniform |
+| JPEG capture and restoration | four u32 status words | captured quantizers, sticky capture error, restored coefficients, sticky restoration error | 16 | 4 | atomic storage / aggregate validation trailer |
 | `jxl_wgpu_decode/frame_surface/blend.wgsl` | `BlendParams` / `Params` | canvas, intersection, source, dispatch, four reference geometry/presence records | 128 | 16 | uniform |
 | `jxl_wgpu_decode/frame_surface/blend.wgsl` | `BlendChannel` / `Channel` | mode, background slot, alpha plane, clamp/association flags, alpha-background slot, three pads | 32 | 16 | read-only storage element |
 | `jxl_wgpu_decode/frame_surface/native.wgsl` | `NativeParams` / `Params` | extent, format, output, original color/intensity, source (plane words, first alpha, scalar plane, flags: F32/linear-original RGB), target luminance/OOTF | 96 | 16 | uniform |
@@ -263,6 +266,8 @@ The table below states the default workgroup configuration for each entry point:
 | `display_image` | source RO, RGBA8 or RGBA16F destination T, U | 16x16 | Tier A (`KernelVariant` 2-D) | source must have `STORAGE`; each pitch-linear plane and its final address is bounded; wide-gamut/HDR requires float output |
 | `vardct_resource` (decoder) | LF-group table RO, full-image dequantized-LF atlas RW, U | 64x1 | Tier A (`KernelVariant` 1-D) | checked per-component extents/source bases and global atlas base/stride/origin; coalesced full-resolution planes apply signaled LF correlation, including equal nonzero JPEG factors; subsampled components write compact grids directly; one 1D workgroup per LF-group block batch |
 | `vardct_raw_matrix` (decoder) | inverse-transformed side-image arena RO, resident resource table and shared decode status RW, U | 64x1 default, autotuned linear lanes | Tier A (`KernelVariant` 1-D) | one invocation per canonical matrix sample; checked plane offsets/strides and one, two, or four aliased resource targets; non-positive or oversized weights set a typed sticky status before AC/render |
+| JPEG `capture` | inverse arena/source status RO, quantizer output/capture status RW, U | 64x1 | Tier B (fixed) | three workgroups transpose exactly 192 positive-u16 samples after shared inverse/overlay completion; zero source/capture status cannot grant authority |
+| JPEG `restore` | LF/AC/artifact/raw correlation RO, quantizer-and-coefficient output/status RW, U | 64x1 | Tier B (fixed) | one workgroup per DCT8 task, split into a bounded 2-D dispatch; per-channel masks/shifts and absolute component word ranges preserve MCU padding; integer DC/CfL bounds and exact completion count precede authority |
 | `vardct_packet` (decoder) | whole or reusable-window codestream/MA metadata RO, reconstruction/raw metadata/coefficients/status RW, control U, Modular params RW | 1x1 | Tier B (fixed) | combined/global-tree and split LF/HF local-tree entry points use logical channel widths with explicit physical strides; all packet forms resume across ordered windows using one 64/128-byte aligned state and reusable upload, while local trees and single-entry TOCs map LF cursors; single-entry TOCs also map the HF-global boundary before the final authoritative map |
 | `progressive_dc::pack_lf` (decoder) | X/Y/B planes RO, VarDCT resources RW, U | 64x1 | Tier A (`KernelVariant` linear) | checked common extents/strides, plane binding ranges, destination resource vec4 range, storage limits and WGSL-u32 addresses; four versioned LF slots retain tracked plane leases through the last consumer; scratch is released after producer validation |
 | `vardct_artifact` (decoder) | LF-group raw metadata RO, artifact/occupancy plus full-image resources RW, U | 1x1 | Tier B (fixed) | validates non-overlapping mixed varblocks, global LF/correlation strides and aligned destination origin, derives per-channel task masks/destinations/LF offsets from JPEG shifts, compacts all 27 strategy buckets, and emits three bounded indirect records per strategy plus exact coefficient ranges |
@@ -529,6 +534,19 @@ returns typed `MemoryBackpressure` before recording that image. Mapped cursors a
 absolute codestream bits and checked against the current window; a valid terminal sample count and
 ANS state stop before the enclosing HF-global upper bound. The frame's existing whole-codestream
 GPU buffer remains separately accounted for other consumers.
+
+JPEG coefficient output adds 48 bytes to the matrix-zero side-image reservation when exact
+capture is requested. Its destination and 16-byte status already belong to the frame, so they
+are not charged again in the temporary job. The destination has 192 u32 quantizers followed by
+padded signed-i32 coefficient planes, all in JPEG natural coefficient order. Plane records select
+the appropriate internal-channel quantization prefix and original component order. Each LF group
+retains one 192-byte restoration uniform. Frame admission counts output, uniforms, status and
+its 16-byte aggregate staging copy; lazy pipeline objects are outside buffer accounting as for
+other kernels. The capture callback holds the frame lifetime through inverse/capture completion.
+Final packet/artifact/AC validation requires status `[192, 0, coefficient_words, 0]`; a missing,
+duplicate, failed or partial capture/restoration cannot publish an authoritative coefficient
+lease. No image layout is assigned to this allocation. Explicit external readback must retain
+its lease; only the final clone releases its output reservation.
 
 The common `ModularSideImagePlan` separates image geometry, transformed meta-channel count,
 MA/channel descriptors, original plane views, inverse jobs and entropy bounds from the raw-matrix

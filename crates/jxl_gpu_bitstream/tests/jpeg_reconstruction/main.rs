@@ -12,10 +12,9 @@ use jxl_gpu_bitstream::{
     parse, write_container_with_boxes,
 };
 
-mod cases;
 mod native;
 
-use cases::CASES;
+use jxl_test_support::corpus::jpeg_reconstruction::CASES;
 
 fn payload<'a>(parsed: &'a ParsedJxl<'_>) -> &'a [u8] {
     parsed

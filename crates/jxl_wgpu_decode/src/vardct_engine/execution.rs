@@ -45,6 +45,7 @@ use super::types::{
 use super::window_plan::{PacketStage, PacketWindowExecutionPlan, map_codestream_source_error};
 
 mod coefficients;
+pub(super) mod jpeg;
 use coefficients::{
     HfCoefficientPassBuffers, HfCoefficientWindowCommands, encode_hf_pass, prepare_hf_windows,
     record_hf_passes,
@@ -429,6 +430,7 @@ struct PostTransformJobBuffers {
 
 enum FrameOutputScratch {
     Components,
+    Jpeg(jpeg::JpegRestoreScratch),
     Color {
         _scratch: ColorOutputScratch,
     },
@@ -441,6 +443,7 @@ impl FrameOutputScratch {
     fn status_bytes(&self) -> u64 {
         match self {
             Self::Color { .. } | Self::Components => 0,
+            Self::Jpeg(_) => super::jpeg::STATUS_BYTES,
             Self::Extra { .. } => {
                 crate::modular_scalar_output::ModularScalarOutputPlan::STATUS_BYTES
             }
@@ -448,15 +451,18 @@ impl FrameOutputScratch {
     }
 
     fn copy_status(&self, encoder: &mut wgpu::CommandEncoder, staging: &wgpu::Buffer) {
-        if let Self::Extra { scratch } = self {
-            encoder.copy_buffer_to_buffer(
-                &scratch.status,
-                0,
-                staging,
-                staging.size() - self.status_bytes(),
-                self.status_bytes(),
-            );
-        }
+        let status = match self {
+            Self::Extra { scratch } => &scratch.status,
+            Self::Jpeg(scratch) => &scratch.status,
+            _ => return,
+        };
+        encoder.copy_buffer_to_buffer(
+            status,
+            0,
+            staging,
+            staging.size() - self.status_bytes(),
+            self.status_bytes(),
+        );
     }
 }
 
@@ -520,7 +526,7 @@ pub struct FramePendingFrame {
     lifetime: Option<Arc<VarDctJobLifetime>>,
     stage: VarDctPendingStage,
     token: SubmissionToken,
-    layout: ImageLayout,
+    layout: Option<ImageLayout>,
     surface: Option<Arc<crate::frame_surface::FrameSurfaceLayout>>,
     frame_name: String,
     expected_groups: Vec<VarDctGroupValidation>,
@@ -599,6 +605,12 @@ impl std::fmt::Debug for FramePendingFrame {
 }
 
 impl FramePendingFrame {
+    fn image_layout(&self) -> Result<&ImageLayout, VarDctDecodeError> {
+        self.layout
+            .as_ref()
+            .ok_or(VarDctDecodeError::UnsupportedOutput)
+    }
+
     #[must_use]
     pub(crate) fn dependency_submission_ready(&self) -> bool {
         matches!(self.stage, VarDctPendingStage::Final { .. })
@@ -632,7 +644,7 @@ impl FramePendingFrame {
         Ok(UnvalidatedGpuImageFrame {
             token: self.token,
             outputs: crate::frame_surface::unvalidated_outputs(
-                &self.layout,
+                self.image_layout()?,
                 self.surface.as_deref(),
                 &lifetime.output,
             ),
@@ -1714,7 +1726,12 @@ impl FramePendingFrame {
         if matches!(completed_passes, Some((0, _))) {
             return Ok(());
         }
-        let hf_end = mapped.len() - lifetime._output_scratch.status_bytes() as usize;
+        let hf_end = mapped
+            .len()
+            .checked_sub(lifetime._output_scratch.status_bytes() as usize)
+            .ok_or(VarDctDecodeError::StatusAbi {
+                status: "output trailer",
+            })?;
         let hf_status_bytes =
             mapped
                 .get(hf_offset..hf_end)
@@ -1738,6 +1755,9 @@ impl FramePendingFrame {
                 expected.validate(status)?;
             }
         }
+        if let FrameOutputScratch::Jpeg(scratch) = &lifetime._output_scratch {
+            scratch.layout.validate_status(&mapped[hf_end..])?;
+        }
         if matches!(lifetime._output_scratch, FrameOutputScratch::Extra { .. }) {
             crate::modular_scalar_output::ModularScalarOutputScratch::validate_status(
                 &mapped[hf_end..],
@@ -1747,10 +1767,10 @@ impl FramePendingFrame {
         Ok(())
     }
 
-    fn finish(
+    fn finish_validated(
         &mut self,
         mapping: Result<(), String>,
-    ) -> DecodeResult<SubmittedGpuFrame<GpuImageFrame>> {
+    ) -> DecodeResult<Arc<VarDctJobLifetime>> {
         mapping.map_err(DecodeError::backend)?;
         let lifetime = self
             .lifetime
@@ -1763,6 +1783,14 @@ impl FramePendingFrame {
             .map_err(DecodeError::backend)?;
         self.validate_mapped_status(&lifetime, &mapped, None)?;
         drop(mapped);
+        Ok(lifetime)
+    }
+
+    fn finish(
+        &mut self,
+        mapping: Result<(), String>,
+    ) -> DecodeResult<SubmittedGpuFrame<GpuImageFrame>> {
+        let lifetime = self.finish_validated(mapping)?;
         Ok(SubmittedGpuFrame::new(
             FrameMetadata {
                 index: 0,
@@ -1776,12 +1804,12 @@ impl FramePendingFrame {
             GpuImageFrame {
                 token: self.token,
                 outputs: crate::frame_surface::outputs(
-                    &self.layout,
+                    self.image_layout()?,
                     self.surface.as_deref(),
                     &lifetime.output,
                 ),
                 changed: crate::frame_surface::changed_regions(
-                    &self.layout,
+                    self.image_layout()?,
                     self.surface.as_deref(),
                 ),
             },

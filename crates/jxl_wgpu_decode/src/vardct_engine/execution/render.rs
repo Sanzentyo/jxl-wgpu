@@ -385,7 +385,7 @@ pub(super) fn encode_frame_render(
                                 },
                             ],
                             output: resident_binding(output)?,
-                            layout: &source.layout,
+                            layout: source.image_layout()?,
                             config: &config,
                         },
                     )?;
@@ -406,7 +406,7 @@ pub(super) fn encode_frame_render(
                         commands,
                         &[first?, second?, third?],
                         resident_binding(output)?,
-                        &source.layout,
+                        source.image_layout()?,
                     )?;
                     FrameOutputScratch::Components
                 }
@@ -462,6 +462,19 @@ pub(super) fn encode_frame_render(
             };
             (output_scratch, post_transform_buffers, lf_output)
         }
+        VarDctFrameOutput::Jpeg(layout) => (
+            FrameOutputScratch::Jpeg(jpeg::encode_restore(
+                device,
+                commands,
+                pipelines,
+                source,
+                group_buffers,
+                output,
+                layout,
+            )?),
+            PostTransformJobBuffers::default(),
+            None,
+        ),
         VarDctFrameOutput::Extra { index, plan } => {
             let extra = extra_planes
                 .first()

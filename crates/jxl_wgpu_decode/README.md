@@ -1042,6 +1042,54 @@ Post-transform composition rejects pre-transform reference domains before submis
 patch execution, non-sRGB/ICC composition,
 and non-coalesced/progressive delivery remain required for full JPEG XL.
 
+### GPU JPEG reconstruction inputs
+
+`VarDctSubmissionEngine::open_jpeg_coefficients(bytes, JpegCoefficientLimits)` accepts a complete
+transport-validated JXL input with a unique parsed `jbrd` and returns `JpegCoefficientSession`.
+Its `GpuSubmissionSession` output is `GpuJpegCoefficients`: an immutable checked layout and a
+budget-tracked `GpuBufferLease`. It has no pixel format or image layout. The session exposes the
+parsed reconstruction metadata separately. Input, inventory and metadata limits remain explicit;
+the default input/codestream cap is 16 MiB and coefficient storage is limited to 64 million
+words (64 × 2²⁰, excluding the 192-word quantization prefix).
+
+The accepted profile is one still non-XYB 8-bit integer VarDCT frame, at most 65535 pixels per axis,
+gray/RGB/YCbCr with axis sampling shifts at most one, without preview, animation, extra channels,
+an external LF frame or a global Modular prefix. The `jbrd` component count must agree with the
+image. Matrix zero must be a raw 3×8×8 JPEG quantization image with the native denominator;
+all quantizers are in 1..=65535. GPU restoration requires DCT8 tasks and LF precision 0..=3.
+JPEG-compatible correlation has factor 84, zero base and zero LF slopes; integer AC CfL applies
+only to equal-sampling color. The qualified coefficient range is -2047..=2047, with fixed-point
+quantizer ratios at most 524287 and correlation map values -128..=127. Wider native coefficient
+behavior is still unsupported. Unsupported metadata/profile/binding and GPU status failures are
+typed and publish no coefficient output.
+
+The shared Modular executor captures the exact inverse-transformed raw quantizers before its
+temporary arena is released. A resident integer pass reads the actual LF samples, accumulated
+AC coefficients, raw correlation map and lowered DCT8 tasks. It restores DC offsets/precision
+and fixed-point CfL, transposes quantizers and coefficients to JPEG natural order, and preserves
+sampling-aligned MCU padding. `layout().planes()` describes components in original JPEG order,
+their real/padded block extents, sampling factors and absolute word offsets. The retained buffer
+starts with three 64-word quantization tables in internal channel order, followed by packed
+signed-i32 coefficient planes; each plane identifies its own quantization offset. All values
+remain on the GPU until a caller explicitly requests readback. ICC interpretation, orientation,
+pixel reconstruction and restoration filters do not run on this path.
+
+Packet, artifact, AC and the 16-byte JPEG capture/restoration status all validate before the
+coefficient lease becomes authoritative. The output allocation, per-group 192-byte restoration
+uniforms, status and aggregate copy use the engine's shared budget. The raw side-image admission
+adds its exact 48-byte capture uniform; the frame lease survives that stage's completion and
+cancellation. The normal stream-window cap also bounds this path, down to 40 bytes. Initial
+backpressure preserves the unsubmitted session for retry; late failure releases reservations
+after submitted work completes. Output clones retain their one shared reservation after the
+session is dropped. `memory_stats()` reports initial frame allocations; cursor-discovered
+descriptors and raw side images retain their existing separate late admissions.
+
+The [coefficient corpus](../../docs/CONFORMANCE_CORPUS.md#gpu-jpeg-quantizer-and-coefficient-binding)
+compares actual GPU output with independent libjpeg-turbo extraction from original JPEGs.
+This is an input stage for reconstruction. JPEG scan/progression and external-metadata
+compatibility, GPU JPEG entropy, complete original-byte assembly and a leased JPEG byte API
+remain open under `CONT-05`; lossless JPEG ingestion remains `ENC-05`.
+
 ### Bounded standard VarDCT engine
 
 

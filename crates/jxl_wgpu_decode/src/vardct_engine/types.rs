@@ -48,6 +48,8 @@ fn align4(value: u64) -> Result<u64, VarDctDecodeError> {
 /// Typed production-path failure for GPU-resident VarDCT decode.
 #[derive(Debug, Error)]
 pub enum VarDctDecodeError {
+    #[error(transparent)]
+    Jpeg(#[from] super::jpeg::JpegCoefficientError),
     #[error("VarDCT Modular extra-channel processing failed")]
     ModularExtra {
         #[source]
@@ -320,7 +322,7 @@ pub struct VarDctDecodeMemoryStats {
     pub epf_filter_uniform_bytes: u64,
     pub resident_transient_bytes: u64,
     pub output_uniform_bytes: u64,
-    /// Scalar sample-range status, included again as a four-byte aggregate staging tail.
+    /// Output-specific status and its aggregate staging tail: four scalar bytes or 16 JPEG bytes.
     pub output_status_bytes: u64,
     /// Full transformed/inverse arena for distributed Modular extra channels.
     pub extra_arena_bytes: u64,
@@ -328,7 +330,7 @@ pub struct VarDctDecodeMemoryStats {
     pub extra_inverse_uniform_bytes: u64,
     /// Normalization, full-resolution extra plane, filter weights and uniforms.
     pub extra_render_bytes: u64,
-    /// Packed target storage retained until the final [`jxl_wgpu::GpuBufferLease`] clone is dropped.
+    /// Image or JPEG coefficient storage retained until the final [`jxl_wgpu::GpuBufferLease`] clone is dropped.
     pub output_lease_bytes: u64,
     /// Base final-decode non-output buffers, excluding the separately reported intermediate work.
     pub transient_bytes: u64,

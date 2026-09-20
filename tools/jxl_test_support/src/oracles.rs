@@ -4,6 +4,7 @@ pub mod composed;
 pub mod extra_channels;
 pub mod gamut_mapping;
 pub mod hdr;
+pub mod jpeg_coefficients;
 pub mod lf;
 pub mod patches;
 pub mod progressive;

@@ -210,6 +210,19 @@ three F32 scratch planes, full-resolution shifted-component destinations, invers
 32-byte interpolation uniforms, and exact 80-byte restoration uniforms are included in the same
 backend byte admission as entropy, transform, output, and aggregate validation storage.
 
+The separate `open_jpeg_coefficients` branch shares this packet/HF continuation and aggregate
+validation, but allocates no pixel surface. Before a raw matrix arena is released, a completion
+pass captures matrix zero as 192 exact natural-order integer quantizers into a frame-owned buffer.
+A final integer pass reads group-local LF, accumulated AC, raw correlation and DCT8 task metadata
+to restore original-order JPEG component planes, including MCU padding. One allocation retains
+both quantizers and coefficients. Capture and restoration counts/errors join packet/artifact/AC
+validation; only their combined success publishes `GpuJpegCoefficients`. Its distinct pending
+type exposes no unvalidated image handoff. Shared permits and map callbacks keep the output and
+late raw-image scratch alive through cancellation, then release transient state independently
+of retained output clones. JPEG scan entropy and byte assembly are subsequent, unimplemented
+stages; [the decoder contract](../crates/jxl_wgpu_decode/README.md#gpu-jpeg-reconstruction-inputs)
+defines this bounded coefficient profile.
+
 An unsupported profile rejects during capability negotiation or header validation. A CPU oracle
 may decode the result in tests, but oracle code cannot be reached from a production encode/decode
 session. The initial interoperable target is a deliberately narrow single-group lossless Modular

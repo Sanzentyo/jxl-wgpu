@@ -810,6 +810,7 @@ dependencies = [
  "jxl-color",
  "jxl-image",
  "jxl-oxide-common",
+ "jxl_test_support",
  "sha2",
  "thiserror",
 ]
@@ -882,6 +883,7 @@ dependencies = [
  "jxl_wgpu_decode",
  "jxl_wgpu_encode",
  "pollster",
+ "sha2",
  "wgpu",
 ]
 

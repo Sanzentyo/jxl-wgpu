@@ -8,6 +8,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+sha2.workspace = true
 jxl.workspace = true
 jxl-bitstream.workspace = true
 jxl-image.workspace = true

@@ -12,6 +12,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(super) enum VarDctFrameOutput {
     Image(VarDctImageOutput),
+    Jpeg(Arc<super::jpeg::JpegCoefficientLayout>),
     Extra {
         index: u32,
         plan: ModularScalarOutputPlan,
@@ -55,6 +56,7 @@ impl VarDctFrameOutput {
     }
     pub(super) fn memory(&self) -> FrameOutputMemory {
         match self {
+            Self::Jpeg(plan) => plan.memory(),
             Self::Image(VarDctImageOutput::Color { plan, .. }) => FrameOutputMemory {
                 storage_bytes: plan.memory.output_storage_bytes,
                 uniform_bytes: plan.memory.uniform_bytes,

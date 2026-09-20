@@ -4699,6 +4699,47 @@ and duplicate or forbidden `brob`-wrapped `jbrd`. The shared strict Brotli imple
 its existing 180 native bidirectional parameter comparisons and six raw-box extractions.
 
 This evidence advances `CONT-05` to **Partial** for bounded metadata parsing/emission. It does
-not close the official original-JPEG output requirement: production still lacks actual GPU
-quantization/LF/AC binding, complete frame/metadata compatibility checks, GPU JPEG entropy and
+not close the official original-JPEG output requirement: production still lacks complete
+frame/metadata compatibility checks, GPU JPEG entropy and
 authoritative byte-output ownership. `ENC-05` and exact generated ICC output remain open.
+
+## GPU JPEG quantizer and coefficient binding
+
+`jxl_wgpu_decode/tests/jpeg_coefficients` uses the same 36 pinned JPEG/JXL pairs through
+`jxl_test_support::corpus::jpeg_reconstruction`. Source bytes and expected hashes are unchanged.
+The production `open_jpeg_coefficients` route decodes JXL LF/AC and raw quantization on the GPU;
+the independent reference compiles
+[`jpeg_coefficients.cpp`](../tools/jxl_test_support/test-data/jpeg_coefficients.cpp) against
+libjpeg-turbo 3.2.0 and reads integer coefficients directly from the original JPEG. Its padded
+virtual-array access follows upstream `src/jdcoefct.c` allocation/consumption, so references
+include interleaved MCU padding instead of omitting edge blocks. Oracle/compiler/adapter absence
+fails these tests. No oracle-provided coefficient enters the production decoder.
+
+Apple M5 / Metal evidence compares every component's quantizer and coefficient exactly for all
+36 inputs: gray, RGB, YCbCr, progressive/restart sources, odd extents, 4:2:0/4:4:0 padding,
+custom selectors, 16-bit quantization declarations, opaque metadata and entropy-preservation
+variants. Layout checks include original component IDs/order, sampling, real/padded block
+geometry and source extent. The official oriented BRG case succeeds without ICC interpretation
+or orientation application. Five additional complete comparisons use 40-byte entropy windows
+and `poll_complete`: gray restart, progressive RGB, progressive 4:2:0/4:4:0 and the multi-LF-group
+gray long-EOB input. Retained coefficient clones keep the exact output reservation after session
+drop, then release it with their last owner.
+
+GPU unit probes cover 192 DC precision/clamping combinations and 18 fixed-point CfL boundary
+combinations, checked with separate f64/wider-integer reference equations, plus 13 capture,
+artifact, range, correlation and ratio rejections. Full decoder fault injection corrupts a
+captured quantizer to zero or 65536; both reject before authoritative output and permit a later
+valid decode. Tests cover exact and one-word-short coefficient limits for every pair, missing
+or duplicate `jbrd`, component mismatch, incompatible profile and incomplete input. Six floating
+sample declarations, including four 8-bit forms accepted by the general VarDCT frontend, reject
+at JPEG layout admission. Byte-budget tests independently exercise exact/one-byte-short capture
+admission, full-decode reservation, initial retry, all three raw capture boundaries and
+final-submission cancellation. The capture
+uniform's 48 bytes are included in the observed late reservation. WGSL parsing/validation and
+Rust offset/size/alignment checks cover both 48-byte capture and 192-byte restoration ABIs.
+
+This qualifies the bounded integer input stage under `CONT-05`, which remains **Partial**.
+It does not implement JPEG scan entropy or authoritative original-byte assembly, does not
+replace the original-JPEG byte acceptance gate, and does not advance GPU JPEG ingestion in
+`ENC-05`. Ratios above 524287, coefficients outside -2047..=2047, broader sampling/frame/global
+prefix combinations and complete external-metadata/scan compatibility remain unsupported.

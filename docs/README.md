@@ -30,6 +30,7 @@ not as a prerequisite reading sequence for every edit.
 | Which GPU handles keep budget ownership? | [Backend buffer leases](../crates/jxl_wgpu/README.md#render-plan-execution) |
 | How are custom submissions, unvalidated images, and numeric display handled? | [Same-queue display](../crates/jxl_wgpu/README.md#same-queue-display) |
 | How do aggregate readback, direct mapping, and cancellation interact? | [Readback ownership](../crates/jxl_wgpu/README.md#aggregate-cpu-readback) |
+| Which JPEG reconstruction integers are authoritative, and are original bytes available? | [GPU JPEG reconstruction inputs](../crates/jxl_wgpu_decode/README.md#gpu-jpeg-reconstruction-inputs) |
 
 ## Implementation and evidence
 

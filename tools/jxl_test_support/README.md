@@ -12,6 +12,15 @@ The module tree follows the source tree:
 - `gpu` drives whole or fragmented test input and reads explicitly requested test output.
 - `offline` writes fixture files and manages native generator processes and hexadecimal formats.
 
+`corpus::jpeg_reconstruction` owns the 36 pinned JPEG/JXL identities used by both metadata and
+GPU coefficient tests. The bitstream crate also imports this crate only as a development
+dependency. `oracles::jpeg_coefficients` compiles
+[`test-data/jpeg_coefficients.cpp`](test-data/jpeg_coefficients.cpp) with C++17 and
+`pkg-config libjpeg`, requiring libjpeg-turbo 3.2.0. It reads coefficients directly from original
+JPEGs, including sampling-aligned virtual-array padding verified against upstream `src/jdcoefct.c`.
+Missing or mismatched native tools fail the test. No JPEG pixel decode or JXL implementation
+supplies these coefficient references.
+
 `oracles::color` owns independent f64 transfer, CIE/Bradford and interval calculations shared by
 original-color tests, resident ICC tests and the offline RGB-to-ICC exporter. Its jxl-oxide path
 provides unbounded pre-OETF XYB stills; the codec's Gamma/DCI black floor makes inversion of an

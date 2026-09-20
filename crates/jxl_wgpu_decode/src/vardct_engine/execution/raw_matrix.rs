@@ -56,9 +56,41 @@ impl FramePendingFrame {
             matrix: plan.matrix_index,
             source: Box::new(source),
         };
+        let jpeg = if let super::FrameOutputScratch::Jpeg(scratch) = &frame._output_scratch {
+            if plan.matrix_index == 0 {
+                if !plan.denominator.is_finite()
+                    || (plan.denominator - 1.0 / (8.0 * 255.0)).abs() > 1e-8
+                    || plan.image.final_planes.len() != 3
+                    || plan
+                        .image
+                        .final_planes
+                        .iter()
+                        .any(|plane| plane.width != 8 || plane.height != 8)
+                {
+                    return Err(super::super::jpeg::JpegCoefficientError::Binding {
+                        reason: "raw JPEG DCT8 quantization image",
+                    }
+                    .into());
+                }
+                Some(crate::wgpu_engine::JpegQuantizationCapture {
+                    output: frame.output.as_wgpu_buffer(),
+                    status: &scratch.status,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let pipeline = &self.pipelines.raw_hf_dequant;
         let mut stream = pipeline
-            .plan_source(&source.codestream, plan, packet_end, source.stream_limit)
+            .plan_source_with_capture(
+                &source.codestream,
+                plan,
+                packet_end,
+                source.stream_limit,
+                jpeg.is_some(),
+            )
             .map_err(error)?;
         let available = self.memory.snapshot().available_bytes;
         if stream.memory_bytes > available {
@@ -70,11 +102,12 @@ impl FramePendingFrame {
                     .min(crate::entropy_window::MIN_STREAM_WINDOW_BYTES)
             {
                 stream = pipeline
-                    .plan_source(
+                    .plan_source_with_capture(
                         &source.codestream,
                         plan,
                         packet_end,
                         source.stream_limit.min(limit),
+                        jpeg.is_some(),
                     )
                     .map_err(error)?;
             }
@@ -92,8 +125,11 @@ impl FramePendingFrame {
             .prepare(
                 &self.backend,
                 &source.codestream,
-                &frame._resources,
-                source.resource_layout,
+                crate::wgpu_engine::RawHfDequantTarget {
+                    resources: &frame._resources,
+                    layout: source.resource_layout,
+                    jpeg,
+                },
                 plan,
                 &stream,
             )
