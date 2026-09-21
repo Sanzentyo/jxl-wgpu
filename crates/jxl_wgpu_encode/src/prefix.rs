@@ -13,6 +13,8 @@ mod tests;
 
 pub(crate) const RAW_SYMBOLS: usize = 33;
 pub(crate) const LZ77_SYMBOLS: usize = 33;
+// The 256-symbol stream alphabet places LZ77 at 224; token 31 covers a full 1024² group.
+pub(crate) const MAX_LZ77_TOKEN: usize = 31;
 const MAX_SYMBOLS: usize = RAW_SYMBOLS + 1;
 const NARROW_RAW_SYMBOLS: usize = 19;
 
@@ -56,7 +58,9 @@ impl PrefixCode {
             ));
         }
         if raw_gpu[max_raw_token + 1..].iter().any(|&count| count != 0)
-            || lz77_gpu[28..].iter().any(|&count| count != 0)
+            || lz77_gpu[MAX_LZ77_TOKEN + 1..]
+                .iter()
+                .any(|&count| count != 0)
         {
             return Err(EncodeError::Backend(
                 "GPU histogram contains an impossible token".into(),
@@ -280,9 +284,10 @@ impl PrefixCode {
         let token = usize::try_from(token)
             .map_err(|_| EncodeError::Backend("GPU LZ77 token overflow".into()))?;
         let expected_nbits = if token < 16 { 0 } else { token - 12 };
-        if token > 27
+        if token > MAX_LZ77_TOKEN
             || nbits != u32::try_from(expected_nbits).unwrap_or(u32::MAX)
             || !extra_bits_are_canonical(nbits, bits)
+            || self.lz77_nbits[token] == 0
         {
             return Err(EncodeError::Backend(
                 "GPU emitted an invalid LZ77 token".into(),

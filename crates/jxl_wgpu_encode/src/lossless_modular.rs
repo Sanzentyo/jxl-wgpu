@@ -26,6 +26,6 @@ pub use serializer::{
 };
 pub use streaming::LosslessModularJob;
 pub use types::{
-    AlphaAssociation, LOSSLESS_MODULAR_GROUP_DIMENSION, LosslessModularFormat,
-    LosslessModularTreeMode,
+    AlphaAssociation, LOSSLESS_MODULAR_GROUP_DIMENSION, LosslessModularConfig,
+    LosslessModularFormat, LosslessModularGroupSize, LosslessModularTreeMode,
 };

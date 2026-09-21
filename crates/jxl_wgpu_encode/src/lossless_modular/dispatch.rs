@@ -15,7 +15,7 @@ use super::streaming::{
     ResidentLosslessModularJob,
 };
 use super::types::{
-    EVENT_WORDS, LosslessModularFormat, LosslessModularTreeMode,
+    EVENT_WORDS, LosslessModularConfig, LosslessModularFormat, LosslessModularTreeMode,
     MAX_DISPATCHES_PER_ARTIFACT_BINDING, ModularParams, OUTPUT_HEADER_WORDS, SHADER,
     modular_sample_depth,
 };
@@ -62,7 +62,7 @@ pub(super) struct ModularDispatchPlan {
     pub(super) memory: LosslessModularMemoryPlan,
 }
 
-/// GPU lossless integer/IEEE floating Modular encoding with row-major 256x256 pass groups.
+/// GPU lossless integer/IEEE floating Modular encoding with configurable row-major pass groups.
 ///
 /// It never reads source pixels on the CPU. Gray, GrayAlpha, RGB and RGBA components may occupy packed,
 /// planar or split storage with explicit swizzles, bit positions and word byte order. Samples
@@ -79,18 +79,30 @@ pub struct LosslessModularBackend {
     storage_offset_alignment: u64,
     max_compute_workgroups_per_dimension: u32,
     pub(super) direct_mapping: bool,
-    tree_mode: LosslessModularTreeMode,
+    config: LosslessModularConfig,
 }
 
 impl LosslessModularBackend {
     #[must_use]
     pub fn new(context: &WgpuContext) -> Self {
-        Self::with_tree_mode(context, LosslessModularTreeMode::SharedGlobal)
+        Self::with_config(context, Default::default())
     }
 
     /// Creates a backend with an explicit multi-group MA-tree placement policy.
     #[must_use]
     pub fn with_tree_mode(context: &WgpuContext, tree_mode: LosslessModularTreeMode) -> Self {
+        Self::with_config(
+            context,
+            LosslessModularConfig {
+                tree_mode,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Selects group geometry and MA-tree placement before any source is submitted.
+    #[must_use]
+    pub fn with_config(context: &WgpuContext, config: LosslessModularConfig) -> Self {
         let limits = context.device().limits();
         let pipeline =
             (limits.max_storage_buffers_per_shader_stage >= 6).then(|| {
@@ -143,8 +155,13 @@ impl LosslessModularBackend {
             storage_offset_alignment: u64::from(limits.min_storage_buffer_offset_alignment),
             max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
             direct_mapping: context.direct_mapping_enabled(),
-            tree_mode,
+            config,
         }
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> LosslessModularConfig {
+        self.config
     }
 
     pub(super) fn pipeline(&self) -> Result<&Arc<wgpu::ComputePipeline>, EncodeError> {
@@ -203,7 +220,11 @@ impl LosslessModularBackend {
     ) -> Result<ModularDispatchPlan, EncodeError> {
         self.pipeline()?;
         let extent = source.layout.extent;
-        let group_grid = LosslessModularGroupGrid::for_extent(extent.width, extent.height)?;
+        let group_grid = LosslessModularGroupGrid::for_extent(
+            extent.width,
+            extent.height,
+            self.config.group_size,
+        )?;
         let source_layout = ModularSourceLayout::new(
             &source.layout,
             source.buffer.size(),
@@ -487,7 +508,7 @@ impl LosslessModularBackend {
             format,
             bits_per_sample: source_spec.bits_per_sample,
             exponent_bits_per_sample: source_spec.exponent_bits_per_sample,
-            tree_mode: self.tree_mode,
+            tree_mode: self.config.tree_mode,
             parameters,
             groups,
             batches,
@@ -903,6 +924,49 @@ mod source_window_tests {
     use jxl_gpu_formats::{ImageLayout, PackingField, PackingWord};
     use jxl_gpu_protocol::Extent2d;
     use wgpu::util::DeviceExt;
+
+    #[test]
+    fn every_group_size_checks_artifact_capacity_before_admission() {
+        let render = pollster::block_on(jxl_wgpu::WgpuBackend::request_default(Default::default()))
+            .expect("required GPU adapter");
+        let context = WgpuContext::from_backend(&render);
+        for group_size in super::super::types::LosslessModularGroupSize::ALL {
+            let edge = group_size.dimension();
+            let layout = ImageLayout::packed(
+                Extent2d::new(edge, edge),
+                LosslessModularFormat::Gray.pixel_format(8).unwrap(),
+            )
+            .unwrap();
+            let buffer = context.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("full Modular group source"),
+                size: layout.logical_size,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            let input = BufferImageSource::new(Arc::new(buffer), layout).unwrap();
+            let mut backend = LosslessModularBackend::with_config(
+                &context,
+                LosslessModularConfig {
+                    group_size,
+                    ..Default::default()
+                },
+            );
+            let plan = backend.memory_plan(&input).unwrap();
+            let expected = 268
+                + 16 * (u64::from(edge) * u64::from(edge)
+                    + (u64::from(edge) * u64::from(edge)).div_ceil(8)
+                    + 1);
+            assert_eq!(plan.artifact_storage_bytes, expected);
+            backend.max_storage_binding_size = expected;
+            assert!(backend.memory_plan(&input).is_ok());
+            backend.max_storage_binding_size = expected - 1;
+            assert!(
+                matches!(backend.memory_plan(&input),Err(EncodeError::Unsupported(UnsupportedFeature::DeviceLimit {name:"max_storage_buffer_binding_size",required,available})) if required == expected && available == expected-1)
+            );
+            assert_eq!(backend.buffer_pool_stats().allocation_misses, 0);
+            assert_eq!(context.memory_stats().reserved_bytes, 0);
+        }
+    }
 
     #[test]
     fn source_span_alone_splits_gpu_batches_and_rejects_an_oversized_group() {

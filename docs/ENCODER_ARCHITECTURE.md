@@ -37,7 +37,7 @@ implementation audits.
 | Input | one pitch-linear `wgpu::Buffer`, one through four packed/planar/split planes, 8/16/24/32-bit words, arbitrary field positions, Native/Little/Big byte order, `ChromaSubsampling::None` |
 | Source color | full-range enumerated RGB/Gray, standard/custom primaries and white, Linear/sRGB/BT.709/PQ/HLG/DCI/Gamma, or unchanged embedded RGB/Gray ICC; four intents and positive binary16 image white |
 | Extent | `1..2^30` per axis, further bounded by device limits |
-| Frame/group layout | standard 256x256 PassGroups, multi-group, row-major TOC |
+| Frame/group layout | selectable 128/256/512/1024-square PassGroups (default 256), LF groups eight times wider/taller, multi-group, row-major TOC |
 | Animation | `true` (5 blend modes, signed crop, 4 reference slots, timecodes) |
 | Determinism | `CrossDevice` integer GPU artifacts and deterministic host assembly |
 | Progressive passes | `max_progressive_passes = 1` |
@@ -79,6 +79,15 @@ image-wide extra-channel declaration; the token kernel preserves all supplied wo
 nonzero color at zero alpha. It does not change bindings, artifact ABI, GPU ownership or sample
 precision. [Alpha-input conformance](CONFORMANCE_CORPUS.md#lossless-modular-alpha-input) separates
 exact raw-sample preservation from arithmetic composition and final alpha presentation.
+
+`LosslessModularConfig` supplies one immutable group size and MA-tree mode to the backend and
+complete encoder. The grid, LF-group count, source windows, artifact capacities and frame-header
+`group_size_shift` derive from that same size. Each animation crop computes its own grid before
+admission. A complete group's channels must fit a GPU batch; larger groups retain typed source,
+artifact, buffer and dispatch rejection. Prefix LZ77 tokens extend through 31 for full 1024² zero
+runs, while exact per-group sample counts, canonical extra bits and histogram agreement still
+validate every artifact. No shader ABI or workgroup shape changes. See
+[group-size conformance](CONFORMANCE_CORPUS.md#lossless-modular-group-sizes).
 
 ### GPU artifact ABI
 
@@ -352,7 +361,7 @@ cargo clippy -p jxl_wgpu_encode --all-targets -- -D warnings
 
 ### Completed slices
 
-- **Multi-group Modular (Slice 3)**: Standard 256x256 PassGroups, multi-group row-major TOC layout,
+- **Multi-group Modular (Slice 3)**: All four standard PassGroup sizes, multi-group row-major TOC layout,
   two-pass streaming with global histogram aggregation, and out-of-order group completion.
 - **Lossless color and alpha inputs (Slice 4 partial)**: Gray/GrayAlpha/RGB/RGBA at integer depths
   `1..=31` or IEEE binary16/binary32, with packed/planar/split addressing and declared alpha

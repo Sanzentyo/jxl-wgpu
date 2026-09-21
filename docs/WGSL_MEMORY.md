@@ -286,7 +286,7 @@ The table below states the default workgroup configuration for each entry point:
 | decoder `lossless_gray8` | codestream/prefix RO, reconstructed/output/status RW, 256-byte parameter records RO, 16-byte dispatch U | 64x1 | Tier A (`KernelVariant` 1-D) | bounded `jwgp` index, aligned token words plus sentinel, per-group MA metadata base, channel-layout tables, four planes/final addresses, packed-row alignment, sample/output ranges and status allocation are prevalidated; one invocation per group lane; channel-fixed Gradient groups may resume through 16-byte-overlapped stream segments using one aligned 32-byte state record per lane |
 | decoder `vardct_pass_group` | bounded stream/entropy bundle RO, quantized-LF plus disjoint LZ/state slices/status RW, 160-byte pass params RO; artifact/order RO, coefficients RW, sink U | 1x1 | Tier B (fixed) | one serial invocation per pass-group window; eight storage bindings meet the portable stage limit; a 464-byte aligned state retains common entropy, nested coefficient progress, sink failure and the 96-word nonzero grid; the 48-byte block-context table ABI addresses QF and signed X/Y/B LF thresholds |
 | `vardct_dct8` | coefficients/tasks/resources RO, X/Y/B RW, U | 8x8 | Tier B (fixed) | exactly one workgroup per validated task; task count and all upload bindings are device-bounded |
-| encoder `lossless_modular` | four source-plane bindings RO (0/3/4/5), artifact RW (1), 256-byte parameter records RO (2) | 1x1 | Tier B (fixed) | one invocation per 256×256 PassGroup/channel; each plane window/alignment/u32 address and artifact capacity are prevalidated; per-component 1–4-byte words, bit positions and Native/Little/Big endian loads preserve 1–31-bit integer or IEEE binary16/binary32 fields; six storage bindings are required |
+| encoder `lossless_modular` | four source-plane bindings RO (0/3/4/5), artifact RW (1), 256-byte parameter records RO (2) | 1x1 | Tier B (fixed) | one invocation per selected 128/256/512/1024-square PassGroup/channel; each plane window/alignment/u32 address and artifact capacity are prevalidated; per-component 1–4-byte words, bit positions and Native/Little/Big endian loads preserve 1–31-bit integer or IEEE binary16/binary32 fields; six storage bindings are required |
 
 The decoder entropy shaders share a nested host/WGSL ABI rather than duplicating an untyped word
 prefix. `EntropyStreamParams` is a 12-byte, four-byte-aligned `repr(C)`/`Pod` record of three `u32`
@@ -405,6 +405,15 @@ against device limits prior to pipeline compilation and dispatch recording.
   are revalidated, including precision, channel identity, full-resolution geometry, row width,
   overlap, logical size and final addressable words. Host precision metadata carries total and
   exponent bits through both resident and streamed assembly.
+  Encoder `LosslessModularConfig` selects 128/256/512/1024-pixel group edges with the same
+  256-byte parameter record and six bindings. Per-channel artifact capacity is still
+  `268 + 16 * (width * height + ceil(width * height / 8) + 1)` bytes, evaluated for the actual
+  edge/crop group. LF geometry scales by eight per axis. Larger groups must individually fit
+  source/artifact limits; batching never splits the channel set of a group. Header geometry,
+  peak reservations and submission counts use that same checked plan. Exact and one-byte-short
+  artifact/budget admission, abandoned jobs and pooled reuse cover every size. Full 1024² zero
+  runs fit the existing 33-entry histogram allocation but now use legal LZ77 tokens through 31;
+  token 32, noncanonical fields and excess sample coverage remain errors.
 - Gray8 decoder output allocation is rounded to four bytes while `logical_size` remains explicit.
   RGBA/BGRA pixels and odd-width YUYV/UYVY pairs use aligned whole-word stores; byte and 16-bit
   plane writers bounds-check each addressed byte against `logical_size`.

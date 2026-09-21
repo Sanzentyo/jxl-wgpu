@@ -48,7 +48,13 @@ pub struct LosslessModularEncoder {
 impl LosslessModularEncoder {
     #[must_use]
     pub fn new(context: WgpuContext) -> Self {
-        let backend = LosslessModularBackend::new(&context);
+        Self::with_config(context, Default::default())
+    }
+
+    /// Creates an encoder with explicit group geometry and MA-tree placement.
+    #[must_use]
+    pub fn with_config(context: WgpuContext, config: super::types::LosslessModularConfig) -> Self {
+        let backend = LosslessModularBackend::with_config(&context, config);
         Self {
             encoder: GpuEncoder::new(context, backend),
             color_options: LosslessModularColorOptions::default(),
@@ -60,13 +66,13 @@ impl LosslessModularEncoder {
     /// Creates an encoder with an explicit multi-group MA-tree placement policy.
     #[must_use]
     pub fn with_tree_mode(context: WgpuContext, tree_mode: LosslessModularTreeMode) -> Self {
-        let backend = LosslessModularBackend::with_tree_mode(&context, tree_mode);
-        Self {
-            encoder: GpuEncoder::new(context, backend),
-            color_options: LosslessModularColorOptions::default(),
-            alpha_association: AlphaAssociation::default(),
-            max_icc_profile_bytes: DEFAULT_PROFILE_LIMIT,
-        }
+        Self::with_config(
+            context,
+            super::types::LosslessModularConfig {
+                tree_mode,
+                ..Default::default()
+            },
+        )
     }
 
     /// Creates an encoder with an application-selected idle buffer retention limit.
@@ -116,6 +122,11 @@ impl LosslessModularEncoder {
     #[must_use]
     pub fn capabilities(&self) -> &EncoderCapabilities {
         self.encoder.capabilities()
+    }
+
+    #[must_use]
+    pub fn config(&self) -> super::types::LosslessModularConfig {
+        self.encoder.backend().config()
     }
 
     /// Reports aggregate owned bytes retained by currently live encode jobs.
@@ -262,7 +273,8 @@ impl LosslessModularEncoder {
         let height = source.layout.extent.height;
         let source_spec = lossless_modular_source_spec(&source.layout.format)?;
         let format = source_spec.format;
-        let group_grid = LosslessModularGroupGrid::for_extent(width, height)?;
+        let group_grid =
+            LosslessModularGroupGrid::for_extent(width, height, self.config().group_size)?;
         let request = FrameEncodeRequest {
             frame_index: FrameIndex::new(0),
             is_last: true,
@@ -910,7 +922,7 @@ impl ModularPacketAssembler {
                 .ok_or_else(|| EncodeError::Backend("gray8 token length underflow".into()))?;
             group.align_to_byte()?;
             let packets = FramePacketSet::new(
-                frame_header(self.format, &self.frame)?,
+                frame_header(self.format, &self.frame, self.group_grid.group_size)?,
                 FrameGroupLayout::new(1, 1, 1)?,
                 [GroupPacket::new(
                     GroupPacketKind::Single,
@@ -933,7 +945,7 @@ impl ModularPacketAssembler {
         let layout = FrameGroupLayout::new(self.group_grid.lf_groups, self.group_grid.groups, 1)?;
         Ok((
             FramePacketSet::new(
-                frame_header(self.format, &self.frame)?,
+                frame_header(self.format, &self.frame, self.group_grid.group_size)?,
                 layout,
                 self.packets,
             )?,
@@ -1141,7 +1153,7 @@ fn validate_gpu_artifacts(
             1 => {
                 let token = usize::try_from(event.token)
                     .map_err(|_| invalid_gpu_artifact("LZ77 token overflow"))?;
-                if token > 27 {
+                if token > crate::prefix::MAX_LZ77_TOKEN {
                     return Err(invalid_gpu_artifact("impossible LZ77 token"));
                 }
                 let expected_nbits = if event.token < 16 {
@@ -1482,6 +1494,7 @@ fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), Enco
 pub(super) fn frame_header(
     format: LosslessModularFormat,
     frame: &ModularFrameHeader,
+    group_size: super::types::LosslessModularGroupSize,
 ) -> Result<BitFragment, EncodeError> {
     let mut output = BitWriter::new();
     output.write_bits(0, 1)?; // non-default frame header
@@ -1493,7 +1506,7 @@ pub(super) fn frame_header(
     if format.has_alpha() {
         output.write_bits(0, 2)?; // alpha upsampling factor one
     }
-    output.write_bits(1, 2)?; // 256x256 Modular groups
+    output.write_bits(u64::from(group_size.size_shift()), 2)?;
     output.write_bits(0, 2)?; // one pass
 
     let have_crop = frame.options.crop.is_some();

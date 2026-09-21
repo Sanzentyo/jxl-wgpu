@@ -506,10 +506,11 @@ mod tests {
         }
         let layout = ImageLayout::from_planes(extent, format, layout.planes).unwrap();
         let source = ModularSourceLayout::new(&layout, layout.logical_size + 3, 256).unwrap();
-        let group = super::super::grid::LosslessModularGroupGrid::for_extent(257, 3)
-            .unwrap()
-            .group(0)
-            .unwrap();
+        let group =
+            super::super::grid::LosslessModularGroupGrid::for_extent(257, 3, Default::default())
+                .unwrap()
+                .group(0)
+                .unwrap();
         let tile = source.group(group).unwrap();
         assert!(
             tile.offsets

@@ -496,6 +496,46 @@ JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossl
 ICC metadata; CMYK/arbitrary extra input, independent precision and broader ICC animation
 composition, encoder syntax and quality retain their remaining gates.
 
+## Lossless Modular group sizes
+
+The [`lossless_layouts::groups`](../crates/jxl_wgpu_encode/tests/lossless_layouts/groups.rs)
+matrix covers all four standard group edges (128/256/512/1024), both MA-tree modes, all four
+Gray/GrayAlpha/RGB/RGBA layouts and integer8/31 plus IEEE16/32: 128 still cases. Planar big-endian,
+reversed, shifted fields and unaligned offsets/pitches produce identical bytes to canonical
+packed input. Dimensions rotate through edge−1, edge, edge+1 and the vertical eight-group LF
+boundary. Inventories check the exact size shift and section count; jxl-oxide working words,
+libjxl original components and whole/256-byte-window fragmented GPU numeric output retain their
+existing exact/`2e-7` precision contracts. Retained outputs outlive sessions.
+
+Eight larger cases cover a complete zero Gray8 tile and dense RGBA8 `(edge+1)²` input at every
+size. Raw output avoids the private acceleration index. Independent working words/native output
+and whole/bounded GPU output verify every pixel; these larger cases use 64 KiB fragmented entropy
+windows. Full 512² and 1024² zero runs exercise the newly reachable LZ77 symbols. Unit negatives
+still reject token 32, unavailable prefix symbols, wrong histogram counts, noncanonical extra bits
+and any run exceeding the exact group area. No tolerance or comparison mask is relaxed.
+
+Eight three-frame Replace animations cross all sizes with RGBA31 and GrayAlpha32. Eight further
+three-frame finite RGBA32 sequences cross both tree modes with all sizes, a canvas beyond the LF
+boundary, signed crops smaller/larger than one group, Add/Multiply color and independent alpha
+reference fields. Native libjxl and Rust jxl compose every frame independently; GPU error retains
+the existing `3e-6` color / `4e-7` alpha source-scale bounds. Whole/fragmented outputs, reverse frame
+insertion, timing/timecodes and retained output lifetime are checked. Each cropped frame's own
+extent determines its PassGroup/LF section counts.
+
+Resident `(edge+1)×9` and streamed `(17*edge)×1` RGBA31 jobs at every size verify exact and
+one-byte-short admission, source retirement on cancellation, blocking/Future equality and pool
+reuse. Separate real-adapter planning tests accept the exact full-tile artifact binding size and
+reject one byte less before allocation. Default constructors still select 256/shared-global and
+retain the unchanged checked-in Gray8 byte fixture. No existing input or reference is replaced.
+
+```console
+JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossless_layouts groups:: -- --test-threads=2
+```
+
+This advances `MOD-E02` to **Partial** for complete group-size selection. Additional RCT/Palette/
+Squeeze choices, global/LF/HF transform topology, parallel token production, adaptive prediction,
+progressive encoding and remaining encoder quality/input gates are still open.
+
 ## Procedural VarDCT encoder matrix
 
 All 27 single-transform strategies now emit real AC. The shared forward primitive has 667

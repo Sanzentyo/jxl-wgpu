@@ -7,8 +7,7 @@ use crate::EncodeError;
 use crate::prefix::{LZ77_SYMBOLS, RAW_SYMBOLS};
 
 /// JPEG XL's default Modular pass-group edge length.
-pub const LOSSLESS_MODULAR_GROUP_DIMENSION: u32 = 256;
-pub(super) const LOSSLESS_MODULAR_LF_GROUP_DIMENSION: u32 = LOSSLESS_MODULAR_GROUP_DIMENSION * 8;
+pub const LOSSLESS_MODULAR_GROUP_DIMENSION: u32 = LosslessModularGroupSize::Pixels256.dimension();
 pub(super) const SHADER: &str = include_str!("../lossless_modular.wgsl");
 pub(super) const MAX_DISPATCHES_PER_ARTIFACT_BINDING: usize = 64;
 
@@ -117,6 +116,57 @@ pub enum LosslessModularTreeMode {
     SharedGlobal,
     /// Every pass group carries a complete local MA configuration.
     LocalPerGroup,
+}
+
+/// JPEG XL's four legal Modular pass-group edge lengths.
+/// A group's LF region is eight times this length on each axis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LosslessModularGroupSize {
+    Pixels128 = 0,
+    #[default]
+    Pixels256 = 1,
+    Pixels512 = 2,
+    Pixels1024 = 3,
+}
+
+impl LosslessModularGroupSize {
+    pub const ALL: [Self; 4] = [
+        Self::Pixels128,
+        Self::Pixels256,
+        Self::Pixels512,
+        Self::Pixels1024,
+    ];
+
+    #[must_use]
+    pub const fn dimension(self) -> u32 {
+        128 << (self as u32)
+    }
+
+    #[must_use]
+    pub const fn size_shift(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Stream encoding policy shared by stills and frames in an animation session.
+/// Defaults retain 256-pixel groups and the shared global MA tree.
+///
+/// ```no_run
+/// # use jxl_wgpu_encode::{LosslessModularConfig, LosslessModularEncoder,
+/// #     LosslessModularGroupSize, LosslessModularTreeMode, WgpuContext};
+/// # fn configure(context: WgpuContext) {
+/// let encoder = LosslessModularEncoder::with_config(context, LosslessModularConfig {
+///     group_size: LosslessModularGroupSize::Pixels512,
+///     tree_mode: LosslessModularTreeMode::LocalPerGroup,
+/// });
+/// assert_eq!(encoder.config().group_size.dimension(), 512);
+/// # }
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LosslessModularConfig {
+    pub group_size: LosslessModularGroupSize,
+    pub tree_mode: LosslessModularTreeMode,
 }
 
 impl LosslessModularFormat {

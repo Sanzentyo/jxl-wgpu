@@ -395,7 +395,7 @@ mod native_tests {
         };
         for (index, frame) in [(0, first), (1, second)] {
             let packets = FramePacketSet::new(
-                frame_header(LosslessModularFormat::Rgba, &frame).unwrap(),
+                frame_header(LosslessModularFormat::Rgba, &frame, Default::default()).unwrap(),
                 FrameGroupLayout::new(1, 1, 1).unwrap(),
                 [GroupPacket::new(GroupPacketKind::Single, Vec::new())],
             )
@@ -452,10 +452,11 @@ mod native_tests {
 
     #[test]
     fn group_grid_is_row_major_and_covers_edge_tiles_exactly() {
-        let grid = LosslessModularGroupGrid::for_extent(513, 257).unwrap();
+        let grid = LosslessModularGroupGrid::for_extent(513, 257, Default::default()).unwrap();
         assert_eq!(
             grid,
             LosslessModularGroupGrid {
+                group_size: Default::default(),
                 width: 513,
                 height: 257,
                 columns: 3,
@@ -488,11 +489,87 @@ mod native_tests {
         assert!(grid.group(6).is_none());
 
         assert_eq!(
-            LosslessModularGroupGrid::for_extent(1, 1).unwrap().groups,
+            LosslessModularGroupGrid::for_extent(1, 1, Default::default())
+                .unwrap()
+                .groups,
             1
         );
-        assert!(LosslessModularGroupGrid::for_extent(0, 1).is_err());
-        assert!(LosslessModularGroupGrid::for_extent(1, 0).is_err());
+        assert!(LosslessModularGroupGrid::for_extent(0, 1, Default::default()).is_err());
+        assert!(LosslessModularGroupGrid::for_extent(1, 0, Default::default()).is_err());
+    }
+
+    #[test]
+    fn large_group_runs_keep_canonical_tokens_histograms_and_exact_sample_bounds() {
+        for (edge, token, nbits) in [
+            (128u32, 25usize, 13u32),
+            (256, 27, 15),
+            (512, 29, 17),
+            (1024, 31, 19),
+        ] {
+            let pixels = edge * edge;
+            let mut header = ModularArtifactHeader {
+                event_count: 1,
+                raw_counts: [0; RAW_SYMBOLS],
+                lz77_counts: [0; LZ77_SYMBOLS],
+            };
+            header.raw_counts[0] = 1;
+            header.lz77_counts[token] = 1;
+            let event = ModularEvent {
+                kind: 1,
+                token: token as u32,
+                extra_bit_count: nbits,
+                extra_bits: pixels - 8 - (1 << nbits),
+            };
+            let bytes = artifact_bytes(header, &[event]);
+            assert!(parse_group_artifact(edge, edge, 1, &bytes).is_ok());
+            // The same valid entropy token is not valid for a shorter image or mismatched count.
+            assert!(matches!(
+                parse_group_artifact(edge, edge - 1, 1, &bytes),
+                Err(EncodeError::Backend(_))
+            ));
+            for invalid in [
+                ModularEvent {
+                    extra_bits: event.extra_bits + 1,
+                    ..event
+                },
+                ModularEvent {
+                    extra_bits: 1 << nbits,
+                    ..event
+                },
+                ModularEvent {
+                    extra_bit_count: nbits + 1,
+                    ..event
+                },
+                ModularEvent { token: 32, ..event },
+            ] {
+                assert!(matches!(
+                    parse_group_artifact(edge, edge, 1, &artifact_bytes(header, &[invalid])),
+                    Err(EncodeError::Backend(_))
+                ));
+            }
+            header.lz77_counts[token] = 2;
+            assert!(matches!(
+                parse_group_artifact(edge, edge, 1, &artifact_bytes(header, &[event])),
+                Err(EncodeError::Backend(_))
+            ));
+        }
+        let unused = crate::prefix::PrefixCode::fixed_unused_channel();
+        assert!(
+            unused
+                .write_run(&mut jxl_gpu_bitstream::BitWriter::new(), 31, 19, 0)
+                .is_err()
+        );
+        let mut invalid_runs = [0; LZ77_SYMBOLS];
+        invalid_runs[32] = 1;
+        assert!(
+            crate::prefix::PrefixCode::from_aggregated_counts(
+                &[0; RAW_SYMBOLS],
+                &invalid_runs,
+                9,
+                false
+            )
+            .is_err()
+        );
     }
 
     fn artifact_bytes(header: ModularArtifactHeader, events: &[ModularEvent]) -> Vec<u8> {
@@ -915,7 +992,7 @@ mod native_tests {
     }
 
     fn expected_artifact_storage_bytes(width: u32, height: u32, alignment: u64) -> u64 {
-        LosslessModularGroupGrid::for_extent(width, height)
+        LosslessModularGroupGrid::for_extent(width, height, Default::default())
             .unwrap()
             .ordered_groups()
             .fold(0, |offset, group| {

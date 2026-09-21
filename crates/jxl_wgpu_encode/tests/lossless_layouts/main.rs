@@ -3,6 +3,7 @@
 mod alpha;
 mod animation;
 mod color;
+mod groups;
 mod icc;
 mod lifetime;
 mod source;

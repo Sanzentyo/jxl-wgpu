@@ -80,7 +80,12 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
 - Integer RGB(A) uses JPEG XL reversible color transform type 0 (YCoCg) in WGSL. Floating
   channels retain their raw IEEE words without a color transform. No transformed image or source
   pixels are read by the CPU.
-- The frame is split into standard 256x256 PassGroups. Edge groups may be one pixel wide or high.
+- `LosslessModularConfig` selects all four standard PassGroup sizes with
+  `LosslessModularGroupSize::{Pixels128, Pixels256, Pixels512, Pixels1024}` and the MA-tree mode.
+  `LosslessModularEncoder::with_config` and `LosslessModularBackend::with_config` use the same
+  immutable policy; `config()` reports it. The default remains 256×256. LF groups cover eight
+  PassGroups per axis. Edge groups may be one pixel wide or high; cropped animation frames use
+  their own extent to calculate both grids.
 - One GPU invocation handles each PassGroup/channel pair. Dispatch parameters and artifacts use
   group-major, channel-major order. Small jobs use one mapped artifact allocation. Larger jobs use
   complete-channel-group batches bounded by storage-binding and dispatch limits.
@@ -112,6 +117,13 @@ one histogram and one serialization submission per batch. Every live batch uses 
 mapped-range consumer are both finished, including when the returned future is abandoned.
 Source range accounting excludes gaps between planes and counts shared alignment prefixes once.
 
+The selected `group_size` is included in `group_grid`. Larger groups increase each channel's
+worst-case artifact to `268 + 16 * (pixels + ceil(pixels / 8) + 1)` bytes. A complete group must fit
+the checked source/artifact binding limits; selecting 1024 does not guarantee that every device
+or memory budget can admit it. Batch splitting, peak reservations and exact submission counts
+are recalculated from that geometry. Long zero runs use the full valid prefix alphabet through
+the 1024²-sample case; histogram, canonical extra-bit and exact sample-count checks remain required.
+
 `icc_profile_bytes` reports the original caller-owned profile retained by a source or animation
 descriptor and included in addressed bytes. `icc_storage_bytes` adds twice the complete image-header
 size to owned/addressed bytes: one header plus the possible temporary copy during exact resizing
@@ -132,16 +144,19 @@ exact dispatch rectangles and normative PassGroup order before completion.
 
 ```rust,no_run
 # use jxl_wgpu_encode::{
-#     BufferImageSource, LosslessModularEncoder, LosslessModularFormat,
-#     LosslessModularTreeMode, WgpuContext,
+#     BufferImageSource, LosslessModularConfig, LosslessModularEncoder, LosslessModularFormat,
+#     LosslessModularGroupSize, LosslessModularTreeMode, WgpuContext,
 # };
 # fn submit(
 #     context: WgpuContext,
 #     source: BufferImageSource,
 # ) -> Result<(), jxl_wgpu_encode::EncodeError> {
-let encoder = LosslessModularEncoder::with_tree_mode(
+let encoder = LosslessModularEncoder::with_config(
     context,
-    LosslessModularTreeMode::LocalPerGroup,
+    LosslessModularConfig {
+        group_size: LosslessModularGroupSize::Pixels512,
+        tree_mode: LosslessModularTreeMode::LocalPerGroup,
+    },
 );
 let plan = encoder.memory_plan(&source)?;
 assert_eq!(plan.group_grid.groups, plan.group_grid.columns * plan.group_grid.rows);
@@ -210,6 +225,10 @@ The [embedded-ICC matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-embe
 checks independent original-profile bytes and source words, requested color output, private tags,
 all intents, animation identity, size limits and shared-budget lifetime.
 Independent extra-channel declarations, CMYK, YUV and textures remain outside this profile.
+The [group-size matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-group-sizes) covers every
+size with shared/local trees, integer/IEEE source words, LF boundaries, full tiles, cropped and
+Replace animations, bounded GPU output and admission/cancellation. The default 256 configuration
+retains the existing checked-in Gray8 codestream bytes.
 
 ## Experimental VarDCT profile
 
