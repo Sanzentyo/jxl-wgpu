@@ -68,8 +68,8 @@ clang++ -std=c++17 -O2 -Wall -Wextra -Werror -ffp-contract=off \
 .git/hdr-icc-regenerate/generator crates/jxl_wgpu/test-data/icc \
   .git/hdr-icc-regenerate/sources .git/hdr-icc-regenerate/references
 diff -rq crates/jxl_wgpu_decode/test-data/hdr_icc .git/hdr-icc-regenerate/references
-cargo test --locked -p jxl_wgpu --test icc hdr:: -- --test-threads=1
-cargo test --locked -p jxl_wgpu_decode --test hdr -- --test-threads=1
+cargo test --locked -p jxl_wgpu --test icc hdr:: -- --test-threads=2
+cargo test --locked -p jxl_wgpu_decode --test hdr -- --test-threads=2
 ```
 
 All generation and GPU jobs use frozen source. The shared evaluator must also reproduce the

@@ -72,7 +72,7 @@ clang++ -std=c++17 -O2 -Wall -Wextra -Werror -ffp-contract=off \
 .git/rgb-icc-regenerate/generator crates/jxl_wgpu/test-data/icc \
   .git/rgb-icc-regenerate/sources .git/rgb-icc-regenerate/references
 diff -rq crates/jxl_wgpu_decode/test-data/rgb_icc .git/rgb-icc-regenerate/references
-cargo test --locked -p jxl_wgpu_decode --test original_color icc:: -- --test-threads=1
+cargo test --locked -p jxl_wgpu_decode --test original_color icc:: -- --test-threads=2
 ```
 
 Both output directories must be new. Two independent source exports and native generations

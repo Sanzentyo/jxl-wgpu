@@ -23,7 +23,7 @@ cmake --build target/gain-map-oracle --target gain_map_oracle --parallel 4
 target/gain-map-oracle/gain_map_oracle generate target/gain-map-generated
 JXL_REQUIRE_NATIVE_ORACLES=1 \
 JXL_GAIN_MAP_ORACLE="$PWD/target/gain-map-oracle/gain_map_oracle" \
-  cargo test --locked -p jxl_wgpu_decode --test gain_map -- --test-threads=1 --nocapture
+  cargo test --locked -p jxl_wgpu_decode --test gain_map -- --test-threads=2 --nocapture
 ```
 
 Generate outside the source tree under test, compare all output bytes, then import deliberately.

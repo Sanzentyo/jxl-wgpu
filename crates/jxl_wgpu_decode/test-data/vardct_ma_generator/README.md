@@ -32,7 +32,7 @@ cmake -S crates/jxl_wgpu_decode/test-data/vardct_ma_generator \
 cmake --build /tmp/jxl-vardct-ma-build --target generate_vardct_ma -j 4
 /tmp/jxl-vardct-ma-build/generate_vardct_ma /tmp/jxl-vardct-ma-output
 diff -r crates/jxl_wgpu_decode/test-data/vardct_ma /tmp/jxl-vardct-ma-output
-cargo test -p jxl_wgpu_decode --test vardct_ma --locked -- --test-threads=1 --nocapture
+cargo test -p jxl_wgpu_decode --test vardct_ma --locked -- --test-threads=2 --nocapture
 ```
 
 The output directory must not exist. Regeneration compares every file byte for byte. Tests load

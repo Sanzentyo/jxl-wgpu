@@ -96,8 +96,8 @@ cmake --build /tmp/jxl-modular-ycbcr-scalar --target decode_modular_ycbcr_scalar
 cargo run -p jxl_wgpu_decode --example regenerate_modular_ycbcr -- \
   /tmp/jxl-modular-ycbcr-build/generate_modular_ycbcr \
   /tmp/jxl-modular-ycbcr-scalar/decode_modular_ycbcr_scalar
-cargo test -p jxl_wgpu_decode --lib profile::ycbcr_tests -- --test-threads=1
-cargo test -p jxl_wgpu_decode --test modular_ycbcr -- --test-threads=1
+cargo test -p jxl_wgpu_decode --lib profile::ycbcr_tests -- --test-threads=2
+cargo test -p jxl_wgpu_decode --test modular_ycbcr -- --test-threads=2
 ```
 
 The GPU tests require an actual adapter and compare native color, selected RGB/extra components,

@@ -36,7 +36,7 @@ cargo run --locked -p jxl_wgpu_decode --example assemble_cmyk -- \
 .git/cmyk-regenerate/generator references crates/jxl_wgpu/test-data/icc/lut \
   .git/cmyk-regenerate/assembled .git/cmyk-regenerate/references
 diff -rq crates/jxl_wgpu_decode/test-data/cmyk/generated .git/cmyk-regenerate/references
-cargo test --locked -p jxl_wgpu_decode --test embedded_icc cmyk:: -- --test-threads=1
+cargo test --locked -p jxl_wgpu_decode --test embedded_icc cmyk:: -- --test-threads=2
 ```
 
 The 181 files contain 18 `.jxl` streams, 18 native `.f32` images, 144 `.reference` files,

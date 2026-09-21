@@ -27,7 +27,7 @@ spot_run_b=$(mktemp -d)
 /tmp/jxl-icc-spots-generator crates/jxl_wgpu_decode/test-data/embedded_icc "$spot_run_b"
 diff -qr "$spot_run_a" "$spot_run_b"
 diff -qr "$spot_run_a" crates/jxl_wgpu_decode/test-data/icc_spots
-cargo test --locked -p jxl_wgpu_decode --test embedded_icc spots:: -- --nocapture --test-threads=1
+cargo test --locked -p jxl_wgpu_decode --test embedded_icc spots:: -- --nocapture --test-threads=2
 ```
 
 The two runs reproduce all **485 files**. Profile inputs reuse the unchanged

@@ -14,7 +14,7 @@ Then, from the workspace root:
 
 ```sh
 cargo run -p jxl_wgpu_decode --example regenerate_original_color
-cargo test -p jxl_wgpu_decode --test original_color -- --test-threads=1
+cargo test -p jxl_wgpu_decode --test original_color -- --test-threads=2
 ```
 
 The Rust completion tool also requires the native extra-channel oracle documented in

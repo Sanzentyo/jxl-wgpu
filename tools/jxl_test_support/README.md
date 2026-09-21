@@ -89,9 +89,10 @@ Run the workspace checks from the repository root with Rust 1.98 or later:
 ```sh
 cargo check --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets --all-features -- --test-threads=1
+cargo test --workspace --all-targets --all-features --no-fail-fast -- --test-threads=2
 ```
 
-GPU tests run serially. Fixture generators use the same manifests and helpers as the tests;
+GPU tests use exactly two libtest threads, with separate test executables run sequentially.
+Fixture generators use the same manifests and helpers as the tests;
 their commands, pinned oracle versions and observed errors are recorded in
 [`CONFORMANCE_CORPUS.md`](../../docs/CONFORMANCE_CORPUS.md).

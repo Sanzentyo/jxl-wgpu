@@ -34,7 +34,7 @@ c++ -std=c++17 -O2 -Wall -Wextra -Werror -ffp-contract=off \
 .git/device-output-regenerate/generator crates/jxl_wgpu/test-data/icc/lut \
   crates/jxl_wgpu_decode/test-data/cmyk/generated .git/device-output-regenerate/references
 diff -rq crates/jxl_wgpu_decode/test-data/device_output .git/device-output-regenerate/references
-cargo test --locked -p jxl_wgpu_decode --test embedded_icc device:: -- --test-threads=1
+cargo test --locked -p jxl_wgpu_decode --test embedded_icc device:: -- --test-threads=2
 ```
 
 The 241 files contain the manifest and 240 reference files, totaling 403,920 independent/native

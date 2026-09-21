@@ -273,10 +273,10 @@ successful encoder reuse with both oracles.
 Unit tests reject noncanonical token-32 bit counts/high bits, token 33 and histogram values outside
 the configured depth. Existing 1–16-bit tests and the unchanged 609-byte Gray8 fixture remain gates.
 
-Focused command (GPU tests remain serial):
+Focused command (two libtest threads):
 
 ```console
-cargo test --locked -p jxl_wgpu_encode --test lossless_wide -- --test-threads=1
+cargo test --locked -p jxl_wgpu_encode --test lossless_wide -- --test-threads=2
 ```
 
 This target isolates high-depth development checks; advertised changes still require the
@@ -319,10 +319,10 @@ numeric-type/exponent mismatches, binary64, BGR and associated-alpha layouts ret
 The existing integer matrices and unchanged 609-byte Gray8 fixture remain regression gates.
 No checked-in source or reference images are regenerated for these procedural tests.
 
-Focused command (GPU tests remain serial):
+Focused command (two libtest threads):
 
 ```console
-cargo test --locked --workspace --all-features --test lossless_float -- --test-threads=1
+cargo test --locked --workspace --all-features --test lossless_float -- --test-threads=2
 ```
 
 This target separates floating development checks; capability changes still require the
@@ -2303,8 +2303,8 @@ Regenerate all 37 codestreams and four linear references with libjxl 0.12.0, `cj
 ```sh
 cargo run -p jxl_wgpu_decode --example regenerate_noise -- \
   crates/jxl_wgpu_decode/test-data/noise
-cargo test -p jxl_wgpu_decode --test noise --test noise_combinations -- --test-threads=1
-cargo test -p jxl_wgpu resident_noise:: --lib -- --test-threads=1
+cargo test -p jxl_wgpu_decode --test noise --test noise_combinations -- --test-threads=2
+cargo test -p jxl_wgpu resident_noise:: --lib -- --test-threads=2
 ```
 
 `tests/noise/main.rs` parses the real signaled model and also clears exactly its ten bytes to compare
@@ -3758,7 +3758,7 @@ twelve. All original fixture bytes remain unchanged.
 cargo run -p jxl_wgpu_decode --example regenerate_lf_extra_channels -- \
   crates/jxl_wgpu_decode/test-data/frame_resampling --resampling
 cargo run -p jxl_wgpu_decode --example regenerate_splines
-cargo test -p jxl_wgpu_decode --test splines -- --test-threads=1
+cargo test -p jxl_wgpu_decode --test splines -- --test-threads=2
 ```
 
 Native prefix references retain linear RGBA and every extra plane. The same existing limits
@@ -3982,7 +3982,7 @@ Regenerate and validate the component references after regenerating the native s
 
 ```sh
 cargo run -p jxl_wgpu_decode --example regenerate_patch_references
-cargo test -p jxl_wgpu_decode --test patches references:: -- --test-threads=1
+cargo test -p jxl_wgpu_decode --test patches references:: -- --test-threads=2
 ```
 
 ## Original SDR profiles and original-domain composition
@@ -4483,7 +4483,7 @@ record every mode, primary, transfer, intensity, sample type and frame form. Exi
 unchanged. The 56 streams present 80 complete images; the native six-frame sequence renderer
 requires its original color profile, so sequence conversion uses independent F64 equations.
 
-`cargo test -p jxl_wgpu_decode --test hdr -- --test-threads=1 --nocapture` checks:
+`cargo test -p jxl_wgpu_decode --test hdr -- --test-threads=2` checks:
 
 - Original Modular/VarDCT RGB and XYB with PQ/HLG, 100/255/1000/4000-nit intensity, BT.2020/BT.709/
   Display-P3 and gray, independent 10-bit alpha, 16-bit/F32 color, progressive AC and group edges.

@@ -13,7 +13,7 @@ cmake -S crates/jxl_wgpu_decode/test-data/extra_upsampling_generator \
 cmake --build .git/extra-upsampling-build --target generate_extra_upsampling -j 4
 .git/extra-upsampling-build/generate_extra_upsampling .git/extra-upsampling-regenerated
 diff -rq crates/jxl_wgpu_decode/test-data/extra_upsampling .git/extra-upsampling-regenerated
-cargo test --locked -p jxl_wgpu_decode --test extra_upsampling -- --test-threads=1
+cargo test --locked -p jxl_wgpu_decode --test extra_upsampling -- --test-threads=2
 ```
 
 `CMAKE_PREFIX_PATH` locates the installed dependencies; adjust it for other hosts. For native

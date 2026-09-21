@@ -88,6 +88,48 @@ fn original_intents_keep_requested_bradford_and_absolute_output_independent() {
             .unwrap()
             .with_alpha_output_policy(AlphaOutputPolicy::Preserve)
             .with_white_point_adaptation(adaptation);
+            // The requested conversion depends on this case and adaptation, not its intent.
+            // Compute each pixel's independent bounds once, then check all four GPU variants.
+            let expected: Vec<[(f64, f64, f64); 4]> = reference
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+                .map(|(pixel, values)| {
+                    let (rgb, transfer) = if let Some(linear) = &linear_original {
+                        (
+                            [linear[pixel][0], linear[pixel][1], linear[pixel][2]],
+                            TransferFunction::Linear,
+                        )
+                    } else {
+                        (
+                            [values[0], values[1], values[2]].map(f64::from),
+                            source.transfer,
+                        )
+                    };
+                    let converted =
+                        oracle::convert(rgb, transfer, TransferFunction::Linear, matrix);
+                    let bounds = oracle::interval(
+                        rgb,
+                        transfer,
+                        TransferFunction::Linear,
+                        matrix,
+                        f64::from(tolerance(&case)),
+                    );
+                    std::array::from_fn(|channel| {
+                        if channel == 3 {
+                            let alpha = f64::from(values[3]);
+                            (alpha - 2e-6, alpha + 2e-6, 0.0)
+                        } else {
+                            (
+                                bounds[channel][0],
+                                bounds[channel][1],
+                                5e-6 * (1.0 + converted[channel].abs()),
+                            )
+                        }
+                    })
+                })
+                .collect();
             let mut baseline = None;
             for intent in corpus::intents::ALL {
                 let data = corpus::intents::replace(&original, intent);
@@ -97,39 +139,10 @@ fn original_intents_keep_requested_bradford_and_absolute_output_independent() {
                     let words = planes::read(&backend, &frame.output().outputs[0]);
                     assert_eq!(words.len(), 37 * 19 * 4);
                     for (pixel, actual) in words.as_chunks::<4>().0.iter().enumerate() {
-                        let values = &reference[(snapshots.len() * 37 * 19 + pixel) * 4..][..4];
-                        let (rgb, transfer) = if let Some(linear) = &linear_original {
-                            (
-                                [linear[pixel][0], linear[pixel][1], linear[pixel][2]],
-                                TransferFunction::Linear,
-                            )
-                        } else {
-                            (
-                                [values[0], values[1], values[2]].map(f64::from),
-                                source.transfer,
-                            )
-                        };
-                        let expected =
-                            oracle::convert(rgb, transfer, TransferFunction::Linear, matrix);
-                        let bounds = oracle::interval(
-                            rgb,
-                            transfer,
-                            TransferFunction::Linear,
-                            matrix,
-                            f64::from(tolerance(&case)),
-                        );
                         for channel in 0..4 {
                             let actual = f64::from(f32::from_bits(actual[channel]));
-                            let (low, high, packing) = if channel == 3 {
-                                let alpha = f64::from(values[3]);
-                                (alpha - 2e-6, alpha + 2e-6, 0.0)
-                            } else {
-                                (
-                                    bounds[channel][0],
-                                    bounds[channel][1],
-                                    5e-6 * (1.0 + expected[channel].abs()),
-                                )
-                            };
+                            let (low, high, packing) =
+                                expected[snapshots.len() * 37 * 19 + pixel][channel];
                             assert!(
                                 actual.is_finite()
                                     && actual >= low - packing

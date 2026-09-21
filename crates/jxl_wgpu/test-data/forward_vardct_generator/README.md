@@ -63,12 +63,12 @@ entries are compared as quantization multipliers; LLF uses the separate LF quant
 
 ```sh
 cargo test -p jxl_gpu_protocol vardct:: -- --nocapture
-cargo test -p jxl_wgpu forward_vardct:: -- --test-threads=1 --nocapture
-cargo test -p jxl_wgpu_encode --lib vardct_encoder::tests::single:: -- --test-threads=1 --nocapture
+cargo test -p jxl_wgpu forward_vardct:: -- --test-threads=2 --nocapture
+cargo test -p jxl_wgpu_encode --lib vardct_encoder::tests::single:: -- --test-threads=2 --nocapture
 ```
 
 The latter two commands require an actual GPU; the encoder test also requires `djxl` in PATH.
-Run GPU suites serially. The shared forward primitive checks all 667 records under Scalar,
+Run GPU test executables sequentially with two libtest threads each. The shared forward primitive checks all 667 records under Scalar,
 32/64/128/256 lanes, demanding byte-identical variants and coefficient error at most
 `2e-6*(1+abs(reference))`, LF error at most `2e-5*(1+abs(reference))`. The recorded peak absolute
 errors are 1.1920929e-7 and 8.9386594e-7. Offset bindings, independent row strides and scalar

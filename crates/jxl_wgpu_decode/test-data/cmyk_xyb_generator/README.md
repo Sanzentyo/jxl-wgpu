@@ -16,7 +16,7 @@ c++ -std=c++17 -O2 -Wall -Wextra -Werror -ffp-contract=off \
 .git/cmyk-xyb-regenerate/generator crates/jxl_wgpu/test-data/icc/lut \
   .git/cmyk-xyb-regenerate/references
 diff -rq crates/jxl_wgpu_decode/test-data/cmyk_xyb .git/cmyk-xyb-regenerate/references
-cargo test --locked -p jxl_wgpu_decode --test embedded_icc xyb::cmyk:: -- --test-threads=1
+cargo test --locked -p jxl_wgpu_decode --test embedded_icc xyb::cmyk:: -- --test-threads=2
 ```
 
 The **73 files** contain 12 three-frame streams, 12 native F32 sample files, 48 ICC reference

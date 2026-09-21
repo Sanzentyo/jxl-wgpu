@@ -143,7 +143,8 @@ one for whole input and one for bounded fragmented input. Its three reconstructi
 cover 148 SDR cases, 80 analytic cases and 320 intent variants. Reusing the whole-input engine
 for final-only output reduces engine construction from 1,644 to six. Each case still opens
 fresh sessions, compares native references and retained/progressive/final-only output, and
-requires zero reserved bytes after releasing its sessions and images. GPU tests remain serial.
+requires zero reserved bytes after releasing its sessions and images. These measurements used
+serial GPU tests; the current two-thread policy is defined in [development](DEVELOPMENT.md).
 
 A before/after run on 2026-09-21, 04:40–05:06 JST used Apple M5 / Metal, macOS 26.6.2
 (25G83), Rust 1.98.1 and `wgpu` 30.0.1. The adapter reports empty driver/version strings.
@@ -200,7 +201,7 @@ The fastest completed run, reuse with two threads, was 130.91 seconds faster tha
 serial run. Four threads were slower than serial before reuse; after reuse the run was manually
 terminated at 742.85 seconds, with no completed result or asserted test failure. This single run
 per configuration establishes neither repeatability nor a safe workspace-wide concurrency policy.
-The required serial GPU validation gate remains unchanged.
+The validation policy at the time of these measurements still required serial GPU tests.
 
 ### Decoder reuse in GPU conformance tests (2026-09-21)
 
@@ -237,6 +238,43 @@ case matrices and ownership checks. There is no paired before/after run under th
 for these four targets, so these numbers do not establish a speedup. In particular, the
 `wgpu_gray8` result is longer than an earlier historical run and needs profiling before drawing
 a performance conclusion.
+
+### Two test threads and reused intent references (2026-09-21)
+
+The maintainer selected exactly two libtest threads for future validation. Cargo configuration
+and the current validation recipes use that count; separate GPU test processes still run
+sequentially. Historical one-thread measurements above retain their original settings.
+
+`original_intents_keep_requested_bradford_and_absolute_output_independent` now computes its
+independent F64 conversion, interval and packing allowance once per case/adaptation/pixel and
+reuses them across all four original intents. Each case retains only its own bounded reference
+array. The 80 cases, both white-point policies, four intent variants, every RGBA comparison,
+cross-intent output identity and zero-reservation assertions are unchanged. Native reconstruction
+and the other eleven tests remain unchanged. This removes three of four identical reference
+calculations, without caching GPU results or omitting any decode/comparison.
+
+The before/after pair used the same twelve-test target, Apple M5 / Metal, macOS 26.6.2 (25G83),
+Rust 1.98.1, `wgpu` 30.0.1, `CARGO_BUILD_JOBS=4`, `JXL_REQUIRE_NATIVE_ORACLES=1`, the normal
+optimized `target/`, and two libtest threads. Each row is one fresh test process without a
+separate warmup or another GPU test job. Driver/version strings are empty. The tested conversion
+uses 37×19 original RGBA F32 frames with explicit GPU-buffer readback.
+
+```console
+cargo test --locked --workspace --all-features --test original_color -- --test-threads=2
+```
+
+| Setup | Threads | Passed / ignored | Libtest elapsed (s) |
+| --- | ---: | ---: | ---: |
+| `7cff6d0` code, prior whole-workspace run | 1 | 12 / 0 | 634.42 |
+| `7cff6d0` code, before reference reuse | 2 | 12 / 0 | 427.95 |
+| Reference calculations reused across intents | 2 | 12 / 0 | 427.27 |
+
+The two-thread before/after difference is only 0.68 seconds (0.16%), within ordinary run
+variation; it does not demonstrate a material elapsed-time benefit from reference reuse.
+The earlier one-thread row comes from the completed workspace run, not a new paired experiment.
+These target timings exclude Cargo compilation and do not establish a whole-workspace speedup
+or repeated-run stability. Whole-workspace validation at the selected concurrency remains
+required when changing the default test policy.
 
 ## Report lifecycle
 

@@ -36,7 +36,7 @@ c++ -std=c++17 -Wall -Wextra -Werror \
   $(pkg-config --cflags --libs lcms2) -o .git/icc-regenerate/generator
 .git/icc-regenerate/generator .git/icc-regenerate/corpus
 diff -rq -x intents crates/jxl_wgpu/test-data/icc .git/icc-regenerate/corpus
-cargo test -p jxl_wgpu --test icc -- --test-threads=1
+cargo test -p jxl_wgpu --test icc -- --test-threads=2
 ```
 
 Generation is offline. `cargo test` consumes the checked-in bytes and does not spawn an oracle.

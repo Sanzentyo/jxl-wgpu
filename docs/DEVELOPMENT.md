@@ -17,6 +17,11 @@ per-task Cargo output directories under `.git` or elsewhere. When disk space run
 active builds and validation jobs, run `cargo clean` from the repository root, then restart the
 required checks. Never clean an output directory while a build or test still uses it.
 
+Use exactly two libtest threads for tests, including GPU tests, as directed by the maintainer
+on 2026-09-21. [Cargo configuration](../.cargo/config.toml) sets `RUST_TEST_THREADS=2`; explicit
+test commands use `--test-threads=2`. Run separate GPU test executables or Cargo test jobs
+sequentially, so process-level parallelism does not multiply the two-thread workload.
+
 ## Validation by change
 
 | Change | Required evidence |
@@ -25,7 +30,7 @@ required checks. Never clean an output directory while a build or test still use
 | Executable documentation examples | Compile/run affected examples when the toolchain and hardware are available; shell syntax alone is not runtime validation. |
 | Test setup or helper changes only | Run affected test targets with their required adapters/oracles and unchanged case matrices, tolerances, and ownership checks. Use the same workload before and after for runtime comparisons. |
 | Host parsing, metadata, or format logic | Affected crate/target tests, malformed-input and limit cases, plus downstream checks for affected codec contracts. |
-| WGSL, codec/output behavior, or GPU ownership | Serial tests on an actual adapter, applicable independent oracles, precision/invalid-input checks, budget admission, cancellation, and retained-output lifetime. |
+| WGSL, codec/output behavior, or GPU ownership | Tests on an actual adapter with two libtest threads, applicable independent oracles, precision/invalid-input checks, budget admission, cancellation, and retained-output lifetime. |
 | Advertised capability or cross-workspace contract | The full gates below plus the relevant roadmap acceptance evidence. Focused passing tests do not replace these gates. |
 
 Integration targets use `tests/<target>/main.rs` with ordinary child modules. Shared
@@ -41,8 +46,8 @@ Run from the repository root while CI is disabled:
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets --all-features
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-cargo test --locked --workspace --all-targets --all-features -- --test-threads=1
-cargo test --locked --workspace --all-features --doc
+cargo test --locked --workspace --all-targets --all-features --no-fail-fast -- --test-threads=2
+cargo test --locked --workspace --all-features --doc -- --test-threads=2
 cargo doc --locked --workspace --no-deps
 cargo check --locked --target wasm32-unknown-unknown \
   -p jxl_gpu_bitstream -p jxl_gpu_protocol -p jxl_gpu_formats \

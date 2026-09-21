@@ -77,7 +77,7 @@ coefficients; the checked-in test here exercises metadata and original-JPEG byte
 ## Executable oracle
 
 ```console
-JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_gpu_bitstream -- --test-threads=1
+JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_gpu_bitstream -- --test-threads=2
 ```
 
 [`../jpeg_reconstruction_oracle/main.cpp`](../jpeg_reconstruction_oracle/main.cpp) compiles

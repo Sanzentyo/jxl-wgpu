@@ -34,7 +34,9 @@ inside another always-discoverable README.
 
 Carry the authorized change through implementation, documentation, and the
 [applicable checks](docs/DEVELOPMENT.md#validation-by-change), fixing regressions it
-introduces without seeking approval between local iterations. GPU tests run serially.
+introduces without seeking approval between local iterations. Run tests with exactly two
+libtest threads (`--test-threads=2`), including GPU tests. Keep separate GPU test processes
+sequential; the two threads are within one test executable.
 Fixture/reference replacement, enabling CI, publishing, and remote mutations must
 belong to the authorized task, not incidental cleanup.
 

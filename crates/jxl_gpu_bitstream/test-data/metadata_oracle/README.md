@@ -15,8 +15,8 @@ The separate Google `brotli` CLI test independently compresses and decompresses 
 inputs for all quality/window combinations. It does not require checked-in generated files.
 
 ```sh
-JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_gpu_bitstream --lib metadata:: -- --test-threads=1 --nocapture
-cargo test --locked -p jxl_wgpu_decode --test container_metadata -- --test-threads=1 --nocapture
+JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_gpu_bitstream --lib metadata:: -- --test-threads=2 --nocapture
+cargo test --locked -p jxl_wgpu_decode --test container_metadata -- --test-threads=2 --nocapture
 ```
 
 Native tools are optional for ordinary unit-test users; `JXL_REQUIRE_NATIVE_ORACLES=1` makes

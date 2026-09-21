@@ -27,8 +27,8 @@ clang++ -std=c++17 -O2 -Wall -Wextra -Werror -DNDEBUG -ffp-contract=off \
   -o .git/tone-regenerate/generator
 .git/tone-regenerate/generator .git/tone-regenerate/native.txt
 cmp crates/jxl_wgpu/test-data/tone_mapping/native.txt .git/tone-regenerate/native.txt
-cargo test --locked -p jxl_wgpu --test icc tone_mapping:: -- --test-threads=1
-cargo test --locked -p jxl_wgpu_decode --test hdr tone_mapping:: -- --test-threads=1
+cargo test --locked -p jxl_wgpu --test icc tone_mapping:: -- --test-threads=2
+cargo test --locked -p jxl_wgpu_decode --test hdr tone_mapping:: -- --test-threads=2
 ```
 
 The external headers are system includes so their existing unused-parameter warnings do not

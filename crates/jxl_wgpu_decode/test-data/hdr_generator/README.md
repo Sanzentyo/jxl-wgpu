@@ -14,7 +14,7 @@ c++ -std=c++17 -O2 -Wall -Wextra -Werror main.cpp references.cpp \
 From the workspace root:
 
 ```sh
-cargo test -p jxl_wgpu_decode --test hdr -- --test-threads=1 --nocapture
+cargo test -p jxl_wgpu_decode --test hdr -- --test-threads=2 --nocapture
 ```
 
 `manifest.txt` explicitly records name, width, height, Modular flag, XYB flag, primaries/gray,
