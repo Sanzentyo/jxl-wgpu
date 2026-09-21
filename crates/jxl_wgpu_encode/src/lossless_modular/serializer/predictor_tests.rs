@@ -7,7 +7,7 @@ fn independent_entropy_decoder_reads_every_predictor_and_weighted_header() {
         let weighted =
             LosslessModularWeightedPredictor::new([31, 0, 1, 2, 3, 4, 5], [0, 15, 1, 2]).unwrap();
         let mut output = BitWriter::new();
-        write_dc_global(&mut output, &codes, None, predictor, weighted).unwrap();
+        write_dc_global(&mut output, &codes, None, predictor, weighted, None).unwrap();
         let bit_len = output.bit_len();
         output.align_to_byte().unwrap();
         let bytes = output.into_bytes();

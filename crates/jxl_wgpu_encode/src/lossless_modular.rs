@@ -6,6 +6,7 @@ mod color;
 mod dispatch;
 mod grid;
 mod icc;
+mod lz77;
 mod memory;
 mod predictor;
 mod rct;
@@ -19,6 +20,7 @@ mod types;
 pub use color::LosslessModularColorOptions;
 pub use dispatch::LosslessModularBackend;
 pub use grid::{LosslessModularGroup, LosslessModularGroupGrid};
+pub use lz77::LosslessModularLz77;
 pub use memory::{
     LosslessModularInFlightMemory, LosslessModularMemoryLimits, LosslessModularMemoryPlan,
 };

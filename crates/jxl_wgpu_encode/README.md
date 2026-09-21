@@ -89,7 +89,7 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   per-group selection remain open. Invalid type/channel combinations fail before GPU admission.
 - `LosslessModularConfig` selects all four standard PassGroup sizes with
   `LosslessModularGroupSize::{Pixels128, Pixels256, Pixels512, Pixels1024}`, the MA-tree mode,
-  reversible color transform and prediction policy.
+  reversible color transform, prediction and LZ77 policy.
   `LosslessModularEncoder::with_config` and `LosslessModularBackend::with_config` use the same
   immutable policy; `config()` reports it. The default remains 256×256. LF groups cover eight
   PassGroups per axis. Edge groups may be one pixel wide or high; cropped animation frames use
@@ -103,6 +103,15 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   One selected predictor applies to all groups/components; each group/channel resets its own
   state. The default remains Gradient and the default coefficients retain existing bytes.
   Predictor and parameter search, learned MA trees and previous-channel decisions remain open.
+- `LosslessModularConfig::lz77` selects `LosslessModularLz77::ZeroRuns` (the byte-preserving
+  default) or `Greedy`. Greedy computes every residual on GPU, then searches a three-symbol
+  hash chain for arbitrary repeated sequences. It checks at most 32 prior candidates, retains
+  the nearest equal-length match and supports overlap and regular distances throughout the
+  channel's group history. A match covers at least seven residuals. The bucket count is the
+  next power of two of the group pixel count, capped at 65,536. Prediction state still advances
+  for every pixel; search history resets at each group/channel. Host code checks canonical
+  length/distance events, history bounds, all histograms and exact sample coverage, then writes
+  prefix metadata and bits. This is an explicit policy, without automatic effort selection.
 - One GPU invocation handles each PassGroup/channel pair. Dispatch parameters and artifacts use
   group-major, channel-major order. Small jobs use one mapped artifact allocation. Larger jobs use
   complete-channel-group batches bounded by storage-binding and dispatch limits.
@@ -126,19 +135,22 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
 
 `LosslessModularEncoder::memory_plan` reports the detected valid bits, exponent width (zero for
 integers), largest component storage-word width, full and peak unions of source plane binding
-ranges, peak parameter/artifact/readback bytes, `weighted_predictor_scratch_bytes`, diagnostic
-total artifact bytes, batch count, exact GPU submission count, streaming mode, total encoder-owned live
-bytes, and the group grid before submission. Streamed jobs report exactly twice the batch count:
+ranges, peak parameter/artifact/readback bytes, `weighted_predictor_scratch_bytes`,
+`lz77_scratch_bytes`, diagnostic total artifact bytes, batch count, exact GPU submission count,
+streaming mode, total encoder-owned live bytes, and the group grid before submission. Streamed jobs
+report exactly twice the batch count:
 one histogram and one serialization submission per batch. Every live batch uses the same shared
 `MemoryBudget`. Its exclusive buffer-pool lease and reservation survive until the map callback and
 mapped-range consumer are both finished, including when the returned future is abandoned.
 Source range accounting excludes gaps between planes and counts shared alignment prefixes once.
 
 The selected `group_size` is included in `group_grid`. Larger groups increase each channel's
-worst-case event artifact to `268 + 16 * (pixels + ceil(pixels / 8) + 1)` bytes. Weighted adds
+worst-case event artifact to `400 + 16 * (pixels + ceil(pixels / 8) + 1)` bytes. Weighted adds
 `20 * group_width` bytes of row state per channel inside that artifact allocation; its reported
-scratch subtotal is already included in owned bytes and any separate readback copy. A complete
-group must fit the checked source/artifact binding limits; selecting 1024 does not guarantee that every device
+scratch subtotal is already included in owned bytes and any separate readback copy. Greedy adds
+`8 * pixels + 4 * hash_buckets` bytes per channel for residual words, chain links and bucket heads,
+also inside the artifact allocation and its reported scratch subtotal. A complete group must fit
+the checked source/artifact binding limits; selecting 1024 does not guarantee that every device
 or memory budget can admit it. Batch splitting, peak reservations and exact submission counts
 are recalculated from that geometry. Long zero runs use the full valid prefix alphabet through
 the 1024²-sample case; histogram, canonical extra-bit and exact sample-count checks remain required.
@@ -255,9 +267,15 @@ retains the existing checked-in Gray8 codestream bytes.
 The [predictor matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-predictors) checks all
 14 predictors, custom Weighted parameters, exact integer/IEEE words, streamed ownership and
 comparison against Gradient on a shifted-row source. Gray8 containers attach the private `jwgp`
-shortcut only for Gradient; every predictor otherwise uses the standard Modular path.
+shortcut only for Gradient with ZeroRuns; other policies use the standard Modular path.
+
+The [general LZ77 matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-general-lz77) adds
+independent distance/overlap checks through the 2²⁰ history limit, all predictors and group
+sizes, integer/IEEE words, high-depth RCT, animation and streamed resource ownership. A periodic
+source produces fewer bytes with Greedy than ZeroRuns; no universal compression gain is claimed.
 
 ## Experimental VarDCT profile
+
 
 
 `VarDctEncoder::new` takes an explicit `VarDctStrategy` and accepts one padded, interleaved sRGB8

@@ -21,7 +21,10 @@ struct Params {
     wp_scratch_word_offset: u32,
     wp_coefficients: array<u32, 7>,
     wp_max_weights: array<u32, 4>,
-    _padding: array<u32, 19>,
+    lz77_mode: u32,
+    lz77_scratch_word_offset: u32,
+    lz77_hash_mask: u32,
+    _padding: array<u32, 16>,
 }
 
 @group(0) @binding(0)
@@ -37,7 +40,8 @@ var<storage, read> source_words_2: array<u32>;
 var<storage, read> source_words_3: array<u32>;
 
 // Word 0 is the event count, words 1..34 are raw-token counts, words
-// 34..67 are LZ77-token counts, and the remaining words are four-word events
+// 34..67 are LZ77-token counts, words 67..100 are distance-token counts,
+// followed by four-word events
 // (kind, token, extra-bit count, extra bits). Weighted row state follows the
 // maximum event range and is private to each group/channel invocation.
 @group(0) @binding(1)
@@ -46,7 +50,7 @@ var<storage, read_write> output_words: array<u32>;
 @group(0) @binding(2)
 var<storage, read> group_params: array<Params>;
 
-const OUTPUT_HEADER_WORDS: u32 = 67u;
+const OUTPUT_HEADER_WORDS: u32 = 100u;
 const EVENT_WORDS: u32 = 4u;
 const EVENT_OVERFLOW: u32 = 0xffffffffu;
 
@@ -169,8 +173,8 @@ fn emit_run(params: Params, count: u32) {
     if count == 0u {
         return;
     }
-    // The prefix stream's raw symbol zero is the LZ77 escape. JPEG XL's
-    // configured minimum length is seven, hence the encoded value is count-8.
+    // One literal zero seeds the legacy distance-one match. JPEG XL's configured
+    // minimum match length is seven, hence the encoded value is count-8.
     let output_base = params.output_word_offset;
     output_words[output_base + 1u] = output_words[output_base + 1u] + 1u;
     let value = count - 8u;
@@ -233,6 +237,88 @@ fn packed_residual(params: Params, x: u32, y: u32) -> u32 {
     return (residual << 1u) ^ (0u - (residual >> 31u));
 }
 
+fn residual_hash(params: Params, position: u32) -> u32 {
+    let base = params.lz77_scratch_word_offset + position;
+    var hash = output_words[base] * 0x9e3779b9u;
+    hash = (hash ^ output_words[base + 1u]) * 0x85ebca6bu;
+    hash = (hash ^ output_words[base + 2u]) * 0xc2b2ae35u;
+    return (hash ^ (hash >> 16u)) & params.lz77_hash_mask;
+}
+
+fn emit_match(params: Params, length: u32, distance: u32) {
+    let value = length - 7u;
+    var token = value;
+    var nbits = 0u;
+    var bits = 0u;
+    if value >= 16u {
+        nbits = 31u - countLeadingZeros(value);
+        token = 12u + nbits;
+        bits = value - (1u << nbits);
+    }
+    output_words[params.output_word_offset + 34u + token] += 1u;
+    append_event(params, 2u, token, nbits, bits);
+    // JPEG XL's regular distance range follows 120 two-dimensional short codes.
+    // Its decoder adds one after subtracting 120, so this is an exact linear distance.
+    let coded_distance = distance + 119u;
+    nbits = 31u - countLeadingZeros(coded_distance);
+    token = nbits + 1u;
+    bits = coded_distance - (1u << nbits);
+    output_words[params.output_word_offset + 67u + token] += 1u;
+    append_event(params, 3u, token, nbits, bits);
+}
+
+fn encode_greedy(params: Params) {
+    let pixels = params.width * params.height;
+    let residuals = params.lz77_scratch_word_offset;
+    let previous = residuals + pixels;
+    let heads = previous + pixels;
+    for (var bucket = 0u; bucket <= params.lz77_hash_mask; bucket += 1u) {
+        output_words[heads + bucket] = 0u;
+    }
+    // Prediction always visits every sample, including pixels later covered by a match.
+    for (var y = 0u; y < params.height; y += 1u) {
+        for (var x = 0u; x < params.width; x += 1u) {
+            output_words[residuals + y * params.width + x] = packed_residual(params, x, y);
+        }
+    }
+    var position = 0u;
+    while position < pixels {
+        var best_length = 0u;
+        var best_distance = 0u;
+        if position + 7u <= pixels {
+            var link = output_words[heads + residual_hash(params, position)];
+            for (var attempt = 0u; attempt < 32u && link != 0u; attempt += 1u) {
+                let candidate = link - 1u;
+                var length = 0u;
+                while position + length < pixels {
+                    if output_words[residuals + candidate + length] != output_words[residuals + position + length] { break; }
+                    length += 1u;
+                }
+                if length > best_length {
+                    best_length = length;
+                    best_distance = position - candidate;
+                }
+                if position + best_length == pixels { break; }
+                link = output_words[previous + candidate];
+            }
+        }
+        var consumed = 1u;
+        if best_length >= 7u {
+            emit_match(params, best_length, best_distance);
+            consumed = best_length;
+        } else {
+            emit_raw(params, output_words[residuals + position]);
+        }
+        // Inserting skipped positions preserves overlap and future hash-chain matches.
+        for (var index = position; index < position + consumed && index + 2u < pixels; index += 1u) {
+            let bucket = heads + residual_hash(params, index);
+            output_words[previous + index] = output_words[bucket];
+            output_words[bucket] = index + 1u;
+        }
+        position += consumed;
+    }
+}
+
 @compute @workgroup_size(1)
 fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if global_id.y != 0u || global_id.z != 0u || global_id.x >= arrayLength(&group_params) {
@@ -245,6 +331,11 @@ fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
         for (var index = 0u; index < params.width * 5u; index += 1u) {
             output_words[params.wp_scratch_word_offset + index] = 0u;
         }
+    }
+
+    if params.lz77_mode == 1u {
+        encode_greedy(params);
+        return;
     }
 
     var run = 0u;

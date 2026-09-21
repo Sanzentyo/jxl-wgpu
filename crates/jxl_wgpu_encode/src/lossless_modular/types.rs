@@ -38,9 +38,12 @@ pub(super) struct ModularParams {
     pub(super) wp_scratch_word_offset: u32,
     pub(super) wp_coefficients: [u32; 7],
     pub(super) wp_max_weights: [u32; 4],
+    pub(super) lz77_mode: u32,
+    pub(super) lz77_scratch_word_offset: u32,
+    pub(super) lz77_hash_mask: u32,
     // An explicit 256-byte array stride keeps every batch boundary valid for the portable
     // storage-buffer offset alignment without hidden Rust padding.
-    pub(super) _padding: [u32; 19],
+    pub(super) _padding: [u32; 16],
 }
 
 /// Fixed storage-buffer header written by `lossless_modular.wgsl`.
@@ -50,6 +53,7 @@ pub(super) struct ModularArtifactHeader {
     pub(super) event_count: u32,
     pub(super) raw_counts: [u32; RAW_SYMBOLS],
     pub(super) lz77_counts: [u32; LZ77_SYMBOLS],
+    pub(super) distance_counts: [u32; RAW_SYMBOLS],
 }
 
 /// Fixed storage-buffer event written after [`ModularArtifactHeader`].
@@ -70,7 +74,7 @@ const _: () = {
     assert!(std::mem::align_of::<ModularSourceParams>() == 4);
     assert!(std::mem::size_of::<ModularParams>() == 256);
     assert!(std::mem::align_of::<ModularParams>() == 4);
-    assert!(std::mem::size_of::<ModularArtifactHeader>() == 67 * 4);
+    assert!(std::mem::size_of::<ModularArtifactHeader>() == 100 * 4);
     assert!(std::mem::align_of::<ModularArtifactHeader>() == 4);
     assert!(std::mem::size_of::<ModularEvent>() == 16);
     assert!(std::mem::align_of::<ModularEvent>() == 4);
@@ -155,7 +159,7 @@ impl LosslessModularGroupSize {
 
 /// Stream encoding policy shared by stills and frames in an animation session.
 /// Defaults retain 256-pixel groups, the shared global MA tree, Gradient prediction,
-/// default Weighted coefficients and automatic color transforms.
+/// default Weighted coefficients, zero-run coding and automatic color transforms.
 ///
 /// ```no_run
 /// # use jxl_wgpu_encode::{LosslessModularConfig, LosslessModularEncoder,
@@ -181,6 +185,8 @@ pub struct LosslessModularConfig {
     pub predictor: super::predictor::LosslessModularPredictor,
     /// Serialized in every Modular header; used when `predictor` is `Weighted`.
     pub weighted_predictor: super::predictor::LosslessModularWeightedPredictor,
+    /// Zero-run coding or bounded GPU search for arbitrary residual matches.
+    pub lz77: super::lz77::LosslessModularLz77,
 }
 
 impl LosslessModularFormat {

@@ -8,12 +8,13 @@ use super::dispatch::{
     LosslessModularBackend, ModularDispatchBatch, ModularDispatchPlan, ModularGroupPlan,
 };
 use super::grid::LosslessModularGroupGrid;
+use super::lz77::LosslessModularLz77;
 use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
 use super::rct::ResolvedRct;
 use super::serializer::{
     ModularFrameHeader, ModularPacketAssembler, ModularPacketConfig, PacketBuildInput,
-    ValidatedModularArtifact, accumulate_artifact_histograms, build_packets, build_prefix_codes,
-    parse_group_artifact, parse_group_artifact_header,
+    ValidatedModularArtifact, accumulate_artifact_histograms, build_distance_code, build_packets,
+    build_prefix_codes, parse_group_artifact, parse_group_artifact_header,
 };
 use super::types::{LosslessModularFormat, LosslessModularTreeMode, ModularParams};
 use crate::buffer_pool::EncoderBufferPool;
@@ -102,6 +103,7 @@ impl StreamingModularWorker {
     fn run(&self) -> Result<GpuFrameArtifacts, EncodeError> {
         let mut aggregate_raw = [[0u64; RAW_SYMBOLS]; 4];
         let mut aggregate_lz77 = [[0u64; LZ77_SYMBOLS]; 4];
+        let mut aggregate_distance = [0u64; RAW_SYMBOLS];
         for batch in &self.plan.batches {
             ensure_streaming_job_active(&self.cancelled)?;
             self.with_batch(batch, |bytes| {
@@ -111,6 +113,7 @@ impl StreamingModularWorker {
                     bytes,
                     &mut aggregate_raw,
                     &mut aggregate_lz77,
+                    &mut aggregate_distance,
                 )
             })?;
         }
@@ -141,9 +144,11 @@ impl StreamingModularWorker {
                 rct: self.plan.rct,
                 predictor: self.plan.predictor,
                 weighted_predictor: self.plan.weighted_predictor,
+                lz77: self.plan.lz77,
                 frame,
             },
             codes,
+            build_distance_code(self.plan.lz77, &aggregate_distance)?,
         )?;
         for batch in &self.plan.batches {
             ensure_streaming_job_active(&self.cancelled)?;
@@ -384,6 +389,7 @@ fn accumulate_streaming_batch_histograms(
     bytes: &[u8],
     aggregate_raw: &mut [[u64; RAW_SYMBOLS]; 4],
     aggregate_lz77: &mut [[u64; LZ77_SYMBOLS]; 4],
+    aggregate_distance: &mut [u64; RAW_SYMBOLS],
 ) -> Result<(), EncodeError> {
     let channels = usize::try_from(plan.format.channel_count())
         .map_err(|_| EncodeError::Backend("Modular channel count overflow".into()))?;
@@ -407,6 +413,7 @@ fn accumulate_streaming_batch_histograms(
             },
             aggregate_raw,
             aggregate_lz77,
+            aggregate_distance,
         )?;
     }
     Ok(())
@@ -635,7 +642,7 @@ pub struct LosslessModularJob {
 }
 
 pub(super) enum LosslessModularJobState {
-    Resident(ResidentLosslessModularJob),
+    Resident(Box<ResidentLosslessModularJob>),
     #[cfg(not(target_arch = "wasm32"))]
     Streaming(StreamingLosslessModularJob),
     #[cfg(target_arch = "wasm32")]
@@ -668,6 +675,7 @@ pub(super) struct ResidentLosslessModularJob {
     pub(super) rct: Option<ResolvedRct>,
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
+    pub(super) lz77: LosslessModularLz77,
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) frame_index: FrameIndex,
@@ -706,6 +714,7 @@ pub(super) struct BrowserStreamingLosslessModularJob {
     pending: Option<PendingStreamingBatch>,
     aggregate_raw: [[u64; RAW_SYMBOLS]; 4],
     aggregate_lz77: [[u64; LZ77_SYMBOLS]; 4],
+    aggregate_distance: [u64; RAW_SYMBOLS],
     assembler: Option<ModularPacketAssembler>,
 }
 
@@ -733,6 +742,7 @@ impl BrowserStreamingLosslessModularJob {
             pending: None,
             aggregate_raw: [[0; RAW_SYMBOLS]; 4],
             aggregate_lz77: [[0; LZ77_SYMBOLS]; 4],
+            aggregate_distance: [0; RAW_SYMBOLS],
             assembler: None,
         };
         job.submit_current_batch()?;
@@ -785,6 +795,7 @@ impl BrowserStreamingLosslessModularJob {
                 rct: self.plan.rct,
                 predictor: self.plan.predictor,
                 weighted_predictor: self.plan.weighted_predictor,
+                lz77: self.plan.lz77,
                 frame: ModularFrameHeader {
                     animation: self.request.animation,
                     canvas_width: self.request.canvas_width,
@@ -794,6 +805,7 @@ impl BrowserStreamingLosslessModularJob {
                 },
             },
             codes,
+            build_distance_code(self.plan.lz77, &self.aggregate_distance)?,
         )?);
         Ok(())
     }
@@ -849,6 +861,7 @@ impl BrowserStreamingLosslessModularJob {
                         bytes,
                         &mut self.aggregate_raw,
                         &mut self.aggregate_lz77,
+                        &mut self.aggregate_distance,
                     )
                 }),
                 StreamingPass::Serialize => {
@@ -917,6 +930,7 @@ impl ResidentLosslessModularJob {
             rct: self.rct,
             predictor: self.predictor,
             weighted_predictor: self.weighted_predictor,
+            lz77: self.lz77,
             frame: &self.header,
             group_plans: &self.groups,
             bytes,
@@ -974,3 +988,6 @@ impl GpuEncodeJob for LosslessModularJob {
         }
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod lz77_tests;

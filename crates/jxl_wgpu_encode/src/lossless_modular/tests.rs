@@ -183,7 +183,9 @@ mod native_tests {
             (
                 "Params",
                 256,
-                vec![0, 4, 8, 12, 16, 20, 24, 28, 32, 128, 132, 136, 164, 180],
+                vec![
+                    0, 4, 8, 12, 16, 20, 24, 28, 32, 128, 132, 136, 164, 180, 184, 188, 192,
+                ],
             ),
         ] {
             let (_, ty) = module
@@ -230,16 +232,19 @@ mod native_tests {
             wp_scratch_word_offset: 34,
             wp_coefficients: [35, 36, 37, 38, 39, 40, 41],
             wp_max_weights: [42, 43, 44, 45],
-            _padding: [0; 19],
+            lz77_mode: 46,
+            lz77_scratch_word_offset: 47,
+            lz77_hash_mask: 48,
+            _padding: [0; 16],
         };
         let words = bytemuck::cast::<ModularParams, [u32; 64]>(params);
-        assert_eq!(&words[..45], &(1..=45).collect::<Vec<_>>());
-        assert!(words[45..].iter().all(|&word| word == 0));
+        assert_eq!(&words[..48], &(1..=48).collect::<Vec<_>>());
+        assert!(words[48..].iter().all(|&word| word == 0));
     }
 
     #[test]
     fn modular_artifact_records_are_word_aligned_and_ordered() {
-        assert_eq!(std::mem::size_of::<ModularArtifactHeader>(), 67 * 4);
+        assert_eq!(std::mem::size_of::<ModularArtifactHeader>(), 100 * 4);
         assert_eq!(std::mem::align_of::<ModularArtifactHeader>(), 4);
         assert_eq!(std::mem::size_of::<ModularEvent>(), 4 * 4);
         assert_eq!(std::mem::align_of::<ModularEvent>(), 4);
@@ -248,11 +253,13 @@ mod native_tests {
             event_count: 7,
             raw_counts: std::array::from_fn(|index| 100 + index as u32),
             lz77_counts: std::array::from_fn(|index| 200 + index as u32),
+            distance_counts: std::array::from_fn(|index| 300 + index as u32),
         };
-        let words = bytemuck::cast::<ModularArtifactHeader, [u32; 67]>(header);
+        let words = bytemuck::cast::<ModularArtifactHeader, [u32; 100]>(header);
         assert_eq!(words[0], 7);
         assert_eq!(words[1..34], header.raw_counts);
         assert_eq!(words[34..67], header.lz77_counts);
+        assert_eq!(words[67..100], header.distance_counts);
 
         let event = ModularEvent {
             kind: 1,
@@ -520,6 +527,7 @@ mod native_tests {
                 event_count: 1,
                 raw_counts: [0; RAW_SYMBOLS],
                 lz77_counts: [0; LZ77_SYMBOLS],
+                distance_counts: [0; RAW_SYMBOLS],
             };
             header.raw_counts[0] = 1;
             header.lz77_counts[token] = 1;
@@ -593,6 +601,7 @@ mod native_tests {
             event_count: 1,
             raw_counts: [0; RAW_SYMBOLS],
             lz77_counts: [0; LZ77_SYMBOLS],
+            distance_counts: [0; RAW_SYMBOLS],
         };
         header.raw_counts[0] = 1;
         header.raw_counts[12] = 1;
@@ -614,6 +623,7 @@ mod native_tests {
             event_count: 1,
             raw_counts: [0; RAW_SYMBOLS],
             lz77_counts: [0; LZ77_SYMBOLS],
+            distance_counts: [0; RAW_SYMBOLS],
         };
         header.raw_counts[2] = 1;
         let malformed = artifact_bytes(
@@ -647,6 +657,7 @@ mod native_tests {
             event_count: 1,
             raw_counts: [0; RAW_SYMBOLS],
             lz77_counts: [0; LZ77_SYMBOLS],
+            distance_counts: [0; RAW_SYMBOLS],
         };
         header.raw_counts[0] = 1;
         let bytes = artifact_bytes(
@@ -667,6 +678,7 @@ mod native_tests {
             event_count: 1,
             raw_counts: [0; RAW_SYMBOLS],
             lz77_counts: [0; LZ77_SYMBOLS],
+            distance_counts: [0; RAW_SYMBOLS],
         };
         header.raw_counts[32] = 1;
         let maximum = ModularEvent {

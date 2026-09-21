@@ -622,6 +622,47 @@ properties, predictor/parameter search and effort tiers.
 JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --lib --test lossless_layouts --no-fail-fast predictor -- --test-threads=2
 ```
 
+## Lossless Modular general LZ77
+
+`lossless_layouts::lz77` adds 168 Greedy cases across all 14 predictors, integer depths
+1/8/16/31 and raw IEEE16/32, Gray/GrayAlpha/RGB/RGBA, shared/local trees, all four group edges
+and global/local RCT types. Repeated source words retain special IEEE values and high-depth
+integer bits; packed/planar/split swizzles, big-endian fields and unaligned pitches must emit
+the same bytes as canonical input. One-pixel axes, short tails, group edges and LF boundaries
+exercise independent histories. jxl-oxide compares exact original working words; required
+libjxl 0.12.0 checks original F32 output with the existing `2e-7` integer bound and exact IEEE
+bits. Whole and 256-byte-window fragmented GPU numeric output compares every component and
+keeps its planes after the session drops.
+
+The independent `jxl-coding` entropy decoder reads regular distances 1/2/7/16/119/120/121/
+255/256/257/65535/65536/1048576 under width multipliers 1/3/129/1024, including overlapping
+copies and exact final bit positions. Negative artifact cases reject absent/orphan/reordered
+distances, noncanonical symbols/extra bits, zero/unavailable/out-of-window distances, altered
+histograms, wrong sample coverage and mixing legacy events with the Greedy distance policy.
+
+A real GPU artifact test uses a 1024² Gray8 group with a seven-value prefix repeated at the
+end and zeros between. It requires both an overlapping distance-one match and distance
+`1024² - 7`, fewer than 32 events, and a token-31 match length. The public encoder independently
+round-trips that source through native/original-word and whole/bounded GPU output. Eighteen
+constant sources cover lengths 1–18 around hash and minimum-match boundaries. A 127×65 periodic
+nonzero source is decoded under both policies and requires Greedy to use less than half the
+ZeroRuns container bytes. This is evidence for that source, not a universal ratio or speed claim.
+
+Eight resident/streamed lifetime cases combine Greedy with Weighted/AverageAll, custom coefficients,
+RCT41, integer31/IEEE32 and every group size. They keep exact and one-byte-short admission,
+cancellation/source retirement, buffer reuse and blocking/Future equality. Two three-frame Replace
+animations and two cropped Add/Multiply sequences retain raw IEEE words, timing and independent
+references under the unchanged native/Rust `3e-6` color and `4e-7` alpha bounds. Memory plans expose
+the LZ77 scratch subtotal inside owned artifact/readback storage. Default ZeroRuns remains covered
+by the existing byte-identical Gray8 fixture and other prior matrices.
+
+```console
+JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --lib --test lossless_layouts --no-fail-fast lz77 -- --test-threads=2
+```
+
+`ENT-E01` remains **Partial**. GPU ANS writing, histogram/context clustering, hybrid-uint choice,
+cross-channel matching and broader effort policies are not provided by this fixed greedy search.
+
 ## Procedural VarDCT encoder matrix
 
 All 27 single-transform strategies now emit real AC. The shared forward primitive has 667

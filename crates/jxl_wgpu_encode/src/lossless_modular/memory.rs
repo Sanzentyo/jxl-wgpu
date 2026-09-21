@@ -26,6 +26,9 @@ pub struct LosslessModularMemoryPlan {
     /// Peak live Weighted predictor row state (20 bytes per column and channel), already
     /// included in `artifact_storage_bytes`. Zero for the other thirteen predictors.
     pub weighted_predictor_scratch_bytes: u64,
+    /// Peak residual words, hash-chain links and bucket heads for greedy LZ77. Already
+    /// included in `artifact_storage_bytes`; zero for the default zero-run policy.
+    pub lz77_scratch_bytes: u64,
     /// Sum of the worst-case artifact ranges across every batch. This is diagnostic only; the
     /// encoder never allocates the sum as one GPU buffer.
     pub total_artifact_bytes: u64,

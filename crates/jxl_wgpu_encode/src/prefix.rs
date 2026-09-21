@@ -281,6 +281,27 @@ impl PrefixCode {
         nbits: u32,
         bits: u32,
     ) -> Result<(), EncodeError> {
+        // The legacy event includes the literal zero that seeds a distance-one match.
+        self.check_match(token, nbits, bits)?;
+        writer.write_bits(u64::from(self.raw.raw_bits[0]), self.raw.raw_nbits[0])?;
+        self.write_match(writer, token, nbits, bits)
+    }
+
+    /// Writes only the LZ77 length symbol. Its caller must serialize the distance next.
+    pub(crate) fn write_match(
+        &self,
+        writer: &mut BitWriter,
+        token: u32,
+        nbits: u32,
+        bits: u32,
+    ) -> Result<(), EncodeError> {
+        let token = self.check_match(token, nbits, bits)?;
+        writer.write_bits(u64::from(self.lz77_bits[token]), self.lz77_nbits[token])?;
+        writer.write_bits(u64::from(bits), nbits as u8)?;
+        Ok(())
+    }
+
+    fn check_match(&self, token: u32, nbits: u32, bits: u32) -> Result<usize, EncodeError> {
         let token = usize::try_from(token)
             .map_err(|_| EncodeError::Backend("GPU LZ77 token overflow".into()))?;
         let expected_nbits = if token < 16 { 0 } else { token - 12 };
@@ -293,10 +314,7 @@ impl PrefixCode {
                 "GPU emitted an invalid LZ77 token".into(),
             ));
         }
-        writer.write_bits(u64::from(self.raw.raw_bits[0]), self.raw.raw_nbits[0])?;
-        writer.write_bits(u64::from(self.lz77_bits[token]), self.lz77_nbits[token])?;
-        writer.write_bits(u64::from(bits), nbits as u8)?;
-        Ok(())
+        Ok(token)
     }
 }
 
@@ -309,14 +327,26 @@ pub(crate) struct RawPrefixCode<const N: usize> {
 
 impl<const N: usize> RawPrefixCode<N> {
     pub(crate) fn from_counts(raw_counts: &[u64; N]) -> Result<Self, EncodeError> {
+        Self::from_counts_bounded(raw_counts, 15)
+    }
+
+    pub(crate) fn from_counts_bounded(
+        raw_counts: &[u64; N],
+        max_bits: u8,
+    ) -> Result<Self, EncodeError> {
         if !(2..=MAX_SYMBOLS).contains(&N) || raw_counts.contains(&0) {
             return Err(EncodeError::InvalidConfiguration(
                 "raw-only prefix alphabets must assign every GPU token",
             ));
         }
+        if !(1..=15).contains(&max_bits) || N > 1usize << max_bits {
+            return Err(EncodeError::InvalidConfiguration(
+                "raw prefix length cannot represent the alphabet",
+            ));
+        }
 
         let mut raw_nbits = [0; N];
-        compute_code_lengths(raw_counts, N, &[0; N], &[15; N], &mut raw_nbits);
+        compute_code_lengths(raw_counts, N, &[0; N], &[max_bits; N], &mut raw_nbits);
         let mut raw_bits = [0; N];
         compute_canonical_code(&raw_nbits, &mut raw_bits, &[], &mut []);
         Ok(Self {

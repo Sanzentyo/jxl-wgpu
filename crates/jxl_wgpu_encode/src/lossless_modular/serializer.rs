@@ -12,6 +12,7 @@ use super::dispatch::frame_covers_canvas;
 use super::dispatch::{LosslessModularBackend, ModularGroupPlan};
 use super::grid::{LosslessModularGroup, LosslessModularGroupGrid};
 use super::icc::{DEFAULT_PROFILE_LIMIT, PreparedImageHeader};
+use super::lz77::LosslessModularLz77;
 use super::memory::{LosslessModularMemoryLimits, LosslessModularMemoryPlan};
 use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
 use super::rct::{LosslessModularRctType, ResolvedRct};
@@ -21,7 +22,7 @@ use super::types::{
     AlphaAssociation, LosslessModularFormat, LosslessModularTreeMode, ModularArtifactHeader,
     ModularEvent, modular_sample_depth,
 };
-use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS};
+use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS, RawPrefixCode};
 use crate::{
     AnimationHeader, BackendError, BitFragment, BlendMode, CodestreamAssembler, Determinism,
     EncodeError, EncodeProfile, EncodeSession, EncoderBufferPoolStats, EncoderCapabilities,
@@ -708,6 +709,7 @@ pub(super) struct PacketBuildInput<'a> {
     pub(super) rct: Option<ResolvedRct>,
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
+    pub(super) lz77: LosslessModularLz77,
     pub(super) frame: &'a ModularFrameHeader,
     pub(super) group_plans: &'a [ModularGroupPlan],
     pub(super) bytes: &'a [u8],
@@ -715,12 +717,14 @@ pub(super) struct PacketBuildInput<'a> {
 
 type RawHistograms = [[u64; RAW_SYMBOLS]; 4];
 type Lz77Histograms = [[u64; LZ77_SYMBOLS]; 4];
+pub(super) type DistanceCode = RawPrefixCode<RAW_SYMBOLS>;
 
 pub(super) fn accumulate_artifact_histograms(
     channel: usize,
     artifact: &ValidatedModularArtifact<'_>,
     aggregate_raw: &mut RawHistograms,
     aggregate_lz77: &mut Lz77Histograms,
+    aggregate_distance: &mut [u64; RAW_SYMBOLS],
 ) -> Result<(), EncodeError> {
     for (total, count) in aggregate_raw[channel]
         .iter_mut()
@@ -738,7 +742,39 @@ pub(super) fn accumulate_artifact_histograms(
             .checked_add(u64::from(count))
             .ok_or_else(|| invalid_gpu_artifact("aggregate LZ77 histogram overflow"))?;
     }
+    for (total, count) in aggregate_distance
+        .iter_mut()
+        .zip(artifact.header.distance_counts)
+    {
+        *total = total
+            .checked_add(u64::from(count))
+            .ok_or_else(|| invalid_gpu_artifact("aggregate distance histogram overflow"))?;
+    }
     Ok(())
+}
+
+pub(super) fn build_distance_code(
+    mode: LosslessModularLz77,
+    counts: &[u64; RAW_SYMBOLS],
+) -> Result<Option<DistanceCode>, EncodeError> {
+    if mode == LosslessModularLz77::ZeroRuns {
+        if counts.iter().any(|&count| count != 0) {
+            return Err(invalid_gpu_artifact(
+                "zero-run mode contains an explicit distance histogram",
+            ));
+        }
+        return Ok(None);
+    }
+    let mut frequencies = [0; RAW_SYMBOLS];
+    for (frequency, &count) in frequencies.iter_mut().zip(counts) {
+        *frequency = count
+            .checked_mul(256)
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| invalid_gpu_artifact("distance histogram scaling overflow"))?;
+    }
+    // 33 symbols fit in six bits; eight leaves room to favour observed distances while
+    // bounding both the metadata code lengths and host prefix-table construction.
+    DistanceCode::from_counts_bounded(&frequencies, 8).map(Some)
 }
 
 pub(super) fn build_prefix_codes(
@@ -790,8 +826,10 @@ pub(super) struct ModularPacketAssembler {
     rct: Option<ResolvedRct>,
     predictor: LosslessModularPredictor,
     weighted_predictor: LosslessModularWeightedPredictor,
+    lz77: LosslessModularLz77,
     frame: ModularFrameHeader,
     codes: [PrefixCode; 4],
+    distance_code: Option<DistanceCode>,
     packets: Vec<GroupPacket>,
     single_group: Option<BitWriter>,
     token_bit_offset_in_group: u64,
@@ -809,6 +847,7 @@ pub(super) struct ModularPacketConfig {
     pub(super) rct: Option<ResolvedRct>,
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
+    pub(super) lz77: LosslessModularLz77,
     pub(super) frame: ModularFrameHeader,
 }
 
@@ -816,6 +855,7 @@ impl ModularPacketAssembler {
     pub(super) fn new(
         config: ModularPacketConfig,
         codes: [PrefixCode; 4],
+        distance_code: Option<DistanceCode>,
     ) -> Result<Self, EncodeError> {
         let ModularPacketConfig {
             width,
@@ -828,8 +868,14 @@ impl ModularPacketAssembler {
             rct,
             predictor,
             weighted_predictor,
+            lz77,
             frame,
         } = config;
+        if distance_code.is_some() != (lz77 == LosslessModularLz77::Greedy) {
+            return Err(invalid_gpu_artifact(
+                "distance code does not match LZ77 policy",
+            ));
+        }
         let (packets, single_group, token_bit_offset_in_group) = if group_grid.groups == 1 {
             let mut group = BitWriter::new();
             write_dc_global(
@@ -838,6 +884,7 @@ impl ModularPacketAssembler {
                 rct.map(|rct| rct.rct_type),
                 predictor,
                 weighted_predictor,
+                distance_code.as_ref(),
             )?;
             let token_bit_offset = u64::try_from(group.bit_len())
                 .map_err(|_| EncodeError::Backend("gray8 token offset overflow".into()))?;
@@ -852,6 +899,7 @@ impl ModularPacketAssembler {
                 rct.filter(|rct| !rct.local).map(|rct| rct.rct_type),
                 predictor,
                 weighted_predictor,
+                distance_code.as_ref(),
             )?;
             dc_global.align_to_byte()?;
             packets.push(GroupPacket::new(
@@ -879,8 +927,10 @@ impl ModularPacketAssembler {
             rct,
             predictor,
             weighted_predictor,
+            lz77,
             frame,
             codes,
+            distance_code,
             packets,
             single_group,
             token_bit_offset_in_group,
@@ -907,7 +957,12 @@ impl ModularPacketAssembler {
         }
         if let Some(group) = &mut self.single_group {
             for (channel, artifact) in artifacts.iter().enumerate() {
-                write_events(group, &self.codes[channel], artifact.events)?;
+                write_events(
+                    group,
+                    &self.codes[channel],
+                    self.distance_code.as_ref(),
+                    artifact.events,
+                )?;
             }
         } else {
             let mut pass_group = BitWriter::new();
@@ -920,10 +975,20 @@ impl ModularPacketAssembler {
                 self.rct.filter(|rct| rct.local).map(|rct| rct.rct_type),
             )?;
             if !use_global_tree {
-                write_ma_config(&mut pass_group, &self.codes, self.predictor)?;
+                write_ma_config(
+                    &mut pass_group,
+                    &self.codes,
+                    self.predictor,
+                    self.distance_code.as_ref(),
+                )?;
             }
             for (channel, artifact) in artifacts.iter().enumerate() {
-                write_events(&mut pass_group, &self.codes[channel], artifact.events)?;
+                write_events(
+                    &mut pass_group,
+                    &self.codes[channel],
+                    self.distance_code.as_ref(),
+                    artifact.events,
+                )?;
             }
             pass_group.align_to_byte()?;
             self.packets.push(GroupPacket::new(
@@ -967,7 +1032,8 @@ impl ModularPacketAssembler {
             let acceleration = (self.format == LosslessModularFormat::Gray
                 && self.bits_per_sample == 8
                 && self.exponent_bits_per_sample == 0
-                && self.predictor == LosslessModularPredictor::Gradient)
+                && self.predictor == LosslessModularPredictor::Gradient
+                && self.lz77 == LosslessModularLz77::ZeroRuns)
                 .then(|| GpuAccelerationArtifact::Gray8Prefix {
                     width: self.width,
                     height: self.height,
@@ -1004,6 +1070,7 @@ pub(super) fn build_packets(
         rct,
         predictor,
         weighted_predictor,
+        lz77,
         frame,
         group_plans,
         bytes,
@@ -1022,6 +1089,7 @@ pub(super) fn build_packets(
     let mut artifacts = Vec::with_capacity(group_plans.len());
     let mut aggregate_raw = [[0u64; RAW_SYMBOLS]; 4];
     let mut aggregate_lz77 = [[0u64; LZ77_SYMBOLS]; 4];
+    let mut aggregate_distance = [0u64; RAW_SYMBOLS];
     for (artifact_index, plan) in group_plans.iter().enumerate() {
         let channel = artifact_index % channels;
         if plan.channel != channel as u32 {
@@ -1046,6 +1114,7 @@ pub(super) fn build_packets(
             &artifact,
             &mut aggregate_raw,
             &mut aggregate_lz77,
+            &mut aggregate_distance,
         )?;
         artifacts.push(artifact);
     }
@@ -1069,9 +1138,11 @@ pub(super) fn build_packets(
             rct,
             predictor,
             weighted_predictor,
+            lz77,
             frame: frame.clone(),
         },
         codes,
+        build_distance_code(lz77, &aggregate_distance)?,
     )?;
     for group in 0..group_grid.groups {
         let start = usize::try_from(group)
@@ -1151,12 +1222,26 @@ pub(super) fn parse_group_artifact<'a>(
 pub(super) fn write_events(
     output: &mut BitWriter,
     code: &PrefixCode,
+    distance_code: Option<&DistanceCode>,
     events: &[ModularEvent],
 ) -> Result<(), EncodeError> {
     for event in events {
-        match event.kind {
-            0 => code.write_raw(output, event.token, event.extra_bit_count, event.extra_bits)?,
-            1 => code.write_run(output, event.token, event.extra_bit_count, event.extra_bits)?,
+        match (event.kind, distance_code) {
+            (0, _) => {
+                code.write_raw(output, event.token, event.extra_bit_count, event.extra_bits)?
+            }
+            (1, None) => {
+                code.write_run(output, event.token, event.extra_bit_count, event.extra_bits)?
+            }
+            (2, Some(_)) => {
+                code.write_match(output, event.token, event.extra_bit_count, event.extra_bits)?
+            }
+            (3, Some(distance_code)) => distance_code.write_raw(
+                output,
+                event.token,
+                event.extra_bit_count,
+                event.extra_bits,
+            )?,
             _ => {
                 return Err(EncodeError::Backend(
                     "GPU emitted an unknown token kind".into(),
@@ -1175,9 +1260,14 @@ fn validate_gpu_artifacts(
 ) -> Result<(), EncodeError> {
     let mut raw_counts = [0u32; RAW_SYMBOLS];
     let mut lz77_counts = [0u32; LZ77_SYMBOLS];
+    let mut distance_counts = [0u32; RAW_SYMBOLS];
     let mut sample_count = 0u64;
+    let mut pending_distance = None;
 
     for event in events {
+        if pending_distance.is_some() && event.kind != 3 {
+            return Err(invalid_gpu_artifact("LZ77 match is missing its distance"));
+        }
         match event.kind {
             0 => {
                 let token = usize::try_from(event.token)
@@ -1198,7 +1288,7 @@ fn validate_gpu_artifacts(
                     .checked_add(1)
                     .ok_or_else(|| invalid_gpu_artifact("sample count overflow"))?;
             }
-            1 => {
+            1 | 2 => {
                 let token = usize::try_from(event.token)
                     .map_err(|_| invalid_gpu_artifact("LZ77 token overflow"))?;
                 if token > crate::prefix::MAX_LZ77_TOKEN {
@@ -1214,9 +1304,13 @@ fn validate_gpu_artifacts(
                 {
                     return Err(invalid_gpu_artifact("non-canonical LZ77 token"));
                 }
-                raw_counts[0] = raw_counts[0]
-                    .checked_add(1)
-                    .ok_or_else(|| invalid_gpu_artifact("raw histogram overflow"))?;
+                if event.kind == 1 {
+                    raw_counts[0] = raw_counts[0]
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_gpu_artifact("raw histogram overflow"))?;
+                } else {
+                    pending_distance = Some(sample_count);
+                }
                 lz77_counts[token] = lz77_counts[token]
                     .checked_add(1)
                     .ok_or_else(|| invalid_gpu_artifact("LZ77 histogram overflow"))?;
@@ -1226,14 +1320,50 @@ fn validate_gpu_artifacts(
                     (1u64 << event.extra_bit_count) + u64::from(event.extra_bits)
                 };
                 sample_count = sample_count
-                    .checked_add(encoded_value + 8)
+                    .checked_add(encoded_value + 7 + u64::from(event.kind == 1))
                     .ok_or_else(|| invalid_gpu_artifact("sample count overflow"))?;
+            }
+            3 => {
+                let available = pending_distance
+                    .take()
+                    .ok_or_else(|| invalid_gpu_artifact("distance without an LZ77 match"))?;
+                let token = usize::try_from(event.token)
+                    .map_err(|_| invalid_gpu_artifact("distance token overflow"))?;
+                if token >= RAW_SYMBOLS
+                    || event.extra_bit_count != event.token.saturating_sub(1)
+                    || !canonical_extra_bits(event.extra_bit_count, event.extra_bits)
+                {
+                    return Err(invalid_gpu_artifact("non-canonical distance token"));
+                }
+                let coded = if event.token == 0 {
+                    0
+                } else {
+                    (1u64 << event.extra_bit_count) + u64::from(event.extra_bits)
+                };
+                let distance = coded
+                    .checked_sub(119)
+                    .filter(|&distance| {
+                        distance != 0 && distance <= (1 << 20) && distance <= available
+                    })
+                    .ok_or_else(|| {
+                        invalid_gpu_artifact("LZ77 distance exceeds the channel history")
+                    })?;
+                debug_assert!(distance <= available);
+                distance_counts[token] = distance_counts[token]
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_gpu_artifact("distance histogram overflow"))?;
             }
             _ => return Err(invalid_gpu_artifact("unknown token kind")),
         }
     }
 
-    if raw_counts != header.raw_counts || lz77_counts != header.lz77_counts {
+    if pending_distance.is_some() {
+        return Err(invalid_gpu_artifact("LZ77 match is missing its distance"));
+    }
+    if raw_counts != header.raw_counts
+        || lz77_counts != header.lz77_counts
+        || distance_counts != header.distance_counts
+    {
         return Err(invalid_gpu_artifact(
             "token histograms do not match the event stream",
         ));
@@ -1267,12 +1397,13 @@ fn write_dc_global(
     rct: Option<LosslessModularRctType>,
     predictor: LosslessModularPredictor,
     weighted_predictor: LosslessModularWeightedPredictor,
+    distance_code: Option<&DistanceCode>,
 ) -> Result<(), EncodeError> {
     // Handcrafted Modular metadata adapted from zune-jpegxl 0.5.2. See this crate's
     // `THIRD_PARTY.md` and `LICENSES/zune-jpegxl-MIT.txt`.
     output.write_bits(1, 1)?; // default LF-channel dequantization
     output.write_bits(1, 1)?; // GlobalModular is present
-    write_ma_config(output, codes, predictor)?;
+    write_ma_config(output, codes, predictor, distance_code)?;
     output.write_bits(1, 1)?;
     write_weighted_predictor(output, weighted_predictor)?;
     write_rct(output, rct)
@@ -1327,6 +1458,7 @@ fn write_ma_config(
     output: &mut BitWriter,
     codes: &[PrefixCode; 4],
     predictor: LosslessModularPredictor,
+    distance_code: Option<&DistanceCode>,
 ) -> Result<(), EncodeError> {
     let gradient = predictor == LosslessModularPredictor::Gradient;
     output.write_bits(0, 1)?;
@@ -1396,16 +1528,26 @@ fn write_ma_config(
     for _ in 0..4 {
         output.write_bits(0, 4)?;
     }
-    output.write_bits(1, 5)?;
+    if distance_code.is_some() {
+        output.write_bits(1, 1)?;
+        output.write_bits(5, 4)?;
+        output.write_bits(0, 5)?; // 1 + 2^5 = 33 distance symbols
+    } else {
+        output.write_bits(1, 5)?; // two-symbol distance alphabet
+    }
     for _ in 0..4 {
         output.write_bits(1, 1)?;
         output.write_bits(8, 4)?;
         // libjxl's U32 selector stores the low eight bits of 256 here.
         output.write_bits(0, 8)?;
     }
-    output.write_bits(1, 2)?;
-    output.write_bits(0, 2)?;
-    output.write_bits(1, 1)?;
+    if let Some(code) = distance_code {
+        code.write_raw_tree(output)?;
+    } else {
+        output.write_bits(1, 2)?;
+        output.write_bits(0, 2)?;
+        output.write_bits(1, 1)?;
+    }
     for code in codes {
         code.write_tree(output)?;
     }
@@ -1813,3 +1955,6 @@ mod rct_wire_tests {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod predictor_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod lz77_tests;

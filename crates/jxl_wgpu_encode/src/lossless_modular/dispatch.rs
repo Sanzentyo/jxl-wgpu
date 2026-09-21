@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use jxl_gpu_bitstream::BitWriter;
 
 use super::grid::LosslessModularGroupGrid;
+use super::lz77::LosslessModularLz77;
 use super::memory::{
     LosslessModularMemoryLimits, LosslessModularMemoryPlan, align_up, event_capacity,
 };
@@ -60,6 +61,7 @@ pub(super) struct ModularDispatchPlan {
     pub(super) rct: Option<ResolvedRct>,
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
+    pub(super) lz77: LosslessModularLz77,
     pub(super) parameters: Vec<ModularParams>,
     pub(super) groups: Vec<ModularGroupPlan>,
     pub(super) batches: Vec<ModularDispatchBatch>,
@@ -303,17 +305,16 @@ impl LosslessModularBackend {
                         .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?,
                 )
                 .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
+            let weighted_words = if self.config.predictor == LosslessModularPredictor::Weighted {
+                5 * u64::from(width)
+            } else {
+                0
+            };
+            let lz77_words = self.config.lz77.scratch_words(width * height);
             let group_output_size = u64::try_from(output_words)
                 .ok()
-                .and_then(|words| {
-                    words.checked_add(
-                        if self.config.predictor == LosslessModularPredictor::Weighted {
-                            5 * u64::from(width)
-                        } else {
-                            0
-                        },
-                    )
-                })
+                .and_then(|words| words.checked_add(weighted_words))
+                .and_then(|words| words.checked_add(lz77_words))
                 .and_then(|words| words.checked_mul(4))
                 .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
             let mut proposed_output_size = output_size;
@@ -404,7 +405,19 @@ impl LosslessModularBackend {
                     })?,
                     wp_coefficients: self.config.weighted_predictor.coefficients().map(u32::from),
                     wp_max_weights: self.config.weighted_predictor.max_weights().map(u32::from),
-                    _padding: [0; 19],
+                    lz77_mode: self.config.lz77 as u32,
+                    lz77_scratch_word_offset: u32::try_from(
+                        u64::from(output_word_offset) + output_words as u64 + weighted_words,
+                    )
+                    .map_err(|_| {
+                        EncodeError::InvalidSource("LZ77 scratch offset exceeds WGSL u32 indexing")
+                    })?,
+                    lz77_hash_mask: self
+                        .config
+                        .lz77
+                        .hash_entries(width * height)
+                        .saturating_sub(1),
+                    _padding: [0; 16],
                 });
                 groups.push(ModularGroupPlan {
                     width,
@@ -479,6 +492,16 @@ impl LosslessModularBackend {
         } else {
             0
         };
+        let lz77_scratch_bytes = batches
+            .iter()
+            .map(|batch| {
+                parameters[batch.first_dispatch..batch.first_dispatch + batch.dispatch_count]
+                    .iter()
+                    .map(|params| 4 * self.config.lz77.scratch_words(params.width * params.height))
+                    .sum::<u64>()
+            })
+            .max()
+            .unwrap_or(0);
         if artifact_storage_bytes > self.max_buffer_size {
             return Err(UnsupportedFeature::DeviceLimit {
                 name: "max_buffer_size",
@@ -538,6 +561,7 @@ impl LosslessModularBackend {
             parameter_storage_bytes,
             artifact_storage_bytes,
             weighted_predictor_scratch_bytes,
+            lz77_scratch_bytes,
             total_artifact_bytes,
             readback_bytes,
             direct_readback: self.direct_mapping,
@@ -560,6 +584,7 @@ impl LosslessModularBackend {
             rct,
             predictor: self.config.predictor,
             weighted_predictor: self.config.weighted_predictor,
+            lz77: self.config.lz77,
             parameters,
             groups,
             batches,
@@ -939,7 +964,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
         }
 
         Ok(LosslessModularJob {
-            state: LosslessModularJobState::Resident(ResidentLosslessModularJob {
+            state: LosslessModularJobState::Resident(Box::new(ResidentLosslessModularJob {
                 lifetime: Some(lifetime),
                 completion,
                 output_size: plan.output_size,
@@ -952,6 +977,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
                 rct: plan.rct,
                 predictor: plan.predictor,
                 weighted_predictor: plan.weighted_predictor,
+                lz77: plan.lz77,
                 width: plan.width,
                 height: plan.height,
                 frame_index: request.frame_index,
@@ -963,7 +989,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
                     options: request.options.clone(),
                     is_last: request.is_last,
                 },
-            }),
+            })),
         })
     }
 }
@@ -998,27 +1024,54 @@ mod source_window_tests {
                 mapped_at_creation: false,
             });
             let input = BufferImageSource::new(Arc::new(buffer), layout).unwrap();
-            let mut backend = LosslessModularBackend::with_config(
-                &context,
-                LosslessModularConfig {
-                    group_size,
-                    ..Default::default()
-                },
-            );
-            let plan = backend.memory_plan(&input).unwrap();
-            let expected = 268
-                + 16 * (u64::from(edge) * u64::from(edge)
-                    + (u64::from(edge) * u64::from(edge)).div_ceil(8)
-                    + 1);
-            assert_eq!(plan.artifact_storage_bytes, expected);
-            backend.max_storage_binding_size = expected;
-            assert!(backend.memory_plan(&input).is_ok());
-            backend.max_storage_binding_size = expected - 1;
-            assert!(
-                matches!(backend.memory_plan(&input),Err(EncodeError::Unsupported(UnsupportedFeature::DeviceLimit {name:"max_storage_buffer_binding_size",required,available})) if required == expected && available == expected-1)
-            );
-            assert_eq!(backend.buffer_pool_stats().allocation_misses, 0);
-            assert_eq!(context.memory_stats().reserved_bytes, 0);
+            for (lz77, predictor) in [
+                (
+                    LosslessModularLz77::ZeroRuns,
+                    LosslessModularPredictor::Gradient,
+                ),
+                (
+                    LosslessModularLz77::Greedy,
+                    LosslessModularPredictor::Gradient,
+                ),
+                (
+                    LosslessModularLz77::Greedy,
+                    LosslessModularPredictor::Weighted,
+                ),
+            ] {
+                let mut backend = LosslessModularBackend::with_config(
+                    &context,
+                    LosslessModularConfig {
+                        group_size,
+                        lz77,
+                        predictor,
+                        ..Default::default()
+                    },
+                );
+                let plan = backend.memory_plan(&input).unwrap();
+                let expected = 400
+                    + 16 * (u64::from(edge) * u64::from(edge)
+                        + (u64::from(edge) * u64::from(edge)).div_ceil(8)
+                        + 1)
+                    + if lz77 == LosslessModularLz77::Greedy {
+                        8 * u64::from(edge * edge) + 4 * u64::from((edge * edge).min(65536))
+                    } else {
+                        0
+                    }
+                    + if predictor == LosslessModularPredictor::Weighted {
+                        20 * u64::from(edge)
+                    } else {
+                        0
+                    };
+                assert_eq!(plan.artifact_storage_bytes, expected);
+                backend.max_storage_binding_size = expected;
+                assert!(backend.memory_plan(&input).is_ok());
+                backend.max_storage_binding_size = expected - 1;
+                assert!(
+                    matches!(backend.memory_plan(&input),Err(EncodeError::Unsupported(UnsupportedFeature::DeviceLimit {name:"max_storage_buffer_binding_size",required,available})) if required == expected && available == expected-1)
+                );
+                assert_eq!(backend.buffer_pool_stats().allocation_misses, 0);
+                assert_eq!(context.memory_stats().reserved_bytes, 0);
+            }
         }
     }
 

@@ -156,6 +156,7 @@ fn custom_weighted_parameters_preserve_full_words_and_every_integer_depth() {
                     color_transform: Transform::LocalRct(
                         Rct::new((index as u32 * 3) % 42).unwrap(),
                     ),
+                    ..Default::default()
                 },
             );
             let case = Case {
@@ -209,6 +210,7 @@ fn weighted_row_state_survives_streaming_and_retires_after_cancellation() {
                 group_size,
                 tree_mode: TREES[index % 2],
                 color_transform: Transform::LocalRct(Rct::new(41).unwrap()),
+                ..Default::default()
             },
         );
         let extent = Extent2d::new(group_size.dimension() * 17, 1);
@@ -264,6 +266,7 @@ fn selected_predictors_keep_animation_words_crops_and_references() {
                 tree_mode: TREES[index],
                 weighted_predictor: Weighted::new([31; 7], [0, 15, 1, 8]).unwrap(),
                 color_transform: Transform::LocalRct(Rct::new(41).unwrap()),
+                ..Default::default()
             },
         );
         groups::animation::check_animation_words(
