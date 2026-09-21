@@ -67,9 +67,10 @@ pub use jxl_gpu_bitstream::FiniteF16;
 pub use lossless_modular::{
     AlphaAssociation, LOSSLESS_MODULAR_GROUP_DIMENSION, LosslessModularAnimationDescriptor,
     LosslessModularAnimationSession, LosslessModularBackend, LosslessModularColorOptions,
-    LosslessModularConfig, LosslessModularEncoder, LosslessModularFormat, LosslessModularGroup,
-    LosslessModularGroupGrid, LosslessModularGroupSize, LosslessModularInFlightMemory,
-    LosslessModularJob, LosslessModularMemoryLimits, LosslessModularMemoryPlan,
+    LosslessModularColorTransform, LosslessModularConfig, LosslessModularEncoder,
+    LosslessModularFormat, LosslessModularGroup, LosslessModularGroupGrid,
+    LosslessModularGroupSize, LosslessModularInFlightMemory, LosslessModularJob,
+    LosslessModularMemoryLimits, LosslessModularMemoryPlan, LosslessModularRctType,
     LosslessModularSubmission, LosslessModularTreeMode,
 };
 pub use packet::{

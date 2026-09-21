@@ -8,6 +8,7 @@ use super::dispatch::{
     LosslessModularBackend, ModularDispatchBatch, ModularDispatchPlan, ModularGroupPlan,
 };
 use super::grid::LosslessModularGroupGrid;
+use super::rct::ResolvedRct;
 use super::serializer::{
     ModularFrameHeader, ModularPacketAssembler, ModularPacketConfig, PacketBuildInput,
     ValidatedModularArtifact, accumulate_artifact_histograms, build_packets, build_prefix_codes,
@@ -135,6 +136,7 @@ impl StreamingModularWorker {
                 bits_per_sample: self.plan.bits_per_sample,
                 exponent_bits_per_sample: self.plan.exponent_bits_per_sample,
                 tree_mode: self.plan.tree_mode,
+                rct: self.plan.rct,
                 frame,
             },
             codes,
@@ -659,6 +661,7 @@ pub(super) struct ResidentLosslessModularJob {
     pub(super) bits_per_sample: u8,
     pub(super) exponent_bits_per_sample: u8,
     pub(super) tree_mode: LosslessModularTreeMode,
+    pub(super) rct: Option<ResolvedRct>,
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) frame_index: FrameIndex,
@@ -772,6 +775,7 @@ impl BrowserStreamingLosslessModularJob {
                 bits_per_sample: self.plan.bits_per_sample,
                 exponent_bits_per_sample: self.plan.exponent_bits_per_sample,
                 tree_mode: self.plan.tree_mode,
+                rct: self.plan.rct,
                 frame: ModularFrameHeader {
                     animation: self.request.animation,
                     canvas_width: self.request.canvas_width,
@@ -901,6 +905,7 @@ impl ResidentLosslessModularJob {
             bits_per_sample: self.bits_per_sample,
             exponent_bits_per_sample: self.exponent_bits_per_sample,
             tree_mode: self.tree_mode,
+            rct: self.rct,
             frame: &self.header,
             group_plans: &self.groups,
             bytes,

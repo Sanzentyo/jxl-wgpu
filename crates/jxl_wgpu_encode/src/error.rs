@@ -128,6 +128,10 @@ pub enum EncodeError {
     ForwardVarDct(#[from] jxl_wgpu::ForwardVarDctError),
     #[error("invalid encoder configuration: {0}")]
     InvalidConfiguration(&'static str),
+    #[error("Modular RCT type {rct_type} is invalid; valid types are 0 through 41")]
+    InvalidModularRctType { rct_type: u32 },
+    #[error("Modular RCT requires three color channels, received {color_channels}")]
+    ModularRctColorChannels { color_channels: u32 },
     #[error("ICC {resource} requires {required} bytes, limit {limit}")]
     IccLimit {
         resource: &'static str,

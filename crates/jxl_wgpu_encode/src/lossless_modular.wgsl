@@ -14,7 +14,7 @@ struct Params {
     channel: u32,
     channels: u32,
     sample_mask: u32,
-    use_rct: u32,
+    rct_type: u32,
     big_endian: u32,
     sources: array<Source, 4>,
     _padding: array<u32, 32>,
@@ -68,31 +68,42 @@ fn source_component(params: Params, x: u32, y: u32, component: u32) -> i32 {
     return bitcast<i32>((value >> source.bit_shift) & params.sample_mask);
 }
 
-// JPEG XL's reversible color transform type 0 maps RGB to YCoCg. Computing it
+fn add_wrap(a: i32, b: i32) -> i32 {
+    return bitcast<i32>(bitcast<u32>(a) + bitcast<u32>(b));
+}
+
+fn sub_wrap(a: i32, b: i32) -> i32 {
+    return bitcast<i32>(bitcast<u32>(a) - bitcast<u32>(b));
+}
+
+// The forward RCT uses wrapping integer words even for raw IEEE input. Computing it
 // in the token kernel avoids both an intermediate image and a CPU color path.
 fn sample_at(params: Params, x: u32, y: u32) -> i32 {
-    // Floating input carries raw IEEE words through integer prediction and entropy. Keeping
-    // the channels independent preserves signed zero, subnormals and every NaN payload.
-    if params.use_rct == 0u {
+    if params.rct_type == 42u || params.channel >= 3u {
         return source_component(params, x, y, params.channel);
     }
-    if params.channel == 3u {
-        return source_component(params, x, y, 3u);
+    let permutation = params.rct_type / 7u;
+    let first = source_component(params, x, y, permutation % 3u);
+    let second = source_component(params, x, y, (permutation + 1u + permutation / 3u) % 3u);
+    let third = source_component(params, x, y, (permutation + 2u - permutation / 3u) % 3u);
+    let operation = params.rct_type % 7u;
+    if operation == 6u {
+        let co = sub_wrap(first, third);
+        let temporary = add_wrap(third, co >> 1u);
+        let cg = sub_wrap(second, temporary);
+        let luma = add_wrap(temporary, cg >> 1u);
+        return vec3<i32>(luma, co, cg)[params.channel];
     }
-    let red = source_component(params, x, y, 0u);
-    let green = source_component(params, x, y, 1u);
-    let blue = source_component(params, x, y, 2u);
-    let co = red - blue;
-    let temporary = blue + (co >> 1u);
-    let cg = green - temporary;
-    let luma = temporary + (cg >> 1u);
-    if params.channel == 0u {
-        return luma;
+    var transformed = vec3<i32>(first, second, third);
+    if operation >= 4u {
+        transformed.y = sub_wrap(second, add_wrap(first, third) >> 1u);
+    } else if operation >= 2u {
+        transformed.y = sub_wrap(second, first);
     }
-    if params.channel == 1u {
-        return co;
+    if (operation & 1u) != 0u {
+        transformed.z = sub_wrap(third, first);
     }
-    return cg;
+    return transformed[params.channel];
 }
 
 fn append_event(params: Params, kind: u32, token: u32, nbits: u32, bits: u32) {

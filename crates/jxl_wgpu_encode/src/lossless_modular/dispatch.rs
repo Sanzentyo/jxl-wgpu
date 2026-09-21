@@ -8,6 +8,7 @@ use super::grid::LosslessModularGroupGrid;
 use super::memory::{
     LosslessModularMemoryLimits, LosslessModularMemoryPlan, align_up, event_capacity,
 };
+use super::rct::ResolvedRct;
 use super::serializer::{ModularFrameHeader, pack_signed, write_animation_header};
 use super::source::{ModularSourceLayout, ModularSourceWindows};
 use super::streaming::{
@@ -55,6 +56,7 @@ pub(super) struct ModularDispatchPlan {
     pub(super) bits_per_sample: u8,
     pub(super) exponent_bits_per_sample: u8,
     pub(super) tree_mode: LosslessModularTreeMode,
+    pub(super) rct: Option<ResolvedRct>,
     pub(super) parameters: Vec<ModularParams>,
     pub(super) groups: Vec<ModularGroupPlan>,
     pub(super) batches: Vec<ModularDispatchBatch>,
@@ -67,7 +69,7 @@ pub(super) struct ModularDispatchPlan {
 /// It never reads source pixels on the CPU. Gray, GrayAlpha, RGB and RGBA components may occupy packed,
 /// planar or split storage with explicit swizzles, bit positions and word byte order. Samples
 /// have one common 1-31-bit integer or binary16/binary32 precision.
-/// Integer RGB samples use reversible YCoCg; floating samples retain their raw bits. The GPU
+/// The selected reversible color transform operates on source words. The GPU
 /// emits predictor residual tokens and histograms; the host only serializes those artifacts.
 pub struct LosslessModularBackend {
     pipeline: Option<Arc<wgpu::ComputePipeline>>,
@@ -100,7 +102,7 @@ impl LosslessModularBackend {
         )
     }
 
-    /// Selects group geometry and MA-tree placement before any source is submitted.
+    /// Selects group geometry, MA-tree placement and RCT policy before any source is submitted.
     #[must_use]
     pub fn with_config(context: &WgpuContext, config: LosslessModularConfig) -> Self {
         let limits = context.device().limits();
@@ -232,6 +234,10 @@ impl LosslessModularBackend {
         )?;
         let source_spec = &source_layout.spec;
         let format = source_spec.format;
+        let rct = self
+            .config
+            .color_transform
+            .resolve(format, source_spec.exponent_bits_per_sample)?;
         let channels = format.channel_count();
         let dispatches =
             group_grid
@@ -370,7 +376,7 @@ impl LosslessModularBackend {
                     channel,
                     channels,
                     sample_mask: u32::MAX >> (32 - source_spec.bits_per_sample),
-                    use_rct: u32::from(channels > 2 && source_spec.exponent_bits_per_sample == 0),
+                    rct_type: rct.map_or(42, |rct| rct.rct_type.value()),
                     big_endian: u32::from(source_spec.big_endian),
                     sources: group_source.components,
                     _padding: [0; 32],
@@ -509,6 +515,7 @@ impl LosslessModularBackend {
             bits_per_sample: source_spec.bits_per_sample,
             exponent_bits_per_sample: source_spec.exponent_bits_per_sample,
             tree_mode: self.config.tree_mode,
+            rct,
             parameters,
             groups,
             batches,
@@ -898,6 +905,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
                 bits_per_sample: plan.bits_per_sample,
                 exponent_bits_per_sample: plan.exponent_bits_per_sample,
                 tree_mode: plan.tree_mode,
+                rct: plan.rct,
                 width: plan.width,
                 height: plan.height,
                 frame_index: request.frame_index,

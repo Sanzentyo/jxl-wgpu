@@ -532,9 +532,56 @@ retain the unchanged checked-in Gray8 byte fixture. No existing input or referen
 JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossless_layouts groups:: -- --test-threads=2
 ```
 
-This advances `MOD-E02` to **Partial** for complete group-size selection. Additional RCT/Palette/
-Squeeze choices, global/LF/HF transform topology, parallel token production, adaptive prediction,
+This advances `MOD-E02` to **Partial** for complete group-size selection. RCT selection is covered
+below; Palette/Squeeze, global/LF/HF transform topology, parallel token production, adaptive prediction,
 progressive encoding and remaining encoder quality/input gates are still open.
+
+## Lossless Modular RCT selection
+
+The [`lossless_layouts::rct`](../crates/jxl_wgpu_encode/tests/lossless_layouts/rct.rs) matrix
+exercises all 42 normative operations/permutations in global and local placement, with both
+MA-tree modes, integer depths 1/8/16/31 and raw IEEE16/32: 1,008 still cases. RGB/RGBA,
+packed/planar/split big-endian storage, reversed swizzles, shifted fields and unaligned padding
+retain canonical packed codestream bytes. Group sizes rotate through all four edges; fused
+packets, separate pass groups and thin LF-boundary images exercise the geometry. Explicit local
+RCT uses a fused DC-global transform in a single-group frame.
+
+jxl-oxide retained working planes compare every integer/IEEE word exactly, including signed zero,
+subnormals, infinities and NaN payloads. libjxl 0.12.0 independently decodes original components
+with the unchanged `2e-7` integer normalization bound and exact IEEE F32 words. Whole and
+256-byte-window fragmented GPU numeric output compares every original component; retained outputs
+outlive their session and release reservations after drop. jxl-oxide's independent frame/TOC
+reader plus `jxl-bitstream` inspect every separate pass-group header for the selected local RCT
+number and tree flag. A separate wire-reader unit checks all global/local RCT encodings, including
+the short selector for YCoCg (wire type 6), identity (0), and no transform.
+
+No-transform and explicit identity streams additionally cover every integer depth `1..=31` with
+exact/native/GPU comparisons. Automatic integer YCoCg and explicit global type 6 emit identical
+bytes at every depth; the unchanged default Gray8 fixture remains covered by the existing tests.
+The new paths preserve wrapping-i32 average/lifting behavior at high depth without widening
+tolerances or using a host pixel transform.
+
+Fourteen three-frame Replace animations cover all seven arithmetic operations, all six
+permutations across the matrix, both placements, integer31/raw IEEE32 and changing physical
+storage. Fourteen more finite IEEE32 animations use signed one-group/multi-group crops beyond
+the LF boundary, Add/Multiply color, independent alpha reference fields and retained frames.
+Native libjxl and Rust jxl independently compose the latter; existing `3e-6` color / `4e-7` alpha
+source-scale bounds, exact whole/fragmented output, timing and reverse insertion remain unchanged.
+Shared test helpers retain the preceding group-size matrix without reducing its cases.
+
+Sixteen resident/streamed lifetime cases cover global/local RCT4/5/6/41, integer31 and raw IEEE32,
+exact and one-byte-short budgets, source retirement after cancellation, blocking/Future equality
+and pool reuse. Invalid wire types 42/255/u32::MAX produce typed constructor errors; explicit RCT
+on Gray/GrayAlpha fails before reservation/submission for stills and animation creation. The
+256-byte parameter ABI changes only byte 24's meaning to RCT type or internal no-transform
+sentinel 42; bindings, artifact capacity and submission counts stay unchanged.
+
+```console
+JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossless_layouts rct:: -- --test-threads=2
+```
+
+`MOD-E02` stays **Partial**. The selected RCT is uniform across groups/frames; adaptive selection,
+arbitrary transform stacks, Palette/delta palette, Squeeze and their global/LF/HF topology remain.
 
 ## Procedural VarDCT encoder matrix
 

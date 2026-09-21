@@ -211,7 +211,7 @@ mod native_tests {
             channel: 4,
             channels: 5,
             sample_mask: 6,
-            use_rct: 7,
+            rct_type: 7,
             big_endian: 8,
             sources: std::array::from_fn(|index| ModularSourceParams {
                 row_stride: 9 + index as u32 * 6,

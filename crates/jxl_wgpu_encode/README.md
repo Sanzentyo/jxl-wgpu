@@ -77,11 +77,19 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   the intent from `profile.header().rendering_intent`; a conflict is rejected instead of modifying
   the profile. Image metadata is validated before GPU admission. GPU storage and submission counts
   are unchanged; variable-sized ICC headers use the shared byte budget described below.
-- Integer RGB(A) uses JPEG XL reversible color transform type 0 (YCoCg) in WGSL. Floating
-  channels retain their raw IEEE words without a color transform. No transformed image or source
-  pixels are read by the CPU.
+- `LosslessModularConfig::color_transform` selects `Auto`, `None`, `GlobalRct` or `LocalRct`.
+  The default `Auto` uses YCoCg (wire type 6) for integer RGB(A) and no transform for Gray/GrayAlpha
+  or IEEE input. `LosslessModularRctType::new(0..=41)` selects every normative operation and
+  permutation; `IDENTITY` and `YCOCG` are named constants. Explicit RCT requires RGB(A), including
+  embedded RGB ICC and IEEE samples. WGSL transforms raw words with wrapping integer arithmetic,
+  preserving NaN payloads, signed zero and independent alpha. No image pixels reach the host.
+  Global RCT is declared once in DC-global; local RCT is declared in each pass group independently
+  of MA-tree placement. A fused single-group frame declares either choice in DC-global.
+  The same selected type applies to every group/frame; arbitrary transform stacks and adaptive
+  per-group selection remain open. Invalid type/channel combinations fail before GPU admission.
 - `LosslessModularConfig` selects all four standard PassGroup sizes with
-  `LosslessModularGroupSize::{Pixels128, Pixels256, Pixels512, Pixels1024}` and the MA-tree mode.
+  `LosslessModularGroupSize::{Pixels128, Pixels256, Pixels512, Pixels1024}`, the MA-tree mode and
+  the reversible color transform.
   `LosslessModularEncoder::with_config` and `LosslessModularBackend::with_config` use the same
   immutable policy; `config()` reports it. The default remains 256×256. LF groups cover eight
   PassGroups per axis. Edge groups may be one pixel wide or high; cropped animation frames use
@@ -145,7 +153,8 @@ exact dispatch rectangles and normative PassGroup order before completion.
 ```rust,no_run
 # use jxl_wgpu_encode::{
 #     BufferImageSource, LosslessModularConfig, LosslessModularEncoder, LosslessModularFormat,
-#     LosslessModularGroupSize, LosslessModularTreeMode, WgpuContext,
+#     LosslessModularColorTransform, LosslessModularGroupSize, LosslessModularRctType,
+#     LosslessModularTreeMode, WgpuContext,
 # };
 # fn submit(
 #     context: WgpuContext,
@@ -156,6 +165,7 @@ let encoder = LosslessModularEncoder::with_config(
     LosslessModularConfig {
         group_size: LosslessModularGroupSize::Pixels512,
         tree_mode: LosslessModularTreeMode::LocalPerGroup,
+        color_transform: LosslessModularColorTransform::LocalRct(LosslessModularRctType::new(41)?),
     },
 );
 let plan = encoder.memory_plan(&source)?;

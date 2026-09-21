@@ -6,6 +6,7 @@ mod color;
 mod groups;
 mod icc;
 mod lifetime;
+mod rct;
 mod source;
 
 use std::num::NonZeroU64;

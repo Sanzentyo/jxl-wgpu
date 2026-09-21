@@ -1,8 +1,8 @@
 use super::*;
 use jxl_wgpu_encode::{LosslessModularConfig, LosslessModularGroupSize};
 
-mod animation;
-mod lifetime;
+pub(super) mod animation;
+pub(super) mod lifetime;
 
 fn encoder(
     rig: &Rig,
@@ -12,6 +12,7 @@ fn encoder(
     let config = LosslessModularConfig {
         group_size,
         tree_mode,
+        ..Default::default()
     };
     let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config);
     assert_eq!(encoder.config(), config);

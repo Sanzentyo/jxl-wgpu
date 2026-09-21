@@ -127,7 +127,7 @@ name shown in parentheses.
 | `jxl_wgpu_encode/vardct_encoder/control.wgsl` | `VarDctArtifactHeader` / header words | status/live counts, AC-presence marker, LF section ranges/total bits, source/block geometry, topology, 19-bin DC histogram, LF descriptors/grid/count, AC descriptor offset/count and fragment offset/stride/word count, 13 pads | 256 | 4 | storage/readback record |
 | `jxl_wgpu_encode/vardct_encoder/control.wgsl` | `DcFragmentDescriptor` / two words | `bit_offset, bit_len` for one row-major LF group | 8 | 4 | storage/readback element |
 | `jxl_wgpu_encode/vardct_encoder/transforms.wgsl` | four host words / `QuantizationEntry` | three f32 dequantization scales followed by one u32 natural-order position | 16 | Rust 4 / WGSL 16 | read-only storage element |
-| `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularParams` / `Params` | `width, height, output_word_offset, channel, channels, sample_mask, use_rct, big_endian`; four 24-byte source records (`row_stride, byte_offset, pixel_stride, word_bytes, bit_shift, plane`); 32 pads | 256 | 4 | read-only storage element |
+| `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularParams` / `Params` | `width, height, output_word_offset, channel, channels, sample_mask, rct_type, big_endian`; four 24-byte source records (`row_stride, byte_offset, pixel_stride, word_bytes, bit_shift, plane`); 32 pads | 256 | 4 | read-only storage element |
 | `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularArtifactHeader` / `output_words[0..67]` | `event_count, raw_counts[33], lz77_counts[33]` | 268 | 4 | storage/readback record |
 | `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularEvent` / four-word event | `kind, token, extra_bit_count, extra_bits` | 16 | 4 | storage/readback element |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | entropy prefix/window, group geometry, sample/channel counts, channel-layout offset, output kind/transfer/range, channels/order/depth, 4 plane offset/stride pairs, chroma geometry/size/mapping, status/stream/fixed-leaf/weighted-predictor fields; canvas width/height and orientation | 256 | 4 | read-only storage element |
@@ -395,8 +395,12 @@ against device limits prior to pipeline compilation and dispatch recording.
   storage is padded to a word and includes a four-byte sentinel; its 16-byte status is parsed as a
   checked `DecodeStatus` record.
   IEEE binary16/binary32 encoder input uses integer bit loads and signed working-word prediction,
-  preserving all source bits without floating arithmetic. `use_rct` at byte 24 selects YCoCg only
-  for integer RGB(A); floating channels serialize with no Modular transform. The 256-byte parameter
+  preserving all source bits without floating arithmetic. `rct_type` at byte 24 selects any
+  normative RCT type `0..=41`, or internal sentinel `42` for no transform. Auto defaults to global
+  YCoCg for integer RGB(A) and none otherwise. Explicit RGB(A) RCT also preserves raw IEEE words;
+  permutations and lifting steps use wrapping integer arithmetic, and alpha is never transformed.
+  The same resolved type selects global/local wire headers in resident and streamed jobs, including
+  browser continuations. This adds no image allocation, submission, binding or readback. The 256-byte parameter
   stride and artifact sizes are unchanged. Source-window limits may now split additional batches,
   each retaining the same parameter/artifact/readback ownership contract. The source records begin
   at byte 32 with a 24-byte stride; each logical component selects one of four independently

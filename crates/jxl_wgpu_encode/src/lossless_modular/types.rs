@@ -31,7 +31,7 @@ pub(super) struct ModularParams {
     pub(super) channel: u32,
     pub(super) channels: u32,
     pub(super) sample_mask: u32,
-    pub(super) use_rct: u32,
+    pub(super) rct_type: u32,
     pub(super) big_endian: u32,
     pub(super) sources: [ModularSourceParams; 4],
     // An explicit 256-byte array stride keeps every batch boundary valid for the portable
@@ -150,15 +150,17 @@ impl LosslessModularGroupSize {
 }
 
 /// Stream encoding policy shared by stills and frames in an animation session.
-/// Defaults retain 256-pixel groups and the shared global MA tree.
+/// Defaults retain 256-pixel groups, the shared global MA tree and automatic color transforms.
 ///
 /// ```no_run
 /// # use jxl_wgpu_encode::{LosslessModularConfig, LosslessModularEncoder,
-/// #     LosslessModularGroupSize, LosslessModularTreeMode, WgpuContext};
+/// #     LosslessModularColorTransform, LosslessModularGroupSize, LosslessModularRctType,
+/// #     LosslessModularTreeMode, WgpuContext};
 /// # fn configure(context: WgpuContext) {
 /// let encoder = LosslessModularEncoder::with_config(context, LosslessModularConfig {
 ///     group_size: LosslessModularGroupSize::Pixels512,
 ///     tree_mode: LosslessModularTreeMode::LocalPerGroup,
+///     color_transform: LosslessModularColorTransform::LocalRct(LosslessModularRctType::YCOCG),
 /// });
 /// assert_eq!(encoder.config().group_size.dimension(), 512);
 /// # }
@@ -167,6 +169,8 @@ impl LosslessModularGroupSize {
 pub struct LosslessModularConfig {
     pub group_size: LosslessModularGroupSize,
     pub tree_mode: LosslessModularTreeMode,
+    /// GPU source-word transform and its wire placement.
+    pub color_transform: super::rct::LosslessModularColorTransform,
 }
 
 impl LosslessModularFormat {

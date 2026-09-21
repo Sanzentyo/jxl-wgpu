@@ -43,7 +43,7 @@ implementation audits.
 | Progressive passes | `max_progressive_passes = 1` |
 | Implemented stages | `ColorTransform`, `ModularTransform`, `ModularPrediction`, `ModularResidualTokenization`, `HistogramReduction` |
 | Predictor | JPEG XL Gradient predictor |
-| Modular transforms | fixed reversible YCoCg for integer RGB(A); none for Gray/GrayAlpha or IEEE samples |
+| Modular transforms | caller-selected none or any of 42 RCT types in DC-global or each pass group; default YCoCg for integer RGB(A), none for Gray/GrayAlpha or IEEE samples |
 | Entropy | JPEG XL prefix code with LZ77 distance 1, not ANS; fixed MA tree |
 | Filters | Gaborish off, EPF zero iterations |
 | Output | raw codestream or standard `jxlc` container; private `jwgp` index emitted only for single-group Gray8 containers with default color/intent/intensity |
@@ -80,7 +80,7 @@ nonzero color at zero alpha. It does not change bindings, artifact ABI, GPU owne
 precision. [Alpha-input conformance](CONFORMANCE_CORPUS.md#lossless-modular-alpha-input) separates
 exact raw-sample preservation from arithmetic composition and final alpha presentation.
 
-`LosslessModularConfig` supplies one immutable group size and MA-tree mode to the backend and
+`LosslessModularConfig` supplies one immutable group size, MA-tree mode and color transform to the backend and
 complete encoder. The grid, LF-group count, source windows, artifact capacities and frame-header
 `group_size_shift` derive from that same size. Each animation crop computes its own grid before
 admission. A complete group's channels must fit a GPU batch; larger groups retain typed source,
@@ -88,6 +88,17 @@ artifact, buffer and dispatch rejection. Prefix LZ77 tokens extend through 31 fo
 runs, while exact per-group sample counts, canonical extra bits and histogram agreement still
 validate every artifact. No shader ABI or workgroup shape changes. See
 [group-size conformance](CONFORMANCE_CORPUS.md#lossless-modular-group-sizes).
+
+The RCT policy resolves against source channels/precision before admission. One typed value feeds
+both the GPU parameter and resident/native/browser packet assembly. A local RCT changes only the
+pass-group transform header; shared and local MA trees remain independent choices. Single-group
+frames fold that transform into their fused DC-global header. The shader loads the selected
+channel permutation and applies the forward wrapping-i32 lifting steps during sample prediction.
+It preserves raw IEEE words and leaves alpha untouched, with no intermediate allocation,
+submission or readback. The parameter word at byte 24 is now the normative RCT type `0..=41`,
+or internal sentinel `42` for no transform. Wire type 42 is rejected by the public constructor.
+[RCT conformance](CONFORMANCE_CORPUS.md#lossless-modular-rct-selection) covers both placements,
+both trees, every operation/permutation, source-word preservation and ownership.
 
 ### GPU artifact ABI
 
@@ -118,7 +129,7 @@ ModularSourceParams / Source = {
 size = 24 bytes, alignment = 4 bytes
 
 ModularParams / Params = {
-    width, height, output_word_offset, channel, channels, sample_mask, use_rct, big_endian: u32,
+    width, height, output_word_offset, channel, channels, sample_mask, rct_type, big_endian: u32,
     sources: array<Source, 4>,
     _padding: array<u32, 32>,
 }
@@ -365,7 +376,7 @@ cargo clippy -p jxl_wgpu_encode --all-targets -- -D warnings
   two-pass streaming with global histogram aggregation, and out-of-order group completion.
 - **Lossless color and alpha inputs (Slice 4 partial)**: Gray/GrayAlpha/RGB/RGBA at integer depths
   `1..=31` or IEEE binary16/binary32, with packed/planar/split addressing and declared alpha
-  association. Integer RGB(A) uses the GPU-side reversible YCoCg transform.
+  association. RGB(A) can select every GPU-side RCT type or no transform, in global or local headers.
 - **Lossless Modular animation (Slice 6)**: Multi-frame `LosslessModularAnimationSession` supporting
   standard timebases, exact durations and timecodes, signed crop rectangles, all 5 blend modes,
   alpha blending, and 4 reference slots with runtime-neutral in-flight futures.

@@ -13,6 +13,7 @@ use super::dispatch::{LosslessModularBackend, ModularGroupPlan};
 use super::grid::{LosslessModularGroup, LosslessModularGroupGrid};
 use super::icc::{DEFAULT_PROFILE_LIMIT, PreparedImageHeader};
 use super::memory::{LosslessModularMemoryLimits, LosslessModularMemoryPlan};
+use super::rct::{LosslessModularRctType, ResolvedRct};
 use super::source::lossless_modular_source_spec;
 use super::streaming::LosslessModularJob;
 use super::types::{
@@ -51,7 +52,7 @@ impl LosslessModularEncoder {
         Self::with_config(context, Default::default())
     }
 
-    /// Creates an encoder with explicit group geometry and MA-tree placement.
+    /// Creates an encoder with explicit group geometry, MA-tree placement and RCT policy.
     #[must_use]
     pub fn with_config(context: WgpuContext, config: super::types::LosslessModularConfig) -> Self {
         let backend = LosslessModularBackend::with_config(&context, config);
@@ -229,6 +230,9 @@ impl LosslessModularEncoder {
         &self,
         descriptor: LosslessModularAnimationDescriptor,
     ) -> Result<LosslessModularAnimationSession, EncodeError> {
+        self.config()
+            .color_transform
+            .resolve(descriptor.format, descriptor.exponent_bits_per_sample)?;
         let (codestream_header, metadata_permit) = image_header(
             descriptor.canvas_width,
             descriptor.canvas_height,
@@ -700,6 +704,7 @@ pub(super) struct PacketBuildInput<'a> {
     pub(super) bits_per_sample: u8,
     pub(super) exponent_bits_per_sample: u8,
     pub(super) tree_mode: LosslessModularTreeMode,
+    pub(super) rct: Option<ResolvedRct>,
     pub(super) frame: &'a ModularFrameHeader,
     pub(super) group_plans: &'a [ModularGroupPlan],
     pub(super) bytes: &'a [u8],
@@ -774,6 +779,7 @@ pub(super) struct ModularPacketAssembler {
     bits_per_sample: u8,
     exponent_bits_per_sample: u8,
     tree_mode: LosslessModularTreeMode,
+    rct: Option<ResolvedRct>,
     frame: ModularFrameHeader,
     codes: [PrefixCode; 4],
     packets: Vec<GroupPacket>,
@@ -790,6 +796,7 @@ pub(super) struct ModularPacketConfig {
     pub(super) bits_per_sample: u8,
     pub(super) exponent_bits_per_sample: u8,
     pub(super) tree_mode: LosslessModularTreeMode,
+    pub(super) rct: Option<ResolvedRct>,
     pub(super) frame: ModularFrameHeader,
 }
 
@@ -806,11 +813,12 @@ impl ModularPacketAssembler {
             bits_per_sample,
             exponent_bits_per_sample,
             tree_mode,
+            rct,
             frame,
         } = config;
         let (packets, single_group, token_bit_offset_in_group) = if group_grid.groups == 1 {
             let mut group = BitWriter::new();
-            write_dc_global(&mut group, &codes, format, exponent_bits_per_sample == 0)?;
+            write_dc_global(&mut group, &codes, rct.map(|rct| rct.rct_type))?;
             let token_bit_offset = u64::try_from(group.bit_len())
                 .map_err(|_| EncodeError::Backend("gray8 token offset overflow".into()))?;
             (Vec::new(), Some(group), token_bit_offset)
@@ -821,8 +829,7 @@ impl ModularPacketAssembler {
             write_dc_global(
                 &mut dc_global,
                 &codes,
-                format,
-                exponent_bits_per_sample == 0,
+                rct.filter(|rct| !rct.local).map(|rct| rct.rct_type),
             )?;
             dc_global.align_to_byte()?;
             packets.push(GroupPacket::new(
@@ -847,6 +854,7 @@ impl ModularPacketAssembler {
             bits_per_sample,
             exponent_bits_per_sample,
             tree_mode,
+            rct,
             frame,
             codes,
             packets,
@@ -880,10 +888,13 @@ impl ModularPacketAssembler {
         } else {
             let mut pass_group = BitWriter::new();
             let use_global_tree = self.tree_mode == LosslessModularTreeMode::SharedGlobal;
-            // GroupHeader: selected tree, default weighted predictor, no local transforms.
+            // GroupHeader: selected tree, default weighted predictor and optional local RCT.
             pass_group.write_bits(u64::from(use_global_tree), 1)?;
             pass_group.write_bits(1, 1)?;
-            pass_group.write_bits(0, 2)?;
+            write_rct(
+                &mut pass_group,
+                self.rct.filter(|rct| rct.local).map(|rct| rct.rct_type),
+            )?;
             if !use_global_tree {
                 write_ma_config(&mut pass_group, &self.codes)?;
             }
@@ -965,6 +976,7 @@ pub(super) fn build_packets(
         bits_per_sample,
         exponent_bits_per_sample,
         tree_mode,
+        rct,
         frame,
         group_plans,
         bytes,
@@ -1021,6 +1033,7 @@ pub(super) fn build_packets(
             bits_per_sample,
             exponent_bits_per_sample,
             tree_mode,
+            rct,
             frame: frame.clone(),
         },
         codes,
@@ -1216,8 +1229,7 @@ fn invalid_gpu_artifact(reason: &'static str) -> EncodeError {
 fn write_dc_global(
     output: &mut BitWriter,
     codes: &[PrefixCode; 4],
-    format: LosslessModularFormat,
-    use_rct: bool,
+    rct: Option<LosslessModularRctType>,
 ) -> Result<(), EncodeError> {
     // Handcrafted Modular metadata adapted from zune-jpegxl 0.5.2. See this crate's
     // `THIRD_PARTY.md` and `LICENSES/zune-jpegxl-MIT.txt`.
@@ -1226,11 +1238,31 @@ fn write_dc_global(
     write_ma_config(output, codes)?;
     output.write_bits(1, 1)?;
     output.write_bits(1, 1)?;
-    if use_rct && format.channel_count() > 2 {
+    write_rct(output, rct)
+}
+
+fn write_rct(
+    output: &mut BitWriter,
+    rct: Option<LosslessModularRctType>,
+) -> Result<(), EncodeError> {
+    if let Some(rct) = rct {
         output.write_bits(1, 2)?; // one transform
         output.write_bits(0, 2)?; // reversible color transform
         output.write_bits(0, 5)?; // begin channel 0
-        output.write_bits(0, 2)?; // YCoCg transform type 0
+        let value = rct.value();
+        // U32(Val(6), Bits(2), BitsOffset(4, 2), BitsOffset(6, 10)).
+        if value == 6 {
+            output.write_bits(0, 2)?;
+        } else if value < 4 {
+            output.write_bits(1, 2)?;
+            output.write_bits(u64::from(value), 2)?;
+        } else if value < 18 {
+            output.write_bits(2, 2)?;
+            output.write_bits(u64::from(value - 2), 4)?;
+        } else {
+            output.write_bits(3, 2)?;
+            output.write_bits(u64::from(value - 10), 6)?;
+        }
     } else {
         output.write_bits(0, 2)?; // no transforms
     }
@@ -1652,4 +1684,41 @@ fn write_frame_duration(output: &mut BitWriter, duration: u32) -> Result<(), Enc
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod rct_wire_tests {
+    use super::*;
+    use jxl_bitstream::{Bitstream, U};
+
+    #[test]
+    fn independent_wire_reader_recovers_every_rct_type_and_no_transform() {
+        for value in (0..42).map(Some).chain([None]) {
+            let mut writer = BitWriter::new();
+            write_rct(
+                &mut writer,
+                value.map(|value| LosslessModularRctType::new(value).unwrap()),
+            )
+            .unwrap();
+            let bytes = writer.into_bytes();
+            let mut reader = Bitstream::new(&bytes);
+            assert_eq!(
+                reader.read_u32(0, 1, 2 + U(4), 18 + U(8)).unwrap(),
+                u32::from(value.is_some())
+            );
+            if let Some(value) = value {
+                assert_eq!(reader.read_bits(2).unwrap(), 0);
+                assert_eq!(
+                    reader
+                        .read_u32(U(3), 8 + U(6), 72 + U(10), 1096 + U(13))
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    reader.read_u32(6, U(2), 2 + U(4), 10 + U(6)).unwrap(),
+                    value
+                );
+            }
+        }
+    }
 }
