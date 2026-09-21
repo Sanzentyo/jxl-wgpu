@@ -228,6 +228,7 @@ fn output_cases() -> Vec<(String, PixelFormat)> {
 
 fn check_formats(
     backend: &WgpuBackend,
+    decoders: &[GpuDecoder<WgpuDecodeEngine>; 2],
     name: &str,
     encoded: &[u8],
     extent: Extent2d,
@@ -287,15 +288,10 @@ fn check_formats(
             eprintln!("{name}/{label}: Rust-djxl F32 reference disagreement {maximum}");
         }
         let mut whole = None;
-        for cap in [u64::MAX, 256] {
-            let decoder = GpuDecoder::new(
-                WgpuDecodeEngine::new(backend.clone())
-                    .unwrap()
-                    .with_stream_window_limit(NonZeroU64::new(cap).unwrap()),
-            );
+        for (cap, decoder) in [u64::MAX, 256].into_iter().zip(decoders) {
             let request = GpuOutputRequest::color(format.clone()).unwrap();
             let mut session = if cap == 256 {
-                open_incremental(&decoder, encoded, request)
+                open_incremental(decoder, encoded, request)
             } else {
                 decoder.open(encoded, request).unwrap()
             };
@@ -359,8 +355,10 @@ fn generic_color_outputs_preserve_oriented_high_depth_vardct_precision() {
     eprintln!("generic VarDCT output adapter: {info:?}");
     let backend =
         WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
+    let decoders = decoders_with_windows(&backend, [u64::MAX, 256]);
     check_formats(
         &backend,
+        &decoders,
         "RGB16",
         &corpus::vardct_depth_combined("rgb_16_multilf"),
         Extent2d::new(17, 2056),
@@ -375,6 +373,7 @@ fn generic_color_output_combines_jpeg_gray_resampling_and_recursive_dc() {
     };
     let backend =
         WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
+    let decoders = decoders_with_windows(&backend, [u64::MAX, 256]);
     let formats = output_cases()
         .into_iter()
         .filter(|(name, _)| {
@@ -401,7 +400,7 @@ fn generic_color_output_combines_jpeg_gray_resampling_and_recursive_dc() {
             Extent2d::new(101, 173),
         ),
     ] {
-        check_formats(&backend, name, &encoded, extent, &formats);
+        check_formats(&backend, &decoders, name, &encoded, extent, &formats);
     }
 }
 

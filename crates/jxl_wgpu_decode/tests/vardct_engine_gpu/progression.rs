@@ -113,6 +113,7 @@ fn gpu_dc_and_ac_images_match_native_libjxl_flushes() {
     };
     let backend =
         WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
+    let decoders = decoders_with_windows(&backend, [u64::MAX, 256]);
     let mut errors = Vec::new();
     for (name, bytes, count) in direct_progressive_cases() {
         let encoded = bytes.as_slice();
@@ -123,12 +124,7 @@ fn gpu_dc_and_ac_images_match_native_libjxl_flushes() {
         };
         assert_eq!(native.len(), count + 1, "{name}: DC, AC passes, final");
         let mut whole = None;
-        for cap in [u64::MAX, 256] {
-            let decoder = GpuDecoder::new(
-                WgpuDecodeEngine::new(backend.clone())
-                    .unwrap()
-                    .with_stream_window_limit(NonZeroU64::new(cap).unwrap()),
-            );
+        for (cap, decoder) in [u64::MAX, 256].into_iter().zip(&decoders) {
             let mut format = PixelFormat::rgb_f32(
                 jxl_gpu_formats::RgbChannelOrder::Rgba,
                 false,
@@ -270,15 +266,11 @@ fn completed_gpu_passes_return_immutable_images_before_the_final_frame() {
     };
     let backend =
         WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
+    let decoders = decoders_with_windows(&backend, [u64::MAX, 256]);
     for (name, bytes, count) in direct_progressive_cases() {
         let encoded = bytes.as_slice();
         let mut whole = None;
-        for cap in [u64::MAX, 256] {
-            let decoder = GpuDecoder::new(
-                WgpuDecodeEngine::new(backend.clone())
-                    .unwrap()
-                    .with_stream_window_limit(NonZeroU64::new(cap).unwrap()),
-            );
+        for (cap, decoder) in [u64::MAX, 256].into_iter().zip(&decoders) {
             let request = GpuOutputRequest::color(vardct_rgb8_format())
                 .unwrap()
                 .with_progressive_output(true)
@@ -544,6 +536,7 @@ fn single_entry_dc_survives_deferred_hf_and_final_only_consumers_skip_updates() 
     };
     let backend =
         WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
+    let decoders = decoders_with_windows(&backend, [u64::MAX, 40]);
     for (name, encoded) in [
         ("custom", corpus::vardct_upsampling("8_custom")),
         ("thin", corpus::vardct_upsampling("4_thin")),
@@ -553,12 +546,7 @@ fn single_entry_dc_survives_deferred_hf_and_final_only_consumers_skip_updates() 
         ("oriented_jpeg", corpus::vardct_oriented_jpeg()),
     ] {
         let mut whole = None;
-        for cap in [u64::MAX, 40] {
-            let decoder = GpuDecoder::new(
-                WgpuDecodeEngine::new(backend.clone())
-                    .unwrap()
-                    .with_stream_window_limit(NonZeroU64::new(cap).unwrap()),
-            );
+        for (cap, decoder) in [u64::MAX, 40].into_iter().zip(&decoders) {
             let request = || {
                 GpuOutputRequest::color(vardct_rgb8_format())
                     .unwrap()

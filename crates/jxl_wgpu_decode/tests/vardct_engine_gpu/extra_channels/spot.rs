@@ -75,6 +75,7 @@ fn gpu_spots_follow_the_reference_color_domain_and_presentation_order() {
     let Ok(backend) = pollster::block_on(WgpuBackend::request_default(Default::default())) else {
         return;
     };
+    let context = associated::DecodeContext::new(&backend);
     for (name, hex) in cases() {
         let data = encoded(hex);
         let inventory = jxl_gpu_bitstream::parse(&data, Default::default())
@@ -108,7 +109,7 @@ fn gpu_spots_follow_the_reference_color_domain_and_presentation_order() {
             });
             let request = associated::floating_request(AlphaOutputPolicy::Preserve, linear, keep)
                 .with_spot_color_policy(SpotColorPolicy::Render);
-            let frames = associated::decode(&backend, &data, request, keep);
+            let frames = associated::decode(&context, &data, request, keep);
             if let Some(expected) = expected {
                 let stride = pixels * (4 + image.extra_channels.len());
                 assert_eq!(expected.len(), frames.len() * stride);
@@ -227,6 +228,7 @@ fn multiple_spots_preserve_declaration_order_extended_values_and_alpha_policy() 
     let Ok(backend) = pollster::block_on(WgpuBackend::request_default(Default::default())) else {
         return;
     };
+    let context = associated::DecodeContext::new(&backend);
     for (name, hex) in multiple_spots() {
         let data = encoded(hex);
         let inventory = jxl_gpu_bitstream::parse(&data, Default::default())
@@ -255,10 +257,10 @@ fn multiple_spots_preserve_declaration_order_extended_values_and_alpha_policy() 
             ] {
                 let request = associated::floating_request(policy, linear, keep)
                     .with_spot_color_policy(SpotColorPolicy::Render);
-                let whole = associated::decode(&backend, &data, request.clone(), false);
+                let whole = associated::decode(&context, &data, request.clone(), false);
                 assert_eq!(
                     whole,
-                    associated::decode(&backend, &data, request, true),
+                    associated::decode(&context, &data, request, true),
                     "{name}: bounded input"
                 );
                 assert_eq!(whole.len(), 1);

@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn hdr_original_and_composed_sources_reach_relative_icc_pcs_with_image_luminance() {
     let backend = backend();
+    let reader = frames::FrameReader::new(&backend);
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let identity = IccProfile::parse(
         std::fs::read(root.join("../jxl_wgpu/test-data/icc/mpe/identity.icc"))
@@ -32,7 +33,7 @@ fn hdr_original_and_composed_sources_reach_relative_icc_pcs_with_image_luminance
                     .unwrap()
                     .with_alpha_output_policy(AlphaOutputPolicy::Preserve)
                     .with_icc_rendering_intent(IccRenderingIntent::Relative);
-                let actual = frames::read(&backend, &case.bytes(), request, planar, 4, bounded);
+                let actual = frames::read(&reader, &case.bytes(), request, planar, 4, bounded);
                 assert_eq!(actual.len(), case.frame_count());
                 for (frame, actual) in actual.iter().enumerate() {
                     assert_eq!(actual.len(), case.frame_words());

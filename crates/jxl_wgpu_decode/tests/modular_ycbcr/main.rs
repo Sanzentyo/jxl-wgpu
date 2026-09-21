@@ -59,29 +59,54 @@ fn local_wide_samples(case: &modular_ycbcr::Case) -> bool {
         }
 }
 
+fn decoder_with_limit(
+    backend: &WgpuBackend,
+    limit: Option<NonZeroU64>,
+) -> GpuDecoder<WgpuDecodeEngine> {
+    let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
+    if let Some(limit) = limit {
+        engine = engine.with_stream_window_limit(limit);
+    }
+    GpuDecoder::new(engine)
+}
+
 #[test]
 fn all_component_selectors_match_native_color_and_numeric_output() {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
+    let decoders = [
+        decoder_with_limit(&backend, None),
+        decoder_with_limit(&backend, NonZeroU64::new(40)),
+        decoder_with_limit(&backend, None),
+    ];
     for case in modular_ycbcr::cases()
         .into_iter()
         .filter(|case| !local_wide_samples(case))
     {
-        require_case(&backend, &case);
+        require_case(&backend, &decoders, &case);
     }
 }
 
 #[test]
 fn local_wide_sample_transforms_match_independent_color_and_numeric_references() {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
+    let decoders = [
+        decoder_with_limit(&backend, None),
+        decoder_with_limit(&backend, NonZeroU64::new(40)),
+        decoder_with_limit(&backend, None),
+    ];
     for case in modular_ycbcr::cases()
         .into_iter()
         .filter(local_wide_samples)
     {
-        require_case(&backend, &case);
+        require_case(&backend, &decoders, &case);
     }
 }
 
-fn require_case(backend: &WgpuBackend, case: &modular_ycbcr::Case) {
+fn require_case(
+    backend: &WgpuBackend,
+    decoders: &[GpuDecoder<WgpuDecodeEngine>; 3],
+    case: &modular_ycbcr::Case,
+) {
     let (bytes, expected) = reference(&case.name);
     let info = jxl_gpu_bitstream::parse(&bytes, Default::default())
         .unwrap()
@@ -92,14 +117,9 @@ fn require_case(backend: &WgpuBackend, case: &modular_ycbcr::Case) {
     let rgba = &expected[..pixels * 4];
     let request = color_request();
     let mut prior = None;
-    for limit in [None, NonZeroU64::new(40)] {
-        let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-        if let Some(limit) = limit {
-            engine = engine.with_stream_window_limit(limit);
-        }
-        let decoder = GpuDecoder::new(engine);
-        let mut session = if limit.is_some() {
-            planes::open_fragmented(&decoder, &bytes, request.clone())
+    for (decoder, fragmented) in decoders[..2].iter().zip([false, true]) {
+        let mut session = if fragmented {
+            planes::open_fragmented(decoder, &bytes, request.clone())
         } else {
             decoder.open(&bytes, request.clone()).unwrap()
         };
@@ -115,7 +135,7 @@ fn require_case(backend: &WgpuBackend, case: &modular_ycbcr::Case) {
         drop((frame, session));
         assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
     }
-    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let decoder = &decoders[2];
     for channel in 0..if case.grayscale { 1 } else { 3 } {
         let request = GpuOutputRequest::numeric(
             PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X]),
@@ -147,7 +167,7 @@ fn require_case(backend: &WgpuBackend, case: &modular_ycbcr::Case) {
         .with_extra_channel(channel as u32)
         .unwrap()
         .with_orientation_policy(OrientationPolicy::Keep);
-        let mut session = planes::open_fragmented(&decoder, &bytes, request);
+        let mut session = planes::open_fragmented(decoder, &bytes, request);
         let frame = session.next_frame().unwrap().unwrap();
         require_samples(
             &case.name,

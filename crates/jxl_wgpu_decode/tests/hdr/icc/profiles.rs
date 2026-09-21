@@ -41,6 +41,7 @@ fn references(path: &Path) -> Vec<[f32; 6]> {
 #[test]
 fn hdr_rgb_xyb_stills_and_sequences_match_native_and_scalar_icc_profiles() {
     let backend = backend();
+    let reader = frames::FrameReader::new(&backend);
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let directory = root.join("test-data/hdr_icc");
     let manifest: Manifest =
@@ -68,7 +69,7 @@ fn hdr_rgb_xyb_stills_and_sequences_match_native_and_scalar_icc_profiles() {
         .unwrap();
         targets.insert(case.target.clone());
         let original = frames::read(
-            &backend,
+            &reader,
             &data,
             GpuOutputRequest::color(source.format(source.transfer, source.space))
                 .unwrap()
@@ -109,7 +110,7 @@ fn hdr_rgb_xyb_stills_and_sequences_match_native_and_scalar_icc_profiles() {
                         .with_icc_rendering_intent(intent)
                         .with_alpha_output_policy(AlphaOutputPolicy::Preserve);
                     let actual =
-                        frames::read(&backend, &data, request, planar, case.channels + 1, bounded);
+                        frames::read(&reader, &data, request, planar, case.channels + 1, bounded);
                     assert_eq!(actual.len(), case.frames);
                     presentations += actual.len();
                     for (frame, pixels) in actual.iter().enumerate() {

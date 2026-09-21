@@ -17,6 +17,7 @@ fn lf_patch_features_match_native_and_preserve_progressive_images() {
 
 fn check_features(lf: bool) {
     let backend = backend();
+    let decoders = decoders(&backend, NonZeroU64::new(256).unwrap());
     for family in corpus::FAMILIES.iter().filter(|family| family.lf == lf) {
         let original = inventory(&encoded(&format!("../{}", family.source)));
         let patched = reference(&format!("features/{}", family.name));
@@ -57,6 +58,7 @@ fn check_features(lf: bool) {
             );
             check_image(
                 &backend,
+                &decoders,
                 &name,
                 &data,
                 ImageReferences {
@@ -126,6 +128,7 @@ fn compare_color(
 
 pub(super) fn check_image(
     backend: &WgpuBackend,
+    decoders: &[GpuDecoder<WgpuDecodeEngine>; 2],
     name: &str,
     data: &[u8],
     references: ImageReferences<'_>,
@@ -168,15 +171,10 @@ pub(super) fn check_image(
             }
         }
         let mut baseline = None;
-        for limit in [None, NonZeroU64::new(256)] {
-            let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-            if let Some(limit) = limit {
-                engine = engine.with_stream_window_limit(limit);
-            }
-            let decoder = GpuDecoder::new(engine);
+        for (limit, decoder) in [None, NonZeroU64::new(256)].into_iter().zip(decoders) {
             let request = color_request(linear).with_orientation_policy(OrientationPolicy::Keep);
             let mut session = if limit.is_some() {
-                planes::open_fragmented(&decoder, data, request.clone())
+                planes::open_fragmented(decoder, data, request.clone())
             } else {
                 decoder.open(data, request.clone()).unwrap()
             };
@@ -251,11 +249,7 @@ pub(super) fn check_image(
             );
         }
     }
-    let decoder = GpuDecoder::new(
-        WgpuDecodeEngine::new(backend.clone())
-            .unwrap()
-            .with_stream_window_limit(NonZeroU64::new(256).unwrap()),
-    );
+    let decoder = &decoders[1];
     for (channel, extra) in info.image_header.extra_channels.iter().enumerate() {
         let mapping = match extra.bit_depth {
             jxl_gpu_bitstream::SampleBitDepth::Integer { .. } => {
@@ -271,7 +265,7 @@ pub(super) fn check_image(
         .with_extra_channel(channel as u32)
         .unwrap()
         .with_orientation_policy(OrientationPolicy::Keep);
-        let mut session = planes::open_fragmented(&decoder, data, request);
+        let mut session = planes::open_fragmented(decoder, data, request);
         let image = pollster::block_on(session.next_frame_async())
             .unwrap()
             .unwrap();
@@ -294,6 +288,7 @@ pub(super) fn check_image(
 #[test]
 fn patch_extra_resampling_mismatch_is_malformed_before_gpu_admission() {
     let backend = backend();
+    let decoders = decoders(&backend, NonZeroU64::new(256).unwrap());
     for (name, lf) in [
         ("extras_resampled_color", false),
         ("vardct_extras_resampled_color", false),
@@ -314,12 +309,7 @@ fn patch_extra_resampling_mismatch_is_malformed_before_gpu_admission() {
             .unwrap();
         let expected_extra_factor = invalid.extra_channel_upsampling[0];
         assert_ne!(expected_extra_factor, invalid.upsampling);
-        for limit in [None, NonZeroU64::new(256)] {
-            let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-            if let Some(limit) = limit {
-                engine = engine.with_stream_window_limit(limit);
-            }
-            let decoder = GpuDecoder::new(engine);
+        for decoder in &decoders {
             let Err(error) = decoder.open(&data, color_request(true)) else {
                 panic!("mismatched patch extra resampling was admitted: {name}");
             };

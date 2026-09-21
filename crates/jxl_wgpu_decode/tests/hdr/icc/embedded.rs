@@ -4,6 +4,7 @@ use super::*;
 fn embedded_rgb_gray_icc_and_xyb_output_hdr_against_independent_linear_references() {
     use jxl_test_support::fixtures::embedded_icc as embedded;
     let backend = backend();
+    let reader = frames::FrameReader::new(&backend);
     for case in embedded::cases() {
         let data = case.bytes();
         let inventory = jxl_gpu_bitstream::parse(&data, Default::default())
@@ -53,7 +54,7 @@ fn embedded_rgb_gray_icc_and_xyb_output_hdr_against_independent_linear_reference
                             let request = GpuOutputRequest::color(format.clone())
                                 .unwrap()
                                 .with_alpha_output_policy(AlphaOutputPolicy::Preserve);
-                            let actual = frames::read(&backend, &data, request, planar, 4, bounded);
+                            let actual = frames::read(&reader, &data, request, planar, 4, bounded);
                             assert_eq!(actual.len(), 1);
                             for (p, pixel) in actual[0].as_chunks::<4>().0.iter().enumerate() {
                                 let original =

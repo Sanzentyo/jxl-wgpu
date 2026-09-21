@@ -85,6 +85,7 @@ pub(super) fn drain(backend: &WgpuBackend, retained: u64) {
 #[test]
 fn patch_passes_match_native_prefixes_and_keep_owned_presentations_immutable() {
     let backend = backend();
+    let decoders = decoders(&backend, NonZeroU64::new(256).unwrap());
     for family in ["vardct", "gray", "modular", "float"] {
         for suffix in ["", "_empty"] {
             let name = format!("{family}{suffix}");
@@ -99,15 +100,10 @@ fn patch_passes_match_native_prefixes_and_keep_owned_presentations_immutable() {
                 &[false][..]
             } {
                 let mut whole = None;
-                for limit in [None, NonZeroU64::new(256)] {
-                    let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-                    if let Some(limit) = limit {
-                        engine = engine.with_stream_window_limit(limit);
-                    }
-                    let decoder = GpuDecoder::new(engine);
+                for (limit, decoder) in [None, NonZeroU64::new(256)].into_iter().zip(&decoders) {
                     let request = color_request(*linear);
                     let mut session = if limit.is_some() {
-                        planes::open_fragmented(&decoder, &data, request.clone())
+                        planes::open_fragmented(decoder, &data, request.clone())
                     } else {
                         decoder.open(&data, request.clone()).unwrap()
                     };
@@ -196,17 +192,13 @@ fn patch_passes_match_native_prefixes_and_keep_owned_presentations_immutable() {
 #[test]
 fn patch_extra_channel_passes_match_native_scalar_planes() {
     let backend = backend();
+    let decoder = decoder_with_limit(&backend, NonZeroU64::new(256));
     for name in ["vardct", "float"] {
         let data = encoded(&format!("progressive/{name}"));
         let inventory = inventory(&data);
         let image = &inventory.image_header;
         let expected = stages(name, &inventory);
         let pixel_count = image.width as usize * image.height as usize;
-        let decoder = GpuDecoder::new(
-            WgpuDecodeEngine::new(backend.clone())
-                .unwrap()
-                .with_stream_window_limit(NonZeroU64::new(256).unwrap()),
-        );
         for (channel, extra) in image.extra_channels.iter().enumerate() {
             let request = GpuOutputRequest::numeric(
                 jxl_gpu_formats::vpi::VpiPitchLinearFormat::F32.pixel_format(),

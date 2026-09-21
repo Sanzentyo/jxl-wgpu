@@ -19,6 +19,7 @@ fn modular_ycbcr_component_references_match_native_with_bounded_progression() {
 
 fn check_references(family: Family) {
     let backend = backend();
+    let decoders = decoders(&backend, NonZeroU64::new(256).unwrap());
     for case in corpus::cases()
         .into_iter()
         .filter(|case| case.family == family)
@@ -61,6 +62,7 @@ fn check_references(family: Family) {
             .map(|_| reference(&format!("{name}.srgb")));
         features::check_image(
             &backend,
+            &decoders,
             &name,
             &data,
             features::ImageReferences {
@@ -121,6 +123,7 @@ fn subsampled_patches_reject_references_saved_after_color_conversion() {
 #[test]
 fn jpeg_patch_destinations_cannot_cross_the_padded_component_extent() {
     let backend = backend();
+    let decoders = decoders(&backend, NonZeroU64::new(256).unwrap());
     // Expected padded extents include raw-factor alignment for equal nonzero selectors.
     for (selectors, width, height) in [
         ("000", 264, 24),
@@ -136,14 +139,9 @@ fn jpeg_patch_destinations_cannot_cross_the_padded_component_extent() {
         for [x, y] in [[width - 1, 0], [0, height - 1]] {
             let values = vec![1, 3, 0, 0, 1, 1, 0, x, y, 1];
             let data = fixtures::assemble(&original, &values);
-            for limit in [None, NonZeroU64::new(256)] {
-                let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-                if let Some(limit) = limit {
-                    engine = engine.with_stream_window_limit(limit);
-                }
-                let decoder = GpuDecoder::new(engine);
+            for (limit, decoder) in [None, NonZeroU64::new(256)].into_iter().zip(&decoders) {
                 let mut session = if limit.is_some() {
-                    planes::open_fragmented(&decoder, &data, request())
+                    planes::open_fragmented(decoder, &data, request())
                 } else {
                     decoder.open(&data, request()).unwrap()
                 };

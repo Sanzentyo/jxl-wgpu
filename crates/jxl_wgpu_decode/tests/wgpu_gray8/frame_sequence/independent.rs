@@ -127,6 +127,7 @@ fn overwritten_modular_vardct_and_lf_entropy_is_validated_before_presentation() 
     let Some(backend) = backend() else {
         return;
     };
+    let decoders = decoders(&backend, [None, NonZeroU64::new(4096)]);
     for case in cases()
         .into_iter()
         .filter(|case| matches!(case.name, "layered_still" | "vardct_rgb" | "vardct_dc"))
@@ -168,17 +169,11 @@ fn overwritten_modular_vardct_and_lf_entropy_is_validated_before_presentation() 
                 plan,
                 "entropy truncation preserves the complete frame plan"
             );
-            for bounded in [false, true] {
+            for (bounded, decoder) in [false, true].into_iter().zip(&decoders) {
                 eprintln!("reject {} physical {index}, bounded={bounded}", case.name);
-                let engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-                let decoder = GpuDecoder::new(if bounded {
-                    engine.with_stream_window_limit(NonZeroU64::new(4096).unwrap())
-                } else {
-                    engine
-                });
                 let mut session = if bounded {
                     incremental(
-                        &decoder,
+                        decoder,
                         &invalid,
                         request(&case).with_progressive_output(true),
                     )
@@ -230,6 +225,7 @@ fn native_31_bit_layers_reuse_one_producer_budget_and_count_every_submission() {
     let Some(backend) = backend() else {
         return;
     };
+    let decoders = decoders(&backend, [None, NonZeroU64::new(256)]);
     for count in [2, 17, 129] {
         let (data, expected) = native_layers(count);
         assert!(expected.iter().any(|&word| word != word as f32 as u32));
@@ -242,15 +238,9 @@ fn native_31_bit_layers_reuse_one_producer_budget_and_count_every_submission() {
             NumericSampleMapping::NativeUnsigned,
         )
         .unwrap();
-        for bounded in [false, true] {
-            let engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-            let decoder = GpuDecoder::new(if bounded {
-                engine.with_stream_window_limit(NonZeroU64::new(256).unwrap())
-            } else {
-                engine
-            });
+        for (bounded, decoder) in [false, true].into_iter().zip(&decoders) {
             let mut session = if bounded {
-                incremental(&decoder, &data, request.clone())
+                incremental(decoder, &data, request.clone())
             } else {
                 decoder.open(&data, request.clone()).unwrap()
             };

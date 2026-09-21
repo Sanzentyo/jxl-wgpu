@@ -57,6 +57,7 @@ pub(super) fn integer_error(bytes: &[u8], values: &[f64], bits: u32) {
 #[test]
 fn lf_native_wide_extras_and_cancellation_keep_exact_ownership() {
     let Some(backend) = backend() else { return };
+    let decoder = decoder_with_limit(&backend, NonZeroU64::new(256));
     for (name, levels) in cases().into_iter().filter(|(name, _)| {
         name.starts_with("integer_associated") || name.starts_with("resampled_associated")
     }) {
@@ -64,11 +65,6 @@ fn lf_native_wide_extras_and_cancellation_keep_exact_ownership() {
             let Some(check) = Check::new(&name, levels, composed) else {
                 return;
             };
-            let decoder = GpuDecoder::new(
-                WgpuDecodeEngine::new(backend.clone())
-                    .unwrap()
-                    .with_stream_window_limit(NonZeroU64::new(256).unwrap()),
-            );
             for extra in 0..2 {
                 let SampleBitDepth::Integer { bits_per_sample } =
                     check.image.extra_channels[extra].bit_depth
@@ -146,15 +142,28 @@ fn lf_native_wide_extras_and_cancellation_keep_exact_ownership() {
 #[test]
 fn lf_deep_and_floating_corruption_cannot_publish_unvalidated_images() {
     let Some(backend) = backend() else { return };
+    let decoder = decoder_with_limit(&backend, NonZeroU64::new(256));
     for (name, levels) in cases()
         .into_iter()
         .filter(|(name, _)| name.starts_with("integer_associated") || name.starts_with("floating_"))
     {
-        reject_corruption(&backend, &name, levels, &fixture(&name, ".composed"));
+        reject_corruption(
+            &backend,
+            &decoder,
+            &name,
+            levels,
+            &fixture(&name, ".composed"),
+        );
     }
 }
 
-pub(super) fn reject_corruption(backend: &WgpuBackend, name: &str, levels: u8, encoded: &[u8]) {
+pub(super) fn reject_corruption(
+    backend: &WgpuBackend,
+    decoder: &GpuDecoder<WgpuDecodeEngine>,
+    name: &str,
+    levels: u8,
+    encoded: &[u8],
+) {
     let inventory = parse(encoded, Default::default())
         .unwrap()
         .codestream_inventory(Default::default())
@@ -181,14 +190,9 @@ pub(super) fn reject_corruption(backend: &WgpuBackend, name: &str, levels: u8, e
             .unwrap()
             .codestream_inventory(Default::default())
             .unwrap();
-        let decoder = GpuDecoder::new(
-            WgpuDecodeEngine::new(backend.clone())
-                .unwrap()
-                .with_stream_window_limit(NonZeroU64::new(256).unwrap()),
-        );
         for extra in [None, Some(1)] {
             let mut session = incremental(
-                &decoder,
+                decoder,
                 &corrupt,
                 request(&inventory.image_header, extra).with_progressive_output(true),
             );
@@ -224,7 +228,7 @@ pub(super) fn reject_corruption(backend: &WgpuBackend, name: &str, levels: u8, e
                 }
             );
             drop(session);
-            released(backend, &decoder, held);
+            released(backend, decoder, held);
         }
     }
 }

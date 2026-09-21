@@ -16,6 +16,7 @@ fn floating_composition_packs_only_after_blending_and_orientation() {
     let Some(backend) = backend() else {
         return;
     };
+    let decoder = decoder_with_limit(&backend, NonZeroU64::new(4096));
     for case in composition_cases() {
         let bytes = encoded(&case);
         let inventory = parse(&bytes, Default::default())
@@ -48,11 +49,6 @@ fn floating_composition_packs_only_after_blending_and_orientation() {
             ))
             .unwrap()
             .with_orientation_policy(orientation);
-            let decoder = GpuDecoder::new(
-                WgpuDecodeEngine::new(backend.clone())
-                    .unwrap()
-                    .with_stream_window_limit(NonZeroU64::new(4096).unwrap()),
-            );
             let mut session = incremental(&decoder, &bytes, request);
             for (index, expected) in original.iter().enumerate() {
                 let frame = pollster::block_on(session.next_frame_async())
@@ -184,16 +180,12 @@ fn composition_admission_dependencies_and_cancellation_release_owned_bytes() {
     let Some(backend) = backend() else {
         return;
     };
+    let decoder = decoder_with_limit(&backend, NonZeroU64::new(4096));
     for case in composition_cases()
         .into_iter()
         .filter(|case| matches!(case.name, "rgba16" | "vardct_dc" | "mixed"))
     {
         let bytes = encoded(&case);
-        let decoder = GpuDecoder::new(
-            WgpuDecodeEngine::new(backend.clone())
-                .unwrap()
-                .with_stream_window_limit(NonZeroU64::new(4096).unwrap()),
-        );
         let mut session = incremental(&decoder, &bytes, request(&case));
         let memory = backend.transient_memory_budget();
         let guard = memory

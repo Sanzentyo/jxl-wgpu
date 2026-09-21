@@ -13,6 +13,7 @@ use std::path::Path;
 #[test]
 fn embedded_icc_and_xyb_tone_mapping_reach_enumerated_display_light() {
     let backend = backend();
+    let reader = frames::FrameReader::new(&backend);
     for case in jxl_test_support::fixtures::embedded_icc::cases() {
         let data = case.bytes();
         let image = jxl_gpu_bitstream::parse(&data, Default::default())
@@ -57,7 +58,7 @@ fn embedded_icc_and_xyb_tone_mapping_reach_enumerated_display_light() {
                 .unwrap()
                 .with_alpha_output_policy(AlphaOutputPolicy::Preserve)
                 .with_tone_mapping(LuminanceRange::new(0.0, 80.0).unwrap());
-                let actual = frames::read(&backend, &data, request, planar, 4, bounded);
+                let actual = frames::read(&reader, &data, request, planar, 4, bounded);
                 assert_eq!(actual.len(), 1);
                 for (p, pixel) in actual[0].as_chunks::<4>().0.iter().enumerate() {
                     let original = [reference[p * 4], reference[p * 4 + 1], reference[p * 4 + 2]]
@@ -102,6 +103,7 @@ fn embedded_icc_and_xyb_tone_mapping_reach_enumerated_display_light() {
 #[test]
 fn image_tone_metadata_maps_hdr_and_icc_presentation_after_composition() {
     let backend = backend();
+    let reader = frames::FrameReader::new(&backend);
     let identity = IccProfile::parse(
         std::fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -130,7 +132,7 @@ fn image_tone_metadata_maps_hdr_and_icc_presentation_after_composition() {
         let display_black = if index % 4 == 1 { 0.03125 } else { 0.0 };
         let target = LuminanceRange::new(display_black, 80.0).unwrap();
         let original = frames::read(
-            &backend,
+            &reader,
             &data,
             GpuOutputRequest::color(case.format(case.transfer, case.space))
                 .unwrap()
@@ -192,7 +194,7 @@ fn image_tone_metadata_maps_hdr_and_icc_presentation_after_composition() {
                         .unwrap()
                         .with_alpha_output_policy(AlphaOutputPolicy::Preserve)
                         .with_tone_mapping(target);
-                    let actual = frames::read(&backend, &data, request, planar, 4, bounded);
+                    let actual = frames::read(&reader, &data, request, planar, 4, bounded);
                     assert_eq!(actual.len(), case.frame_count());
                     for (frame, pixels) in actual.iter().enumerate() {
                         for (p, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {

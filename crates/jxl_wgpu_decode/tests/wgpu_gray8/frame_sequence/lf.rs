@@ -8,6 +8,7 @@ fn overwritten_unused_lf_roots_are_validated_in_both_sequence_paths() {
     let Some(backend) = backend() else {
         return;
     };
+    let decoder = decoder_with_limit(&backend, None);
     for case in cases()
         .into_iter()
         .chain(composition_cases())
@@ -49,7 +50,6 @@ fn overwritten_unused_lf_roots_are_validated_in_both_sequence_paths() {
         assert_eq!(checked.frames.len(), inventory.frames.len() + 1);
         assert_eq!(rust_frames(&case, &valid), rust_frames(&case, &original));
         assert_eq!(djxl_frames(&case, &valid), djxl_frames(&case, &original));
-        let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
         let mut session = decoder
             .open(&invalid, request(&case).with_progressive_output(true))
             .unwrap();
@@ -104,16 +104,12 @@ fn lf_versions_are_reused_across_presentations_and_released_after_the_last_consu
     let Some(backend) = backend() else {
         return;
     };
+    let decoders = decoders(&backend, [None, NonZeroU64::new(4096)]);
     for (bounded, progressive) in [(false, false), (true, false), (false, true), (true, true)] {
-        let engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-        let decoder = GpuDecoder::new(if bounded {
-            engine.with_stream_window_limit(NonZeroU64::new(4096).unwrap())
-        } else {
-            engine
-        });
+        let decoder = &decoders[usize::from(bounded)];
         let mut session = if bounded {
             incremental(
-                &decoder,
+                decoder,
                 &reused,
                 request(&case).with_progressive_output(progressive),
             )
@@ -536,6 +532,7 @@ fn vardct_lf_roots_and_skip_progressive_consumers_match_both_reference_decoders(
     let Some(backend) = backend() else {
         return;
     };
+    let decoders = decoders(&backend, [None, NonZeroU64::new(256)]);
     for (gaborish, upsampling) in [(false, 1), (true, 1), (true, 2)] {
         let root = vardct_root(gaborish, upsampling);
         for unused in [false, true] {
@@ -565,15 +562,9 @@ fn vardct_lf_roots_and_skip_progressive_consumers_match_both_reference_decoders(
             assert_eq!(plan.nodes[0].lf_last_use.is_none(), unused);
             let expected = rust_frames(&case, &modified);
             let djxl = djxl_frames(&case, &modified);
-            for bounded in [false, true] {
-                let engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-                let decoder = GpuDecoder::new(if bounded {
-                    engine.with_stream_window_limit(NonZeroU64::new(256).unwrap())
-                } else {
-                    engine
-                });
+            for (bounded, decoder) in [false, true].into_iter().zip(&decoders) {
                 let mut session = if bounded {
-                    incremental(&decoder, &modified, request(&case))
+                    incremental(decoder, &modified, request(&case))
                 } else {
                     decoder.open(&modified, request(&case)).unwrap()
                 };
@@ -622,6 +613,7 @@ fn modular_lf_restoration_and_upsampling_match_both_reference_decoders() {
     let Some(backend) = backend() else {
         return;
     };
+    let decoders = decoders(&backend, [None, NonZeroU64::new(256)]);
     let parsed = parse(&original, Default::default()).unwrap();
     let inventory = parsed.codestream_inventory(Default::default()).unwrap();
     let data = parsed.codestream();
@@ -685,15 +677,9 @@ fn modular_lf_restoration_and_upsampling_match_both_reference_decoders() {
             );
         }
         previous = Some(expected[0].1.clone());
-        for bounded in [false, true] {
-            let engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-            let decoder = GpuDecoder::new(if bounded {
-                engine.with_stream_window_limit(NonZeroU64::new(256).unwrap())
-            } else {
-                engine
-            });
+        for (bounded, decoder) in [false, true].into_iter().zip(&decoders) {
             let mut session = if bounded {
-                incremental(&decoder, &modified, request(&case))
+                incremental(decoder, &modified, request(&case))
             } else {
                 decoder.open(&modified, request(&case)).unwrap()
             };

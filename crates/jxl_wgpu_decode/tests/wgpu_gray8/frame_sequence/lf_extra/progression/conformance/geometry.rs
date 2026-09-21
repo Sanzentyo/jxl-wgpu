@@ -20,6 +20,7 @@ fn cases() -> Vec<(String, u8)> {
 #[test]
 fn lf_intrinsic_shifts_and_signed_samples_match_native_and_composed_outputs() {
     let Some(backend) = backend() else { return };
+    let decoders = decoders(&backend, [None, NonZeroU64::new(256)]);
     for (name, levels) in cases() {
         for composed in [false, true] {
             let Some(check) = Check::from_directory(&directory(), &name, levels, composed) else {
@@ -40,6 +41,7 @@ fn lf_intrinsic_shifts_and_signed_samples_match_native_and_composed_outputs() {
                 for extra in [None, Some(0), Some(1)] {
                     let outputs = check.run(
                         &backend,
+                        &decoders,
                         bounded,
                         orientation,
                         extra,
@@ -54,7 +56,8 @@ fn lf_intrinsic_shifts_and_signed_samples_match_native_and_composed_outputs() {
                         AlphaOutputPolicy::Associated,
                         AlphaOutputPolicy::Unassociated,
                     ] {
-                        let converted = check.run(&backend, true, orientation, None, policy);
+                        let converted =
+                            check.run(&backend, &decoders, true, orientation, None, policy);
                         check.check_policy(&preserved, &converted, policy);
                     }
                 }
@@ -158,6 +161,7 @@ fn cropped(name: &str, levels: u8, suffix: &str, origin: [i32; 2]) -> Option<Che
 #[test]
 fn lf_cropped_consumers_keep_local_prediction_and_signed_canvas_placement() {
     let Some(backend) = backend() else { return };
+    let decoders = decoders(&backend, [None, NonZeroU64::new(256)]);
     for (name, levels) in cases() {
         for (suffix, origin) in [(".crop_left", [-3, 5]), (".crop_top", [5, -3])] {
             let Some(check) = cropped(&name, levels, suffix, origin) else {
@@ -167,6 +171,7 @@ fn lf_cropped_consumers_keep_local_prediction_and_signed_canvas_placement() {
                 for extra in [None, Some(0), Some(1)] {
                     check.run(
                         &backend,
+                        &decoders,
                         bounded,
                         if bounded {
                             OrientationPolicy::Apply
@@ -185,17 +190,13 @@ fn lf_cropped_consumers_keep_local_prediction_and_signed_canvas_placement() {
 #[test]
 fn lf_cropped_native_samples_survive_cancellation_and_final_only_drain() {
     let Some(backend) = backend() else { return };
+    let decoder = decoder_with_limit(&backend, NonZeroU64::new(40));
     for (name, levels) in cases().into_iter().filter(|(name, _)| {
         name.starts_with("shifted_integer_") || name.starts_with("signed_float_")
     }) {
         let Some(check) = cropped(&name, levels, ".crop_left", [-3, 5]) else {
             return;
         };
-        let decoder = GpuDecoder::new(
-            WgpuDecodeEngine::new(backend.clone())
-                .unwrap()
-                .with_stream_window_limit(NonZeroU64::new(40).unwrap()),
-        );
         for extra in 0..2 {
             let depth = check.image.extra_channels[extra].bit_depth;
             let request = match depth {
@@ -277,9 +278,11 @@ fn lf_cropped_native_samples_survive_cancellation_and_final_only_drain() {
 #[test]
 fn lf_cropped_and_shifted_corruption_keeps_validated_outputs_alive() {
     let Some(backend) = backend() else { return };
+    let decoder = decoder_with_limit(&backend, NonZeroU64::new(256));
     for (name, levels) in cases() {
         lifecycle::reject_corruption(
             &backend,
+            &decoder,
             &name,
             levels,
             &fixture_from(&directory(), &name, ".crop_top"),

@@ -179,6 +179,7 @@ fn reference_only_frames_save_slot_three_without_a_presentation() {
     let Some(backend) = backend() else {
         return;
     };
+    let decoder = decoder_with_limit(&backend, NonZeroU64::new(4096));
     for case in composition_cases()
         .into_iter()
         .filter(|case| matches!(case.name, "gray" | "rgba16"))
@@ -195,11 +196,6 @@ fn reference_only_frames_save_slot_three_without_a_presentation() {
         assert_eq!(plan.presentations[0].physical_frames, 0..3);
         let expected = rust_float_frames(&bytes, case.format);
         let djxl = djxl_frames(&case, &bytes);
-        let decoder = GpuDecoder::new(
-            WgpuDecodeEngine::new(backend.clone())
-                .unwrap()
-                .with_stream_window_limit(NonZeroU64::new(4096).unwrap()),
-        );
         let mut session = incremental(&decoder, &bytes, request(&case));
         for (index, oracle) in expected.iter().enumerate() {
             let frame = pollster::block_on(session.next_frame_async())

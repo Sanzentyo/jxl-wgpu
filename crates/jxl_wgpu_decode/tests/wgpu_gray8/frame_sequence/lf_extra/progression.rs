@@ -117,6 +117,7 @@ mod conformance;
 #[test]
 fn lf_presentations_preserve_alpha_and_numeric_extras_and_final_bytes() {
     let Some(backend) = backend() else { return };
+    let decoders = decoders(&backend, [None, NonZeroU64::new(40)]);
     for (name, hex, _) in fixtures() {
         let data = data(hex);
         let inventory = parse(&data, Default::default())
@@ -129,12 +130,7 @@ fn lf_presentations_preserve_alpha_and_numeric_extras_and_final_bytes() {
             .filter(|f| f.frame_type == FrameType::LowFrequency)
             .map(|f| expected(name, f.lf_level as u8, &inventory.image_header))
             .collect();
-        for bounded in [false, true] {
-            let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-            if bounded {
-                engine = engine.with_stream_window_limit(NonZeroU64::new(40).unwrap());
-            }
-            let decoder = GpuDecoder::new(engine);
+        for (bounded, decoder) in [false, true].into_iter().zip(&decoders) {
             for extra in [None, Some(0), Some(1)] {
                 let request =
                     output_request(extra).with_max_frame_slots(NonZeroUsize::new(1).unwrap());
@@ -145,7 +141,7 @@ fn lf_presentations_preserve_alpha_and_numeric_extras_and_final_bytes() {
                 drop(baseline);
                 let request = request.with_progressive_output(true);
                 let mut session = if bounded {
-                    incremental(&decoder, &data, request)
+                    incremental(decoder, &data, request)
                 } else {
                     decoder.open(&data, request).unwrap()
                 };
@@ -258,6 +254,7 @@ fn compose(planes: &mut [Vec<f64>; 5], background: &[f32]) {
 #[test]
 fn composed_lf_extras_wait_for_background_and_preserve_all_output_planes() {
     let Some(backend) = backend() else { return };
+    let decoders = decoders(&backend, [None, NonZeroU64::new(40)]);
     for name in ["nested_modular_gab1", "nested_vardct_gab1"] {
         let data = fixture_file(name, "composed");
         let inventory = parse(&data, Default::default())
@@ -316,12 +313,7 @@ fn composed_lf_extras_wait_for_background_and_preserve_all_output_planes() {
         }
 
         let pixels = inventory.image_header.width as usize * inventory.image_header.height as usize;
-        for bounded in [false, true] {
-            let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-            if bounded {
-                engine = engine.with_stream_window_limit(NonZeroU64::new(40).unwrap());
-            }
-            let decoder = GpuDecoder::new(engine);
+        for (bounded, decoder) in [false, true].into_iter().zip(&decoders) {
             for extra in [None, Some(0), Some(1)] {
                 for native in [false, true] {
                     if native && extra.is_none() {
@@ -360,7 +352,7 @@ fn composed_lf_extras_wait_for_background_and_preserve_all_output_planes() {
                         assert!(error <= 5e-4, "{name} final extra={extra:?}: {error}");
                     }
                     let mut session =
-                        incremental(&decoder, &data, request.with_progressive_output(true));
+                        incremental(decoder, &data, request.with_progressive_output(true));
                     let mut lf = 0;
                     let mut finals = 0;
                     while let Some(update) =
@@ -424,6 +416,7 @@ fn composed_lf_extras_wait_for_background_and_preserve_all_output_planes() {
 #[test]
 fn lf_extra_updates_cancel_or_switch_to_blocking_and_async_final_without_leaks() {
     let Some(backend) = backend() else { return };
+    let decoder = decoder_with_limit(&backend, NonZeroU64::new(40));
     for (name, hex, _) in fixtures()
         .into_iter()
         .filter(|(name, _, _)| name.starts_with("nested"))
@@ -434,11 +427,6 @@ fn lf_extra_updates_cancel_or_switch_to_blocking_and_async_final_without_leaks()
             } else {
                 data(hex)
             };
-            let decoder = GpuDecoder::new(
-                WgpuDecodeEngine::new(backend.clone())
-                    .unwrap()
-                    .with_stream_window_limit(NonZeroU64::new(40).unwrap()),
-            );
             for extra in [None, Some(1)] {
                 let request =
                     output_request(extra).with_max_frame_slots(NonZeroUsize::new(1).unwrap());
@@ -525,6 +513,7 @@ fn lf_extra_updates_cancel_or_switch_to_blocking_and_async_final_without_leaks()
 #[test]
 fn corrupt_lf_extras_and_late_backgrounds_cannot_publish_unvalidated_previews() {
     let Some(backend) = backend() else { return };
+    let decoder = decoder_with_limit(&backend, NonZeroU64::new(40));
     for name in ["nested_modular_gab1", "nested_vardct_gab1"] {
         let data = fixture_file(name, "composed");
         let inventory = parse(&data, Default::default())
@@ -546,11 +535,6 @@ fn corrupt_lf_extras_and_late_backgrounds_cannot_publish_unvalidated_previews() 
                 .unwrap()
                 .codestream_inventory(Default::default())
                 .unwrap();
-            let decoder = GpuDecoder::new(
-                WgpuDecodeEngine::new(backend.clone())
-                    .unwrap()
-                    .with_stream_window_limit(NonZeroU64::new(40).unwrap()),
-            );
             for extra in [None, Some(1)] {
                 let mut session = incremental(
                     &decoder,

@@ -3,25 +3,47 @@ use jxl_wgpu::WgpuBackend;
 use jxl_wgpu_decode::{GpuDecoder, GpuOutputRequest, WgpuDecodeEngine};
 use std::num::{NonZeroU64, NonZeroUsize};
 
+pub(super) struct FrameReader<'a> {
+    backend: &'a WgpuBackend,
+    decoders: [GpuDecoder<WgpuDecodeEngine>; 2],
+}
+
+impl<'a> FrameReader<'a> {
+    pub(super) fn new(backend: &'a WgpuBackend) -> Self {
+        Self {
+            backend,
+            decoders: [
+                GpuDecoder::new(WgpuDecodeEngine::new(backend.clone()).unwrap()),
+                GpuDecoder::new(
+                    WgpuDecodeEngine::new(backend.clone())
+                        .unwrap()
+                        .with_stream_window_limit(NonZeroU64::new(256).unwrap()),
+                ),
+            ],
+        }
+    }
+
+    pub(super) fn decoder(&self, bounded: bool) -> &GpuDecoder<WgpuDecodeEngine> {
+        &self.decoders[usize::from(bounded)]
+    }
+}
+
 pub(super) fn read(
-    backend: &WgpuBackend,
+    reader: &FrameReader<'_>,
     data: &[u8],
     request: GpuOutputRequest,
     planar: bool,
     channels: usize,
     bounded: bool,
 ) -> Vec<Vec<u32>> {
-    let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-    if bounded {
-        engine = engine.with_stream_window_limit(NonZeroU64::new(256).unwrap());
-    }
-    let decoder = GpuDecoder::new(engine);
+    let backend = reader.backend;
+    let decoder = reader.decoder(bounded);
     let format = request.format().clone();
     let request = request
         .with_progressive_output(!planar)
         .with_max_frame_slots(NonZeroUsize::new(64).unwrap());
     let mut session = if bounded {
-        planes::open_fragmented(&decoder, data, request)
+        planes::open_fragmented(decoder, data, request)
     } else {
         decoder.open(data, request).unwrap()
     };

@@ -4,6 +4,10 @@ use std::num::NonZeroUsize;
 #[test]
 fn subsampled_passes_match_native_prefixes_and_keep_held_images_immutable() {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
+    let decoders = [
+        decoder_with_limit(&backend, None),
+        decoder_with_limit(&backend, NonZeroU64::new(40)),
+    ];
     for case in modular_ycbcr::cases()
         .into_iter()
         .filter(|case| case.passes > 1)
@@ -27,13 +31,8 @@ fn subsampled_passes_match_native_prefixes_and_keep_held_images_immutable() {
             .with_progressive_output(true)
             .with_max_frame_slots(NonZeroUsize::new(1).unwrap());
             let mut prior = None;
-            for limit in [None, NonZeroU64::new(40)] {
-                let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-                if let Some(limit) = limit {
-                    engine = engine.with_stream_window_limit(limit);
-                }
-                let decoder = GpuDecoder::new(engine);
-                let mut session = planes::open_fragmented(&decoder, &bytes, request.clone());
+            for decoder in &decoders {
+                let mut session = planes::open_fragmented(decoder, &bytes, request.clone());
                 let mut held = Vec::new();
                 let mut outputs = Vec::new();
                 while let Some(update) = pollster::block_on(session.next_update_async()).unwrap() {
@@ -86,7 +85,7 @@ fn subsampled_passes_match_native_prefixes_and_keep_held_images_immutable() {
                     continue;
                 }
                 // Retaining the first update must not prevent final-only draining or alter it.
-                let mut session = planes::open_fragmented(&decoder, &bytes, request.clone());
+                let mut session = planes::open_fragmented(decoder, &bytes, request.clone());
                 let first = session.next_update().unwrap().unwrap();
                 let final_image = session.next_frame().unwrap().unwrap();
                 let actual = planes::read(&backend, &final_image.output().outputs[0]);
@@ -102,7 +101,7 @@ fn subsampled_passes_match_native_prefixes_and_keep_held_images_immutable() {
                 admission::drain(&backend, 0);
 
                 // Cancelling the producer after a published pass must preserve the held image.
-                let mut session = planes::open_fragmented(&decoder, &bytes, request.clone());
+                let mut session = planes::open_fragmented(decoder, &bytes, request.clone());
                 let first = session.next_update().unwrap().unwrap();
                 drop(session);
                 assert_eq!(

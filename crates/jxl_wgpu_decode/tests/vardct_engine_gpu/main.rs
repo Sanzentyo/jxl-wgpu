@@ -42,6 +42,21 @@ mod raw_matrix;
 
 static DJXL_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+fn decoder_with_window(backend: &WgpuBackend, cap: u64) -> GpuDecoder<WgpuDecodeEngine> {
+    GpuDecoder::new(
+        WgpuDecodeEngine::new(backend.clone())
+            .unwrap()
+            .with_stream_window_limit(NonZeroU64::new(cap).unwrap()),
+    )
+}
+
+fn decoders_with_windows<const N: usize>(
+    backend: &WgpuBackend,
+    caps: [u64; N],
+) -> [GpuDecoder<WgpuDecodeEngine>; N] {
+    caps.map(|cap| decoder_with_window(backend, cap))
+}
+
 fn open_incremental(
     decoder: &GpuDecoder<WgpuDecodeEngine>,
     encoded: &[u8],

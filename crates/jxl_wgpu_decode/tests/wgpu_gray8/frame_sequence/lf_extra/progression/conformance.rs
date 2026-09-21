@@ -322,16 +322,13 @@ impl Check {
     fn run(
         &self,
         backend: &WgpuBackend,
+        decoders: &[GpuDecoder<WgpuDecodeEngine>; 2],
         bounded: bool,
         orientation: OrientationPolicy,
         extra: Option<u32>,
         alpha: AlphaOutputPolicy,
     ) -> Vec<Vec<f32>> {
-        let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-        if bounded {
-            engine = engine.with_stream_window_limit(NonZeroU64::new(256).unwrap());
-        }
-        let decoder = GpuDecoder::new(engine);
+        let decoder = &decoders[usize::from(bounded)];
         let request = request(&self.image, extra)
             .with_alpha_output_policy(alpha)
             .with_orientation_policy(orientation)
@@ -354,7 +351,7 @@ impl Check {
         drop(final_only);
         let request = request.with_progressive_output(true);
         let mut session = if bounded {
-            incremental(&decoder, &self.encoded, request)
+            incremental(decoder, &self.encoded, request)
         } else {
             decoder.open(&self.encoded, request).unwrap()
         };
@@ -504,6 +501,7 @@ impl Check {
 #[test]
 fn lf_precision_association_resampling_and_all_dependency_levels_match_native_producers() {
     let Some(backend) = backend() else { return };
+    let decoders = decoders(&backend, [None, NonZeroU64::new(256)]);
     for (name, levels) in cases() {
         let Some(check) = Check::new(&name, levels, false) else {
             return;
@@ -512,6 +510,7 @@ fn lf_precision_association_resampling_and_all_dependency_levels_match_native_pr
             for extra in [None, Some(0), Some(1)] {
                 check.run(
                     &backend,
+                    &decoders,
                     bounded,
                     OrientationPolicy::Keep,
                     extra,
@@ -525,6 +524,7 @@ fn lf_precision_association_resampling_and_all_dependency_levels_match_native_pr
 #[test]
 fn lf_composition_orientation_and_alpha_policies_match_independent_layers() {
     let Some(backend) = backend() else { return };
+    let decoders = decoders(&backend, [None, NonZeroU64::new(256)]);
     for (name, levels) in cases() {
         let Some(check) = Check::new(&name, levels, true) else {
             return;
@@ -539,6 +539,7 @@ fn lf_composition_orientation_and_alpha_policies_match_independent_layers() {
             for extra in [None, Some(0), Some(1)] {
                 let result = check.run(
                     &backend,
+                    &decoders,
                     bounded,
                     orientation,
                     extra,
@@ -552,7 +553,7 @@ fn lf_composition_orientation_and_alpha_policies_match_independent_layers() {
                 AlphaOutputPolicy::Unassociated,
                 AlphaOutputPolicy::Associated,
             ] {
-                let result = check.run(&backend, bounded, orientation, None, alpha);
+                let result = check.run(&backend, &decoders, bounded, orientation, None, alpha);
                 check.check_policy(&preserved, &result, alpha);
             }
         }
@@ -562,6 +563,7 @@ fn lf_composition_orientation_and_alpha_policies_match_independent_layers() {
         for extra in [None, Some(0), Some(1)] {
             check.run(
                 &backend,
+                &decoders,
                 true,
                 OrientationPolicy::Apply,
                 extra,

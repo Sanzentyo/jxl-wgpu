@@ -167,6 +167,77 @@ and the other nine tests, are unchanged. The observed reduction is 60.79 seconds
 target. This single pair does not establish a portable speedup or a new whole-workspace timing;
 the full suite was not rerun for this test-setup-only change.
 
+### Modular YCbCr test reuse and concurrency (2026-09-21)
+
+The two `modular_ycbcr` case-matrix tests partition 474 streams. Before this change, each case
+constructed separate whole-input, 40-byte-window, and numeric-output GPU decoders: 1,422 engine
+constructions across the two tests. Each test now retains one decoder per mode across its cases,
+reducing those constructions to six. The progressive-output test similarly reuses its two
+window-policy decoders. Every case still opens fresh sessions, checks the same independent native
+samples and fragmented output, and asserts that completed output reservations are released.
+The admission/cancellation test and all case matrices and tolerances are unchanged.
+
+One before/after run per configuration on Apple M5 / Metal, macOS 26.6.2 (25G83), Rust 1.98.1
+and `wgpu` 30.0.1 used the normal `target/`, the optimized test profile, `CARGO_BUILD_JOBS=4`,
+and `JXL_REQUIRE_NATIVE_ORACLES=1`. Runs were sequential, with no other GPU test job running:
+
+```console
+cargo test --locked -p jxl_wgpu_decode --all-features --test modular_ycbcr -- --test-threads=N
+```
+
+| Setup | Threads | Wall time (s) | Result |
+| --- | ---: | ---: | --- |
+| `514eec9`, engines per case | 1 | 486.52 | 4 passed |
+| `514eec9`, engines per case | 2 | 408.63 | 4 passed |
+| `514eec9`, engines per case | 4 | 699.70 | 4 passed |
+| Engines reused within each test | 1 | 433.60 | 4 passed |
+| Engines reused within each test | 2 | 355.61 | 4 passed |
+| Engines reused within each test | 4 | >742.85 | Stopped after two passed; two still running |
+
+Wall times include Cargo's cached-build check; the first run of each setup rebuilt this target
+in about one second. Reuse saved about 53 seconds in each completed 1- and 2-thread comparison.
+The fastest completed run, reuse with two threads, was 130.91 seconds faster than the original
+serial run. Four threads were slower than serial before reuse; after reuse the run was manually
+terminated at 742.85 seconds, with no completed result or asserted test failure. This single run
+per configuration establishes neither repeatability nor a safe workspace-wide concurrency policy.
+The required serial GPU validation gate remains unchanged.
+
+### Decoder reuse in GPU conformance tests (2026-09-21)
+
+Fixed whole-input and bounded-window decoders are now reused across cases within the affected
+`patches`, `hdr`, `wgpu_gray8`, and `vardct_engine_gpu` test functions. For example, the 56-case
+HDR ICC profile matrix previously constructed 17 decoders per case and now retains two for the
+test. Each decode still opens a new session; the native references, output tolerances,
+malformed-input checks, retained-image comparisons, and budget assertions are unchanged.
+
+One post-change run per target used Apple M5 / Metal, macOS 26.6.2 (25G83), Rust 1.98.1,
+`wgpu` 30.0.1, the normal optimized test profile in `target/`, `CARGO_BUILD_JOBS=4`,
+`JXL_REQUIRE_NATIVE_ORACLES=1`, and `--test-threads=1`. Targets ran sequentially without another
+GPU test job. Dimensions and color/numeric formats vary by case and are defined in the
+[patch recipes](../tools/jxl_test_support/src/fixtures/patch_references.rs),
+[HDR corpus](../tools/jxl_test_support/src/fixtures/hdr.rs),
+[Gray8 test matrix](../crates/jxl_wgpu_decode/tests/wgpu_gray8/main.rs), and
+[VarDCT test matrix](../crates/jxl_wgpu_decode/tests/vardct_engine_gpu/main.rs).
+Every target writes GPU output buffers and explicitly reads them back for comparison. No separate
+warmup was run:
+
+```console
+cargo test --locked -p jxl_wgpu_decode --all-features --test TARGET -- --test-threads=1
+```
+
+| Target | Tests passed / ignored | Test execution (s) |
+| --- | ---: | ---: |
+| `patches` | 24 / 0 | 686.71 |
+| `hdr` | 11 / 0 | 151.02 |
+| `wgpu_gray8` | 79 / 0 | 1018.66 |
+| `vardct_engine_gpu` | 72 / 0 | 914.88 |
+
+These are libtest elapsed times, excluding Cargo compilation. This run validates the changed
+case matrices and ownership checks. There is no paired before/after run under the same conditions
+for these four targets, so these numbers do not establish a speedup. In particular, the
+`wgpu_gray8` result is longer than an earlier historical run and needs profiling before drawing
+a performance conclusion.
+
 ## Report lifecycle
 
 Checked-in tuning data must contain an adapter fingerprint and the codec profile, shader, format

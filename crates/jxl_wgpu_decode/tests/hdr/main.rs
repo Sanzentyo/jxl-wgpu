@@ -13,7 +13,7 @@ mod transfer;
 
 use jxl_test_support::gpu::planes;
 use jxl_wgpu::WgpuBackend;
-use jxl_wgpu_decode::{AlphaOutputPolicy, GpuDecoder, GpuOutputRequest, WgpuDecodeEngine};
+use jxl_wgpu_decode::{AlphaOutputPolicy, GpuOutputRequest};
 use std::num::{NonZeroU64, NonZeroUsize};
 
 fn backend() -> WgpuBackend {
@@ -41,6 +41,7 @@ fn compare(actual: &[u32], reference: &[f32], tolerance: f32, name: &str) {
 #[test]
 fn original_hdr_stills_and_composed_progression_match_native_whole_and_bounded() {
     let backend = backend();
+    let reader = frames::FrameReader::new(&backend);
     for case in corpus::cases() {
         eprintln!("HDR original {}", case.name);
         let data = case.bytes();
@@ -54,11 +55,7 @@ fn original_hdr_stills_and_composed_progression_match_native_whole_and_bounded()
         assert_eq!(reference.len(), case.frame_words() * case.frame_count());
         let mut baseline = None;
         for limit in [None, NonZeroU64::new(256)] {
-            let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-            if let Some(limit) = limit {
-                engine = engine.with_stream_window_limit(limit);
-            }
-            let decoder = GpuDecoder::new(engine);
+            let decoder = reader.decoder(limit.is_some());
             let request = GpuOutputRequest::color(case.format(case.transfer, case.space))
                 .unwrap()
                 .with_alpha_output_policy(AlphaOutputPolicy::Preserve)
@@ -74,7 +71,7 @@ fn original_hdr_stills_and_composed_progression_match_native_whole_and_bounded()
                 )
                 .with_progressive_output(true);
             let mut session = if limit.is_some() {
-                planes::open_fragmented(&decoder, &data, request)
+                planes::open_fragmented(decoder, &data, request)
             } else {
                 decoder.open(&data, request).unwrap()
             };
@@ -131,7 +128,7 @@ fn original_hdr_stills_and_composed_progression_match_native_whole_and_bounded()
                 0
             );
         }
-        let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+        let decoder = reader.decoder(false);
         let request = GpuOutputRequest::color(case.format(case.transfer, case.space))
             .unwrap()
             .with_alpha_output_policy(AlphaOutputPolicy::Preserve);

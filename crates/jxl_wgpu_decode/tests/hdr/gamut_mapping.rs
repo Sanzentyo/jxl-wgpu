@@ -14,6 +14,7 @@ mod reference;
 #[test]
 fn hdr_gamut_and_tone_mapping_follow_composition_and_preserve_protected_light() {
     let backend = backend();
+    let reader = frames::FrameReader::new(&backend);
     let mut presentations = 0;
     let mut components = 0;
     for (index, case) in corpus::cases().into_iter().enumerate() {
@@ -30,7 +31,7 @@ fn hdr_gamut_and_tone_mapping_follow_composition_and_preserve_protected_light() 
             },
         );
         let originals = frames::read(
-            &backend,
+            &reader,
             &data,
             GpuOutputRequest::color(case.format(case.transfer, case.space))
                 .unwrap()
@@ -83,7 +84,7 @@ fn hdr_gamut_and_tone_mapping_follow_composition_and_preserve_protected_light() 
                             request =
                                 request.with_tone_mapping(LuminanceRange::new(0.0, 80.0).unwrap());
                         }
-                        let actual = frames::read(&backend, &data, request, planar, 4, bounded);
+                        let actual = frames::read(&reader, &data, request, planar, 4, bounded);
                         assert_eq!(actual.len(), case.frame_count());
                         for (frame, pixels) in actual.iter().enumerate() {
                             for (p, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
@@ -158,6 +159,7 @@ fn hdr_gamut_and_tone_mapping_follow_composition_and_preserve_protected_light() 
 #[test]
 fn embedded_profiles_map_to_requested_rgb_gamut_after_icc_conversion() {
     let backend = backend();
+    let reader = frames::FrameReader::new(&backend);
     for (index, case) in jxl_test_support::fixtures::embedded_icc::cases().enumerate() {
         let data = case.bytes();
         let rgba = case.linear_reference();
@@ -200,7 +202,7 @@ fn embedded_profiles_map_to_requested_rgb_gamut_after_icc_conversion() {
                         request =
                             request.with_tone_mapping(LuminanceRange::new(0.0, 80.0).unwrap());
                     }
-                    let actual = frames::read(&backend, &data, request, planar, 4, bounded);
+                    let actual = frames::read(&reader, &data, request, planar, 4, bounded);
                     assert_eq!(actual.len(), 1);
                     for (p, pixel) in actual[0].as_chunks::<4>().0.iter().enumerate() {
                         let light = [rgba[p * 4], rgba[p * 4 + 1], rgba[p * 4 + 2]].map(f64::from);

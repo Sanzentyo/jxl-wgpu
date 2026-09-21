@@ -23,7 +23,7 @@ use jxl_wgpu::{
 use jxl_wgpu_decode::{
     F64OutputPath, F64OutputPolicy, GpuDecoder, GpuOutputRequest, ModularChannels,
     ModularPredictor, ModularReconstructionSpecialization, NumericSampleMapping, OutputWritePath,
-    PrefetchBackpressure, WgpuSubmissionEngine,
+    PrefetchBackpressure, WgpuDecodeEngine, WgpuSubmissionEngine,
 };
 use jxl_wgpu_encode::{
     BufferImageSource, LosslessModularEncoder, LosslessModularFormat, LosslessModularTreeMode,
@@ -81,6 +81,24 @@ fn backend() -> Option<WgpuBackend> {
         ..WgpuBackendConfig::default()
     };
     backend_with_config(config)
+}
+
+fn decoder_with_limit(
+    backend: &WgpuBackend,
+    limit: Option<NonZeroU64>,
+) -> GpuDecoder<WgpuDecodeEngine> {
+    let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
+    if let Some(limit) = limit {
+        engine = engine.with_stream_window_limit(limit);
+    }
+    GpuDecoder::new(engine)
+}
+
+fn decoders(
+    backend: &WgpuBackend,
+    limits: [Option<NonZeroU64>; 2],
+) -> [GpuDecoder<WgpuDecodeEngine>; 2] {
+    limits.map(|limit| decoder_with_limit(backend, limit))
 }
 
 fn direct_readback_backend() -> Option<WgpuBackend> {

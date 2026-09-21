@@ -52,6 +52,7 @@ fn request() -> GpuOutputRequest {
 #[test]
 fn patch_linear_color_matches_native_without_extended_srgb_approximations() {
     let backend = backend();
+    let decoder = decoder_with_limit(&backend, None);
     for name in ["xyb_modular", "xyb_vardct", "float_vardct"] {
         let expected = reference(&format!("{name}.linear"));
         let mut format = jxl_wgpu_decode::vardct_rgb8_format().color_spec;
@@ -63,7 +64,6 @@ fn patch_linear_color_matches_native_without_extended_srgb_approximations() {
                 .unwrap()
                 .with_alpha_output_policy(AlphaOutputPolicy::Preserve)
                 .with_spot_color_policy(SpotColorPolicy::Preserve);
-        let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
         let mut session = decoder.open(&encoded(name), req).unwrap();
         let frame = session.next_frame().unwrap().unwrap();
         let words = planes::read(&backend, &frame.output().outputs[0]);
@@ -89,9 +89,28 @@ fn backend() -> WgpuBackend {
     .unwrap()
 }
 
+fn decoder_with_limit(
+    backend: &WgpuBackend,
+    limit: Option<NonZeroU64>,
+) -> GpuDecoder<WgpuDecodeEngine> {
+    let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
+    if let Some(limit) = limit {
+        engine = engine.with_stream_window_limit(limit);
+    }
+    GpuDecoder::new(engine)
+}
+
+fn decoders(backend: &WgpuBackend, limit: NonZeroU64) -> [GpuDecoder<WgpuDecodeEngine>; 2] {
+    [
+        decoder_with_limit(backend, None),
+        decoder_with_limit(backend, Some(limit)),
+    ]
+}
+
 #[test]
 fn patch_color_matches_native_before_transform_references() {
     let backend = backend();
+    let decoders = decoders(&backend, NonZeroU64::new(256).unwrap());
     for name in [
         "modular",
         "gray",
@@ -133,14 +152,9 @@ fn patch_color_matches_native_before_transform_references() {
                 reference(&name)
             };
             let mut prior = None;
-            for limit in [None, NonZeroU64::new(256)] {
-                let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-                if let Some(limit) = limit {
-                    engine = engine.with_stream_window_limit(limit);
-                }
-                let decoder = GpuDecoder::new(engine);
+            for (limit, decoder) in [None, NonZeroU64::new(256)].into_iter().zip(&decoders) {
                 let mut session = if limit.is_some() {
-                    planes::open_fragmented(&decoder, &data, request())
+                    planes::open_fragmented(decoder, &data, request())
                 } else {
                     decoder.open(&data, request()).unwrap()
                 };
@@ -206,6 +220,7 @@ fn inventory(bytes: &[u8]) -> jxl_gpu_bitstream::CodestreamInventory {
 #[test]
 fn patch_extra_channels_match_native_including_color_alpha_override() {
     let backend = backend();
+    let decoders = decoders(&backend, NonZeroU64::new(256).unwrap());
     for name in [
         "alpha",
         "xyb_modular",
@@ -241,13 +256,8 @@ fn patch_extra_channels_match_native_including_color_alpha_override() {
             .with_extra_channel(index as u32)
             .unwrap();
             let mut previous = None;
-            for limit in [None, NonZeroU64::new(256)] {
-                let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-                if let Some(limit) = limit {
-                    engine = engine.with_stream_window_limit(limit);
-                }
-                let decoder = GpuDecoder::new(engine);
-                let mut session = planes::open_fragmented(&decoder, &data, request.clone());
+            for decoder in &decoders {
+                let mut session = planes::open_fragmented(decoder, &data, request.clone());
                 let frame = pollster::block_on(session.next_frame_async())
                     .unwrap()
                     .unwrap();

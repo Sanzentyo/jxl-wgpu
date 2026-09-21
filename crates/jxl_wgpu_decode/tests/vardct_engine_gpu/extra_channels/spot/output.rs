@@ -10,6 +10,7 @@ fn spot_presentation_precedes_native_quantization_and_target_chroma_subsampling(
     let Ok(backend) = pollster::block_on(WgpuBackend::request_default(Default::default())) else {
         return;
     };
+    let context = associated::DecodeContext::new(&backend);
     let srgb = ColorSpecification::Defined(ColorSpec {
         transfer: TransferFunction::Srgb,
         ..ColorSpec::bt709(ColorRange::Limited, ChromaLocation2d::CENTER)
@@ -39,10 +40,10 @@ fn spot_presentation_precedes_native_quantization_and_target_chroma_subsampling(
                     let request = GpuOutputRequest::color(format)
                         .unwrap()
                         .with_alpha_output_policy(policy);
-                    let frames = associated::decode(&backend, &data, request.clone(), false);
+                    let frames = associated::decode(&context, &data, request.clone(), false);
                     assert_eq!(
                         frames,
-                        associated::decode(&backend, &data, request, true),
+                        associated::decode(&context, &data, request, true),
                         "{name}/{bits}: native async"
                     );
                     if let Some(mut expected) =
@@ -99,7 +100,7 @@ fn spot_presentation_precedes_native_quantization_and_target_chroma_subsampling(
                 ))
                 .unwrap()
                 .with_alpha_output_policy(policy);
-                let rgba = associated::decode(&backend, &data, request, false);
+                let rgba = associated::decode(&context, &data, request, false);
                 let values = oracle::floats(&rgba[0].1);
                 let planes: [Vec<f32>; 3] = std::array::from_fn(|c| {
                     values.as_chunks::<4>().0.iter().map(|p| p[c]).collect()
@@ -117,8 +118,8 @@ fn spot_presentation_precedes_native_quantization_and_target_chroma_subsampling(
                 let request = GpuOutputRequest::color(format)
                     .unwrap()
                     .with_alpha_output_policy(policy);
-                let actual = associated::decode(&backend, &data, request.clone(), false);
-                assert_eq!(actual, associated::decode(&backend, &data, request, true));
+                let actual = associated::decode(&context, &data, request.clone(), false);
+                assert_eq!(actual, associated::decode(&context, &data, request, true));
                 assert_eq!(actual[0].0, expected.layout);
                 let high = expected.layout.format.color_spec == cl;
                 for (a, b) in actual[0]
@@ -152,6 +153,7 @@ fn spot_policy_never_tints_selected_numeric_planes_and_hdr_output_is_finite() {
     let Ok(backend) = pollster::block_on(WgpuBackend::request_default(Default::default())) else {
         return;
     };
+    let context = associated::DecodeContext::new(&backend);
     for (name, hex) in multiple_spots()
         .into_iter()
         .filter(|(name, _)| name.ends_with("rgb"))
@@ -173,9 +175,9 @@ fn spot_policy_never_tints_selected_numeric_planes_and_hdr_output_is_finite() {
                     .unwrap()
                     .with_extra_channel(index as u32)
                     .unwrap();
-                let rendered = associated::decode(&backend, &data, request.clone(), false);
+                let rendered = associated::decode(&context, &data, request.clone(), false);
                 let preserved = associated::decode(
-                    &backend,
+                    &context,
                     &data,
                     request.with_spot_color_policy(SpotColorPolicy::Preserve),
                     true,
@@ -195,8 +197,8 @@ fn spot_policy_never_tints_selected_numeric_planes_and_hdr_output_is_finite() {
                     ColorSpecification::Defined(color),
                 ))
                 .unwrap();
-                let rendered = associated::decode(&backend, &data, request.clone(), false);
-                let bounded = associated::decode(&backend, &data, request, true);
+                let rendered = associated::decode(&context, &data, request.clone(), false);
+                let bounded = associated::decode(&context, &data, request, true);
                 assert_eq!(rendered, bounded, "{name}: bounded HDR output");
                 assert!(rendered.iter().all(|(_, bytes)| {
                     bytes

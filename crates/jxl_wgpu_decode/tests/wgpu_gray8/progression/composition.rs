@@ -1,6 +1,6 @@
 use super::*;
 use jxl_test_support::oracles::composed as composed_oracle;
-use jxl_wgpu_decode::{AlphaOutputPolicy, FrameExecutionPlan, OrientationPolicy, WgpuDecodeEngine};
+use jxl_wgpu_decode::{AlphaOutputPolicy, FrameExecutionPlan, OrientationPolicy};
 
 mod ownership;
 
@@ -59,6 +59,7 @@ fn composed_modular_and_numeric_updates_match_independent_native_layers() {
     let Some(backend) = backend() else {
         return;
     };
+    let decoders = decoders(&backend, [NonZeroU64::new(u64::MAX), NonZeroU64::new(40)]);
     for (name, directory, hex) in cases() {
         let data = hex_bytes(hex);
         let inventory = jxl_gpu_bitstream::parse(&data, Default::default())
@@ -141,16 +142,11 @@ fn composed_modular_and_numeric_updates_match_independent_native_layers() {
                 let plan = FrameExecutionPlan::negotiate_with_orientation(&inventory, orientation)
                     .unwrap();
                 let mut whole = None;
-                for cap in [u64::MAX, 40] {
-                    let decoder = GpuDecoder::new(
-                        WgpuDecodeEngine::new(backend.clone())
-                            .unwrap()
-                            .with_stream_window_limit(NonZeroU64::new(cap).unwrap()),
-                    );
+                for (cap, decoder) in [u64::MAX, 40].into_iter().zip(&decoders) {
                     let mut session = if cap == u64::MAX {
                         decoder.open(&data, request.clone()).unwrap()
                     } else {
-                        frame_sequence::incremental(&decoder, &data, request.clone())
+                        frame_sequence::incremental(decoder, &data, request.clone())
                     };
                     let mut held = Vec::new();
                     let mut pixels = Vec::new();

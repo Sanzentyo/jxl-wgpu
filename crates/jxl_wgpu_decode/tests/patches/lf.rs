@@ -49,6 +49,7 @@ fn progression(
 #[test]
 fn lf_patch_color_waits_for_dictionary_and_reference_and_matches_independent_oracles() {
     let backend = backend();
+    let decoders = decoders(&backend, NonZeroU64::new(256).unwrap());
     for family in FAMILIES {
         for suffix in ["", "_empty"] {
             let name = format!("{family}{suffix}");
@@ -66,14 +67,9 @@ fn lf_patch_color_waits_for_dictionary_and_reference_and_matches_independent_ora
             for linear in [false, true] {
                 let request = color_request(linear);
                 let mut whole = None;
-                for limit in [None, NonZeroU64::new(256)] {
-                    let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-                    if let Some(limit) = limit {
-                        engine = engine.with_stream_window_limit(limit);
-                    }
-                    let decoder = GpuDecoder::new(engine);
+                for (limit, decoder) in [None, NonZeroU64::new(256)].into_iter().zip(&decoders) {
                     let mut session = if limit.is_some() {
-                        planes::open_fragmented(&decoder, &data, request.clone())
+                        planes::open_fragmented(decoder, &data, request.clone())
                     } else {
                         decoder.open(&data, request.clone()).unwrap()
                     };

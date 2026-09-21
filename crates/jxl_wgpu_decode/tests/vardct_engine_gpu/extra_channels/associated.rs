@@ -67,19 +67,33 @@ pub(super) fn floating_request(
     .with_spot_color_policy(SpotColorPolicy::Preserve)
 }
 
+pub(super) struct DecodeContext<'a> {
+    backend: &'a WgpuBackend,
+    decoders: [GpuDecoder<WgpuDecodeEngine>; 2],
+}
+
+impl<'a> DecodeContext<'a> {
+    pub(super) fn new(backend: &'a WgpuBackend) -> Self {
+        Self {
+            backend,
+            decoders: [
+                GpuDecoder::new(WgpuDecodeEngine::new(backend.clone()).unwrap()),
+                decoder_with_window(backend, 1024),
+            ],
+        }
+    }
+}
+
 pub(super) fn decode(
-    backend: &WgpuBackend,
+    context: &DecodeContext<'_>,
     data: &[u8],
     request: GpuOutputRequest,
     bounded: bool,
 ) -> Vec<(ImageLayout, Vec<u8>)> {
-    let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-    if bounded {
-        engine = engine.with_stream_window_limit(NonZeroU64::new(1024).unwrap());
-    }
-    let decoder = GpuDecoder::new(engine);
+    let backend = context.backend;
+    let decoder = &context.decoders[usize::from(bounded)];
     let mut session = if bounded {
-        resampled::fragmented(&decoder, data, request)
+        resampled::fragmented(decoder, data, request)
     } else {
         decoder.open(data, request).unwrap()
     };
@@ -190,6 +204,7 @@ fn associated_stills_preserve_or_convert_alpha_after_color_and_resampling() {
     let Ok(backend) = pollster::block_on(WgpuBackend::request_default(Default::default())) else {
         return;
     };
+    let context = DecodeContext::new(&backend);
     for (name, hex) in stills() {
         let data = encoded(hex);
         let inventory = jxl_gpu_bitstream::parse(&data, Default::default())
@@ -230,8 +245,8 @@ fn associated_stills_preserve_or_convert_alpha_after_color_and_resampling() {
                 AlphaOutputPolicy::Associated,
             ] {
                 let request = floating_request(policy, linear, keep);
-                let whole = decode(&backend, &data, request.clone(), false);
-                let bounded = decode(&backend, &data, request, true);
+                let whole = decode(&context, &data, request.clone(), false);
+                let bounded = decode(&context, &data, request, true);
                 assert_eq!(whole, bounded, "{name}/{policy:?}: bounded input");
                 assert_eq!(whole.len(), 1);
                 let values = unpack(&whole[0].0, &whole[0].1, keep);
@@ -284,7 +299,7 @@ fn associated_stills_preserve_or_convert_alpha_after_color_and_resampling() {
                     );
                 }
                 if !linear {
-                    verify_integer(&backend, name, &data, image.bit_depth, policy, &values);
+                    verify_integer(&context, name, &data, image.bit_depth, policy, &values);
                 }
             }
         }
@@ -292,7 +307,7 @@ fn associated_stills_preserve_or_convert_alpha_after_color_and_resampling() {
 }
 
 fn verify_integer(
-    backend: &WgpuBackend,
+    context: &DecodeContext<'_>,
     name: &str,
     data: &[u8],
     depth: jxl_gpu_bitstream::SampleBitDepth,
@@ -322,8 +337,8 @@ fn verify_integer(
             .unwrap()
             .with_alpha_output_policy(policy)
             .with_spot_color_policy(SpotColorPolicy::Preserve);
-        let frames = decode(backend, data, request.clone(), false);
-        assert_eq!(frames, decode(backend, data, request, true));
+        let frames = decode(context, data, request.clone(), false);
+        assert_eq!(frames, decode(context, data, request, true));
         let channels = if alpha { 4 } else { 3 };
         let samples: Vec<u16> = if bits > 8 {
             frames[0]
@@ -353,6 +368,7 @@ fn alpha_output_policy_never_changes_selected_extra_samples() {
     let Ok(backend) = pollster::block_on(WgpuBackend::request_default(Default::default())) else {
         return;
     };
+    let context = DecodeContext::new(&backend);
     for (name, hex) in stills()
         .into_iter()
         .filter(|(name, _)| name.contains("associated"))
@@ -377,7 +393,7 @@ fn alpha_output_policy_never_changes_selected_extra_samples() {
                 let request = scalar::scalar_request(index as u32, bits_per_sample as u8, floating)
                     .with_orientation_policy(OrientationPolicy::Apply);
                 let whole = decode(
-                    &backend,
+                    &context,
                     &data,
                     request
                         .clone()
@@ -385,7 +401,7 @@ fn alpha_output_policy_never_changes_selected_extra_samples() {
                     false,
                 );
                 let bounded = decode(
-                    &backend,
+                    &context,
                     &data,
                     request.with_alpha_output_policy(AlphaOutputPolicy::Associated),
                     true,
@@ -430,6 +446,7 @@ fn alpha_conversion_precedes_yuv_subsampling_and_quantization() {
     let Ok(backend) = pollster::block_on(WgpuBackend::request_default(Default::default())) else {
         return;
     };
+    let context = DecodeContext::new(&backend);
     let srgb = ColorSpecification::Defined(ColorSpec {
         transfer: TransferFunction::Srgb,
         ..ColorSpec::bt709(ColorRange::Limited, ChromaLocation2d::CENTER)
@@ -465,7 +482,7 @@ fn alpha_conversion_precedes_yuv_subsampling_and_quantization() {
                 ))
                 .unwrap()
                 .with_alpha_output_policy(policy);
-                let rgba = decode(&backend, &data, floating, false);
+                let rgba = decode(&context, &data, floating, false);
                 let values = oracle::floats(&rgba[0].1);
                 let planes: [Vec<f32>; 3] = std::array::from_fn(|c| {
                     values.as_chunks::<4>().0.iter().map(|p| p[c]).collect()
@@ -483,8 +500,8 @@ fn alpha_conversion_precedes_yuv_subsampling_and_quantization() {
                 let request = GpuOutputRequest::color(format.clone())
                     .unwrap()
                     .with_alpha_output_policy(policy);
-                let actual = decode(&backend, &data, request.clone(), false);
-                assert_eq!(actual, decode(&backend, &data, request, true));
+                let actual = decode(&context, &data, request.clone(), false);
+                assert_eq!(actual, decode(&context, &data, request, true));
                 assert_eq!(actual[0].0, expected.layout);
                 let high_depth = expected.layout.format.color_spec == cl;
                 for (a, b) in actual[0]
@@ -600,6 +617,7 @@ fn associated_composition_keeps_reference_values_until_final_packing() {
     let Ok(backend) = pollster::block_on(WgpuBackend::request_default(Default::default())) else {
         return;
     };
+    let context = DecodeContext::new(&backend);
     for (name, hex) in [
         (
             "modular_rgb",
@@ -642,8 +660,8 @@ fn associated_composition_keeps_reference_values_until_final_packing() {
                 AlphaOutputPolicy::Associated,
             ] {
                 let request = floating_request(policy, linear, keep);
-                let frames = decode(&backend, &data, request.clone(), false);
-                assert_eq!(frames, decode(&backend, &data, request, true));
+                let frames = decode(&context, &data, request.clone(), false);
+                assert_eq!(frames, decode(&context, &data, request, true));
                 assert_eq!(reference.len(), frames.len() * pixels * 5);
                 if !linear {
                     let jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample } =
@@ -663,8 +681,8 @@ fn associated_composition_keeps_reference_values_until_final_packing() {
                     let request = GpuOutputRequest::color(format.clone())
                         .unwrap()
                         .with_alpha_output_policy(policy);
-                    let packed = decode(&backend, &data, request.clone(), false);
-                    assert_eq!(packed, decode(&backend, &data, request, true));
+                    let packed = decode(&context, &data, request.clone(), false);
+                    assert_eq!(packed, decode(&context, &data, request, true));
                     for ((_, bytes), (layout, floats)) in packed.iter().zip(&frames) {
                         let values = unpack(layout, floats, false);
                         let mask = ((1u32 << bits) - 1) as f32;

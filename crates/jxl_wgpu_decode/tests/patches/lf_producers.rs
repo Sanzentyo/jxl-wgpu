@@ -12,6 +12,7 @@ const FAMILIES: [&str; 4] = [
 #[test]
 fn patched_lf_predictions_match_native_finals_and_preserve_progressive_delivery() {
     let backend = backend();
+    let decoders = decoders(&backend, NonZeroU64::new(256).unwrap());
     for family in FAMILIES {
         let unchanged = reference(&format!("lf_producers/{family}_empty"));
         let changed = reference(&format!("lf_producers/{family}"));
@@ -50,15 +51,10 @@ fn patched_lf_predictions_match_native_finals_and_preserve_progressive_delivery(
                         }
                     }
                 }
-                for limit in [None, NonZeroU64::new(256)] {
-                    let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-                    if let Some(limit) = limit {
-                        engine = engine.with_stream_window_limit(limit);
-                    }
-                    let decoder = GpuDecoder::new(engine);
+                for (limit, decoder) in [None, NonZeroU64::new(256)].into_iter().zip(&decoders) {
                     let request = color_request(linear);
                     let mut session = if limit.is_some() {
-                        planes::open_fragmented(&decoder, &data, request.clone())
+                        planes::open_fragmented(decoder, &data, request.clone())
                     } else {
                         decoder.open(&data, request.clone()).unwrap()
                     };
@@ -124,11 +120,7 @@ fn patched_lf_predictions_match_native_finals_and_preserve_progressive_delivery(
                     );
                 }
             }
-            let decoder = GpuDecoder::new(
-                WgpuDecodeEngine::new(backend.clone())
-                    .unwrap()
-                    .with_stream_window_limit(NonZeroU64::new(256).unwrap()),
-            );
+            let decoder = &decoders[1];
             for channel in 0..2 {
                 let request = GpuOutputRequest::numeric(
                     jxl_gpu_formats::vpi::VpiPitchLinearFormat::F32.pixel_format(),
@@ -137,7 +129,7 @@ fn patched_lf_predictions_match_native_finals_and_preserve_progressive_delivery(
                 .unwrap()
                 .with_extra_channel(channel)
                 .unwrap();
-                let mut session = planes::open_fragmented(&decoder, &data, request);
+                let mut session = planes::open_fragmented(decoder, &data, request);
                 let image = pollster::block_on(session.next_frame_async())
                     .unwrap()
                     .unwrap();
@@ -159,6 +151,7 @@ fn patched_lf_predictions_match_native_finals_and_preserve_progressive_delivery(
 #[test]
 fn lf_dictionary_destinations_use_reduced_coded_geometry_before_publication() {
     let backend = backend();
+    let decoders = decoders(&backend, NonZeroU64::new(256).unwrap());
     for family in FAMILIES {
         let data = encoded(&format!("../lf_extra_channels/{family}"));
         let info = inventory(&data);
@@ -189,12 +182,7 @@ fn lf_dictionary_destinations_use_reduced_coded_geometry_before_publication() {
                 .lf_last_use
                 .is_none()
         );
-        for limit in [None, NonZeroU64::new(256)] {
-            let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-            if let Some(limit) = limit {
-                engine = engine.with_stream_window_limit(limit);
-            }
-            let decoder = GpuDecoder::new(engine);
+        for decoder in &decoders {
             for invalid in [&invalid, &unused] {
                 let mut session = decoder.open(invalid, color_request(true)).unwrap();
                 assert!(matches!(
@@ -216,6 +204,7 @@ fn lf_dictionary_destinations_use_reduced_coded_geometry_before_publication() {
 #[test]
 fn later_lf_entropy_errors_preserve_earlier_patched_images_and_release_reservations() {
     let backend = backend();
+    let decoders = decoders(&backend, NonZeroU64::new(256).unwrap());
     for family in ["nested_vardct_gab1", "nested_modular_gab1"] {
         let data = encoded(&format!("lf_producers/{family}"));
         let info = inventory(&data);
@@ -226,19 +215,14 @@ fn later_lf_entropy_errors_preserve_earlier_patched_images_and_release_reservati
         assert!(section.bytes.length > 16);
         let end = section.bytes.end().unwrap() as usize;
         corrupt[end - 16..end].fill(0xff);
-        for limit in [None, NonZeroU64::new(256)] {
-            let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-            if let Some(limit) = limit {
-                engine = engine.with_stream_window_limit(limit);
-            }
-            let decoder = GpuDecoder::new(engine);
+        for decoder in &decoders {
             let request = color_request(true);
             let mut baseline = decoder.open(&data, request.clone()).unwrap();
             let first = baseline.next_update().unwrap().unwrap();
             let expected = planes::read(&backend, &first.output().outputs[0]);
             drop((baseline, first));
             drain(&backend, 0);
-            let mut session = planes::open_fragmented(&decoder, &corrupt, request);
+            let mut session = planes::open_fragmented(decoder, &corrupt, request);
             let first = pollster::block_on(session.next_update_async())
                 .unwrap()
                 .unwrap();

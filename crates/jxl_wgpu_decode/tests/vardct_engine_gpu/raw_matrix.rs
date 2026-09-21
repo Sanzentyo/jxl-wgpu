@@ -7,6 +7,7 @@ fn raw_matrix_windowed_public_decode_matches_both_oracles_and_releases_memory() 
     };
     let backend =
         WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
+    let decoders = decoders_with_windows(&backend, [u64::MAX, 40, 64, 256]);
     let extent = Extent2d::new(264, 64);
     let expected = rust_jxl_rgb8(corpus::jpeg_transcode_raw_matrix(), extent);
     for encoded in [
@@ -22,12 +23,7 @@ fn raw_matrix_windowed_public_decode_matches_both_oracles_and_releases_memory() 
         let djxl = djxl_rgb8(encoded, extent);
         let mut whole_output = None;
         let mut whole_submissions = 0;
-        for cap in [u64::MAX, 40, 64, 256] {
-            let decoder = GpuDecoder::new(
-                WgpuDecodeEngine::new(backend.clone())
-                    .unwrap()
-                    .with_stream_window_limit(NonZeroU64::new(cap).unwrap()),
-            );
+        for (cap, decoder) in [u64::MAX, 40, 64, 256].into_iter().zip(&decoders) {
             let request = || GpuOutputRequest::color(vardct_rgb8_format()).unwrap();
             let mut session = if cap == u64::MAX {
                 decoder.open(encoded, request()).unwrap()

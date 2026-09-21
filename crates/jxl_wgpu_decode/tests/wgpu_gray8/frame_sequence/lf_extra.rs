@@ -153,6 +153,7 @@ fn lf_extra_ranges(
 #[test]
 fn lf_extra_channels_survive_global_cursor_continuations_and_match_independent_references() {
     let Some(backend) = backend() else { return };
+    let decoders = decoders(&backend, [None, NonZeroU64::new(256)]);
     for (name, hex, reference) in fixtures() {
         let data = data(hex);
         let inventory = parse(&data, Default::default())
@@ -207,16 +208,11 @@ fn lf_extra_channels_survive_global_cursor_continuations_and_match_independent_r
         }
         let mut whole_submissions = [0; 3];
         let mut whole_planes = [None, None, None];
-        for bounded in [false, true] {
-            let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-            if bounded {
-                engine = engine.with_stream_window_limit(NonZeroU64::new(256).unwrap());
-            }
-            let decoder = GpuDecoder::new(engine);
+        for (bounded, decoder) in [false, true].into_iter().zip(&decoders) {
             for (selection, extra) in [None, Some(0), Some(1)].into_iter().enumerate() {
                 let request = output_request(extra);
                 let mut session = if bounded {
-                    incremental(&decoder, &data, request)
+                    incremental(decoder, &data, request)
                 } else {
                     decoder.open(&data, request).unwrap()
                 };
@@ -277,6 +273,7 @@ fn lf_extra_channels_survive_global_cursor_continuations_and_match_independent_r
 #[test]
 fn referenced_lf_distributed_extra_entropy_is_validated_for_every_group_and_output() {
     let Some(backend) = backend() else { return };
+    let decoders = decoders(&backend, [None, NonZeroU64::new(256)]);
     for (name, hex, _) in fixtures()
         .into_iter()
         .filter(|(name, _, _)| name.starts_with("distributed"))
@@ -298,15 +295,10 @@ fn referenced_lf_distributed_extra_entropy_is_validated_for_every_group_and_outp
                 .unwrap()
                 .codestream_inventory(Default::default())
                 .unwrap();
-            for bounded in [false, true] {
-                let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-                if bounded {
-                    engine = engine.with_stream_window_limit(NonZeroU64::new(256).unwrap());
-                }
-                let decoder = GpuDecoder::new(engine);
+            for (bounded, decoder) in [false, true].into_iter().zip(&decoders) {
                 for extra in [None, Some(0), Some(1)] {
                     let mut session = if bounded {
-                        incremental(&decoder, &corrupt, output_request(extra))
+                        incremental(decoder, &corrupt, output_request(extra))
                     } else {
                         decoder.open(&corrupt, output_request(extra)).unwrap()
                     };
@@ -359,6 +351,7 @@ fn global_end(data: &[u8], frame: &jxl_gpu_bitstream::FrameInventory) -> usize {
 #[test]
 fn lf_extra_channels_are_validated_even_in_overwritten_roots_and_unselected_consumers() {
     let Some(backend) = backend() else { return };
+    let decoders = decoders(&backend, [None, NonZeroU64::new(256)]);
     for (name, hex, _) in fixtures()
         .into_iter()
         .filter(|(name, _, _)| name.ends_with('0'))
@@ -397,14 +390,9 @@ fn lf_extra_channels_are_validated_even_in_overwritten_roots_and_unselected_cons
             if physical == 0 {
                 assert!(plan.nodes[0].lf_last_use.is_none());
             }
-            for bounded in [false, true] {
-                let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-                if bounded {
-                    engine = engine.with_stream_window_limit(NonZeroU64::new(256).unwrap());
-                }
-                let decoder = GpuDecoder::new(engine);
+            for (bounded, decoder) in [false, true].into_iter().zip(&decoders) {
                 let mut session = if bounded {
-                    incremental(&decoder, &corrupt, output_request(Some(0)))
+                    incremental(decoder, &corrupt, output_request(Some(0)))
                 } else {
                     decoder.open(&corrupt, output_request(Some(0))).unwrap()
                 };
@@ -439,16 +427,12 @@ fn lf_extra_channels_are_validated_even_in_overwritten_roots_and_unselected_cons
 fn cancelling_lf_extra_channels_releases_producer_planes_global_arenas_and_input() {
     use std::task::{Context, Poll, Waker};
     let Some(backend) = backend() else { return };
+    let decoder = decoder_with_limit(&backend, NonZeroU64::new(128));
     for (name, hex, _) in fixtures()
         .into_iter()
         .filter(|(name, _, _)| name.ends_with('1'))
     {
         let data = data(hex);
-        let decoder = GpuDecoder::new(
-            WgpuDecodeEngine::new(backend.clone())
-                .unwrap()
-                .with_stream_window_limit(NonZeroU64::new(128).unwrap()),
-        );
         let mut completed = incremental(&decoder, &data, output_request(None));
         drop(
             pollster::block_on(completed.next_frame_async())

@@ -79,6 +79,7 @@ fn all_extra_channels_compose_with_independent_references_and_alpha_selectors() 
     let Ok(backend) = pollster::block_on(WgpuBackend::request_default(Default::default())) else {
         return;
     };
+    let context = associated::DecodeContext::new(&backend);
     for (name, hex) in cases() {
         let data = encoded(hex);
         let inventory = jxl_gpu_bitstream::parse(&data, Default::default())
@@ -101,10 +102,10 @@ fn all_extra_channels_compose_with_independent_references_and_alpha_selectors() 
             continue;
         };
         let color = associated::floating_request(AlphaOutputPolicy::Preserve, false, false);
-        let whole = associated::decode(&backend, &data, color.clone(), false);
+        let whole = associated::decode(&context, &data, color.clone(), false);
         assert_eq!(
             whole,
-            associated::decode(&backend, &data, color, true),
+            associated::decode(&context, &data, color, true),
             "{name}: color input windows"
         );
         assert_eq!(whole.len(), 6);
@@ -139,11 +140,11 @@ fn all_extra_channels_compose_with_independent_references_and_alpha_selectors() 
             .unwrap()
             .with_extra_channel(index as u32)
             .unwrap();
-            let whole = associated::decode(&backend, &data, request.clone(), false);
+            let whole = associated::decode(&context, &data, request.clone(), false);
             assert_eq!(
                 whole,
                 associated::decode(
-                    &backend,
+                    &context,
                     &data,
                     request.with_alpha_output_policy(AlphaOutputPolicy::Associated),
                     true
@@ -177,6 +178,7 @@ fn composed_extra_native_quantization_and_orientation_follow_the_selected_declar
     let Ok(backend) = pollster::block_on(WgpuBackend::request_default(Default::default())) else {
         return;
     };
+    let context = associated::DecodeContext::new(&backend);
     for (name, hex) in cases()
         .into_iter()
         .filter(|(name, _)| matches!(*name, "gray" | "vardct_resampled"))
@@ -209,10 +211,10 @@ fn composed_extra_native_quantization_and_orientation_follow_the_selected_declar
             .with_extra_channel(index as u32)
             .unwrap()
             .with_orientation_policy(OrientationPolicy::Keep);
-            let whole = associated::decode(&backend, &data, request.clone(), false);
+            let whole = associated::decode(&context, &data, request.clone(), false);
             assert_eq!(
                 whole,
-                associated::decode(&backend, &data, request, true),
+                associated::decode(&context, &data, request, true),
                 "{name}/extra{index}: native input windows"
             );
             let sample_bytes = bits_per_sample.div_ceil(8) as usize;
@@ -243,6 +245,7 @@ fn composed_color_output_uses_the_first_alpha_after_independent_channel_blending
     let Ok(backend) = pollster::block_on(WgpuBackend::request_default(Default::default())) else {
         return;
     };
+    let context = associated::DecodeContext::new(&backend);
     for (name, hex) in cases()
         .into_iter()
         .filter(|(name, _)| matches!(*name, "gray" | "vardct"))
@@ -268,7 +271,7 @@ fn composed_color_output_uses_the_first_alpha_after_independent_channel_blending
             AlphaOutputPolicy::Unassociated,
         ] {
             let request = associated::floating_request(policy, true, true);
-            let frames = associated::decode(&backend, &data, request, true);
+            let frames = associated::decode(&context, &data, request, true);
             assert_eq!(frames.len(), expected.len());
             for ((layout, bytes), (reference, _)) in frames.iter().zip(&expected) {
                 let mut values = associated::unpack(layout, bytes, true);
