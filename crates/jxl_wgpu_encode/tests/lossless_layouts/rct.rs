@@ -17,6 +17,7 @@ fn config(value: u32, local: bool, tree: usize) -> LosslessModularConfig {
         } else {
             Transform::GlobalRct(rct)
         },
+        ..Default::default()
     }
 }
 

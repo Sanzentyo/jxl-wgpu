@@ -34,9 +34,13 @@ pub(super) struct ModularParams {
     pub(super) rct_type: u32,
     pub(super) big_endian: u32,
     pub(super) sources: [ModularSourceParams; 4],
+    pub(super) predictor: u32,
+    pub(super) wp_scratch_word_offset: u32,
+    pub(super) wp_coefficients: [u32; 7],
+    pub(super) wp_max_weights: [u32; 4],
     // An explicit 256-byte array stride keeps every batch boundary valid for the portable
     // storage-buffer offset alignment without hidden Rust padding.
-    pub(super) _padding: [u32; 32],
+    pub(super) _padding: [u32; 19],
 }
 
 /// Fixed storage-buffer header written by `lossless_modular.wgsl`.
@@ -150,7 +154,8 @@ impl LosslessModularGroupSize {
 }
 
 /// Stream encoding policy shared by stills and frames in an animation session.
-/// Defaults retain 256-pixel groups, the shared global MA tree and automatic color transforms.
+/// Defaults retain 256-pixel groups, the shared global MA tree, Gradient prediction,
+/// default Weighted coefficients and automatic color transforms.
 ///
 /// ```no_run
 /// # use jxl_wgpu_encode::{LosslessModularConfig, LosslessModularEncoder,
@@ -161,6 +166,7 @@ impl LosslessModularGroupSize {
 ///     group_size: LosslessModularGroupSize::Pixels512,
 ///     tree_mode: LosslessModularTreeMode::LocalPerGroup,
 ///     color_transform: LosslessModularColorTransform::LocalRct(LosslessModularRctType::YCOCG),
+///     ..Default::default()
 /// });
 /// assert_eq!(encoder.config().group_size.dimension(), 512);
 /// # }
@@ -171,6 +177,10 @@ pub struct LosslessModularConfig {
     pub tree_mode: LosslessModularTreeMode,
     /// GPU source-word transform and its wire placement.
     pub color_transform: super::rct::LosslessModularColorTransform,
+    /// One of all fourteen standard predictors, shared by every group and component.
+    pub predictor: super::predictor::LosslessModularPredictor,
+    /// Serialized in every Modular header; used when `predictor` is `Weighted`.
+    pub weighted_predictor: super::predictor::LosslessModularWeightedPredictor,
 }
 
 impl LosslessModularFormat {

@@ -128,6 +128,13 @@ pub enum EncodeError {
     ForwardVarDct(#[from] jxl_wgpu::ForwardVarDctError),
     #[error("invalid encoder configuration: {0}")]
     InvalidConfiguration(&'static str),
+    #[error("weighted predictor {name}[{index}] is {value}, maximum is {maximum}")]
+    WeightedPredictorParameter {
+        name: &'static str,
+        index: usize,
+        value: u8,
+        maximum: u8,
+    },
     #[error("Modular RCT type {rct_type} is invalid; valid types are 0 through 41")]
     InvalidModularRctType { rct_type: u32 },
     #[error("Modular RCT requires three color channels, received {color_channels}")]

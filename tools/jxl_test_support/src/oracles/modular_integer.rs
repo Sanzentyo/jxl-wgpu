@@ -2,9 +2,26 @@
 
 /// Independently inspect local headers of a one-pass Modular encoder frame.
 /// Returns `(use_global_tree, rct_type)` for each separate pass group. Fused single-group
-/// frames have no local header. This helper requires the encoder's default weighted predictor
-/// and zero or one RCT, and intentionally rejects broader transform stacks.
+/// frames have no local header. This helper accepts zero or one RCT, and intentionally
+/// rejects broader transform stacks.
 pub fn local_rct_headers(data: &[u8], frame_index: usize) -> Vec<(bool, Option<u32>)> {
+    local_modular_headers(data, frame_index)
+        .into_iter()
+        .map(|header| (header.global_tree, header.rct))
+        .collect()
+}
+
+/// Independently parsed declarations in a separate Modular pass group.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LocalModularHeader {
+    pub global_tree: bool,
+    pub coefficients: [u8; 7],
+    pub max_weights: [u8; 4],
+    pub rct: Option<u32>,
+}
+
+/// Reads the WP parameters even when the selected tree does not use Weighted prediction.
+pub fn local_modular_headers(data: &[u8], frame_index: usize) -> Vec<LocalModularHeader> {
     use jxl_bitstream::U;
     let image = jxl_oxide::JxlImage::read_with_defaults(data).unwrap();
     let frame = image.frame(frame_index).unwrap();
@@ -17,7 +34,17 @@ pub fn local_rct_headers(data: &[u8], frame_index: usize) -> Vec<(bool, Option<u
             assert!(!stream.partial);
             let bits = &mut stream.bitstream;
             let global_tree = bits.read_bool().unwrap();
-            assert!(bits.read_bool().unwrap(), "default weighted predictor");
+            let default_wp = bits.read_bool().unwrap();
+            let coefficients = if default_wp {
+                [16, 10, 7, 7, 7, 0, 0]
+            } else {
+                std::array::from_fn(|_| bits.read_bits(5).unwrap() as u8)
+            };
+            let max_weights = if default_wp {
+                [13, 12, 12, 12]
+            } else {
+                std::array::from_fn(|_| bits.read_bits(4).unwrap() as u8)
+            };
             let count = bits.read_u32(0, 1, 2 + U(4), 18 + U(8)).unwrap();
             assert!(count <= 1);
             let rct = (count == 1).then(|| {
@@ -29,7 +56,12 @@ pub fn local_rct_headers(data: &[u8], frame_index: usize) -> Vec<(bool, Option<u
                 );
                 bits.read_u32(6, U(2), 2 + U(4), 10 + U(6)).unwrap()
             });
-            (global_tree, rct)
+            LocalModularHeader {
+                global_tree,
+                coefficients,
+                max_weights,
+                rct,
+            }
         })
         .collect()
 }

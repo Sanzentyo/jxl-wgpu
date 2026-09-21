@@ -7,6 +7,7 @@ mod dispatch;
 mod grid;
 mod icc;
 mod memory;
+mod predictor;
 mod rct;
 mod serializer;
 mod source;
@@ -21,6 +22,7 @@ pub use grid::{LosslessModularGroup, LosslessModularGroupGrid};
 pub use memory::{
     LosslessModularInFlightMemory, LosslessModularMemoryLimits, LosslessModularMemoryPlan,
 };
+pub use predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
 pub use rct::{LosslessModularColorTransform, LosslessModularRctType};
 pub use serializer::{
     LosslessModularAnimationDescriptor, LosslessModularAnimationSession, LosslessModularEncoder,

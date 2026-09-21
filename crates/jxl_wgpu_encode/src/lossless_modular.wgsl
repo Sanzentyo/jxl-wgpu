@@ -17,7 +17,11 @@ struct Params {
     rct_type: u32,
     big_endian: u32,
     sources: array<Source, 4>,
-    _padding: array<u32, 32>,
+    predictor: u32,
+    wp_scratch_word_offset: u32,
+    wp_coefficients: array<u32, 7>,
+    wp_max_weights: array<u32, 4>,
+    _padding: array<u32, 19>,
 }
 
 @group(0) @binding(0)
@@ -34,7 +38,8 @@ var<storage, read> source_words_3: array<u32>;
 
 // Word 0 is the event count, words 1..34 are raw-token counts, words
 // 34..67 are LZ77-token counts, and the remaining words are four-word events
-// (kind, token, extra-bit count, extra bits).
+// (kind, token, extra-bit count, extra bits). Weighted row state follows the
+// maximum event range and is private to each group/channel invocation.
 @group(0) @binding(1)
 var<storage, read_write> output_words: array<u32>;
 
@@ -44,6 +49,27 @@ var<storage, read> group_params: array<Params>;
 const OUTPUT_HEADER_WORDS: u32 = 67u;
 const EVENT_WORDS: u32 = 4u;
 const EVENT_OVERFLOW: u32 = 0xffffffffu;
+
+/*__JXL_MODULAR_PREDICT__*/
+
+var<private> active_params: Params;
+
+fn wp_current_width() -> u32 { return active_params.width; }
+fn wp_coefficient(index: u32) -> u32 { return active_params.wp_coefficients[index]; }
+fn wp_max_weight(index: u32) -> u32 { return active_params.wp_max_weights[index]; }
+fn wp_true_error(index: u32) -> i32 {
+    return bitcast<i32>(output_words[active_params.wp_scratch_word_offset + index]);
+}
+fn wp_subpred_error(index: u32, component: u32) -> u32 {
+    return output_words[active_params.wp_scratch_word_offset + active_params.width + index * 4u + component];
+}
+fn wp_store_row(index: u32, true_error: i32, errors: array<u32, 4>) {
+    output_words[active_params.wp_scratch_word_offset + index] = bitcast<u32>(true_error);
+    for (var component = 0u; component < 4u; component += 1u) {
+        output_words[active_params.wp_scratch_word_offset + active_params.width + index * 4u + component] = errors[component];
+    }
+}
+fn predictor_error() { output_words[active_params.output_word_offset] = EVENT_OVERFLOW; }
 
 fn source_byte(plane: u32, byte_index: u32) -> u32 {
     var word: u32;
@@ -183,13 +209,26 @@ fn packed_residual(params: Params, x: u32, y: u32) -> u32 {
         }
     }
 
-    // Compare before subtracting: high-depth chroma differences can overflow i32.
-    // When northwest is inside the interval the mathematical gradient fits i32;
-    // intermediate and residual arithmetic explicitly retain the low 32 bits.
-    let low = min(left, top);
-    let high = max(left, top);
-    let gradient = bitcast<i32>(bitcast<u32>(left) + bitcast<u32>(top) - bitcast<u32>(top_left));
-    let prediction = select(select(gradient, high, top_left < low), low, top_left > high);
+    // Keep the default predictor's source reads independent of unused neighbours.
+    if params.predictor == 5u {
+        let prediction = gradient_i32(top, left, top_left);
+        let residual = bitcast<u32>(pixel) - bitcast<u32>(prediction);
+        return (residual << 1u) ^ (0u - (residual >> 31u));
+    }
+    var top_right = top;
+    if y != 0u && x + 1u < params.width { top_right = sample_at(params, x + 1u, y - 1u); }
+    var top_right_right = top_right;
+    if y != 0u && x + 2u < params.width { top_right_right = sample_at(params, x + 2u, y - 1u); }
+    var top_top = top;
+    if y >= 2u { top_top = sample_at(params, x, y - 2u); }
+    var left_left = left;
+    if x >= 2u { left_left = sample_at(params, x - 2u, y); }
+    var weighted = WeightedPrediction();
+    if params.predictor == 6u {
+        weighted = weighted_predict(top, top_left, top_right, left, top_top);
+    }
+    let prediction = predictor_value(params.predictor, weighted, top, left, top_left, top_right, top_top, left_left, top_right_right);
+    if params.predictor == 6u { weighted_record(weighted, pixel); }
     let residual = bitcast<u32>(pixel) - bitcast<u32>(prediction);
     return (residual << 1u) ^ (0u - (residual >> 31u));
 }
@@ -200,6 +239,13 @@ fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
     let params = group_params[global_id.x];
+    active_params = params;
+    if params.predictor == 6u {
+        wp_reset();
+        for (var index = 0u; index < params.width * 5u; index += 1u) {
+            output_words[params.wp_scratch_word_offset + index] = 0u;
+        }
+    }
 
     var run = 0u;
     for (var y = 0u; y < params.height; y += 1u) {

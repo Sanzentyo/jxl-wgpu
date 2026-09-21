@@ -543,7 +543,8 @@ Its portable WGSL emulates the required signed 64-bit smooth-tendency intermedia
 words, then applies the specified wrapping `i32` reconstruction. Actual-adapter tests compare odd,
 even, one-dimensional, and extreme-value cases to an independent scalar oracle. The stock decoder
 feeds transformed entropy output directly into this arena.
-Entropy reconstruction and inverse Palette share one implementation of all 14 Modular predictors.
+Entropy reconstruction, inverse Palette and Modular encoding share all 14 predictors through
+`jxl_wgpu::modular_prediction_shader`.
 Their averaging, self-correcting predictions, and weighted sums use portable signed 64-bit
 intermediates represented by two GPU words. Persistent predictor errors retain the specified
 `i32`/`u32` storage, so bounded-input and Palette continuation layouts remain unchanged. Implicit

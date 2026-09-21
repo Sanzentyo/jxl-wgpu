@@ -33,6 +33,8 @@ mod forward_vardct;
 mod image_output;
 mod memory_budget;
 mod metrics;
+mod modular_predict;
+pub use modular_predict::modular_prediction_shader;
 mod pipeline_cache;
 mod planner;
 mod poller;

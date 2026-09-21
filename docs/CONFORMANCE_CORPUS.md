@@ -583,6 +583,45 @@ JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossl
 `MOD-E02` stays **Partial**. The selected RCT is uniform across groups/frames; adaptive selection,
 arbitrary transform stacks, Palette/delta palette, Squeeze and their global/LF/HF topology remain.
 
+## Lossless Modular predictors
+
+`lossless_layouts::predictors` exercises all 14 explicit predictors in 168 integer and 56 raw
+IEEE cases, rotating Gray/GrayAlpha/RGB/RGBA, all four group sizes, global/local trees and RCT
+types, packed/planar/split storage, swizzles, shifted fields and big-endian words. One-pixel axes,
+odd row tails, separate pass groups and LF boundaries exercise neighbour replication and resets.
+Each stream preserves canonical-layout bytes. jxl-oxide checks every original working word;
+libjxl 0.12.0 checks normalized integers within the existing `2e-7` bound and IEEE F32 words
+exactly, including signed zero, subnormals, infinities and NaN payloads. Whole and 256-byte-window
+fragmented GPU numeric output retains every component after session drop.
+
+Fourteen Weighted parameter sets cover defaults, all-zero/all-maximum fields, each coefficient
+alone at 31 and each maximum weight alone at 15. Both tree modes use RGB(A) RCT working words
+at integer31/IEEE32 in 28 cases. Another 31 all-maximum cases cover every integer precision.
+The independent local-header reader checks custom parameters and RCT declarations. A metadata
+unit uses `jxl-coding` to decode all four MA leaves for each predictor, then reads the exact custom
+WP fields; constructors reject each out-of-range coefficient and weight independently.
+
+Eight resident/streamed lifetime cases cover Weighted at all four group sizes, integer31/IEEE32,
+custom coefficients, exact and one-byte-short budgets, cancellation/source retirement, buffer
+reuse and blocking/Future equality. The reported scratch peak is checked against group widths
+and channel counts, including the 64-dispatch batch boundary. Two three-frame Replace animations
+and two cropped Add/Multiply sequences exercise Weighted/AverageAll, raw IEEE words, custom
+headers, local RCT, timing, independent references and retained output. Composition keeps the
+existing independent native/Rust bounds of `3e-6` color and `4e-7` alpha.
+
+A 127×65 Gray8 shifted-row source compares all 14 stream sizes with all oracle/output checks.
+NorthEast produces fewer bytes than Gradient for this source; this is an explicit choice test,
+not an adaptive search or a general compression-ratio claim. Custom WP fields are retained even
+for unused predictors. The default Gradient fixture stays byte-identical; non-Gradient Gray8
+containers omit the Gradient-specific private acceleration index and decode through the standard
+path. Shared predictor WGSL also retains the decoder's independent native-i64 arithmetic and
+Palette continuation tests. `MOD-E03` remains **Partial** for learned MA trees, previous-channel
+properties, predictor/parameter search and effort tiers.
+
+```console
+JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --lib --test lossless_layouts --no-fail-fast predictor -- --test-threads=2
+```
+
 ## Procedural VarDCT encoder matrix
 
 All 27 single-transform strategies now emit real AC. The shared forward primitive has 667

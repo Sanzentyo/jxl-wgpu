@@ -23,6 +23,9 @@ pub struct LosslessModularMemoryPlan {
     pub parameter_storage_bytes: u64,
     /// Largest artifact allocation used by one streamed GPU batch.
     pub artifact_storage_bytes: u64,
+    /// Peak live Weighted predictor row state (20 bytes per column and channel), already
+    /// included in `artifact_storage_bytes`. Zero for the other thirteen predictors.
+    pub weighted_predictor_scratch_bytes: u64,
     /// Sum of the worst-case artifact ranges across every batch. This is diagnostic only; the
     /// encoder never allocates the sum as one GPU buffer.
     pub total_artifact_bytes: u64,

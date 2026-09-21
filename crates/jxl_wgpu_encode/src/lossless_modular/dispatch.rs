@@ -8,6 +8,7 @@ use super::grid::LosslessModularGroupGrid;
 use super::memory::{
     LosslessModularMemoryLimits, LosslessModularMemoryPlan, align_up, event_capacity,
 };
+use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
 use super::rct::ResolvedRct;
 use super::serializer::{ModularFrameHeader, pack_signed, write_animation_header};
 use super::source::{ModularSourceLayout, ModularSourceWindows};
@@ -57,6 +58,8 @@ pub(super) struct ModularDispatchPlan {
     pub(super) exponent_bits_per_sample: u8,
     pub(super) tree_mode: LosslessModularTreeMode,
     pub(super) rct: Option<ResolvedRct>,
+    pub(super) predictor: LosslessModularPredictor,
+    pub(super) weighted_predictor: LosslessModularWeightedPredictor,
     pub(super) parameters: Vec<ModularParams>,
     pub(super) groups: Vec<ModularGroupPlan>,
     pub(super) batches: Vec<ModularDispatchBatch>,
@@ -112,7 +115,9 @@ impl LosslessModularBackend {
                     .device()
                     .create_shader_module(wgpu::ShaderModuleDescriptor {
                         label: Some("jxl-wgpu lossless modular token kernel"),
-                        source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+                        source: wgpu::ShaderSource::Wgsl(
+                            jxl_wgpu::modular_prediction_shader(SHADER).into(),
+                        ),
                     });
                 Arc::new(context.device().create_compute_pipeline(
                     &wgpu::ComputePipelineDescriptor {
@@ -300,6 +305,15 @@ impl LosslessModularBackend {
                 .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
             let group_output_size = u64::try_from(output_words)
                 .ok()
+                .and_then(|words| {
+                    words.checked_add(
+                        if self.config.predictor == LosslessModularPredictor::Weighted {
+                            5 * u64::from(width)
+                        } else {
+                            0
+                        },
+                    )
+                })
                 .and_then(|words| words.checked_mul(4))
                 .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
             let mut proposed_output_size = output_size;
@@ -379,7 +393,18 @@ impl LosslessModularBackend {
                     rct_type: rct.map_or(42, |rct| rct.rct_type.value()),
                     big_endian: u32::from(source_spec.big_endian),
                     sources: group_source.components,
-                    _padding: [0; 32],
+                    predictor: self.config.predictor.value(),
+                    wp_scratch_word_offset: u32::try_from(
+                        u64::from(output_word_offset) + output_words as u64,
+                    )
+                    .map_err(|_| {
+                        EncodeError::InvalidSource(
+                            "weighted scratch offset exceeds WGSL u32 indexing",
+                        )
+                    })?,
+                    wp_coefficients: self.config.weighted_predictor.coefficients().map(u32::from),
+                    wp_max_weights: self.config.weighted_predictor.max_weights().map(u32::from),
+                    _padding: [0; 19],
                 });
                 groups.push(ModularGroupPlan {
                     width,
@@ -438,6 +463,22 @@ impl LosslessModularBackend {
             .map(|batch| batch.artifact_binding_size.get())
             .max()
             .ok_or(EncodeError::InvalidSource("artifact batch plan is empty"))?;
+        let weighted_predictor_scratch_bytes = if self.config.predictor
+            == LosslessModularPredictor::Weighted
+        {
+            batches
+                .iter()
+                .map(|batch| {
+                    parameters[batch.first_dispatch..batch.first_dispatch + batch.dispatch_count]
+                        .iter()
+                        .map(|params| 20 * u64::from(params.width))
+                        .sum::<u64>()
+                })
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
         if artifact_storage_bytes > self.max_buffer_size {
             return Err(UnsupportedFeature::DeviceLimit {
                 name: "max_buffer_size",
@@ -496,6 +537,7 @@ impl LosslessModularBackend {
             peak_source_binding_bytes,
             parameter_storage_bytes,
             artifact_storage_bytes,
+            weighted_predictor_scratch_bytes,
             total_artifact_bytes,
             readback_bytes,
             direct_readback: self.direct_mapping,
@@ -516,6 +558,8 @@ impl LosslessModularBackend {
             exponent_bits_per_sample: source_spec.exponent_bits_per_sample,
             tree_mode: self.config.tree_mode,
             rct,
+            predictor: self.config.predictor,
+            weighted_predictor: self.config.weighted_predictor,
             parameters,
             groups,
             batches,
@@ -906,6 +950,8 @@ impl GpuEncodeBackend for LosslessModularBackend {
                 exponent_bits_per_sample: plan.exponent_bits_per_sample,
                 tree_mode: plan.tree_mode,
                 rct: plan.rct,
+                predictor: plan.predictor,
+                weighted_predictor: plan.weighted_predictor,
                 width: plan.width,
                 height: plan.height,
                 frame_index: request.frame_index,

@@ -48,7 +48,7 @@ addition to libjxl; the older jxl-oxide header reader does not implement the per
 reference-field rule for mixed full-frame blend modes.
 The [RCT encoder matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-rct-selection) also uses
 jxl-oxide's frame/TOC reader and the independent `jxl-bitstream` U32 decoder to inspect every
-separate pass-group header. It verifies the requested local transform number and MA-tree choice
+separate pass-group header. It verifies the requested local transform number, MA-tree choice and default/custom Weighted coefficients
 without consulting the production metadata parser or deriving expected source words from an inverse.
 The extra-channel native oracle's `--original-icc` mode requires libjxl 0.12.0 and exact identity
 between the original and actual DATA ICC bytes before returning original device samples. Original

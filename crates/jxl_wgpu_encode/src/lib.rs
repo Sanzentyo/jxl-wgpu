@@ -8,6 +8,8 @@
 //! [`LosslessModularEncoder`] implements standard multi-group lossless Modular Gray/GrayAlpha/RGB/RGBA
 //! for every unsigned integer depth in `1..=31` and IEEE binary16/binary32. Packed, planar and
 //! split pitch-linear buffers support component swizzles and explicit word bit/byte order.
+//! [`LosslessModularConfig`] selects group geometry, all 42 RCT types and all 14 predictors,
+//! including checked custom Weighted/SelfCorrecting parameters.
 //! Full-range enumerated source color is retained, with explicit intent and image-white options.
 //! [`AlphaAssociation`] declares source association without changing samples or invisible color.
 //! Samples remain GPU-resident through reversible
@@ -70,8 +72,9 @@ pub use lossless_modular::{
     LosslessModularColorTransform, LosslessModularConfig, LosslessModularEncoder,
     LosslessModularFormat, LosslessModularGroup, LosslessModularGroupGrid,
     LosslessModularGroupSize, LosslessModularInFlightMemory, LosslessModularJob,
-    LosslessModularMemoryLimits, LosslessModularMemoryPlan, LosslessModularRctType,
-    LosslessModularSubmission, LosslessModularTreeMode,
+    LosslessModularMemoryLimits, LosslessModularMemoryPlan, LosslessModularPredictor,
+    LosslessModularRctType, LosslessModularSubmission, LosslessModularTreeMode,
+    LosslessModularWeightedPredictor,
 };
 pub use packet::{
     BitFragment, EncodedFrame, FrameGroupLayout, FramePacketSet, GroupPacket, GroupPacketKind,

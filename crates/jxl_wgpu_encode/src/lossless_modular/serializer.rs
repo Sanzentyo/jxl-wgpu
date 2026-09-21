@@ -13,6 +13,7 @@ use super::dispatch::{LosslessModularBackend, ModularGroupPlan};
 use super::grid::{LosslessModularGroup, LosslessModularGroupGrid};
 use super::icc::{DEFAULT_PROFILE_LIMIT, PreparedImageHeader};
 use super::memory::{LosslessModularMemoryLimits, LosslessModularMemoryPlan};
+use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
 use super::rct::{LosslessModularRctType, ResolvedRct};
 use super::source::lossless_modular_source_spec;
 use super::streaming::LosslessModularJob;
@@ -52,7 +53,7 @@ impl LosslessModularEncoder {
         Self::with_config(context, Default::default())
     }
 
-    /// Creates an encoder with explicit group geometry, MA-tree placement and RCT policy.
+    /// Creates an encoder with explicit group geometry, MA-tree placement, RCT and prediction.
     #[must_use]
     pub fn with_config(context: WgpuContext, config: super::types::LosslessModularConfig) -> Self {
         let backend = LosslessModularBackend::with_config(&context, config);
@@ -705,6 +706,8 @@ pub(super) struct PacketBuildInput<'a> {
     pub(super) exponent_bits_per_sample: u8,
     pub(super) tree_mode: LosslessModularTreeMode,
     pub(super) rct: Option<ResolvedRct>,
+    pub(super) predictor: LosslessModularPredictor,
+    pub(super) weighted_predictor: LosslessModularWeightedPredictor,
     pub(super) frame: &'a ModularFrameHeader,
     pub(super) group_plans: &'a [ModularGroupPlan],
     pub(super) bytes: &'a [u8],
@@ -741,6 +744,7 @@ pub(super) fn accumulate_artifact_histograms(
 pub(super) fn build_prefix_codes(
     format: LosslessModularFormat,
     bits_per_sample: u8,
+    predictor: LosslessModularPredictor,
     aggregate_raw: &RawHistograms,
     aggregate_lz77: &Lz77Histograms,
 ) -> Result<[PrefixCode; 4], EncodeError> {
@@ -750,8 +754,12 @@ pub(super) fn build_prefix_codes(
     let mut codes = [unused.clone(), unused.clone(), unused.clone(), unused];
     for channel in 0..channels {
         let transformed_extra_token = u8::from(format.color_channel_count() == 3);
-        let wide_samples = bits_per_sample > 14;
-        let max_raw_token = if (15..=16).contains(&bits_per_sample) {
+        // Other predictors may overshoot the sample range, including with custom WP
+        // coefficients. Their wrapping residuals use the full integer alphabet.
+        let wide_samples = bits_per_sample > 14 || predictor != LosslessModularPredictor::Gradient;
+        let max_raw_token = if predictor != LosslessModularPredictor::Gradient {
+            RAW_SYMBOLS - 1
+        } else if (15..=16).contains(&bits_per_sample) {
             18
         } else {
             usize::from(
@@ -780,6 +788,8 @@ pub(super) struct ModularPacketAssembler {
     exponent_bits_per_sample: u8,
     tree_mode: LosslessModularTreeMode,
     rct: Option<ResolvedRct>,
+    predictor: LosslessModularPredictor,
+    weighted_predictor: LosslessModularWeightedPredictor,
     frame: ModularFrameHeader,
     codes: [PrefixCode; 4],
     packets: Vec<GroupPacket>,
@@ -797,6 +807,8 @@ pub(super) struct ModularPacketConfig {
     pub(super) exponent_bits_per_sample: u8,
     pub(super) tree_mode: LosslessModularTreeMode,
     pub(super) rct: Option<ResolvedRct>,
+    pub(super) predictor: LosslessModularPredictor,
+    pub(super) weighted_predictor: LosslessModularWeightedPredictor,
     pub(super) frame: ModularFrameHeader,
 }
 
@@ -814,11 +826,19 @@ impl ModularPacketAssembler {
             exponent_bits_per_sample,
             tree_mode,
             rct,
+            predictor,
+            weighted_predictor,
             frame,
         } = config;
         let (packets, single_group, token_bit_offset_in_group) = if group_grid.groups == 1 {
             let mut group = BitWriter::new();
-            write_dc_global(&mut group, &codes, rct.map(|rct| rct.rct_type))?;
+            write_dc_global(
+                &mut group,
+                &codes,
+                rct.map(|rct| rct.rct_type),
+                predictor,
+                weighted_predictor,
+            )?;
             let token_bit_offset = u64::try_from(group.bit_len())
                 .map_err(|_| EncodeError::Backend("gray8 token offset overflow".into()))?;
             (Vec::new(), Some(group), token_bit_offset)
@@ -830,6 +850,8 @@ impl ModularPacketAssembler {
                 &mut dc_global,
                 &codes,
                 rct.filter(|rct| !rct.local).map(|rct| rct.rct_type),
+                predictor,
+                weighted_predictor,
             )?;
             dc_global.align_to_byte()?;
             packets.push(GroupPacket::new(
@@ -855,6 +877,8 @@ impl ModularPacketAssembler {
             exponent_bits_per_sample,
             tree_mode,
             rct,
+            predictor,
+            weighted_predictor,
             frame,
             codes,
             packets,
@@ -888,15 +912,15 @@ impl ModularPacketAssembler {
         } else {
             let mut pass_group = BitWriter::new();
             let use_global_tree = self.tree_mode == LosslessModularTreeMode::SharedGlobal;
-            // GroupHeader: selected tree, default weighted predictor and optional local RCT.
+            // Each local Modular stream declares its own WP coefficients and transform list.
             pass_group.write_bits(u64::from(use_global_tree), 1)?;
-            pass_group.write_bits(1, 1)?;
+            write_weighted_predictor(&mut pass_group, self.weighted_predictor)?;
             write_rct(
                 &mut pass_group,
                 self.rct.filter(|rct| rct.local).map(|rct| rct.rct_type),
             )?;
             if !use_global_tree {
-                write_ma_config(&mut pass_group, &self.codes)?;
+                write_ma_config(&mut pass_group, &self.codes, self.predictor)?;
             }
             for (channel, artifact) in artifacts.iter().enumerate() {
                 write_events(&mut pass_group, &self.codes[channel], artifact.events)?;
@@ -942,7 +966,8 @@ impl ModularPacketAssembler {
             )?;
             let acceleration = (self.format == LosslessModularFormat::Gray
                 && self.bits_per_sample == 8
-                && self.exponent_bits_per_sample == 0)
+                && self.exponent_bits_per_sample == 0
+                && self.predictor == LosslessModularPredictor::Gradient)
                 .then(|| GpuAccelerationArtifact::Gray8Prefix {
                     width: self.width,
                     height: self.height,
@@ -977,6 +1002,8 @@ pub(super) fn build_packets(
         exponent_bits_per_sample,
         tree_mode,
         rct,
+        predictor,
+        weighted_predictor,
         frame,
         group_plans,
         bytes,
@@ -1023,7 +1050,13 @@ pub(super) fn build_packets(
         artifacts.push(artifact);
     }
 
-    let codes = build_prefix_codes(format, bits_per_sample, &aggregate_raw, &aggregate_lz77)?;
+    let codes = build_prefix_codes(
+        format,
+        bits_per_sample,
+        predictor,
+        &aggregate_raw,
+        &aggregate_lz77,
+    )?;
     let mut assembler = ModularPacketAssembler::new(
         ModularPacketConfig {
             width,
@@ -1034,6 +1067,8 @@ pub(super) fn build_packets(
             exponent_bits_per_sample,
             tree_mode,
             rct,
+            predictor,
+            weighted_predictor,
             frame: frame.clone(),
         },
         codes,
@@ -1230,15 +1265,34 @@ fn write_dc_global(
     output: &mut BitWriter,
     codes: &[PrefixCode; 4],
     rct: Option<LosslessModularRctType>,
+    predictor: LosslessModularPredictor,
+    weighted_predictor: LosslessModularWeightedPredictor,
 ) -> Result<(), EncodeError> {
     // Handcrafted Modular metadata adapted from zune-jpegxl 0.5.2. See this crate's
     // `THIRD_PARTY.md` and `LICENSES/zune-jpegxl-MIT.txt`.
     output.write_bits(1, 1)?; // default LF-channel dequantization
     output.write_bits(1, 1)?; // GlobalModular is present
-    write_ma_config(output, codes)?;
+    write_ma_config(output, codes, predictor)?;
     output.write_bits(1, 1)?;
-    output.write_bits(1, 1)?;
+    write_weighted_predictor(output, weighted_predictor)?;
     write_rct(output, rct)
+}
+
+fn write_weighted_predictor(
+    output: &mut BitWriter,
+    predictor: LosslessModularWeightedPredictor,
+) -> Result<(), EncodeError> {
+    let default = predictor == LosslessModularWeightedPredictor::default();
+    output.write_bits(u64::from(default), 1)?;
+    if !default {
+        for coefficient in predictor.coefficients() {
+            output.write_bits(u64::from(coefficient), 5)?;
+        }
+        for weight in predictor.max_weights() {
+            output.write_bits(u64::from(weight), 4)?;
+        }
+    }
+    Ok(())
 }
 
 fn write_rct(
@@ -1269,19 +1323,51 @@ fn write_rct(
     Ok(())
 }
 
-fn write_ma_config(output: &mut BitWriter, codes: &[PrefixCode; 4]) -> Result<(), EncodeError> {
+fn write_ma_config(
+    output: &mut BitWriter,
+    codes: &[PrefixCode; 4],
+    predictor: LosslessModularPredictor,
+) -> Result<(), EncodeError> {
+    let gradient = predictor == LosslessModularPredictor::Gradient;
     output.write_bits(0, 1)?;
     output.write_bits(1, 1)?;
-    output.write_bits(0, 2)?;
+    output.write_bits(u64::from(!gradient), 2)?;
+    if !gradient {
+        // The predictor context has a single-symbol distribution. All other tree
+        // fields keep the original split=0, four-symbol prefix distribution.
+        for context in [0, 0, 1, 0, 0, 0] {
+            output.write_bits(context, 1)?;
+        }
+    }
     output.write_bits(1, 1)?;
     output.write_bits(0, 4)?;
+    if !gradient {
+        output.write_bits(15, 4)?; // literal predictor, without hybrid extra bits
+    }
     output.write_bits(0b100011, 6)?;
+    if !gradient {
+        let symbol = predictor.value();
+        output.write_bits(u64::from(symbol != 0), 1)?;
+        if symbol != 0 {
+            let exponent = symbol.ilog2();
+            output.write_bits(u64::from(exponent), 4)?;
+            output.write_bits(u64::from(symbol - (1 << exponent)), exponent as u8)?;
+        }
+    }
     output.write_bits(1, 2)?;
     output.write_bits(3, 2)?;
     for symbol in 0..4 {
         output.write_bits(symbol, 2)?;
     }
     output.write_bits(0, 1)?;
+    if !gradient && predictor.value() != 0 {
+        output.write_bits(1, 2)?; // simple prefix tree
+        output.write_bits(0, 2)?; // one symbol
+        output.write_bits(
+            u64::from(predictor.value()),
+            (predictor.value() + 1).next_power_of_two().ilog2() as u8,
+        )?;
+    }
 
     const TREE_INDICES: [usize; 26] = [
         1, 2, 1, 4, 1, 0, 0, 5, 0, 0, 0, 0, 5, 0, 0, 0, 0, 5, 0, 0, 0, 0, 5, 0, 0, 0,
@@ -1289,7 +1375,9 @@ fn write_ma_config(output: &mut BitWriter, codes: &[PrefixCode; 4]) -> Result<()
     const SYMBOL_BITS: [u64; 6] = [0b00, 0b10, 0b001, 0b101, 0b0011, 0b0111];
     const SYMBOL_NBITS: [u8; 6] = [2, 2, 3, 3, 4, 4];
     for index in TREE_INDICES {
-        output.write_bits(SYMBOL_BITS[index], SYMBOL_NBITS[index])?;
+        if gradient || index != 5 {
+            output.write_bits(SYMBOL_BITS[index], SYMBOL_NBITS[index])?;
+        }
     }
 
     output.write_bits(1, 1)?;
@@ -1722,3 +1810,6 @@ mod rct_wire_tests {
         }
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod predictor_tests;

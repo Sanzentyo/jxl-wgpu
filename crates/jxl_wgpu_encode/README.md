@@ -88,12 +88,21 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   The same selected type applies to every group/frame; arbitrary transform stacks and adaptive
   per-group selection remain open. Invalid type/channel combinations fail before GPU admission.
 - `LosslessModularConfig` selects all four standard PassGroup sizes with
-  `LosslessModularGroupSize::{Pixels128, Pixels256, Pixels512, Pixels1024}`, the MA-tree mode and
-  the reversible color transform.
+  `LosslessModularGroupSize::{Pixels128, Pixels256, Pixels512, Pixels1024}`, the MA-tree mode,
+  reversible color transform and prediction policy.
   `LosslessModularEncoder::with_config` and `LosslessModularBackend::with_config` use the same
   immutable policy; `config()` reports it. The default remains 256×256. LF groups cover eight
   PassGroups per axis. Edge groups may be one pixel wide or high; cropped animation frames use
   their own extent to calculate both grids.
+- `LosslessModularConfig::predictor` selects all 14 standard `LosslessModularPredictor` values:
+  Zero, West, North, AverageWestNorth, Select, Gradient, Weighted, NorthEast, NorthWest, WestWest,
+  AverageWestNorthWest, AverageNorthNorthWest, AverageNorthNorthEast and AverageAll.
+  `weighted_predictor` accepts `LosslessModularWeightedPredictor::new([u8; 7], [u8; 4])` with
+  coefficients 0–31 and maximum weights 0–15; out-of-range fields return a typed error. Every
+  Modular header retains the parameters, including when the tree uses another predictor.
+  One selected predictor applies to all groups/components; each group/channel resets its own
+  state. The default remains Gradient and the default coefficients retain existing bytes.
+  Predictor and parameter search, learned MA trees and previous-channel decisions remain open.
 - One GPU invocation handles each PassGroup/channel pair. Dispatch parameters and artifacts use
   group-major, channel-major order. Small jobs use one mapped artifact allocation. Larger jobs use
   complete-channel-group batches bounded by storage-binding and dispatch limits.
@@ -104,7 +113,7 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   and the next poll records exactly one next batch without requiring a Web Worker or a particular
   async runtime. Peak GPU memory is therefore bounded independently of total image area even though
   the final standard codestream remains contiguous.
-- Every group/channel produces independent Gradient-predictor residuals, LZ77/raw token events, and
+- Every group/channel produces independent selected-predictor residuals, LZ77/raw token events, and
   histograms. The host validates every artifact, combines histograms per channel, creates the four
   JPEG XL context prefix codes, and serializes channels inside standard row-major TOC groups.
 - LF global always carries a valid shared Modular tree and entropy code; LF groups and HF global
@@ -116,9 +125,9 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   multiple bounded artifact batches through blocking and runtime-neutral completion.
 
 `LosslessModularEncoder::memory_plan` reports the detected valid bits, exponent width (zero for
-integers), largest component storage-word width,
-full and peak unions of source plane binding ranges, peak parameter/artifact/readback bytes, diagnostic total
-artifact bytes, batch count, exact GPU submission count, streaming mode, total encoder-owned live
+integers), largest component storage-word width, full and peak unions of source plane binding
+ranges, peak parameter/artifact/readback bytes, `weighted_predictor_scratch_bytes`, diagnostic
+total artifact bytes, batch count, exact GPU submission count, streaming mode, total encoder-owned live
 bytes, and the group grid before submission. Streamed jobs report exactly twice the batch count:
 one histogram and one serialization submission per batch. Every live batch uses the same shared
 `MemoryBudget`. Its exclusive buffer-pool lease and reservation survive until the map callback and
@@ -126,8 +135,10 @@ mapped-range consumer are both finished, including when the returned future is a
 Source range accounting excludes gaps between planes and counts shared alignment prefixes once.
 
 The selected `group_size` is included in `group_grid`. Larger groups increase each channel's
-worst-case artifact to `268 + 16 * (pixels + ceil(pixels / 8) + 1)` bytes. A complete group must fit
-the checked source/artifact binding limits; selecting 1024 does not guarantee that every device
+worst-case event artifact to `268 + 16 * (pixels + ceil(pixels / 8) + 1)` bytes. Weighted adds
+`20 * group_width` bytes of row state per channel inside that artifact allocation; its reported
+scratch subtotal is already included in owned bytes and any separate readback copy. A complete
+group must fit the checked source/artifact binding limits; selecting 1024 does not guarantee that every device
 or memory budget can admit it. Batch splitting, peak reservations and exact submission counts
 are recalculated from that geometry. Long zero runs use the full valid prefix alphabet through
 the 1024²-sample case; histogram, canonical extra-bit and exact sample-count checks remain required.
@@ -166,6 +177,7 @@ let encoder = LosslessModularEncoder::with_config(
         group_size: LosslessModularGroupSize::Pixels512,
         tree_mode: LosslessModularTreeMode::LocalPerGroup,
         color_transform: LosslessModularColorTransform::LocalRct(LosslessModularRctType::new(41)?),
+        ..Default::default()
     },
 );
 let plan = encoder.memory_plan(&source)?;
@@ -240,7 +252,13 @@ size with shared/local trees, integer/IEEE source words, LF boundaries, full til
 Replace animations, bounded GPU output and admission/cancellation. The default 256 configuration
 retains the existing checked-in Gray8 codestream bytes.
 
+The [predictor matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-predictors) checks all
+14 predictors, custom Weighted parameters, exact integer/IEEE words, streamed ownership and
+comparison against Gradient on a shifted-row source. Gray8 containers attach the private `jwgp`
+shortcut only for Gradient; every predictor otherwise uses the standard Modular path.
+
 ## Experimental VarDCT profile
+
 
 `VarDctEncoder::new` takes an explicit `VarDctStrategy` and accepts one padded, interleaved sRGB8
 image whose extent equals that transform. All 27 standard strategies are executable end to end,

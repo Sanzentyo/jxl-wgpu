@@ -170,7 +170,8 @@ mod native_tests {
 
     #[test]
     fn naga_validates_the_streaming_modular_shader() {
-        let module = naga::front::wgsl::parse_str(SHADER).expect("Modular WGSL parses");
+        let module = naga::front::wgsl::parse_str(&jxl_wgpu::modular_prediction_shader(SHADER))
+            .expect("Modular WGSL parses");
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::empty(),
@@ -179,7 +180,11 @@ mod native_tests {
         .expect("Modular WGSL validates with portable WebGPU capabilities");
         for (name, size, offsets) in [
             ("Source", 24, vec![0, 4, 8, 12, 16, 20]),
-            ("Params", 256, vec![0, 4, 8, 12, 16, 20, 24, 28, 32, 128]),
+            (
+                "Params",
+                256,
+                vec![0, 4, 8, 12, 16, 20, 24, 28, 32, 128, 132, 136, 164, 180],
+            ),
         ] {
             let (_, ty) = module
                 .types
@@ -221,11 +226,15 @@ mod native_tests {
                 bit_shift: 13 + index as u32 * 6,
                 plane: 14 + index as u32 * 6,
             }),
-            _padding: [0; 32],
+            predictor: 33,
+            wp_scratch_word_offset: 34,
+            wp_coefficients: [35, 36, 37, 38, 39, 40, 41],
+            wp_max_weights: [42, 43, 44, 45],
+            _padding: [0; 19],
         };
         let words = bytemuck::cast::<ModularParams, [u32; 64]>(params);
-        assert_eq!(&words[..32], &(1..=32).collect::<Vec<_>>());
-        assert!(words[32..].iter().all(|&word| word == 0));
+        assert_eq!(&words[..45], &(1..=45).collect::<Vec<_>>());
+        assert!(words[45..].iter().all(|&word| word == 0));
     }
 
     #[test]
@@ -698,6 +707,7 @@ mod native_tests {
             super::super::serializer::build_prefix_codes(
                 LosslessModularFormat::Rgba,
                 31,
+                crate::LosslessModularPredictor::Gradient,
                 &raw,
                 &runs
             )
@@ -707,6 +717,7 @@ mod native_tests {
             super::super::serializer::build_prefix_codes(
                 LosslessModularFormat::Rgba,
                 29,
+                crate::LosslessModularPredictor::Gradient,
                 &raw,
                 &runs
             ),
