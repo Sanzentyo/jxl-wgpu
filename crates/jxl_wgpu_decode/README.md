@@ -1158,7 +1158,11 @@ standard packet topologies. A one-entry TOC stages LF and HF metadata before par
 HF-global and AC continuation, with transforms selected from the decoded strategy map. A sectioned TOC covers one or
 more independently bounded LF groups with GPU-decoded mixed maps of any of JPEG XL's 27 regular
 and special strategies across one or more 256-pixel pass groups. Those pass groups may carry real HF coefficients across one through eleven spectral/refinement passes
-using any of the 13 natural or entropy-coded custom coefficient-order families. Scanline and
+using any of the 13 natural or entropy-coded custom coefficient-order families. All 13 may be
+custom in one pass: the metadata cursor's symbol bound is derived from the declared families,
+with at most 387,867 values (three times one length plus every AC Lehmer digit per family).
+Permutation lengths, individual ranks, exact entropy termination and packet ends remain checked.
+Scanline and
 entropy-coded center-first TOC order are both accepted: inventory retains physical section ranges
 and the frontend normalizes them to logical group order before assigning pixel rectangles and
 per-group scratch. The explicit section topology distinguishes combined and separately addressable

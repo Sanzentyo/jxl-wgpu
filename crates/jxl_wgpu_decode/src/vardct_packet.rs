@@ -2431,7 +2431,19 @@ fn parse_coefficient_orders_reader(
         })
         .transpose()?;
     let mut decoder_cursor = decoder.as_ref().map(|decoder| {
-        MetadataEntropyCursor::new(decoder, MaTreeLimits::default().metadata_symbol_limit)
+        // Each declared family has three permutations: one end value and at most N - N/64
+        // Lehmer digits per channel. All 13 families need up to 387,867 values, exceeding the
+        // unrelated MA-tree default. Bound this consumer by its complete finite grammar.
+        let symbol_limit = HF_ORDER_EXTENTS
+            .iter()
+            .enumerate()
+            .filter(|(id, _)| prefix.used_orders & (1 << id) != 0)
+            .map(|(_, [width, height])| {
+                let area = (width * height) as usize;
+                HF_ORDER_CHANNELS * (1 + area - area / 64)
+            })
+            .sum();
+        MetadataEntropyCursor::new(decoder, symbol_limit)
     });
     if let Some(cursor) = decoder_cursor.as_mut() {
         cursor
@@ -3836,6 +3848,56 @@ mod tests {
         let params = VarDctModularParams::default().with_stream_segment(segment, 41, 128);
 
         assert_eq!(params.window_contract(), [64, 0, 192, 112, 4, 128, 41]);
+    }
+
+    #[test]
+    fn custom_order_permutation_errors_are_bounded_to_the_packet() {
+        fn stream(symbols: [u64; 2], bits: &[u64]) -> (Vec<u8>, u64) {
+            let mut out = jxl_gpu_bitstream::BitWriter::new();
+            out.write_bits(0, 1).unwrap(); // No LZ77.
+            out.write_bits(1, 1).unwrap(); // One cluster across all eight contexts.
+            out.write_bits(0, 2).unwrap();
+            out.write_bits(1, 1).unwrap(); // Prefix coding.
+            out.write_bits(7, 4).unwrap(); // Values below 128 are literal symbols.
+            out.write_bits(0, 3).unwrap(); // No token MSB/LSB bits.
+            out.write_bits(0, 3).unwrap();
+            out.write_bits(1, 1).unwrap(); // Alphabet size 65.
+            out.write_bits(6, 4).unwrap();
+            out.write_bits(0, 6).unwrap();
+            out.write_bits(1, 2).unwrap(); // Simple prefix tree with two symbols.
+            out.write_bits(1, 2).unwrap();
+            for symbol in symbols {
+                out.write_bits(symbol, 7).unwrap();
+            }
+            for &bit in bits {
+                out.write_bits(bit, 1).unwrap();
+            }
+            let end = out.bit_len() as u64;
+            (out.into_bytes(), end)
+        }
+        let prefix = HfGlobalPrefix {
+            num_hf_presets: 1,
+            used_orders: 1,
+            order_entropy_bit_offset: 0,
+        };
+        for (symbols, payload) in [([0, 64], vec![1]), ([1, 63], vec![0, 1])] {
+            let (bytes, end) = stream(symbols, &payload);
+            let mut reader = BitReader::new(&bytes);
+            assert!(matches!(
+                parse_coefficient_orders_reader(&mut reader, prefix, end),
+                Err(BoundedVarDctPacketError::CoefficientOrderCoding(
+                    jxl_coding::Error::InvalidPermutation
+                ))
+            ));
+            assert!(reader.bit_offset() <= end);
+        }
+        let (bytes, end) = stream([0, 1], &[0, 0, 0]); // Three empty/identity permutations.
+        let mut reader = BitReader::new(&bytes);
+        parse_coefficient_orders_reader(&mut reader, prefix, end).unwrap();
+        assert_eq!(reader.bit_offset(), end);
+        let mut reader = BitReader::new(&bytes);
+        assert!(parse_coefficient_orders_reader(&mut reader, prefix, end - 1).is_err());
+        assert!(reader.bit_offset() < end);
     }
 
     #[test]

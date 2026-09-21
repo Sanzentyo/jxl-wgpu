@@ -8,6 +8,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use jxl_wgpu::{KernelVariant, MemoryPermit};
+use wgpu::util::DeviceExt;
 
 use super::ac::{AcFragments, validate_blocks, validate_transform_fragments};
 use super::bitstream::{build_frame_packet, image_header, pack_signed_control};
@@ -130,8 +131,9 @@ impl VarDctBackend {
         map: VarDctStrategyMap,
         config: VarDctConfig,
     ) -> Result<Self, EncodeError> {
+        let plan = TransformPlan::new(map, config.quantization, &config.coefficient_orders)?;
         let mut backend = Self::new_with_topology(context, VarDctTopology::StrategyMap, config)?;
-        backend.transform_plan = Some(Arc::new(TransformPlan::new(map, config.quantization)?));
+        backend.transform_plan = Some(Arc::new(plan));
         Ok(backend)
     }
 
@@ -229,6 +231,7 @@ impl VarDctBackend {
                     }],
                 )?,
                 config.quantization,
+                &config.coefficient_orders,
             )?))
         } else {
             None
@@ -240,7 +243,7 @@ impl VarDctBackend {
             hf_entropy,
             topology,
             transform_plan,
-            config,
+            config: config.clone(),
             capabilities: EncoderCapabilities {
                 profiles: vec![ProfileCapability::VarDct {
                     quantization: config.quantization,
@@ -547,7 +550,7 @@ pub(super) fn align_up(value: u64, alignment: u64) -> Option<u64> {
 fn validate_tiled_device_limits(limits: &wgpu::Limits) -> Result<(), EncodeError> {
     let checks = [(
         "max_storage_buffers_per_shader_stage",
-        3,
+        4,
         u64::from(limits.max_storage_buffers_per_shader_stage),
     )];
     if let Some((name, required, available)) = checks
@@ -642,6 +645,18 @@ impl GpuEncodeBackend for VarDctBackend {
             .queue()
             .write_buffer(&parameters, 0, bytemuck::bytes_of(&plan.kernel.params));
 
+        let tiled_orders = (self.topology == VarDctTopology::TiledDct8).then(|| {
+            context
+                .device()
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("tiled VarDCT coefficient orders"),
+                    contents: bytemuck::cast_slice(
+                        &self.config.coefficient_orders.indices(VarDctStrategy::Dct8),
+                    ),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        });
+
         let source_binding = wgpu::BufferBinding {
             buffer: &source.buffer,
             offset: plan.source_binding_offset,
@@ -677,6 +692,13 @@ impl GpuEncodeBackend for VarDctBackend {
                                 offset: 0,
                                 size: Some(artifact_binding_size),
                             }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: tiled_orders
+                                .as_ref()
+                                .expect("tiled coefficient orders")
+                                .as_entire_binding(),
                         },
                     ],
                 })
@@ -784,6 +806,7 @@ impl GpuEncodeBackend for VarDctBackend {
             _parameters: parameters,
             _artifact: artifact,
             _transform: transform_scratch,
+            _tiled_orders: tiled_orders,
             readback,
             _memory_permit: memory_permit,
             mapped: AtomicBool::new(false),
@@ -815,7 +838,7 @@ impl GpuEncodeBackend for VarDctBackend {
             completion,
             code: self.code.clone(),
             hf_entropy: self.hf_entropy.clone(),
-            config: self.config,
+            config: self.config.clone(),
             frame_layout: plan.frame,
             transform_plan: self.transform_plan.clone(),
             artifact_layout: job_layout,
@@ -888,6 +911,7 @@ impl VarDctMapCompletion {
 
 struct VarDctJobLifetime {
     _transform: Option<transforms::Scratch>,
+    _tiled_orders: Option<wgpu::Buffer>,
     _parameters: Arc<wgpu::Buffer>,
     _artifact: Arc<wgpu::Buffer>,
     readback: Arc<wgpu::Buffer>,
@@ -1000,7 +1024,7 @@ impl VarDctJob {
                     &self.code,
                     &self.hf_entropy,
                     self.frame_layout,
-                    self.config,
+                    &self.config,
                 )?,
                 acceleration: None,
             })
@@ -1576,7 +1600,7 @@ impl VarDctEncoder {
 ///
 /// Accepts nonzero RGB8 dimensions through 16,384 pixels on each axis, with
 /// partial edge blocks replicated on the GPU. Every block carries quantized
-/// DC and AC, using default matrices, natural order and one prefix distribution.
+/// DC and AC, using default matrices, configurable coefficient orders and one prefix distribution.
 /// The frame has every 2,048-pixel LF group and 256-pixel AC group; a single
 /// AC group uses the standard fused packet. Exact quantizer settings are configurable;
 /// perceptual distance and rate-control guarantees remain unimplemented.

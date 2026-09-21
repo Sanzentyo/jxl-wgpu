@@ -4,6 +4,7 @@ use super::*;
 use jxl_gpu_bitstream::BitReader;
 
 pub(super) struct Oracle {
+    strategy: VarDctStrategy,
     order: Vec<usize>,
     dequant: [Vec<f64>; 3],
     basis: Vec<f64>,
@@ -39,6 +40,7 @@ pub(super) fn native_oracles() -> Vec<Oracle> {
                     .collect()
             });
             Oracle {
+                strategy: VarDctStrategy::ALL[id as usize],
                 order,
                 dequant,
                 basis: if area == 64 {
@@ -179,7 +181,9 @@ pub(super) fn check_ac(
     for channel in [1, 0, 2] {
         let mut remaining = ac::read_unsigned(&mut reader, &entropy);
         assert!(remaining as usize <= coefficients.len() - skip);
-        for &index in &oracle.order[skip..] {
+        let custom = config.coefficient_orders.permutations(oracle.strategy);
+        for rank in skip..oracle.order.len() {
+            let index = oracle.order[custom.map_or(rank, |orders| orders[channel][rank] as usize)];
             let packed = if remaining == 0 {
                 0
             } else {

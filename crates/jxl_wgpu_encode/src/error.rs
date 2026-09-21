@@ -114,6 +114,12 @@ pub enum PacketError {
 
 #[derive(Debug, Error)]
 pub enum EncodeError {
+    #[error("invalid VarDCT coefficient order for family {family}, channel {channel}: {reason}")]
+    VarDctCoefficientOrder {
+        family: u8,
+        channel: u8,
+        reason: &'static str,
+    },
     #[error(transparent)]
     Unsupported(#[from] UnsupportedFeature),
     #[error(transparent)]

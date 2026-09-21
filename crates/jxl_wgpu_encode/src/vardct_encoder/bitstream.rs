@@ -112,7 +112,7 @@ fn write_lf_global(
     code: &VarDctPrefixCode,
     hf_entropy: &HfEntropyPlan,
     coefficient_payload: bool,
-    config: VarDctConfig,
+    config: &VarDctConfig,
 ) -> Result<(), EncodeError> {
     let lf_metadata = config.lf_metadata;
     output.write_bits(u64::from(lf_metadata.has_default_dequantization()), 1)?;
@@ -156,7 +156,7 @@ fn write_local_modular_header(output: &mut BitWriter) -> Result<(), EncodeError>
     Ok(())
 }
 
-fn write_unsigned_token(
+pub(super) fn write_unsigned_token(
     output: &mut BitWriter,
     code: &VarDctPrefixCode,
     value: u32,
@@ -332,7 +332,7 @@ pub(super) fn build_frame_packet(
     code: &VarDctPrefixCode,
     hf_entropy: &HfEntropyPlan,
     frame: VarDctFrameLayout,
-    config: VarDctConfig,
+    config: &VarDctConfig,
 ) -> Result<FramePacketSet, EncodeError> {
     let ac_groups = frame.ac_group_count()?;
     let lf_groups = frame.lf_group_count()?;
@@ -341,7 +341,12 @@ pub(super) fn build_frame_packet(
         let mut group = BitWriter::new();
         write_lf_global(&mut group, code, hf_entropy, coefficient_payload, config)?;
         write_lf_group(&mut group, code, artifact, frame, 0, config.quantization)?;
-        hf_entropy.write_global(&mut group, ac_groups, coefficient_payload)?;
+        hf_entropy.write_global(
+            &mut group,
+            ac_groups,
+            coefficient_payload,
+            &config.coefficient_orders,
+        )?;
         artifact.ac.append_group(&mut group, frame, 0)?;
         group.align_to_byte()?;
         return Ok(FramePacketSet::new(
@@ -364,7 +369,12 @@ pub(super) fn build_frame_packet(
     )?;
     dc_global.align_to_byte()?;
     let mut ac_global = BitWriter::new();
-    hf_entropy.write_global(&mut ac_global, ac_groups, coefficient_payload)?;
+    hf_entropy.write_global(
+        &mut ac_global,
+        ac_groups,
+        coefficient_payload,
+        &config.coefficient_orders,
+    )?;
     ac_global.align_to_byte()?;
 
     let mut packets = Vec::with_capacity(

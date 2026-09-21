@@ -273,6 +273,8 @@ pub struct VarDctMemoryPlan {
     pub parameter_storage_bytes: u64,
     pub artifact_storage_bytes: u64,
     pub readback_bytes: u64,
+    /// Tiled DCT8's X/Y/B order table; general transforms include orders in `transform`.
+    pub coefficient_order_bytes: u64,
     /// Resident forward-transform allocations, retained until submission completion.
     pub transform: Option<VarDctTransformMemoryPlan>,
     pub owned_bytes_per_job: u64,
@@ -300,7 +302,7 @@ impl VarDctTransformMemoryPlan {
         let coefficient_bytes = forward.coefficient_bytes;
         let lf_bytes = forward.lf_bytes;
         let quantized_bytes = forward.coefficient_bytes;
-        let quantization_metadata_bytes = coefficient_bytes / 3 * 4;
+        let quantization_metadata_bytes = coefficient_bytes / 3 * 6;
         Self {
             forward,
             xyb_bytes,
@@ -328,13 +330,22 @@ impl VarDctMemoryPlan {
     ) -> Self {
         let parameter_storage_bytes = std::mem::size_of::<VarDctKernelParams>() as u64;
         let readback_bytes = artifact_storage_bytes;
-        let owned_bytes_per_job = parameter_storage_bytes + artifact_storage_bytes + readback_bytes;
+        let coefficient_order_bytes = if matches!(kernel_layout, VarDctKernelLayout::TiledDct8) {
+            64 * 3 * 4
+        } else {
+            0
+        };
+        let owned_bytes_per_job = parameter_storage_bytes
+            + artifact_storage_bytes
+            + readback_bytes
+            + coefficient_order_bytes;
         Self {
             kernel_layout,
             source_binding_bytes,
             parameter_storage_bytes,
             artifact_storage_bytes,
             readback_bytes,
+            coefficient_order_bytes,
             transform: None,
             owned_bytes_per_job,
             addressed_bytes_per_job: source_binding_bytes + owned_bytes_per_job,

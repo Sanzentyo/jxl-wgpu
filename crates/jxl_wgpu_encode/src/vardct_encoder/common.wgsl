@@ -24,13 +24,6 @@ fn quantize_checked(value: f32, error: u32) -> i32 {
     return i32(rounded);
 }
 
-const DCT8_NATURAL_ORDER: array<u32, 64> = array<u32, 64>(
-    0u, 1u, 8u, 16u, 9u, 2u, 3u, 10u, 17u, 24u, 32u, 25u, 18u, 11u, 4u, 5u,
-    12u, 19u, 26u, 33u, 40u, 48u, 41u, 34u, 27u, 20u, 13u, 6u, 7u, 14u, 21u, 28u,
-    35u, 42u, 49u, 56u, 57u, 50u, 43u, 36u, 29u, 22u, 15u, 23u, 30u, 37u, 44u, 51u,
-    58u, 59u, 52u, 45u, 38u, 31u, 39u, 46u, 53u, 60u, 61u, 54u, 47u, 55u, 62u, 63u,
-);
-
 fn load_u8(byte_address: u32) -> u32 {
     let word = source_words[byte_address >> 2u];
     return (word >> ((byte_address & 3u) * 8u)) & 255u;

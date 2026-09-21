@@ -8,7 +8,7 @@ use super::types::{
     ArtifactLayout, TiledVarDctGrid, VarDctFrameLayout, VarDctStrategy, VarDctTopology,
     VarDctTransformMemoryPlan,
 };
-use super::{VarDctHfMultiplier, VarDctQuantization};
+use super::{VarDctCoefficientOrders, VarDctHfMultiplier, VarDctQuantization};
 use crate::EncodeError;
 
 /// A transform's upper-left corner, measured in 8×8 blocks of the padded image.
@@ -154,7 +154,7 @@ pub(super) struct TransformPlan {
     pub map: VarDctStrategyMap,
     pub tasks: Vec<TransformTask>,
     pub batches: Vec<StrategyBatch>,
-    pub metadata: Vec<[u32; 4]>,
+    pub metadata: Vec<[u32; 6]>,
     pub memory: VarDctTransformMemoryPlan,
     pub ac_words: u32,
     pub ac_groups: Vec<Vec<usize>>,
@@ -165,6 +165,7 @@ impl TransformPlan {
     pub fn new(
         map: VarDctStrategyMap,
         quantization: VarDctQuantization,
+        orders: &VarDctCoefficientOrders,
     ) -> Result<Self, EncodeError> {
         let code = fixed_prefix_code()?;
         let mut metadata = Vec::new();
@@ -188,8 +189,10 @@ impl TransformPlan {
                     .default_dequant_matrix()
                     .scales
                     .into_iter()
-                    .zip(strategy.natural_order())
-                    .map(|([x, y, b], order)| [x.to_bits(), y.to_bits(), b.to_bits(), order]),
+                    .zip(orders.indices(strategy))
+                    .map(|([x, y, b], [ox, oy, ob])| {
+                        [x.to_bits(), y.to_bits(), b.to_bits(), ox, oy, ob]
+                    }),
             );
             batches.push(StrategyBatch {
                 strategy,
@@ -263,7 +266,7 @@ impl TransformPlan {
         memory.coefficient_bytes = memory.xyb_bytes;
         memory.quantized_bytes = memory.xyb_bytes;
         memory.lf_bytes = u64::from(lf_offset) * 4;
-        memory.quantization_metadata_bytes = metadata.len() as u64 * 16;
+        memory.quantization_metadata_bytes = metadata.len() as u64 * 24;
         memory.task_metadata_bytes =
             tasks.len() as u64 * std::mem::size_of::<TransformTask>() as u64;
         memory.total_bytes = forward.transient_bytes

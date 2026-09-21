@@ -1,4 +1,5 @@
 // Tiled DCT8: one workgroup owns each replicated 8x8 input block and AC fragment.
+@group(0) @binding(3) var<storage, read> coefficient_orders: array<array<u32, 3>, 64>;
 
 // Both vec3 arrays have a 16-byte stride: exactly 2,048 workgroup bytes.
 // AC coefficients live only here, never in storage or mapped readback buffers.
@@ -20,11 +21,11 @@ fn serialize_block_ac(block: u32) {
         let channel = array<u32, 3>(1u, 0u, 2u)[channel_index];
         var nonzero = 0u;
         for (var order = 1u; order < 64u; order += 1u) {
-            nonzero += u32(block_ac[DCT8_NATURAL_ORDER[order]][channel] != 0);
+            nonzero += u32(block_ac[coefficient_orders[order][channel]][channel] != 0);
         }
         bit_offset = encode_ac_unsigned(base, params.ac_words_per_block, nonzero, bit_offset);
         for (var order = 1u; order < 64u && nonzero != 0u; order += 1u) {
-            let value = block_ac[DCT8_NATURAL_ORDER[order]][channel];
+            let value = block_ac[coefficient_orders[order][channel]][channel];
             bit_offset = encode_ac_unsigned(base, params.ac_words_per_block, zigzag_signed(value), bit_offset);
             nonzero -= u32(value != 0);
         }
@@ -103,4 +104,3 @@ fn quantize_blocks(
         serialize_block_ac(block);
     }
 }
-

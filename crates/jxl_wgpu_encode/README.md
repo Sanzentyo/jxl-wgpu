@@ -308,7 +308,7 @@ code; blocking and runtime-neutral Future assembly are identical.
 The GPU executes sRGB linearization, XYB conversion, forward transforms, LF/AC quantization, the per-8×8
 clamped-Gradient DC predictor, signed tokenization, prefix packing, histogramming, and the
 standard strategy map. All 27 strategies and `TiledVarDctEncoder` use default dequantization
-matrices and natural coefficient orders, with one prefix distribution
+matrices and natural or caller-selected coefficient orders, with one prefix distribution
 for all 495 coefficient contexts and no LZ77. `VarDctQuantization` validates exact global scale
 `1..=73728`, LF quantizer `1..=65536`, and a default `VarDctHfMultiplier` in `1..=256`.
 `VarDctTransform::with_hf_multiplier` overrides the default for that transform; sorting a map
@@ -316,6 +316,17 @@ preserves its associated multiplier. GPU quantization and serialized LF/HF metad
 same values. Defaults are `(8813, 10, 6)` and carry no perceptual-distance claim. The former
 `PerceptualDistance` API was removed; general distance/quality guarantees, adaptive selection,
 and rate control remain unimplemented.
+
+`VarDctConfig::coefficient_orders` accepts `VarDctCoefficientOrders`, shared by single transforms,
+mixed maps and tiled DCT8. `with_order(strategy, [x, y, b])` validates three permutations of
+natural ranks `0..width*height`; the first `width*height/64` LF ranks must stay in place. All
+13 JPEG XL size classes are supported, including the separate special-8×8 class. Transposed
+rectangles share a class. A later call replaces that whole class; unspecified classes and explicit
+identity permutations use natural order. Length, range, duplicate and LF-prefix errors are typed.
+The GPU quantizes every AC location and serializes each channel in its selected order. Host work
+only validates and serializes caller-supplied permutation metadata using bounded Lehmer coding;
+it neither selects orders from pixels nor reads coefficients. Config clones share immutable tables.
+Content-adaptive order selection remains a separate roadmap item.
 
 The LF and AC streams use 33-symbol raw prefix alphabets, covering every signed 32-bit value.
 The global MA tree is one Gradient leaf with no LZ77. Prefix bits retain all 15 canonical bits;
@@ -365,8 +376,12 @@ owns one horizontal scratch allocation and a 20-byte forward task per transform;
 occupy 44 bytes per transform. No GPU allocation is created per individual transform.
 Sources use channel origins within one complete XYB binding, so small maps also work on devices
 requiring 1024-byte storage offsets without padding each channel allocation.
-An 8×8 DCT submission owns 11,668 bytes: 768 parameters, 3,072 artifact, 3,072 readback and
-4,756 resident transform bytes. It no longer allocates a fixed diagnostic coefficient readback.
+Each general-transform matrix/order entry contains three F32 scales and three U32 indices in
+24 bytes. An 8×8 DCT submission owns 12,180 bytes: 768 parameters, 3,072 artifact, 3,072 readback
+and 5,268 resident transform bytes. Tiled DCT8 instead retains a separate 768-byte X/Y/B order
+table at read-only storage binding 3, reported by `coefficient_order_bytes` and included in the
+job's owned bytes. It requires four storage bindings and retains the table through completion
+or cancellation. No coefficient readback is added.
 Single transforms reserve one AC slot for three counts and at most `area - area / 64` coefficients
 per channel; the largest 256×256 slot has 217,730 words. Mixed maps reserve the exact
 strategy-specific bound per transform, with one length word each and no maximum-size slot
@@ -380,9 +395,9 @@ are checked before submission. A full 16K square therefore also depends on adapt
 capacity.
 
 Actual-GPU tests compare emitted streams with Rust `jxl`, installed `djxl`, and the stock GPU
-decoder. All 27 strategies run textured RGB8 inputs with default and custom correlation: each AC
+decoder. All 27 strategies run textured RGB8 inputs with default/custom correlation and natural/custom orders: each AC
 coefficient is checked against independent f64 transforms and pinned native basis/matrix/order
-data, and all 54 streams agree across the three decoders within one RGB8 code. The shared
+data, and all 108 streams agree across the three decoders within one RGB8 code. The shared
 forward primitive separately checks 667 native coefficient/LF cases, including complete impulse
 bases for all ten strategies with an 8×8 footprint. See the
 [native fixture generator](../jxl_wgpu/test-data/forward_vardct_generator/README.md).

@@ -8,6 +8,7 @@ mod ac;
 mod bitstream;
 mod dispatch;
 mod entropy;
+mod orders;
 mod quantization;
 mod strategy_map;
 mod transforms;
@@ -17,6 +18,7 @@ mod types;
 mod tests;
 
 pub use dispatch::{TiledVarDctEncoder, VarDctBackend, VarDctEncoder, VarDctJob, VarDctSubmission};
+pub use orders::VarDctCoefficientOrders;
 pub use quantization::{VarDctConfig, VarDctHfMultiplier, VarDctQuantization};
 pub use strategy_map::{VarDctStrategyMap, VarDctTransform};
 pub use types::{

@@ -1,5 +1,5 @@
 // Image normalization and transform-parallel quantization/entropy coding.
-struct QuantizationEntry { dequant: vec3<f32>, order: u32 }
+struct QuantizationEntry { dequant: array<f32, 3>, order: array<u32, 3> }
 struct TransformTask {
     block_x: u32, block_y: u32, coefficient_offset: u32, lf_offset: u32,
     width: u32, height: u32, metadata_offset: u32, ac_word_offset: u32,
@@ -42,7 +42,7 @@ fn quantize_transforms_ac(@builtin(workgroup_id) group: vec3<u32>, @builtin(loca
     let area = task.width * task.height;
     for (var order = lane; order < area; order += wg_x) {
         if order < area / 64u { continue; }
-        let index = quantization[task.metadata_offset + order].order;
+        let index = quantization[task.metadata_offset + order].order[0];
         let offset = task.coefficient_offset + index;
         let coefficient = vec3<f32>(forward_coefficients[offset],
             forward_coefficients[offset + area], forward_coefficients[offset + 2u * area]);
@@ -103,11 +103,11 @@ fn serialize_transforms_ac(@builtin(workgroup_id) group: vec3<u32>) {
         let offset = task.coefficient_offset + channel * area;
         var nonzero = 0u;
         for (var order = llf; order < area; order += 1u) {
-            nonzero += u32(quantized_coefficients[offset + quantization[task.metadata_offset + order].order] != 0);
+            nonzero += u32(quantized_coefficients[offset + quantization[task.metadata_offset + order].order[channel]] != 0);
         }
         bit_offset = encode_ac_unsigned(base, task.ac_word_capacity, nonzero, bit_offset);
         for (var order = llf; order < area && nonzero != 0u; order += 1u) {
-            let value = quantized_coefficients[offset + quantization[task.metadata_offset + order].order];
+            let value = quantized_coefficients[offset + quantization[task.metadata_offset + order].order[channel]];
             bit_offset = encode_ac_unsigned(base, task.ac_word_capacity, zigzag_signed(value), bit_offset);
             nonzero -= u32(value != 0);
         }

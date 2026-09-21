@@ -384,13 +384,13 @@ cargo clippy -p jxl_wgpu_encode --all-targets -- -D warnings
   standard strategies, and `TiledVarDctEncoder` supports multi-LF/multi-AC-group DCT8 grids with
   checked axes through 16K. Both frontends serialize validated exact-binary16 LF dequantization plus
   LF/HF chroma-correlation metadata. All 27 strategies perform the forward transform, normative LF
-  extraction, default-matrix quantization, natural-order scan and AC bit-fragment serialization
+  extraction, default-matrix quantization, caller-selected coefficient-order scans and AC bit-fragment serialization
   without exposing pixels or raw/quantized AC to the host. Single transforms use shared resident
   passes; tiled DCT8 keeps each block in 2 KiB workgroup storage. The single `TransformKind`
   alphabet and shared matrix/order metadata are used by both encoder and decoder. Its
   `HfEntropyPlan` currently selects one prefix cluster for all 495 coefficient contexts,
   disables LZ77, and emits one pass. That plan is a stable policy boundary rather than a temporary
-  wire format: future adaptive clustering, ANS/LZ, coefficient orders, and pass selection can use
+  wire format: future adaptive clustering, ANS/LZ, content-adaptive order selection, and pass selection can use
   different plans while retaining the GPU artifact contract. Native coefficient/LF fixtures and
   independent f64 compressed-coefficient checks cover every strategy with default/custom correlation.
 

@@ -18,7 +18,7 @@ fn packet(bytes: &[u8]) -> BoundedVarDctPacketPlan {
     BoundedVarDctPacketPlan::parse(bytes, &inventory).unwrap()
 }
 
-fn assert_decoders_agree(bytes: &[u8], width: usize, height: usize) -> Vec<u8> {
+pub(super) fn assert_decoders_agree(bytes: &[u8], width: usize, height: usize) -> Vec<u8> {
     let (device, queue, info) =
         test_device().expect("actual GPU required for quantizer validation");
     let backend = WgpuBackend::from_device(
@@ -117,7 +117,7 @@ fn signed_hf_metadata_endpoints_interoperate_through_whole_and_fragmented_packet
         &code,
         &hf,
         VarDctFrameLayout::single(VarDctStrategy::Dct8),
-        VarDctConfig::default(),
+        &VarDctConfig::default(),
     )
     .unwrap();
     let header = packets.frame_header.clone();
@@ -163,7 +163,8 @@ fn signed_hf_metadata_endpoints_interoperate_through_whole_and_fragmented_packet
         for value in [0, 0, 0, raw, 0] {
             sample(&mut group, value);
         }
-        hf.write_global(&mut group, 1, false).unwrap();
+        hf.write_global(&mut group, 1, false, &Default::default())
+            .unwrap();
         group.align_to_byte().unwrap();
         let packets = FramePacketSet::new(
             header.clone(),
@@ -248,7 +249,8 @@ fn maximal_global_lf_product_and_full_hf_metadata_preserve_solid_white() {
             ],
         )
         .unwrap();
-        let encoder = VarDctEncoder::new_with_strategy_map(context.clone(), map, config).unwrap();
+        let encoder =
+            VarDctEncoder::new_with_strategy_map(context.clone(), map, config.clone()).unwrap();
         let tiled = TiledVarDctEncoder::new_with_config(context.clone(), config).unwrap();
         for bytes in [
             encoder
@@ -283,10 +285,12 @@ fn gpu_lf_quantization_overflow_is_reported_and_releases_memory() {
         let config = VarDctConfig {
             quantization: quantization(73728, 65536, hf_multiplier),
             lf_metadata: metadata,
+            ..Default::default()
         };
         let pixels = reference::pattern(8, 8);
         let single =
-            VarDctEncoder::new_with_config(context.clone(), VarDctStrategy::Dct8, config).unwrap();
+            VarDctEncoder::new_with_config(context.clone(), VarDctStrategy::Dct8, config.clone())
+                .unwrap();
         let tiled = TiledVarDctEncoder::new_with_config(context.clone(), config).unwrap();
         for result in [
             single.encode(padded_rgb_source_sized(&context, 8, 8, &pixels)),

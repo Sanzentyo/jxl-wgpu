@@ -4,6 +4,7 @@ mod ac;
 mod artifact;
 mod mixed;
 mod native;
+mod orders;
 mod quantization;
 mod reference;
 mod single;
@@ -351,7 +352,7 @@ fn fixed_control_plane_decodes_as_standard_black_vardct() {
             &code,
             &hf_entropy,
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
-            VarDctConfig::default(),
+            &VarDctConfig::default(),
         )
         .unwrap(),
     )
@@ -375,7 +376,7 @@ fn fixed_control_plane_accepts_nonzero_quantized_xyb_dc() {
             &code,
             &hf_entropy,
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
-            VarDctConfig::default(),
+            &VarDctConfig::default(),
         )
         .unwrap(),
     )
@@ -402,7 +403,7 @@ fn custom_lf_metadata_roundtrips_through_the_standard_control_plane() {
             &code,
             &hf_entropy,
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
-            config_with_lf(metadata),
+            &config_with_lf(metadata),
         )
         .unwrap(),
     )
@@ -518,6 +519,15 @@ fn naga_validates_vardct_shaders() {
         .validate(&module)
         .expect("VarDCT WGSL validates");
         for (_, ty) in module.types.iter() {
+            if ty.name.as_deref() == Some("QuantizationEntry") {
+                let naga::TypeInner::Struct { members, span } = &ty.inner else {
+                    panic!("quantization metadata must be a structure");
+                };
+                assert_eq!(*span, std::mem::size_of::<[u32; 6]>() as u32);
+                assert_eq!(*span, 24);
+                assert_eq!(members[0].offset, 0);
+                assert_eq!(members[1].offset, 12);
+            }
             if ty.name.as_deref() == Some("TransformTask") {
                 let naga::TypeInner::Struct { members, span } = &ty.inner else {
                     panic!("transform tasks must be structures");
@@ -641,7 +651,7 @@ fn gpu_profile_encodes_exact_black_from_padded_rgb() {
     assert_eq!(plan.parameter_storage_bytes, 768);
     assert_eq!(plan.artifact_storage_bytes, 3_072);
     assert_eq!(plan.readback_bytes, 3_072);
-    assert_eq!(plan.owned_bytes_per_job, 11_668);
+    assert_eq!(plan.owned_bytes_per_job, 12_180);
     assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
 
     let codestream = encoder.encode(source).unwrap();
@@ -941,7 +951,7 @@ fn abandoned_tiled_job_holds_and_releases_its_exact_budget() {
     assert_eq!(plan.kernel_layout, VarDctKernelLayout::TiledDct8);
     assert_eq!(
         plan.owned_bytes_per_job,
-        768 + 2 * plan.artifact_storage_bytes
+        768 + 2 * plan.artifact_storage_bytes + plan.coefficient_order_bytes
     );
 
     let limited_context = WgpuContext::with_memory_budget(

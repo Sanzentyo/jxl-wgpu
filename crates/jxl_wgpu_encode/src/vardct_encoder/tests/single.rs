@@ -46,13 +46,26 @@ fn all_27_strategies_emit_native_checked_nonzero_ac_and_interoperate() {
             })
             .collect::<Vec<_>>();
         let coefficients = forward(&pixels, w, h, oracle);
-        for (custom, metadata) in [VarDctLfMetadata::default(), custom_lf_metadata()]
-            .into_iter()
-            .enumerate()
+        let mut natural_pixels = Vec::new();
+        for (custom, metadata) in [
+            VarDctLfMetadata::default(),
+            custom_lf_metadata(),
+            VarDctLfMetadata::default(),
+            custom_lf_metadata(),
+        ]
+        .into_iter()
+        .enumerate()
         {
+            let config = VarDctConfig {
+                coefficient_orders: if custom >= 2 {
+                    orders::selected([strategy])
+                } else {
+                    Default::default()
+                },
+                ..config_with_lf(metadata)
+            };
             let encoder =
-                VarDctBackend::new_with_config(&context, strategy, config_with_lf(metadata))
-                    .unwrap();
+                VarDctBackend::new_with_config(&context, strategy, config.clone()).unwrap();
             let source = padded_rgb_source_sized(&context, w, h, &pixels);
             let request = FrameEncodeRequest {
                 frame_index: FrameIndex::new(0),
@@ -71,25 +84,27 @@ fn all_27_strategies_emit_native_checked_nonzero_ac_and_interoperate() {
                 .submit(&context, GpuFrameSource::Buffer(source.clone()), &request)
                 .unwrap();
             let (words, bits, artifacts) = job.wait_with_ac_for_test().unwrap();
-            let nonzero = check_ac(
-                &words,
-                bits,
-                &coefficients,
-                oracle,
-                config_with_lf(metadata),
-            );
+            let nonzero = check_ac(&words, bits, &coefficients, oracle, config.clone());
             assert!(nonzero > 0, "textured input must emit nonzero AC");
             let frame = assemble_frame(artifacts.packets).unwrap();
             let mut stream = image_header(width, height).unwrap().bytes().to_vec();
             stream.extend_from_slice(frame.bytes());
             let convenience =
-                VarDctEncoder::new_with_config(context.clone(), strategy, config_with_lf(metadata))
-                    .unwrap();
+                VarDctEncoder::new_with_config(context.clone(), strategy, config.clone()).unwrap();
             assert_eq!(
                 pollster::block_on(convenience.submit(source).unwrap()).unwrap(),
                 stream
             );
             let rust = decode_rgb8_sized(&stream, w, h);
+            if custom < 2 {
+                natural_pixels.push(rust.clone());
+            } else {
+                assert_eq!(
+                    rust,
+                    natural_pixels[custom - 2],
+                    "custom orders preserve quantized pixels"
+                );
+            }
             let mut session = decoder
                 .open(
                     &stream,
@@ -124,7 +139,7 @@ fn all_27_strategies_emit_native_checked_nonzero_ac_and_interoperate() {
                 "{strategy:?}/{custom}: native/Rust max error {error}"
             );
             eprintln!("{strategy:?}/{custom}: {nonzero} nonzero coefficients, {bits} AC bits");
-            streams.push((strategy, metadata, pixels.clone(), stream));
+            streams.push((strategy, config, pixels.clone(), stream));
         }
     }
     for variant in [
@@ -137,14 +152,10 @@ fn all_27_strategies_emit_native_checked_nonzero_ac_and_interoperate() {
         let context =
             test_context_with_variants(&device, &queue, &info, &[(FORWARD_KERNEL_KEY, variant)])
                 .unwrap();
-        for (strategy, metadata, pixels, expected) in &streams {
+        for (strategy, config, pixels, expected) in &streams {
             let Extent2d { width, height } = strategy.pixel_extent();
-            let encoder = VarDctEncoder::new_with_config(
-                context.clone(),
-                *strategy,
-                config_with_lf(*metadata),
-            )
-            .unwrap();
+            let encoder =
+                VarDctEncoder::new_with_config(context.clone(), *strategy, config.clone()).unwrap();
             let actual = encoder
                 .encode(padded_rgb_source_sized(
                     &context,
@@ -156,7 +167,7 @@ fn all_27_strategies_emit_native_checked_nonzero_ac_and_interoperate() {
             assert_eq!(&actual, expected, "{strategy:?}/{variant:?}");
             assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
         }
-        eprintln!("{variant:?}: 54 single-transform codestreams are byte-identical");
+        eprintln!("{variant:?}: 108 single-transform codestreams are byte-identical");
     }
     fs::remove_dir_all(directory).unwrap();
 }
@@ -282,7 +293,7 @@ fn single_transform_metadata_storage_is_admitted_before_submission() {
         encoder.submit(source),
         Err(EncodeError::Unsupported(UnsupportedFeature::DeviceLimit {
             name: "max_storage_buffer_binding_size",
-            required: 524_288,
+            required: 786_432,
             available: LIMIT
         }))
     ));

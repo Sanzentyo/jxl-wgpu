@@ -29,6 +29,8 @@
 //! explicit global/LF controls and per-transform HF multipliers; content-adaptive strategy search,
 //! distance control and progressive encoding
 //! remain incomplete. [`TiledVarDctEncoder`] provides an optimized DCT8 workgroup path.
+//! [`VarDctCoefficientOrders`] selects independent X/Y/B permutations for every standard size class;
+//! GPU serializers consume them without exposing image coefficients to the host.
 //!
 //! Fixed CPU/WGSL ABI records use `#[repr(C)]` plus `bytemuck::Pod`. WGSL defines
 //! host-shareable numeric values as little-endian, so this crate rejects big-endian targets at
@@ -87,8 +89,8 @@ pub use session::{
     GpuAccelerationArtifact, GpuFrameArtifacts, ReferenceSlot, SessionDescriptor,
 };
 pub use vardct_encoder::{
-    TiledVarDctEncoder, TiledVarDctGrid, VarDctBackend, VarDctColorEncoding, VarDctConfig,
-    VarDctEncoder, VarDctHfMultiplier, VarDctJob, VarDctKernelLayout, VarDctLfMetadata,
-    VarDctMemoryPlan, VarDctQuantization, VarDctStrategy, VarDctStrategyMap, VarDctSubmission,
-    VarDctTransform, VarDctTransformMemoryPlan,
+    TiledVarDctEncoder, TiledVarDctGrid, VarDctBackend, VarDctCoefficientOrders,
+    VarDctColorEncoding, VarDctConfig, VarDctEncoder, VarDctHfMultiplier, VarDctJob,
+    VarDctKernelLayout, VarDctLfMetadata, VarDctMemoryPlan, VarDctQuantization, VarDctStrategy,
+    VarDctStrategyMap, VarDctSubmission, VarDctTransform, VarDctTransformMemoryPlan,
 };

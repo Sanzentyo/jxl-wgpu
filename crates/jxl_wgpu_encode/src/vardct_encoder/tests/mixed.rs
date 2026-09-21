@@ -82,7 +82,7 @@ fn maps_reject_holes_overlap_bounds_and_group_crossing_and_canonicalize_order() 
     let mut reversed = map.transforms().to_vec();
     reversed.reverse();
     assert_eq!(VarDctStrategyMap::new(512, 512, reversed).unwrap(), map);
-    let plan = TransformPlan::new(map, VarDctQuantization::default()).unwrap();
+    let plan = TransformPlan::new(map, VarDctQuantization::default(), &Default::default()).unwrap();
     assert_eq!(plan.batches.len(), 27);
     assert_eq!(plan.memory.forward.parameter_bytes, 27 * 64);
     assert_eq!(
@@ -138,7 +138,7 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
             .collect();
         VarDctStrategyMap::new(width, height, transforms).unwrap()
     };
-    let maps = [
+    let mut maps = vec![
         packed_map(512, 512, true),
         packed_map(2057, 17, false),
         VarDctStrategyMap::new(
@@ -163,6 +163,7 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
         quantized_map(512, 512, true),
         quantized_map(2057, 17, false),
     ];
+    maps.extend_from_within(..3);
     let mut streams = Vec::new();
     for (case, map) in maps.into_iter().enumerate() {
         let Extent2d { width, height } = map.extent();
@@ -181,9 +182,16 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
             } else {
                 VarDctQuantization::default()
             },
+            coefficient_orders: if case >= 6 {
+                orders::selected(map.transforms().iter().map(|task| task.strategy))
+            } else {
+                Default::default()
+            },
         };
-        let plan = TransformPlan::new(map.clone(), config.quantization).unwrap();
-        let encoder = VarDctBackend::new_with_strategy_map(&context, map.clone(), config).unwrap();
+        let plan = TransformPlan::new(map.clone(), config.quantization, &config.coefficient_orders)
+            .unwrap();
+        let encoder =
+            VarDctBackend::new_with_strategy_map(&context, map.clone(), config.clone()).unwrap();
 
         let source = padded_rgb_source_sized(&context, w, h, &pixels);
         let request = FrameEncodeRequest {
@@ -238,7 +246,7 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
                         crate::VarDctHfMultiplier::new(task.hf_multiplier).unwrap(),
                     )
                     .unwrap(),
-                    ..config
+                    ..config.clone()
                 },
             );
         }
@@ -308,7 +316,7 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
             reordered.reverse();
             let map = VarDctStrategyMap::new(extent.width, extent.height, reordered).unwrap();
             let encoder =
-                VarDctEncoder::new_with_strategy_map(context.clone(), map, *config).unwrap();
+                VarDctEncoder::new_with_strategy_map(context.clone(), map, config.clone()).unwrap();
             let source = padded_rgb_source_sized(
                 &context,
                 extent.width as usize,
@@ -329,65 +337,70 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
 #[test]
 fn mixed_jobs_admit_exact_memory_reject_wrong_extents_and_release_after_cancellation() {
     let context = test_context().expect("actual GPU required for mixed memory evidence");
-    let map = packed_map(512, 512, true);
-    let metadata = VarDctLfMetadata::default();
-    let pixels = reference::pattern(512, 512);
-    let encoder = VarDctEncoder::new_with_strategy_map(
-        context.clone(),
-        map.clone(),
-        config_with_lf(metadata),
-    )
-    .unwrap();
-    let source = padded_rgb_source_sized(&context, 512, 512, &pixels);
-    let memory = encoder.memory_plan(&source).unwrap();
-    assert_eq!(memory.kernel_layout, VarDctKernelLayout::StrategyMap);
-    let wrong = padded_rgb_source_sized(&context, 8, 8, &[[0; 3]; 64]);
-    assert!(matches!(
-        encoder.submit(wrong),
-        Err(EncodeError::InvalidSource(_))
-    ));
-    let insufficient = WgpuContext::with_memory_budget(
-        Arc::new(context.device().clone()),
-        Arc::new(context.queue().clone()),
-        NonZeroU64::new(memory.owned_bytes_per_job - 1).unwrap(),
-    )
-    .unwrap();
-    let encoder =
-        VarDctEncoder::new_with_strategy_map(insufficient, map.clone(), config_with_lf(metadata))
-            .unwrap();
-    assert!(matches!(
-        encoder.submit(source.clone()),
-        Err(EncodeError::MemoryBackpressure(_))
-    ));
-    assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
-    let exact = WgpuContext::with_memory_budget(
-        Arc::new(context.device().clone()),
-        Arc::new(context.queue().clone()),
-        NonZeroU64::new(memory.owned_bytes_per_job).unwrap(),
-    )
-    .unwrap();
-    let encoder =
-        VarDctEncoder::new_with_strategy_map(exact.clone(), map, config_with_lf(metadata)).unwrap();
-    let submission = encoder.submit(source).unwrap();
-    assert_eq!(
-        encoder.in_flight_memory_stats().reserved_bytes,
-        memory.owned_bytes_per_job
-    );
-    drop(submission);
-    let fence = exact.queue().submit([]);
-    exact
-        .device()
-        .poll(wgpu::PollType::Wait {
-            submission_index: Some(fence),
-            timeout: None,
-        })
+    for coefficient_orders in [Default::default(), orders::selected(VarDctStrategy::ALL)] {
+        let map = packed_map(512, 512, true);
+        let metadata = VarDctLfMetadata::default();
+        let custom = VarDctConfig {
+            coefficient_orders,
+            ..config_with_lf(metadata)
+        };
+        let pixels = reference::pattern(512, 512);
+        let encoder =
+            VarDctEncoder::new_with_strategy_map(context.clone(), map.clone(), custom.clone())
+                .unwrap();
+        let source = padded_rgb_source_sized(&context, 512, 512, &pixels);
+        let memory = encoder.memory_plan(&source).unwrap();
+        assert_eq!(memory.kernel_layout, VarDctKernelLayout::StrategyMap);
+        let wrong = padded_rgb_source_sized(&context, 8, 8, &[[0; 3]; 64]);
+        assert!(matches!(
+            encoder.submit(wrong),
+            Err(EncodeError::InvalidSource(_))
+        ));
+        let insufficient = WgpuContext::with_memory_budget(
+            Arc::new(context.device().clone()),
+            Arc::new(context.queue().clone()),
+            NonZeroU64::new(memory.owned_bytes_per_job - 1).unwrap(),
+        )
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while encoder.in_flight_memory_stats().reserved_bytes != 0
-        && std::time::Instant::now() < deadline
-    {
-        exact.device().poll(wgpu::PollType::Poll).unwrap();
-        std::thread::yield_now();
+        let encoder =
+            VarDctEncoder::new_with_strategy_map(insufficient, map.clone(), custom.clone())
+                .unwrap();
+        assert!(matches!(
+            encoder.submit(source.clone()),
+            Err(EncodeError::MemoryBackpressure(_))
+        ));
+        assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
+        let exact = WgpuContext::with_memory_budget(
+            Arc::new(context.device().clone()),
+            Arc::new(context.queue().clone()),
+            NonZeroU64::new(memory.owned_bytes_per_job).unwrap(),
+        )
+        .unwrap();
+        let encoder = VarDctEncoder::new_with_strategy_map(exact.clone(), map, custom).unwrap();
+        let submission = encoder.submit(source.clone()).unwrap();
+        assert_eq!(
+            encoder.in_flight_memory_stats().reserved_bytes,
+            memory.owned_bytes_per_job
+        );
+        drop(submission);
+        let fence = exact.queue().submit([]);
+        exact
+            .device()
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(fence),
+                timeout: None,
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while encoder.in_flight_memory_stats().reserved_bytes != 0
+            && std::time::Instant::now() < deadline
+        {
+            exact.device().poll(wgpu::PollType::Poll).unwrap();
+            std::thread::yield_now();
+        }
+        assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
+        let bytes = encoder.encode(source).unwrap();
+        assert_eq!(decode_rgb8_sized(&bytes, 512, 512).len(), 512 * 512 * 3);
+        assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
     }
-    assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
 }

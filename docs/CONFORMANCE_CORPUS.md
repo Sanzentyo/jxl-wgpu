@@ -694,12 +694,33 @@ code is in `tests/native.rs`; there are no path-based module remappings.
 `vardct_encoder/tests/single.rs` adds textured images for all 27 strategies with default and custom
 LF/HF correlation. Each compressed AC value is checked against independent f64 color conversion,
 cosine sums or native impulse bases, and native matrices/orders within one integer quantizer step.
-All 54 streams agree across Rust `jxl`, `djxl` and the stock GPU decoder within one RGB8 code,
+All 108 natural/custom-order streams agree across Rust `jxl`, `djxl` and the stock GPU decoder within one RGB8 code,
 and their bytes are identical under Scalar/32/64/128/256 lanes. Large-transform decoding now
 accepts the frequency-CfL requirement implemented by the resident renderer, while unknown
 capability bits remain errors. A maximum-magnitude 256x256 fragment uses 6,967,356 bits in its
 217,730-word allocation; invalid lengths/counts are rejected. A 500 KiB storage-binding limit
-independently rejects the 524,304-byte matrix/order allocation before any job reservation.
+independently rejects the 786,432-byte matrix/order allocation before any job reservation.
+
+`vardct_encoder/tests/orders.rs` independently decodes every caller-supplied X/Y/B permutation
+through `jxl_coding`, including all 13 families together and both compact family-mask shortcuts.
+Reverse, rotated and shuffled AC ranks extend through 65,536 coefficients; the LF prefix remains
+fixed. Length, duplicate/range and moved-LF inputs are rejected before GPU work. Identity orders
+restore the default, transposed rectangles share a class, and special 8×8 orders do not change DCT8.
+
+The single-transform matrix crosses both correlation choices with natural/custom orders, checks
+every AC value against the unchanged native/f64 references, and requires identical decoded pixels
+between order choices. Three additional mixed maps (512×512, 2057×17 and 13×21) carry custom
+orders, including all 13 families in one image. All nine maps and all 108 single-transform streams
+retain Scalar/32/64/128/256 byte identity and the one-RGB8-code native/Rust/GPU bound.
+Tiled custom-order cases cover 1×1, 13×21, 257×17 and 2057×17 with custom correlation, blocking/Future
+identity, five variants and exact natural/custom pixel equality. Whole and seven-byte-fragmented
+input through 40-byte GPU windows produce identical GPU output. Exact/one-byte-deficient budgets,
+abandoned completion and successful reuse cover both the tiled order buffer and mixed arenas.
+
+The all-family mixed case exposed a decoder metadata cursor limit inherited from MA trees. Its
+replacement is the declared permutation grammar's bound, at most 387,867 values for all families.
+Decoder unit inputs still require typed rejection of excessive permutation length, out-of-range
+Lehmer digits and a one-bit-truncated last channel without reading past the packet boundary.
 
 `vardct_encoder/tests/quantization.rs` checks the complete global-scale/LF syntax ranges and
 effective HF multipliers 1–256. Mixed and tiled solid-white images exercise both endpoints,

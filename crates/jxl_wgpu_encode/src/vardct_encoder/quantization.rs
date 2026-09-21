@@ -2,7 +2,7 @@
 
 use crate::EncodeError;
 
-use super::VarDctLfMetadata;
+use super::{VarDctCoefficientOrders, VarDctLfMetadata};
 
 /// An effective JPEG XL HF multiplier in `1..=256`. Larger values retain finer AC detail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -97,9 +97,11 @@ impl Default for VarDctQuantization {
     }
 }
 
-/// Quantizer and LF metadata shared by single, tiled, and mapped encoders.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+/// Quantizers, LF metadata and coefficient orders shared by single, tiled, and mapped encoders.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct VarDctConfig {
     pub quantization: VarDctQuantization,
     pub lf_metadata: VarDctLfMetadata,
+    /// Immutable caller-selected permutations; defaults to natural order for every size class.
+    pub coefficient_orders: VarDctCoefficientOrders,
 }
