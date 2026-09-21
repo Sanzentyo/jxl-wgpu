@@ -11,6 +11,7 @@ use super::color::{LosslessModularColorOptions, ModularColorEncoding, ModularIma
 use super::dispatch::frame_covers_canvas;
 use super::dispatch::{LosslessModularBackend, ModularGroupPlan};
 use super::grid::{LosslessModularGroup, LosslessModularGroupGrid};
+use super::icc::{DEFAULT_PROFILE_LIMIT, PreparedImageHeader};
 use super::memory::{LosslessModularMemoryLimits, LosslessModularMemoryPlan};
 use super::source::lossless_modular_source_spec;
 use super::streaming::LosslessModularJob;
@@ -41,6 +42,7 @@ pub struct LosslessModularEncoder {
     encoder: GpuEncoder<LosslessModularBackend>,
     color_options: LosslessModularColorOptions,
     alpha_association: AlphaAssociation,
+    max_icc_profile_bytes: u64,
 }
 
 impl LosslessModularEncoder {
@@ -51,6 +53,7 @@ impl LosslessModularEncoder {
             encoder: GpuEncoder::new(context, backend),
             color_options: LosslessModularColorOptions::default(),
             alpha_association: AlphaAssociation::default(),
+            max_icc_profile_bytes: DEFAULT_PROFILE_LIMIT,
         }
     }
 
@@ -62,6 +65,7 @@ impl LosslessModularEncoder {
             encoder: GpuEncoder::new(context, backend),
             color_options: LosslessModularColorOptions::default(),
             alpha_association: AlphaAssociation::default(),
+            max_icc_profile_bytes: DEFAULT_PROFILE_LIMIT,
         }
     }
 
@@ -77,11 +81,13 @@ impl LosslessModularEncoder {
             encoder: GpuEncoder::new(context, backend),
             color_options: LosslessModularColorOptions::default(),
             alpha_association: AlphaAssociation::default(),
+            max_icc_profile_bytes: DEFAULT_PROFILE_LIMIT,
         }
     }
 
     /// Selects the declaration shared by subsequent stills and animations.
-    /// Source primaries/white/transfer continue to come from each source format.
+    /// Source primaries/white/transfer or ICC bytes continue to come from each source format.
+    /// ICC input requires the selected intent to match the profile header.
     pub fn with_color_options(
         mut self,
         options: LosslessModularColorOptions,
@@ -99,6 +105,14 @@ impl LosslessModularEncoder {
         self
     }
 
+    /// Bounds the original embedded ICC profile before header allocation. The default is
+    /// 16 MiB; zero disables ICC input. JPEG XL's metadata limits also remain enforced.
+    #[must_use]
+    pub fn with_max_icc_profile_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_icc_profile_bytes = max_bytes;
+        self
+    }
+
     #[must_use]
     pub fn capabilities(&self) -> &EncoderCapabilities {
         self.encoder.capabilities()
@@ -110,13 +124,40 @@ impl LosslessModularEncoder {
         self.encoder.memory_stats()
     }
 
-    /// Computes all source, artifact, and readback bytes before submission.
+    /// Computes source, ICC header, artifact, and readback bytes before a still submission.
+    /// Animations retain one separately admitted image header across all frame jobs.
     pub fn memory_plan(
         &self,
         source: &crate::BufferImageSource,
     ) -> Result<LosslessModularMemoryPlan, EncodeError> {
-        let plan = self.encoder.backend().memory_plan(source)?;
+        let mut plan = self.encoder.backend().memory_plan(source)?;
         self.alpha_association.validate(plan.format)?;
+        let spec = lossless_modular_source_spec(&source.layout.format)?;
+        let header = image_header(
+            source.layout.extent.width,
+            source.layout.extent.height,
+            spec.format,
+            spec.bits_per_sample,
+            spec.exponent_bits_per_sample,
+            AnimationHeader::Still,
+            spec.color.metadata(
+                self.color_options,
+                self.alpha_association,
+                self.max_icc_profile_bytes,
+            ),
+        )?;
+        plan.icc_profile_bytes = header.icc_profile_bytes;
+        plan.icc_storage_bytes = header.icc_storage_bytes;
+        plan.owned_bytes_per_job = plan
+            .owned_bytes_per_job
+            .checked_add(header.icc_storage_bytes)
+            .ok_or(EncodeError::InvalidConfiguration("ICC job size overflow"))?;
+        plan.addressed_bytes_per_job = plan
+            .addressed_bytes_per_job
+            .checked_add(header.icc_storage_bytes)
+            .ok_or(EncodeError::InvalidConfiguration(
+                "ICC addressed size overflow",
+            ))?;
         Ok(plan)
     }
 
@@ -177,17 +218,20 @@ impl LosslessModularEncoder {
         &self,
         descriptor: LosslessModularAnimationDescriptor,
     ) -> Result<LosslessModularAnimationSession, EncodeError> {
-        let codestream_header = image_header(
+        let (codestream_header, metadata_permit) = image_header(
             descriptor.canvas_width,
             descriptor.canvas_height,
             descriptor.format,
             descriptor.bits_per_sample,
             descriptor.exponent_bits_per_sample,
             descriptor.animation,
-            descriptor
-                .color
-                .metadata(self.color_options, self.alpha_association),
-        )?;
+            descriptor.color.metadata(
+                self.color_options,
+                self.alpha_association,
+                self.max_icc_profile_bytes,
+            ),
+        )?
+        .finish(self.encoder.memory_budget())?;
         let session = self.encoder.begin_session(SessionDescriptor {
             profile: EncodeProfile::ModularLossless {
                 sample_bit_depth: descriptor.sample_bit_depth(),
@@ -202,6 +246,7 @@ impl LosslessModularEncoder {
             session,
             assembler: CodestreamAssembler::new(codestream_header)?,
             descriptor,
+            metadata_permit,
         })
     }
 
@@ -235,23 +280,27 @@ impl LosslessModularEncoder {
             options: FrameOptions::default(),
         };
         // Finish validating image metadata before any GPU admission or submission.
-        let codestream_header = image_header(
+        let (codestream_header, metadata_permit) = image_header(
             width,
             height,
             format,
             source_spec.bits_per_sample,
             source_spec.exponent_bits_per_sample,
             AnimationHeader::Still,
-            source_spec
-                .color
-                .metadata(self.color_options, self.alpha_association),
-        )?;
+            source_spec.color.metadata(
+                self.color_options,
+                self.alpha_association,
+                self.max_icc_profile_bytes,
+            ),
+        )?
+        .finish(self.encoder.memory_budget())?;
         let frame = self
             .encoder
             .submit_frame(GpuFrameSource::Buffer(source), request)?;
         Ok(LosslessModularSubmission {
             frame: Some(frame),
-            codestream_header,
+            codestream_header: Some(codestream_header),
+            metadata_permit,
             default_color: source_spec.color == ModularColorEncoding::default()
                 && self.color_options == LosslessModularColorOptions::default(),
             container,
@@ -264,7 +313,7 @@ impl LosslessModularEncoder {
 }
 
 /// Stream-wide contract for one lossless Modular animation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LosslessModularAnimationDescriptor {
     canvas_width: u32,
     canvas_height: u32,
@@ -279,8 +328,9 @@ impl LosslessModularAnimationDescriptor {
     /// Infers stream components, precision and color from a supported source format.
     ///
     /// Frame storage may differ, but every submitted frame must have the same encoded color
-    /// declaration (custom xy rounded to 1e-6 and gamma to 1e-7). Image white and rendering
-    /// intent come from the encoder's [`LosslessModularColorOptions`].
+    /// declaration (custom xy rounded to 1e-6 and gamma to 1e-7, or identical original ICC
+    /// bytes). Image white and rendering intent come from the encoder's
+    /// [`LosslessModularColorOptions`]; the intent must agree with an embedded profile.
     pub fn from_pixel_format(
         canvas_width: u32,
         canvas_height: u32,
@@ -375,32 +425,32 @@ impl LosslessModularAnimationDescriptor {
     }
 
     #[must_use]
-    pub const fn canvas_width(self) -> u32 {
+    pub const fn canvas_width(&self) -> u32 {
         self.canvas_width
     }
 
     #[must_use]
-    pub const fn canvas_height(self) -> u32 {
+    pub const fn canvas_height(&self) -> u32 {
         self.canvas_height
     }
 
     #[must_use]
-    pub const fn format(self) -> LosslessModularFormat {
+    pub const fn format(&self) -> LosslessModularFormat {
         self.format
     }
 
     #[must_use]
-    pub const fn bits_per_sample(self) -> u8 {
+    pub const fn bits_per_sample(&self) -> u8 {
         self.bits_per_sample
     }
 
     #[must_use]
-    pub const fn sample_bit_depth(self) -> jxl_gpu_bitstream::SampleBitDepth {
+    pub const fn sample_bit_depth(&self) -> jxl_gpu_bitstream::SampleBitDepth {
         modular_sample_depth(self.bits_per_sample, self.exponent_bits_per_sample)
     }
 
     #[must_use]
-    pub const fn animation(self) -> AnimationHeader {
+    pub const fn animation(&self) -> AnimationHeader {
         self.animation
     }
 }
@@ -410,12 +460,13 @@ pub struct LosslessModularAnimationSession {
     session: EncodeSession<LosslessModularBackend>,
     assembler: CodestreamAssembler,
     descriptor: LosslessModularAnimationDescriptor,
+    metadata_permit: Option<jxl_wgpu::MemoryPermit>,
 }
 
 impl LosslessModularAnimationSession {
     #[must_use]
-    pub const fn descriptor(&self) -> LosslessModularAnimationDescriptor {
-        self.descriptor
+    pub const fn descriptor(&self) -> &LosslessModularAnimationDescriptor {
+        &self.descriptor
     }
 
     #[must_use]
@@ -450,11 +501,13 @@ impl LosslessModularAnimationSession {
     }
 
     pub fn finish_raw(self) -> Result<Vec<u8>, EncodeError> {
+        let _metadata_permit = self.metadata_permit;
         self.session.ensure_closed()?;
         Ok(self.assembler.finish_raw()?)
     }
 
     pub fn finish_container(self) -> Result<Vec<u8>, EncodeError> {
+        let _metadata_permit = self.metadata_permit;
         self.session.ensure_closed()?;
         self.assembler.finish_container()
     }
@@ -477,7 +530,8 @@ impl LosslessModularAnimationSession {
 /// A `Future` with an executor-independent blocking counterpart.
 pub struct LosslessModularSubmission {
     frame: Option<FrameSubmission<LosslessModularJob>>,
-    codestream_header: BitFragment,
+    codestream_header: Option<BitFragment>,
+    metadata_permit: Option<jxl_wgpu::MemoryPermit>,
     container: bool,
     group_grid: LosslessModularGroupGrid,
     format: LosslessModularFormat,
@@ -522,7 +576,7 @@ impl LosslessModularSubmission {
         self.assemble(frame)
     }
 
-    fn assemble(&self, frame: GpuFrameArtifacts) -> Result<Vec<u8>, EncodeError> {
+    fn assemble(&mut self, frame: GpuFrameArtifacts) -> Result<Vec<u8>, EncodeError> {
         // The private Gray8 shortcut remains restricted to its original default color contract.
         let acceleration = frame.acceleration.filter(|_| self.default_color);
         let fused_group_size = acceleration
@@ -537,7 +591,15 @@ impl LosslessModularSubmission {
             })
             .transpose()?;
         let encoded_frame = assemble_frame(frame.packets)?;
-        let mut codestream = self.codestream_header.bytes().to_vec();
+        let header = self
+            .codestream_header
+            .take()
+            .expect("unassembled image header");
+        let header_bytes = header.bytes().len();
+        let mut codestream = header.into_bytes();
+        codestream
+            .try_reserve_exact(encoded_frame.bytes().len())
+            .map_err(|_| crate::PacketError::SizeOverflow)?;
         codestream.extend_from_slice(encoded_frame.bytes());
         if !self.container {
             return Ok(codestream);
@@ -557,10 +619,7 @@ impl LosslessModularSubmission {
             .len()
             .checked_sub(group_size)
             .ok_or_else(|| EncodeError::Backend("gray8 group size exceeds frame size".into()))?;
-        let group_start = self
-            .codestream_header
-            .bytes()
-            .len()
+        let group_start = header_bytes
             .checked_add(bytes_before_group)
             .ok_or_else(|| EncodeError::Backend("gray8 codestream size overflow".into()))?;
 
@@ -612,7 +671,10 @@ impl Future for LosslessModularSubmission {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => {
                 submission.frame.take();
-                Poll::Ready(result.and_then(|frame| submission.assemble(frame)))
+                let result = result.and_then(|frame| submission.assemble(frame));
+                submission.codestream_header.take();
+                submission.metadata_permit.take();
+                Poll::Ready(result)
             }
         }
     }
@@ -1226,7 +1288,7 @@ pub(super) fn image_header(
     exponent_bits_per_sample: u8,
     animation: AnimationHeader,
     color: ModularImageMetadata,
-) -> Result<BitFragment, EncodeError> {
+) -> Result<PreparedImageHeader, EncodeError> {
     color.options.validate()?;
     color.alpha.validate(format)?;
     let extra_fields = animation.is_animation() || color.options.extra_fields();
@@ -1278,8 +1340,11 @@ pub(super) fn image_header(
     }
     output.write_bits(0, 2)?;
     output.write_bits(1, 1)?;
-    output.align_to_byte()?;
-    Ok(BitFragment::byte_aligned(output.into_bytes())?)
+    PreparedImageHeader::new(
+        output,
+        color.encoding.icc_profile(),
+        color.max_icc_profile_bytes,
+    )
 }
 
 pub(super) fn write_animation_header(

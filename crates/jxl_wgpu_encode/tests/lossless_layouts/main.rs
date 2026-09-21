@@ -3,6 +3,7 @@
 mod alpha;
 mod animation;
 mod color;
+mod icc;
 mod lifetime;
 mod source;
 
@@ -150,6 +151,11 @@ fn check_oracles(encoded: &[u8], expected: &[u32], case: &Case) -> Vec<f32> {
 
 fn check_frame_oracles(encoded: &[u8], frames: &[&[u32]], case: &Case) -> Vec<f32> {
     let native = native(encoded);
+    check_frame_samples(encoded, frames, case, &native);
+    native
+}
+
+fn check_frame_samples(encoded: &[u8], frames: &[&[u32]], case: &Case, native: &[f32]) {
     let pixels = frames[0].len() / case.format.channel_count() as usize;
     let frame_size = pixels * (4 + usize::from(case.format.has_alpha()));
     assert_eq!(native.len(), frame_size * frames.len());
@@ -208,7 +214,6 @@ fn check_frame_oracles(encoded: &[u8], frames: &[&[u32]], case: &Case) -> Vec<f3
             }
         }
     }
-    native
 }
 
 const TREES: [LosslessModularTreeMode; 2] = [

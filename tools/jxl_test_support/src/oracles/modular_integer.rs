@@ -8,12 +8,18 @@
 pub fn original_planes(data: &[u8], frame_index: usize) -> Vec<Vec<i32>> {
     let mut image = jxl_oxide::JxlImage::read_with_defaults(data).unwrap();
     assert!(!image.image_header().metadata.xyb_encoded);
-    let jxl_image::color::ColourEncoding::Enum(encoding) =
-        &image.image_header().metadata.colour_encoding
-    else {
-        panic!("integer oracle requires an enumerated original color encoding")
-    };
-    image.request_color_encoding(encoding.clone());
+    match &image.image_header().metadata.colour_encoding {
+        jxl_image::color::ColourEncoding::Enum(encoding) => {
+            image.request_color_encoding(encoding.clone());
+        }
+        jxl_image::color::ColourEncoding::IccProfile(_) => {
+            let profile = image
+                .original_icc()
+                .expect("embedded original ICC")
+                .to_vec();
+            image.request_icc(&profile).unwrap();
+        }
+    }
     image.set_render_spot_color(false);
     let render = image.render_frame(frame_index).unwrap();
     render

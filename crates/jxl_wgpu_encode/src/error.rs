@@ -128,6 +128,12 @@ pub enum EncodeError {
     ForwardVarDct(#[from] jxl_wgpu::ForwardVarDctError),
     #[error("invalid encoder configuration: {0}")]
     InvalidConfiguration(&'static str),
+    #[error("ICC {resource} requires {required} bytes, limit {limit}")]
+    IccLimit {
+        resource: &'static str,
+        required: u64,
+        limit: u64,
+    },
     #[error("invalid GPU frame source: {0}")]
     InvalidSource(&'static str),
     #[error("invalid encoder source layout: {0}")]

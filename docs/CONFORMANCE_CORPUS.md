@@ -445,8 +445,56 @@ JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossl
 ```
 
 `ENC-01`, `IO-02`, `FRAME-05` and `QA-03/06` remain **Partial**. Alpha still shares color's declared
-precision; independent extra precision/types, resampling/shift policies, embedded ICC, YUV/textures
+precision; independent extra precision/types, resampling/shift policies, CMYK, YUV/textures
 and the remaining encoder capabilities retain their separate gates.
+
+## Lossless Modular embedded ICC
+
+The [`lossless_layouts::icc`](../crates/jxl_wgpu_encode/tests/lossless_layouts/icc.rs) matrix
+embeds the unchanged RGB and Gray matrix/TRC profiles from the decoder corpus. Thirty-two still
+cases cross Gray/GrayAlpha/RGB/RGBA, both MA-tree modes, integer 8/31 and IEEE16/32 at 257×3.
+Planar big-endian, reversed, shifted source fields with unaligned offsets/pitches produce identical
+containers to canonical packed `IccDevice` input. Associated alpha retains invisible source color.
+The independent native original-profile API checks every byte, jxl-oxide retains exact working
+words, and libjxl's verified original-device output keeps the existing integer `2e-7` bound or exact
+IEEE bits. Whole and 256-byte-window fragmented GPU numeric output matches each source component,
+including alpha and IEEE special values, after its session is dropped.
+
+Twelve more 1×257 GrayAlpha/RGBA stills preserve ICC v2/v4.3 headers, all four intents,
+APPL/MSFT/SGI/SUNW/unknown platform signatures, creator prediction and private tags with up to
+65,536 bytes covering the full byte alphabet. Original native profile export and both independent
+sample oracles remain exact under split layouts and changing device-channel labels. Unit tests
+independently entropy-decode every byte across all 41 contexts, all eight starting bit offsets and
+the ICC stream-length buckets. Metadata size/overflow checks exercise both original and transformed
+256 MiB limits without allocating those large profiles.
+
+Two finite IEEE32 cases reuse the existing 17×9 decoder input and scalar linear-color references.
+Newly encoded native linear output equals the unchanged native-encoded fixture bit-for-bit.
+GPU RGBA-F32 color remains within the established `2e-4` independent scalar bound, alpha stays
+bit-exact, and whole/fragmented retained outputs agree exactly. The native CMM has different
+curve/matrix precision from the scalar oracle; native/scalar equality is not assumed.
+
+Four three-frame associated GrayAlpha/RGBA animations cross integer31 and IEEE32. Physical
+layouts, byte order and ordinary/device labels change per frame; independently parsed equal
+profiles remain compatible. A byte change to the creator field rejects before advancing the
+frame index or changing the header reservation. Reverse insertion, blocking/Future completion,
+timing/timecodes, exact independent/native words and retained GPU outputs are checked. The session
+retains one header reservation after frame completion and releases it on finish or drop.
+
+Resident 257×9 and streamed 16K×1 GrayAlpha31 jobs cover exact/one-byte-short budgets, metadata-only
+backpressure, unique source/profile owner retirement after cancellation, completed-future retention,
+blocking/Future equality and pool reuse. Animation creation, frame admission, error completion and
+abandonment separately verify header/GPU permit lifetimes. Zero/undersized ICC limits, mismatched
+intent/model/profile, invalid/duplicate/device-mixed channels and CMYK input reject before GPU
+allocation. No existing fixtures, references or numerical tolerances are changed.
+
+```console
+JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossless_layouts icc:: -- --test-threads=2
+```
+
+`ENC-01`, `IO-02`, `FRAME-05`, `API-05` and `QA-03/06` remain **Partial**. This preserves RGB/Gray
+ICC metadata; CMYK/arbitrary extra input, independent precision and broader ICC animation
+composition, encoder syntax and quality retain their remaining gates.
 
 ## Procedural VarDCT encoder matrix
 

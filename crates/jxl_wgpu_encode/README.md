@@ -60,12 +60,23 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   `[1/8192, 1]` and rounds to `1e-7`. Out-of-range coordinates and geometry that becomes singular
   after rounding are rejected. Gray retains white/transfer; its RGB primaries are not encoded.
   The YCbCr encoding field must be `Undefined`. BT.2020's distinct transfer, limited range,
-  undefined transfers, ICC and non-RGB/Gray declarations remain unsupported.
+  undefined transfers and non-RGB/Gray declarations remain unsupported.
+- `ColorSpecification::Icc` embeds a structurally validated `IccProfile` with RGB or Gray device
+  space, preserving every original byte, including private tags. `Rgb`/`Gray` models use their
+  existing component swizzles. `IccDevice` instead uses `Swizzle::Device`, `Channel::Device(0..N)`
+  for the profile's color components and optional `Channel::Alpha`. The source precision and
+  storage rules above apply to both forms. No profile evaluation or image conversion is needed.
+  `with_max_icc_profile_bytes` defaults to 16 MiB; zero disables ICC input. Original and transformed
+  profile streams must also fit JPEG XL's 256 MiB limits. Limit failures use `EncodeError::IccLimit`
+  before variable-sized header allocation or GPU admission. CMYK and other device spaces remain
+  unsupported.
 - `with_color_options(LosslessModularColorOptions)` selects all four ICC rendering intents and
   a positive exact `FiniteF16` image white in cd/m². Defaults are Relative and 255 cd/m², also for
   HDR; the caller explicitly selects another known source white. This declares metadata and
-  performs no tone mapping, primary conversion or alpha-association change. Image metadata is
-  validated before GPU admission. GPU storage, submission counts and byte budgets are unchanged.
+  performs no tone mapping, primary conversion or alpha-association change. For ICC input, select
+  the intent from `profile.header().rendering_intent`; a conflict is rejected instead of modifying
+  the profile. Image metadata is validated before GPU admission. GPU storage and submission counts
+  are unchanged; variable-sized ICC headers use the shared byte budget described below.
 - Integer RGB(A) uses JPEG XL reversible color transform type 0 (YCoCg) in WGSL. Floating
   channels retain their raw IEEE words without a color transform. No transformed image or source
   pixels are read by the CPU.
@@ -100,6 +111,17 @@ one histogram and one serialization submission per batch. Every live batch uses 
 `MemoryBudget`. Its exclusive buffer-pool lease and reservation survive until the map callback and
 mapped-range consumer are both finished, including when the returned future is abandoned.
 Source range accounting excludes gaps between planes and counts shared alignment prefixes once.
+
+`icc_profile_bytes` reports the original caller-owned profile retained by a source or animation
+descriptor and included in addressed bytes. `icc_storage_bytes` adds twice the complete image-header
+size to owned/addressed bytes: one header plus the possible temporary copy during exact resizing
+or container wrapping. The encoder reserves this amount before writing the ICC payload; it writes
+header predictions and literal metadata directly, without an intermediate transformed-profile
+allocation. The permit survives assembly and retires on completion even if the completed future
+remains alive. Cancellation drops the host header while active GPU batches keep their own permits
+through completion. Returned codestream/container vectors are caller-owned after completion.
+The frame-only backend reports zero ICC storage; an animation session admits one image header at
+creation and holds it until finishing or dropping, independently of its frame jobs.
 
 The returned `LosslessModularSubmission` implements `Future` without depending on an async runtime;
 native callers may instead use `wait`. Browser builds intentionally reject blocking `wait`, because
@@ -174,15 +196,20 @@ RGBA32 jobs retain the existing exact admission, cancellation and pool-reuse con
 `EncodeProfile::ModularLossless` carries `sample_bit_depth: SampleBitDepth`, distinguishing
 integer depth from floating depth and exponent width. Matching storage widths do not permit
 changing numeric type between frames. `LosslessModularAnimationDescriptor::from_pixel_format`
-also infers the stream's enumerated color declaration. Frames may change physical layout but must
-keep the same serialized color, precision and logical channels; mismatch leaves the next frame
-index unchanged. The existing `new`/`new_float` descriptors select default sRGB/gray.
+also infers the stream's enumerated color declaration or retains its original ICC profile. Frames
+may change physical layout but must keep the same serialized color, precision and logical channels;
+ICC identity compares every original byte. Mismatch leaves the next frame index unchanged. The
+descriptor is `Clone`, and `session.descriptor()` borrows it. The existing `new`/`new_float`
+descriptors select default sRGB/gray.
 The [source-color matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-source-color)
 checks independent native profile bytes, exact original samples, requested color conversion and
 Replace animations. The [alpha-input matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-alpha-input)
 checks exact GrayAlpha/associated source words, all three output alpha policies and six-frame
 compositions against independent native/Rust decoders, with retained output and cancellation.
-Independent extra-channel declarations, embedded ICC, YUV and textures remain outside this profile.
+The [embedded-ICC matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-embedded-icc)
+checks independent original-profile bytes and source words, requested color output, private tags,
+all intents, animation identity, size limits and shared-budget lifetime.
+Independent extra-channel declarations, CMYK, YUV and textures remain outside this profile.
 
 ## Experimental VarDCT profile
 

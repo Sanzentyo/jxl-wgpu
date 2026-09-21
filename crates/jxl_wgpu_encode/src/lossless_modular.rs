@@ -5,6 +5,7 @@
 mod color;
 mod dispatch;
 mod grid;
+mod icc;
 mod memory;
 mod serializer;
 mod source;

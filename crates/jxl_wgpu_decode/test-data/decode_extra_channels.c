@@ -5,7 +5,8 @@
  * --prefix flushes one incomplete frame at the supplied physical section boundary.
  * --xyb requests libjxl's scaled XYB output for offline component-domain references.
  * --original requests and verifies the enumerated original encoding using libjxl 0.12.0.
- * /tmp/jxl-extra-oracle INPUT.jxl [--preview] [--prefix] [--preserve-alpha] [--linear|--xyb|--original] [--keep-orientation] [--render-spots] > CHANNELS.f32
+ * --original-icc verifies exact original/data ICC identity before original-component output.
+ * /tmp/jxl-extra-oracle INPUT.jxl [--preview] [--prefix] [--preserve-alpha] [--linear|--xyb|--original|--original-icc] [--keep-orientation] [--render-spots] > CHANNELS.f32
  */
 #include <jxl/decode.h>
 #include <jxl/encode.h>
@@ -16,22 +17,27 @@
 #include <stdlib.h>
 #include <string.h>
 
+static void require_icc(int ok, const char* message) {
+  if (!ok) { fprintf(stderr, "original ICC oracle: %s\n", message); exit(3); }
+}
+
 int main(int argc, char** argv) {
   if (argc < 2) return 2;
-  int unpremultiply = 1, linear = 0, xyb = 0, original = 0, keep_orientation = 0, render_spots = 0, preview = 0, prefix = 0;
+  int unpremultiply = 1, linear = 0, xyb = 0, original = 0, original_icc = 0, keep_orientation = 0, render_spots = 0, preview = 0, prefix = 0;
   for (int i=2; i<argc; ++i) {
     if (!strcmp(argv[i], "--preserve-alpha")) unpremultiply = 0;
     else if (!strcmp(argv[i], "--linear")) linear = 1;
     else if (!strcmp(argv[i], "--xyb")) xyb = 1;
     else if (!strcmp(argv[i], "--original")) original = 1;
+    else if (!strcmp(argv[i], "--original-icc")) original_icc = 1;
     else if (!strcmp(argv[i], "--keep-orientation")) keep_orientation = 1;
     else if (!strcmp(argv[i], "--render-spots")) render_spots = 1;
     else if (!strcmp(argv[i], "--preview")) preview = 1;
     else if (!strcmp(argv[i], "--prefix")) prefix = 1;
     else return 2;
   }
-  if (xyb + linear + original > 1) return 2;
-  if (original && JxlDecoderVersion() != 12000) return 2;
+  if (xyb + linear + original + original_icc > 1) return 2;
+  if ((original || original_icc) && JxlDecoderVersion() != 12000) return 2;
   FILE* in = fopen(argv[1], "rb"); if (!in) return 2;
   if (fseek(in, 0, SEEK_END)) return 2;
   long length = ftell(in); if (length <= 0) return 2;
@@ -40,7 +46,7 @@ int main(int argc, char** argv) {
   if (fread(data, 1, (size_t)length, in) != (size_t)length) return 2;
   fclose(in);
   JxlDecoder* dec = JxlDecoderCreate(NULL);
-  if ((linear || original) && dec) JxlDecoderSetCms(dec, *JxlGetDefaultCms());
+  if ((linear || original || original_icc) && dec) JxlDecoderSetCms(dec, *JxlGetDefaultCms());
   if (!dec || JxlDecoderSubscribeEvents(dec, JXL_DEC_BASIC_INFO | JXL_DEC_COLOR_ENCODING | (preview ? JXL_DEC_PREVIEW_IMAGE : JXL_DEC_FULL_IMAGE)) != JXL_DEC_SUCCESS
       || JxlDecoderSetRenderSpotcolors(dec, render_spots) != JXL_DEC_SUCCESS
       || JxlDecoderSetUnpremultiplyAlpha(dec, unpremultiply) != JXL_DEC_SUCCESS
@@ -59,6 +65,26 @@ int main(int argc, char** argv) {
       extras = calloc(info.num_extra_channels ? info.num_extra_channels : 1, sizeof(*extras));
       if (!extras) return 2;
     } else if (status == JXL_DEC_COLOR_ENCODING) {
+      if (original_icc) {
+        size_t original_size = 0, actual_size = 0;
+        if (JxlDecoderGetICCProfileSize(dec, JXL_COLOR_PROFILE_TARGET_ORIGINAL, &original_size) != JXL_DEC_SUCCESS
+            || !original_size || original_size > (16 << 20)) return 3;
+        uint8_t* declared = malloc(original_size);
+        uint8_t* actual = malloc(original_size);
+        if (!declared || !actual) return 2;
+        require_icc(JxlDecoderGetColorAsICCProfile(dec, JXL_COLOR_PROFILE_TARGET_ORIGINAL, declared, original_size) == JXL_DEC_SUCCESS, "read declared profile");
+        /* Original-profile streams already expose the declared device samples. libjxl 0.12
+         * rejects an explicit ICC request here; require exact DATA profile identity below.
+         * XYB needs an explicit output-profile request. */
+        if (!info.uses_original_profile)
+          require_icc(JxlDecoderSetOutputColorProfile(dec, NULL, declared, original_size) == JXL_DEC_SUCCESS, "request declared profile");
+        require_icc(JxlDecoderGetICCProfileSize(dec, JXL_COLOR_PROFILE_TARGET_DATA, &actual_size) == JXL_DEC_SUCCESS, "read output profile size");
+        require_icc(actual_size == original_size, "output profile size differs");
+        require_icc(JxlDecoderGetColorAsICCProfile(dec, JXL_COLOR_PROFILE_TARGET_DATA, actual, actual_size) == JXL_DEC_SUCCESS, "read output profile");
+        require_icc(!memcmp(declared, actual, original_size), "output profile bytes differ");
+        free(declared);
+        free(actual);
+      }
       if (original) {
         JxlColorEncoding declared, actual;
         if (JxlDecoderGetColorAsEncodedProfile(dec, JXL_COLOR_PROFILE_TARGET_ORIGINAL, &declared) != JXL_DEC_SUCCESS) return 3;

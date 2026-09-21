@@ -35,7 +35,7 @@ implementation audits.
 | Color models | Gray (`NonColor`/`X000` or `Gray`/`X001`), GrayAlpha (`Gray`/`X00W`), RGB/RGBA with bijective component swizzles; alpha is one extra channel with declared association |
 | Sample depths | every integer `1..=31` or IEEE binary16/binary32, with equal precision across components |
 | Input | one pitch-linear `wgpu::Buffer`, one through four packed/planar/split planes, 8/16/24/32-bit words, arbitrary field positions, Native/Little/Big byte order, `ChromaSubsampling::None` |
-| Source color | full-range enumerated RGB/Gray, standard/custom primaries and white, Linear/sRGB/BT.709/PQ/HLG/DCI/Gamma; four intents and positive binary16 image white |
+| Source color | full-range enumerated RGB/Gray, standard/custom primaries and white, Linear/sRGB/BT.709/PQ/HLG/DCI/Gamma, or unchanged embedded RGB/Gray ICC; four intents and positive binary16 image white |
 | Extent | `1..2^30` per axis, further bounded by device limits |
 | Frame/group layout | standard 256x256 PassGroups, multi-group, row-major TOC |
 | Animation | `true` (5 blend modes, signed crop, 4 reference slots, timecodes) |
@@ -59,6 +59,18 @@ exact positive binary16 unit-white luminance, defaulting to Relative/255 cd/m².
 continues to preserve source words. Animation descriptors bind logical channels, precision and
 serialized color across physical layout changes. The crate README owns the API and rejected cases;
 [source-color conformance](CONFORMANCE_CORPUS.md#lossless-modular-source-color) records its evidence.
+
+Embedded ICC lowering accepts RGB/Gray profiles with either ordinary component swizzles or
+explicit `IccDevice`/`Device` channel labels. The host codes only profile metadata: a bounded
+header predictor, one literal-copy command and a uniform eight-bit prefix alphabet shared by all
+41 ICC contexts preserve the entire original profile. It neither evaluates profile methods nor
+reads source pixels. The source profile's intent must match the encoder options. Byte limits and
+an exact header plan precede variable-sized allocation; the shared budget reserves the header
+and one temporary assembly copy. Assembly moves that allocation and reserves its final extension
+once. Stills release the metadata permit on completion/cancellation; animation sessions hold one
+permit across frames and bind byte-identical profiles. GPU parameters, bindings, artifact sizes
+and submission counts do not change. [ICC evidence](CONFORMANCE_CORPUS.md#lossless-modular-embedded-icc)
+covers native profile/sample interoperability and resource lifetime.
 
 GrayAlpha maps the gray and alpha swizzle outputs to logical channels 0/1 in the existing source
 parameter array. Its image header declares grayscale and one alpha extra channel, while RGB(A)

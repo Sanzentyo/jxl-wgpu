@@ -68,6 +68,9 @@ fn unrepresentable_or_singular_source_metadata_is_rejected() {
             TransferFunction::Gamma(jxl_gpu_protocol::GammaExponent::new(gamma).unwrap());
         let encoded =
             ModularColorEncoding::from_format(&format(ColorSpace::Bt709, transfer)).unwrap();
+        let ModularColorEncoding::Enumerated(encoded) = encoded else {
+            panic!("enumerated source color");
+        };
         let TransferFunctionInventory::Gamma {
             scaled_gamma,
             inverted: true,

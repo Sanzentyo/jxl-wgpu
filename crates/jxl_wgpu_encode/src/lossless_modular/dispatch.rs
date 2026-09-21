@@ -209,7 +209,7 @@ impl LosslessModularBackend {
             source.buffer.size(),
             self.storage_offset_alignment,
         )?;
-        let source_spec = source_layout.spec;
+        let source_spec = &source_layout.spec;
         let format = source_spec.format;
         let channels = format.channel_count();
         let dispatches =
@@ -440,8 +440,13 @@ impl LosslessModularBackend {
             .checked_add(readback_bytes)
             .and_then(|value| value.checked_add(parameter_storage_bytes))
             .ok_or(EncodeError::InvalidSource("per-job memory size overflow"))?;
+        let icc_profile_bytes = source_spec
+            .color
+            .icc_profile()
+            .map_or(0, |profile| profile.bytes().len() as u64);
         let addressed_bytes_per_job = owned_bytes_per_job
             .checked_add(peak_source_binding_bytes)
+            .and_then(|bytes| bytes.checked_add(icc_profile_bytes))
             .ok_or(EncodeError::InvalidSource("per-job memory size overflow"))?;
         let batch_count = u32::try_from(batches.len())
             .map_err(|_| EncodeError::InvalidSource("artifact batch count overflow"))?;
@@ -470,6 +475,8 @@ impl LosslessModularBackend {
             batch_count,
             gpu_submission_count,
             streaming,
+            icc_profile_bytes,
+            icc_storage_bytes: 0,
             owned_bytes_per_job,
             addressed_bytes_per_job,
         };
@@ -957,7 +964,10 @@ mod source_window_tests {
                 AnimationHeader::Still,
                 Default::default(),
             )
-            .unwrap(),
+            .unwrap()
+            .finish(context.memory_budget())
+            .unwrap()
+            .0,
         )
         .unwrap();
         assembly.insert(job.wait().unwrap()).unwrap();

@@ -634,6 +634,14 @@ impl BitWriter {
         }
     }
 
+    /// Reserves output bytes before a caller starts a size-checked metadata write.
+    /// This does not advance the stream or impose a maximum on subsequent writes.
+    pub fn try_reserve_bytes(&mut self, additional: usize) -> Result<(), Error> {
+        self.bytes
+            .try_reserve_exact(additional)
+            .map_err(|_| Error::SizeOverflow)
+    }
+
     pub fn write_bits(&mut self, value: u64, count: u8) -> Result<(), Error> {
         if count > 56 {
             return Err(Error::InvalidBitCount(count));

@@ -9,7 +9,7 @@ use jxl_gpu_formats::{
 };
 use jxl_gpu_protocol::{
     Chromaticity, ColorMatrix, RgbChromaticities, RgbColorSpace, WhitePointAdaptation,
-    icc::IccRenderingIntent,
+    icc::{IccProfile, IccRenderingIntent},
 };
 
 use super::types::{AlphaAssociation, LosslessModularFormat};
@@ -22,6 +22,8 @@ use crate::{EncodeError, UnsupportedFeature};
 /// is JPEG XL's 255 cd/m². HDR callers can supply their known image white explicitly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LosslessModularColorOptions {
+    /// For ICC input, this must equal the intent in the profile header; its original bytes
+    /// are embedded unchanged. A conflicting declaration is rejected before admission.
     pub rendering_intent: IccRenderingIntent,
     /// Positive, exact binary16 luminance, in cd/m²; no implicit rounding is performed.
     pub intensity_target: FiniteF16,
@@ -63,21 +65,55 @@ impl LosslessModularColorOptions {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct ModularColorEncoding {
+pub(super) struct EnumeratedColorEncoding {
     white: WhitePointInventory,
     primaries: PrimariesInventory,
     transfer: TransferFunctionInventory,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ModularColorEncoding {
+    Enumerated(EnumeratedColorEncoding),
+    Icc(IccProfile),
+}
+
+impl Default for ModularColorEncoding {
+    fn default() -> Self {
+        Self::Enumerated(EnumeratedColorEncoding::default())
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct ModularImageMetadata {
     pub(super) encoding: ModularColorEncoding,
     pub(super) options: LosslessModularColorOptions,
     pub(super) alpha: AlphaAssociation,
+    pub(super) max_icc_profile_bytes: u64,
+}
+
+impl Default for ModularImageMetadata {
+    fn default() -> Self {
+        Self {
+            encoding: ModularColorEncoding::default(),
+            options: LosslessModularColorOptions::default(),
+            alpha: AlphaAssociation::default(),
+            max_icc_profile_bytes: super::icc::DEFAULT_PROFILE_LIMIT,
+        }
+    }
 }
 
 impl ModularColorEncoding {
     pub(super) fn from_format(format: &PixelFormat) -> Result<Self, EncodeError> {
+        if let ColorSpecification::Icc(profile) = &format.color_spec {
+            if matches!(
+                (format.model, &profile.header().device_space.0),
+                (ColorModel::Rgb | ColorModel::IccDevice, b"RGB ")
+                    | (ColorModel::Gray | ColorModel::IccDevice, b"GRAY")
+            ) {
+                return Ok(Self::Icc(profile.clone()));
+            }
+            return Err(UnsupportedFeature::InputFormat.into());
+        }
         let spec = match (&format.color_spec, format.model) {
             (ColorSpecification::Undefined, ColorModel::NonColor)
             | (
@@ -151,26 +187,58 @@ impl ModularColorEncoding {
             }
             _ => return Err(UnsupportedFeature::InputFormat.into()),
         };
-        Ok(Self {
+        Ok(Self::Enumerated(EnumeratedColorEncoding {
             white,
             primaries,
             transfer,
-        })
+        }))
     }
 
     pub(super) fn metadata(
-        self,
+        &self,
         options: LosslessModularColorOptions,
         alpha: AlphaAssociation,
+        max_icc_profile_bytes: u64,
     ) -> ModularImageMetadata {
         ModularImageMetadata {
-            encoding: self,
+            encoding: self.clone(),
             options,
             alpha,
+            max_icc_profile_bytes,
+        }
+    }
+
+    pub(super) fn icc_profile(&self) -> Option<&IccProfile> {
+        match self {
+            Self::Icc(profile) => Some(profile),
+            Self::Enumerated(_) => None,
         }
     }
 
     pub(super) fn write(
+        &self,
+        output: &mut BitWriter,
+        format: LosslessModularFormat,
+        intent: IccRenderingIntent,
+    ) -> Result<(), EncodeError> {
+        match self {
+            Self::Icc(profile) => {
+                if profile.header().rendering_intent != intent {
+                    return Err(EncodeError::InvalidConfiguration(
+                        "encoder intent must match the unchanged embedded ICC profile",
+                    ));
+                }
+                output.write_bits(0, 1)?; // explicit color encoding
+                output.write_bits(1, 1)?; // embedded ICC
+                write_enum(output, u32::from(format.color_channel_count() == 1))
+            }
+            Self::Enumerated(encoding) => encoding.write(output, format, intent),
+        }
+    }
+}
+
+impl EnumeratedColorEncoding {
+    fn write(
         self,
         output: &mut BitWriter,
         format: LosslessModularFormat,

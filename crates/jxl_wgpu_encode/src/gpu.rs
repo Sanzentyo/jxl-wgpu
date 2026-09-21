@@ -288,6 +288,10 @@ impl<B: GpuEncodeBackend> GpuEncoder<B> {
         self.context.memory_stats()
     }
 
+    pub(crate) fn memory_budget(&self) -> &MemoryBudget {
+        self.context.memory_budget()
+    }
+
     /// Returns the concrete backend so profile-specific limits and memory
     /// plans can be queried before a submission is admitted.
     #[must_use]

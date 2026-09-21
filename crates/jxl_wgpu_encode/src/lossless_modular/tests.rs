@@ -352,7 +352,8 @@ mod native_tests {
             Default::default(),
         )
         .unwrap();
-        let mut assembler = CodestreamAssembler::new(header).unwrap();
+        let budget = jxl_wgpu::MemoryBudget::new(std::num::NonZeroU64::new(1024).unwrap());
+        let mut assembler = CodestreamAssembler::new(header.finish(&budget).unwrap().0).unwrap();
         let slot_one = crate::ReferenceSlot::new(1).unwrap();
         let first = ModularFrameHeader {
             animation,

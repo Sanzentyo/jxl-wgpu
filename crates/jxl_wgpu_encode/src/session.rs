@@ -423,12 +423,11 @@ impl CodestreamAssembler {
     }
 
     pub fn finish_raw(self) -> Result<Vec<u8>, PacketError> {
-        let mut output = self.codestream_header.bytes().to_vec();
         let mut saw_last = false;
         let frame_count = self.frames.len();
         for expected in 0..frame_count {
             let index = FrameIndex(u32::try_from(expected).map_err(|_| PacketError::SizeOverflow)?);
-            let (is_last, frame) = self
+            let (is_last, _) = self
                 .frames
                 .get(&index)
                 .ok_or(PacketError::MissingFrame(index.get()))?;
@@ -436,13 +435,21 @@ impl CodestreamAssembler {
                 return Err(PacketError::InvalidFinalFrame);
             }
             saw_last |= *is_last;
-            output
-                .try_reserve(frame.bytes().len())
-                .map_err(|_| PacketError::SizeOverflow)?;
-            output.extend_from_slice(frame.bytes());
         }
         if frame_count == 0 || !saw_last {
             return Err(PacketError::InvalidFinalFrame);
+        }
+        let additional = self.frames.values().try_fold(0usize, |bytes, (_, frame)| {
+            bytes
+                .checked_add(frame.bytes().len())
+                .ok_or(PacketError::SizeOverflow)
+        })?;
+        let mut output = self.codestream_header.into_bytes();
+        output
+            .try_reserve_exact(additional)
+            .map_err(|_| PacketError::SizeOverflow)?;
+        for (_, frame) in self.frames.values() {
+            output.extend_from_slice(frame.bytes());
         }
         Ok(output)
     }

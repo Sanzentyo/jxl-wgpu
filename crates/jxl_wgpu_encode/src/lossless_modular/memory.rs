@@ -13,7 +13,7 @@ pub struct LosslessModularMemoryPlan {
     pub exponent_bits_per_sample: u8,
     /// Largest storage word containing a component (`1`, `2`, `3`, or `4` bytes).
     pub bytes_per_sample: u8,
-    /// Number of independently tokenized Modular channels (1, 3, or 4).
+    /// Number of independently tokenized Modular channels (1 through 4).
     pub channel_count: u32,
     /// Union of the full source plane binding ranges, excluding gaps between planes.
     pub source_binding_bytes: u64,
@@ -36,6 +36,11 @@ pub struct LosslessModularMemoryPlan {
     /// jobs submit every batch once for histogram aggregation and once for serialization.
     pub gpu_submission_count: u32,
     pub streaming: bool,
+    /// Caller-owned ICC bytes retained by the source/descriptor; zero for enumerated color.
+    pub icc_profile_bytes: u64,
+    /// Shared-budget reservation for the ICC image header and a temporary assembly copy.
+    /// Included in `owned_bytes_per_job` for the complete encoder; the frame backend sets zero.
+    pub icc_storage_bytes: u64,
     pub owned_bytes_per_job: u64,
     pub addressed_bytes_per_job: u64,
 }

@@ -34,7 +34,8 @@ provides unbounded pre-OETF XYB stills; the codec's Gamma/DCI black floor makes 
 already encoded original image unsuitable for that reference. These helpers use ordinary module
 imports and stay outside production dependencies.
 
-`oracles::modular_integer` requests the declared original encoding from jxl-oxide 0.12.6 and
+`oracles::modular_integer` requests the declared original encoding or original embedded ICC
+from jxl-oxide 0.12.6 and
 copies its retained integer planes through jxl-render 0.12.4. It rejects F32 planes rather than
 rounding them back to integers, so exact 17–31-bit encoder checks include the low sample bits.
 The [wide-integer encoder matrix](../../docs/CONFORMANCE_CORPUS.md#wide-integer-modular-encoding)
@@ -45,6 +46,13 @@ compares those words exactly, including NaN payloads and signed zero, and indepe
 libjxl's original F32 output. Finite arithmetic composition uses the Rust `jxl` F32 oracle in
 addition to libjxl; the older jxl-oxide header reader does not implement the per-channel
 reference-field rule for mixed full-frame blend modes.
+The extra-channel native oracle's `--original-icc` mode requires libjxl 0.12.0 and exact identity
+between the original and actual DATA ICC bytes before returning original device samples. Original
+profile streams use their native default, because libjxl rejects an explicit ICC request for them;
+XYB streams explicitly request the original profile. This never substitutes a generated profile
+or silently accepts a different output encoding. The encoder ICC matrix separately exports the
+original profile through `oracles::icc_profile`, checks raw integer/IEEE words, and compares requested
+color output with the unchanged independent scalar corpus and native-encoded fixture.
 Neither oracle is a production dependency or a fallback.
 
 `fixtures::icc_spots` reads a typed manifest for native ICC/enumerated RGB/Gray sources, both

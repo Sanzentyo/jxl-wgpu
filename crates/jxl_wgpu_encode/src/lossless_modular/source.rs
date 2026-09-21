@@ -12,7 +12,7 @@ use super::memory::align_up;
 use super::types::{LosslessModularFormat, ModularParams, ModularSourceParams};
 use crate::{EncodeError, UnsupportedFeature};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct LosslessModularSourceSpec {
     pub(super) format: LosslessModularFormat,
     pub(super) color: ModularColorEncoding,
@@ -43,10 +43,58 @@ pub(super) fn lossless_modular_source_spec(
     {
         return Err(UnsupportedFeature::InputFormat.into());
     }
-    let Swizzle::Xyzw(swizzle) = format.swizzle else {
+    let device_channels = if format.model == ColorModel::IccDevice {
+        let ColorSpecification::Icc(profile) = &format.color_spec else {
+            return Err(UnsupportedFeature::InputFormat.into());
+        };
+        if format.swizzle != Swizzle::Device {
+            return Err(UnsupportedFeature::InputFormat.into());
+        }
+        match &profile.header().device_space.0 {
+            b"GRAY" => Some(1),
+            b"RGB " => Some(3),
+            _ => return Err(UnsupportedFeature::InputFormat.into()),
+        }
+    } else {
+        None
+    };
+    let (model, logical_swizzle) = if let Some(channels) = device_channels {
+        let alpha = format
+            .planes
+            .iter()
+            .flat_map(|plane| &plane.words)
+            .any(|word| {
+                word.fields
+                    .iter()
+                    .any(|field| field.kind == PackingFieldKind::Channel(Channel::Alpha))
+            });
+        if channels == 1 {
+            (
+                ColorModel::Gray,
+                Swizzle::Xyzw([
+                    SwizzleComponent::X,
+                    SwizzleComponent::Zero,
+                    SwizzleComponent::Zero,
+                    if alpha {
+                        SwizzleComponent::Y
+                    } else {
+                        SwizzleComponent::One
+                    },
+                ]),
+            )
+        } else {
+            (
+                ColorModel::Rgb,
+                if alpha { Swizzle::XYZW } else { Swizzle::XYZ1 },
+            )
+        }
+    } else {
+        (format.model, format.swizzle)
+    };
+    let Swizzle::Xyzw(swizzle) = logical_swizzle else {
         return Err(UnsupportedFeature::InputFormat.into());
     };
-    let logical_format = match (format.model, format.swizzle, &format.color_spec) {
+    let logical_format = match (model, logical_swizzle, &format.color_spec) {
         (ColorModel::NonColor, Swizzle::X000, ColorSpecification::Undefined) => {
             LosslessModularFormat::Gray
         }
@@ -100,10 +148,18 @@ pub(super) fn lossless_modular_source_spec(
             for field in &word.fields {
                 bit_shift -= u32::from(field.bits);
                 let index = match field.kind {
-                    PackingFieldKind::Channel(Channel::X) => 0,
-                    PackingFieldKind::Channel(Channel::Y) => 1,
-                    PackingFieldKind::Channel(Channel::Z) => 2,
-                    PackingFieldKind::Channel(Channel::W) => 3,
+                    PackingFieldKind::Channel(Channel::X) if device_channels.is_none() => 0,
+                    PackingFieldKind::Channel(Channel::Y) if device_channels.is_none() => 1,
+                    PackingFieldKind::Channel(Channel::Z) if device_channels.is_none() => 2,
+                    PackingFieldKind::Channel(Channel::W) if device_channels.is_none() => 3,
+                    PackingFieldKind::Channel(Channel::Device(index))
+                        if device_channels.is_some_and(|count| index < count) =>
+                    {
+                        usize::from(index)
+                    }
+                    PackingFieldKind::Channel(Channel::Alpha) if device_channels.is_some() => {
+                        usize::from(device_channels.expect("checked ICC device source"))
+                    }
                     PackingFieldKind::Padding => continue,
                     _ => return Err(UnsupportedFeature::InputFormat.into()),
                 };

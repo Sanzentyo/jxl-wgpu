@@ -47,6 +47,10 @@ impl BitFragment {
         &self.bytes
     }
 
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
     #[must_use]
     pub const fn bit_len(&self) -> usize {
         self.bit_len
