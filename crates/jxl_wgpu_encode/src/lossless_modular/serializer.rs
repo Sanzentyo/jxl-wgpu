@@ -11,10 +11,11 @@ use super::dispatch::frame_covers_canvas;
 use super::dispatch::{LosslessModularBackend, ModularGroupPlan};
 use super::grid::{LosslessModularGroup, LosslessModularGroupGrid};
 use super::memory::{LosslessModularMemoryLimits, LosslessModularMemoryPlan};
+use super::source::lossless_modular_source_spec;
 use super::streaming::LosslessModularJob;
 use super::types::{
     LosslessModularFormat, LosslessModularTreeMode, ModularArtifactHeader, ModularEvent,
-    lossless_modular_source_spec, modular_sample_depth,
+    modular_sample_depth,
 };
 use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS};
 use crate::{

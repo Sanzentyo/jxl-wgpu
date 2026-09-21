@@ -9,6 +9,7 @@ use super::memory::{
     LosslessModularMemoryLimits, LosslessModularMemoryPlan, align_up, event_capacity,
 };
 use super::serializer::{ModularFrameHeader, pack_signed, write_animation_header};
+use super::source::{ModularSourceLayout, ModularSourceWindows};
 use super::streaming::{
     EncodeJobLifetime, LosslessModularJob, LosslessModularJobState, MapCompletion,
     ResidentLosslessModularJob,
@@ -16,7 +17,7 @@ use super::streaming::{
 use super::types::{
     EVENT_WORDS, LosslessModularFormat, LosslessModularTreeMode,
     MAX_DISPATCHES_PER_ARTIFACT_BINDING, ModularParams, OUTPUT_HEADER_WORDS, SHADER,
-    lossless_modular_source_spec, modular_sample_depth,
+    modular_sample_depth,
 };
 use crate::buffer_pool::EncoderBufferPool;
 use crate::{
@@ -42,8 +43,7 @@ pub(super) struct ModularDispatchBatch {
     pub(super) dispatch_count: usize,
     pub(super) artifact_byte_offset: u64,
     pub(super) artifact_binding_size: NonZeroU64,
-    pub(super) source_binding_offset: u64,
-    pub(super) source_binding_size: NonZeroU64,
+    pub(super) source_windows: ModularSourceWindows,
 }
 
 #[derive(Clone, Debug)]
@@ -64,15 +64,17 @@ pub(super) struct ModularDispatchPlan {
 
 /// GPU lossless integer/IEEE floating Modular encoding with row-major 256x256 pass groups.
 ///
-/// It never reads source pixels on the CPU. The source buffer may contain packed Gray, RGB, or
-/// RGBA samples in canonical native storage: 1-31-bit integers or binary16/binary32 words.
+/// It never reads source pixels on the CPU. Gray, RGB and RGBA components may occupy packed,
+/// planar or split storage with explicit swizzles, bit positions and word byte order. Samples
+/// have one common 1-31-bit integer or binary16/binary32 precision.
 /// Integer RGB samples use reversible YCoCg; floating samples retain their raw bits. The GPU
 /// emits predictor residual tokens and histograms; the host only serializes those artifacts.
 pub struct LosslessModularBackend {
-    pub(super) pipeline: Arc<wgpu::ComputePipeline>,
+    pipeline: Option<Arc<wgpu::ComputePipeline>>,
     pub(super) buffer_pool: Arc<EncoderBufferPool>,
     capabilities: EncoderCapabilities,
     max_storage_binding_size: u64,
+    max_storage_buffers_per_shader_stage: u32,
     max_buffer_size: u64,
     storage_offset_alignment: u64,
     max_compute_workgroups_per_dimension: u32,
@@ -89,23 +91,26 @@ impl LosslessModularBackend {
     /// Creates a backend with an explicit multi-group MA-tree placement policy.
     #[must_use]
     pub fn with_tree_mode(context: &WgpuContext, tree_mode: LosslessModularTreeMode) -> Self {
-        let module = context
-            .device()
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("jxl-wgpu lossless modular token kernel"),
-                source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-            });
-        let pipeline = Arc::new(context.device().create_compute_pipeline(
-            &wgpu::ComputePipelineDescriptor {
-                label: Some("jxl-wgpu lossless modular token pipeline"),
-                layout: None,
-                module: &module,
-                entry_point: Some("encode"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            },
-        ));
         let limits = context.device().limits();
+        let pipeline =
+            (limits.max_storage_buffers_per_shader_stage >= 6).then(|| {
+                let module = context
+                    .device()
+                    .create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("jxl-wgpu lossless modular token kernel"),
+                        source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+                    });
+                Arc::new(context.device().create_compute_pipeline(
+                    &wgpu::ComputePipelineDescriptor {
+                        label: Some("jxl-wgpu lossless modular token pipeline"),
+                        layout: None,
+                        module: &module,
+                        entry_point: Some("encode"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        cache: None,
+                    },
+                ))
+            });
         Self {
             pipeline,
             buffer_pool: EncoderBufferPool::new(DEFAULT_ENCODER_BUFFER_POOL_BYTES),
@@ -133,12 +138,24 @@ impl LosslessModularBackend {
                 ],
             },
             max_storage_binding_size: limits.max_storage_buffer_binding_size,
+            max_storage_buffers_per_shader_stage: limits.max_storage_buffers_per_shader_stage,
             max_buffer_size: limits.max_buffer_size,
             storage_offset_alignment: u64::from(limits.min_storage_buffer_offset_alignment),
             max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
             direct_mapping: context.direct_mapping_enabled(),
             tree_mode,
         }
+    }
+
+    pub(super) fn pipeline(&self) -> Result<&Arc<wgpu::ComputePipeline>, EncodeError> {
+        self.pipeline.as_ref().ok_or_else(|| {
+            UnsupportedFeature::DeviceLimit {
+                name: "max_storage_buffers_per_shader_stage",
+                required: 6,
+                available: u64::from(self.max_storage_buffers_per_shader_stage),
+            }
+            .into()
+        })
     }
 
     pub fn memory_plan(
@@ -184,9 +201,15 @@ impl LosslessModularBackend {
         &self,
         source: &crate::BufferImageSource,
     ) -> Result<ModularDispatchPlan, EncodeError> {
+        self.pipeline()?;
         let extent = source.layout.extent;
         let group_grid = LosslessModularGroupGrid::for_extent(extent.width, extent.height)?;
-        let source_spec = lossless_modular_source_spec(&source.layout.format)?;
+        let source_layout = ModularSourceLayout::new(
+            &source.layout,
+            source.buffer.size(),
+            self.storage_offset_alignment,
+        )?;
+        let source_spec = source_layout.spec;
         let format = source_spec.format;
         let channels = format.channel_count();
         let dispatches =
@@ -204,72 +227,12 @@ impl LosslessModularBackend {
             }
             .into());
         }
-        if source.layout.planes.len() != 1
-            || !source.buffer.usage().contains(wgpu::BufferUsages::STORAGE)
+        if !source.buffer.usage().contains(wgpu::BufferUsages::STORAGE)
             || !source.buffer.size().is_multiple_of(4)
         {
             return Err(UnsupportedFeature::InputFormat.into());
         }
-        let plane = source
-            .layout
-            .plane(0)
-            .ok_or(EncodeError::InvalidSource("missing Modular plane"))?;
-        let row_stride = u32::try_from(plane.row_stride).map_err(|_| {
-            EncodeError::InvalidSource("row stride exceeds the Modular profile limit")
-        })?;
-        let row_bytes = u64::from(extent.width)
-            .checked_mul(u64::from(channels))
-            .and_then(|value| value.checked_mul(u64::from(source_spec.bytes_per_sample)))
-            .ok_or(EncodeError::InvalidSource("source row size overflow"))?;
-        if plane.row_stride < row_bytes {
-            return Err(EncodeError::InvalidSource(
-                "row stride is smaller than the packed Modular row width",
-            ));
-        }
-        let preceding_rows = plane
-            .row_stride
-            .checked_mul(u64::from(extent.height - 1))
-            .ok_or(EncodeError::InvalidSource(
-                "source address arithmetic overflow",
-            ))?;
-        let sample_end = plane
-            .offset
-            .checked_add(preceding_rows)
-            .and_then(|value| value.checked_add(row_bytes))
-            .ok_or(EncodeError::InvalidSource(
-                "source address arithmetic overflow",
-            ))?;
-        let _full_stride_end = plane
-            .row_stride
-            .checked_mul(u64::from(extent.height))
-            .and_then(|value| plane.offset.checked_add(value))
-            .ok_or(EncodeError::InvalidSource(
-                "source address arithmetic overflow",
-            ))?;
-        let binding_end = align_up(sample_end, 4)
-            .ok_or(EncodeError::InvalidSource("source binding size overflow"))?;
-        if binding_end > source.buffer.size() {
-            return Err(EncodeError::InvalidSource(
-                "source binding does not contain the final addressable sample word",
-            ));
-        }
-        // A storage array of u32 also needs a word-aligned base even on a
-        // hypothetical device reporting a smaller dynamic-offset alignment.
-        let alignment = self.storage_offset_alignment.max(4);
-        let source_binding_offset = plane.offset - plane.offset % alignment;
-        if !source_binding_offset.is_multiple_of(alignment) {
-            return Err(EncodeError::InvalidSource(
-                "source storage binding offset is not device-aligned",
-            ));
-        }
-        let source_binding_bytes = binding_end
-            .checked_sub(source_binding_offset)
-            .ok_or(EncodeError::InvalidSource("source binding range underflow"))?;
-        if !source_binding_bytes.is_multiple_of(4) {
-            return Err(EncodeError::InvalidSource(
-                "source storage binding size is not word-aligned",
-            ));
-        }
+        let source_binding_bytes = source_layout.full_windows.addressed_bytes()?;
         let dispatch_count = usize::try_from(dispatches)
             .map_err(|_| EncodeError::InvalidSource("Modular dispatch count overflow"))?;
         if !256_u64.is_multiple_of(self.storage_offset_alignment.max(1)) {
@@ -289,9 +252,13 @@ impl LosslessModularBackend {
         let mut output_size = 0u64;
         let mut batch_first_dispatch = 0usize;
         let mut batch_artifact_offset = 0u64;
+        let mut batch_source_windows = ModularSourceWindows::default();
         for group in group_grid.ordered_groups() {
-            let x = group.x;
-            let y = group.y;
+            let group_source = source_layout.group(group)?;
+            group_source
+                .windows
+                .validate(self.max_storage_binding_size)?;
+            let proposed_source_windows = batch_source_windows.merge(group_source.windows);
             let width = group.width;
             let height = group.height;
             let pixel_count = usize::try_from(u64::from(width) * u64::from(height))
@@ -326,22 +293,22 @@ impl LosslessModularBackend {
                         EncodeError::InvalidSource("Modular channel count overflow")
                     })?)
                     .is_none_or(|count| count > MAX_DISPATCHES_PER_ARTIFACT_BINDING)
-                    || proposed_batch_bytes > self.max_storage_binding_size)
+                    || proposed_batch_bytes > self.max_storage_binding_size
+                    || proposed_source_windows.maximum_bytes() > self.max_storage_binding_size)
             {
                 let batch_end_dispatch = parameters.len();
                 batches.push(modular_dispatch_batch(
                     batch_first_dispatch..batch_end_dispatch,
                     batch_artifact_offset..output_size,
                     &mut ModularBatchFinalizeContext {
-                        minimum_source_binding_offset: source_binding_offset,
+                        source_windows: batch_source_windows,
                         absolute_source_offsets: &absolute_source_offsets,
                         parameters: &mut parameters,
-                        groups: &groups,
-                        source_alignment: artifact_alignment,
                         max_storage_binding_size: self.max_storage_binding_size,
                     },
                 )?);
                 batch_first_dispatch = parameters.len();
+                batch_source_windows = ModularSourceWindows::default();
                 output_size = align_up(output_size, artifact_alignment).ok_or(
                     EncodeError::InvalidSource("artifact batch alignment overflow"),
                 )?;
@@ -364,22 +331,7 @@ impl LosslessModularBackend {
                 }
                 .into());
             }
-            let tile_byte_offset = plane
-                .offset
-                .checked_add(plane.row_stride.checked_mul(u64::from(y)).ok_or(
-                    EncodeError::InvalidSource("source address arithmetic overflow"),
-                )?)
-                .and_then(|value| {
-                    u64::from(x)
-                        .checked_mul(u64::from(channels))
-                        .and_then(|value| {
-                            value.checked_mul(u64::from(source_spec.bytes_per_sample))
-                        })
-                        .and_then(|x_offset| value.checked_add(x_offset))
-                })
-                .ok_or(EncodeError::InvalidSource(
-                    "source address arithmetic overflow",
-                ))?;
+            batch_source_windows = batch_source_windows.merge(group_source.windows);
             for channel in 0..channels {
                 output_size = align_up(output_size, artifact_alignment).ok_or(
                     EncodeError::InvalidSource("artifact group alignment overflow"),
@@ -393,15 +345,14 @@ impl LosslessModularBackend {
                 parameters.push(ModularParams {
                     width,
                     height,
-                    row_stride,
-                    byte_offset: 0,
                     output_word_offset,
                     channel,
                     channels,
-                    bytes_per_sample: u32::from(source_spec.bytes_per_sample),
                     sample_mask: u32::MAX >> (32 - source_spec.bits_per_sample),
                     use_rct: u32::from(channels > 2 && source_spec.exponent_bits_per_sample == 0),
-                    _padding: [0; 54],
+                    big_endian: u32::from(source_spec.big_endian),
+                    sources: group_source.components,
+                    _padding: [0; 32],
                 });
                 groups.push(ModularGroupPlan {
                     width,
@@ -411,7 +362,7 @@ impl LosslessModularBackend {
                     output_size: group_output_size,
                     max_events,
                 });
-                absolute_source_offsets.push(tile_byte_offset);
+                absolute_source_offsets.push(group_source.offsets);
                 output_size = output_size
                     .checked_add(group_output_size)
                     .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
@@ -423,11 +374,9 @@ impl LosslessModularBackend {
                 batch_first_dispatch..batch_end_dispatch,
                 batch_artifact_offset..output_size,
                 &mut ModularBatchFinalizeContext {
-                    minimum_source_binding_offset: source_binding_offset,
+                    source_windows: batch_source_windows,
                     absolute_source_offsets: &absolute_source_offsets,
                     parameters: &mut parameters,
-                    groups: &groups,
-                    source_alignment: artifact_alignment,
                     max_storage_binding_size: self.max_storage_binding_size,
                 },
             )?);
@@ -476,11 +425,12 @@ impl LosslessModularBackend {
                 total.checked_add(batch.artifact_binding_size.get())
             })
             .ok_or(EncodeError::InvalidSource("total artifact size overflow"))?;
-        let peak_source_binding_bytes = batches
-            .iter()
-            .map(|batch| batch.source_binding_size.get())
-            .max()
-            .ok_or(EncodeError::InvalidSource("source batch plan is empty"))?;
+        let peak_source_binding_bytes = batches.iter().try_fold(0u64, |peak, batch| {
+            batch
+                .source_windows
+                .addressed_bytes()
+                .map(|bytes| peak.max(bytes))
+        })?;
         let readback_bytes = if self.direct_mapping {
             0
         } else {
@@ -540,11 +490,9 @@ impl LosslessModularBackend {
     }
 }
 struct ModularBatchFinalizeContext<'a> {
-    minimum_source_binding_offset: u64,
-    absolute_source_offsets: &'a [u64],
+    source_windows: ModularSourceWindows,
+    absolute_source_offsets: &'a [[u64; 4]],
     parameters: &'a mut [ModularParams],
-    groups: &'a [ModularGroupPlan],
-    source_alignment: u64,
     max_storage_binding_size: u64,
 }
 
@@ -585,95 +533,21 @@ fn modular_dispatch_batch(
     let artifact_binding_size = NonZeroU64::new(artifact_binding_bytes).ok_or(
         EncodeError::InvalidSource("artifact batch binding must not be empty"),
     )?;
-    let batch_offsets = context
-        .absolute_source_offsets
-        .get(first_dispatch..end_dispatch)
-        .ok_or(EncodeError::InvalidSource(
-            "source batch dispatch range is invalid",
-        ))?;
-    let mut source_binding_offset = *batch_offsets
-        .iter()
-        .min()
-        .ok_or(EncodeError::InvalidSource("source batch is empty"))?;
-    source_binding_offset -= source_binding_offset % context.source_alignment;
-    if source_binding_offset < context.minimum_source_binding_offset {
-        return Err(EncodeError::InvalidSource(
-            "source batch begins before the declared image plane",
-        ));
-    }
-    let mut source_binding_end = source_binding_offset;
-    for (index, &absolute_source_offset) in context
-        .absolute_source_offsets
-        .iter()
-        .enumerate()
-        .take(end_dispatch)
-        .skip(first_dispatch)
-    {
-        let params = context
-            .parameters
-            .get(index)
-            .ok_or(EncodeError::InvalidSource(
-                "parameter batch range is invalid",
-            ))?;
-        let group = context.groups.get(index).ok_or(EncodeError::InvalidSource(
-            "artifact batch range is invalid",
-        ))?;
-        let row_bytes = u64::from(group.width)
-            .checked_mul(u64::from(params.channels))
-            .and_then(|value| value.checked_mul(u64::from(params.bytes_per_sample)))
-            .ok_or(EncodeError::InvalidSource("source batch row size overflow"))?;
-        let source_end = absolute_source_offset
-            .checked_add(
-                u64::from(params.row_stride)
-                    .checked_mul(u64::from(group.height.saturating_sub(1)))
-                    .ok_or(EncodeError::InvalidSource("source batch address overflow"))?,
-            )
-            .and_then(|value| value.checked_add(row_bytes))
-            .ok_or(EncodeError::InvalidSource("source batch address overflow"))?;
-        source_binding_end = source_binding_end.max(source_end);
-    }
-    source_binding_end = align_up(source_binding_end, 4)
-        .ok_or(EncodeError::InvalidSource("source batch size overflow"))?;
-    let source_binding_bytes = source_binding_end
-        .checked_sub(source_binding_offset)
-        .ok_or(EncodeError::InvalidSource("source batch range underflow"))?;
-    if source_binding_bytes > context.max_storage_binding_size {
-        return Err(UnsupportedFeature::DeviceLimit {
-            name: "max_storage_buffer_binding_size",
-            required: source_binding_bytes,
-            available: context.max_storage_binding_size,
-        }
-        .into());
-    }
-    let source_binding_size = NonZeroU64::new(source_binding_bytes)
-        .ok_or(EncodeError::InvalidSource("source batch binding is empty"))?;
-    let shader_last_byte = source_binding_bytes
-        .checked_sub(1)
-        .ok_or(EncodeError::InvalidSource("source batch binding is empty"))?;
-    u32::try_from(shader_last_byte).map_err(|_| {
-        EncodeError::InvalidSource("source batch exceeds the WGSL u32 address space")
-    })?;
-    for (index, &absolute_source_offset) in context
-        .absolute_source_offsets
-        .iter()
-        .enumerate()
-        .take(end_dispatch)
-        .skip(first_dispatch)
-    {
-        context.parameters[index].byte_offset = u32::try_from(
-            absolute_source_offset
-                .checked_sub(source_binding_offset)
-                .ok_or(EncodeError::InvalidSource("source batch address underflow"))?,
-        )
-        .map_err(|_| EncodeError::InvalidSource("source batch address exceeds WGSL u32"))?;
+    context
+        .source_windows
+        .validate(context.max_storage_binding_size)?;
+    for index in dispatches {
+        context.source_windows.rebase(
+            &mut context.parameters[index],
+            context.absolute_source_offsets[index],
+        )?;
     }
     Ok(ModularDispatchBatch {
         first_dispatch,
         dispatch_count,
         artifact_byte_offset,
         artifact_binding_size,
-        source_binding_offset,
-        source_binding_size,
+        source_windows: context.source_windows,
     })
 }
 pub(super) fn validate_modular_frame_request(
@@ -868,7 +742,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
             0,
             bytemuck::cast_slice(&plan.parameters),
         );
-        let bind_group_layout = self.pipeline.get_bind_group_layout(0);
+        let bind_group_layout = self.pipeline()?.get_bind_group_layout(0);
         let bind_groups = plan
             .batches
             .iter()
@@ -890,6 +764,8 @@ impl GpuEncodeBackend for LosslessModularBackend {
                     .ok_or(EncodeError::InvalidSource(
                         "artifact batch parameter size overflow",
                     ))?;
+                let [source0, source1, source2, source3] =
+                    batch.source_windows.entries(&source.buffer);
                 Ok((
                     context
                         .device()
@@ -897,14 +773,10 @@ impl GpuEncodeBackend for LosslessModularBackend {
                             label: Some("jxl-wgpu lossless modular batch bindings"),
                             layout: &bind_group_layout,
                             entries: &[
-                                wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                        buffer: &source.buffer,
-                                        offset: batch.source_binding_offset,
-                                        size: Some(batch.source_binding_size),
-                                    }),
-                                },
+                                source0,
+                                source1,
+                                source2,
+                                source3,
                                 wgpu::BindGroupEntry {
                                     binding: 1,
                                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -941,7 +813,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
                 label: Some("jxl-wgpu lossless modular tokenization"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(self.pipeline()?);
             for (bind_group, dispatch_count) in &bind_groups {
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.dispatch_workgroups(*dispatch_count, 1, 1);
@@ -1011,5 +883,129 @@ impl GpuEncodeBackend for LosslessModularBackend {
                 },
             }),
         })
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod source_window_tests {
+    use super::*;
+    use crate::{
+        BufferImageSource, CodestreamAssembler, GpuEncodeJob, LosslessModularEncoder,
+        ProgressivePlan,
+    };
+    use jxl_gpu_formats::{ImageLayout, PackingField, PackingWord};
+    use jxl_gpu_protocol::Extent2d;
+    use wgpu::util::DeviceExt;
+
+    #[test]
+    fn source_span_alone_splits_gpu_batches_and_rejects_an_oversized_group() {
+        let render = pollster::block_on(jxl_wgpu::WgpuBackend::request_default(Default::default()))
+            .expect("required GPU adapter");
+        let context = WgpuContext::from_backend(&render);
+        let extent = Extent2d::new(513, 1);
+        let mut format = LosslessModularFormat::Gray.pixel_format(8).unwrap();
+        format.planes[0].words.extend((0..127).map(|_| PackingWord {
+            fields: vec![PackingField::padding(8)],
+        }));
+        let layout = ImageLayout::packed(extent, format).unwrap();
+        let mut bytes = vec![0xa5; layout.logical_size as usize];
+        let expected: Vec<u8> = (0..513).map(|x| (x * 71) as u8).collect();
+        for (x, &value) in expected.iter().enumerate() {
+            bytes[x * 128] = value;
+        }
+        let buffer = context
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("source-driven batch splitting"),
+                contents: &bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let input = BufferImageSource::new(Arc::new(buffer), layout).unwrap();
+        let mut backend = LosslessModularBackend::new(&context);
+        backend.max_storage_binding_size = 40 * 1024;
+        let plan = backend.dispatch_plan(&input).unwrap();
+        assert_eq!(plan.batches.len(), 2);
+        assert!(plan.memory.source_binding_bytes > backend.max_storage_binding_size);
+        assert!(
+            plan.batches
+                .iter()
+                .all(|batch| batch.source_windows.maximum_bytes() <= 40 * 1024)
+        );
+        let request = FrameEncodeRequest {
+            frame_index: FrameIndex::new(0),
+            is_last: true,
+            profile: EncodeProfile::ModularLossless {
+                sample_bit_depth: plan.memory.sample_bit_depth(),
+            },
+            progressive: ProgressivePlan::single(),
+            minimum_determinism: Determinism::CrossDevice,
+            animation: AnimationHeader::Still,
+            canvas_width: extent.width,
+            canvas_height: extent.height,
+            options: FrameOptions::default(),
+        };
+        let job = backend
+            .submit(&context, GpuFrameSource::Buffer(input.clone()), &request)
+            .unwrap();
+        let mut assembly = CodestreamAssembler::new(
+            super::super::serializer::image_header(
+                extent.width,
+                extent.height,
+                LosslessModularFormat::Gray,
+                8,
+                0,
+                AnimationHeader::Still,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assembly.insert(job.wait().unwrap()).unwrap();
+        let encoded = assembly.finish_raw().unwrap();
+        let canonical = LosslessModularEncoder::new(context.clone())
+            .encode(input.clone())
+            .unwrap();
+        assert_eq!(encoded, canonical);
+        let decoded = jxl_test_support::oracles::modular_integer::original_planes(&encoded, 0);
+        assert_eq!(
+            decoded,
+            vec![expected.into_iter().map(i32::from).collect::<Vec<_>>()]
+        );
+        assert_eq!(context.memory_stats().reserved_bytes, 0);
+        backend.max_storage_binding_size = 4096;
+        assert!(matches!(
+            backend.memory_plan(&input),
+            Err(EncodeError::Unsupported(UnsupportedFeature::DeviceLimit {
+                name: "max_storage_buffer_binding_size",
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn insufficient_storage_bindings_are_typed_before_pipeline_creation() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
+            .expect("required GPU adapter");
+        let limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 5,
+            ..Default::default()
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits: limits,
+            ..Default::default()
+        }))
+        .unwrap();
+        let context = WgpuContext::new(Arc::new(device), Arc::new(queue)).unwrap();
+        let backend = LosslessModularBackend::new(&context);
+        assert!(matches!(
+            backend.pipeline(),
+            Err(EncodeError::Unsupported(UnsupportedFeature::DeviceLimit {
+                name: "max_storage_buffers_per_shader_stage",
+                required: 6,
+                available: 5
+            }))
+        ));
+        assert_eq!(context.memory_stats().reserved_bytes, 0);
+        assert_eq!(backend.buffer_pool_stats().allocation_misses, 0);
     }
 }

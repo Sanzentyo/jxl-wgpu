@@ -35,7 +35,7 @@ impl LosslessModularBackend {
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker = StreamingModularWorker {
             context: context.clone(),
-            pipeline: Arc::clone(&self.pipeline),
+            pipeline: Arc::clone(self.pipeline()?),
             buffer_pool: Arc::clone(&self.buffer_pool),
             direct_mapping: self.direct_mapping,
             source,
@@ -71,7 +71,7 @@ impl LosslessModularBackend {
             state: LosslessModularJobState::Streaming(Box::new(
                 BrowserStreamingLosslessModularJob::new(
                     context.clone(),
-                    Arc::clone(&self.pipeline),
+                    Arc::clone(self.pipeline()?),
                     Arc::clone(&self.buffer_pool),
                     self.direct_mapping,
                     source,
@@ -263,20 +263,17 @@ fn submit_streaming_batch(
     context
         .queue()
         .write_buffer(&buffers.parameters, 0, bytemuck::cast_slice(parameters));
+    let [source0, source1, source2, source3] = batch.source_windows.entries(&source.buffer);
     let bind_group = context
         .device()
         .create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("jxl-wgpu streamed lossless modular bindings"),
             layout: &pipeline.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &source.buffer,
-                        offset: batch.source_binding_offset,
-                        size: Some(batch.source_binding_size),
-                    }),
-                },
+                source0,
+                source1,
+                source2,
+                source3,
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: buffers.artifact.as_entire_binding(),

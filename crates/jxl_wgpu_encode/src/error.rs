@@ -130,6 +130,8 @@ pub enum EncodeError {
     InvalidConfiguration(&'static str),
     #[error("invalid GPU frame source: {0}")]
     InvalidSource(&'static str),
+    #[error("invalid encoder source layout: {0}")]
+    SourceLayout(#[from] jxl_gpu_formats::LayoutError),
     #[error("VarDCT LF dequantization multiplier for {channel} is too small: {value}")]
     VarDctLfDequantization { channel: &'static str, value: f32 },
     #[error("VarDCT channel correlation colour factor {value} is outside 2..=65793")]

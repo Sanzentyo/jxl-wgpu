@@ -16,13 +16,13 @@ use super::memory::{align_up, event_capacity};
 #[cfg(not(target_arch = "wasm32"))]
 use super::serializer::{ModularFrameHeader, frame_header, image_header, parse_group_artifact};
 #[cfg(not(target_arch = "wasm32"))]
-use super::streaming::{MapCompletion, StreamingAdvance, StreamingCursor, StreamingPass};
+use super::source::lossless_modular_source_spec;
 #[cfg(not(target_arch = "wasm32"))]
-use super::types::lossless_modular_source_spec;
+use super::streaming::{MapCompletion, StreamingAdvance, StreamingCursor, StreamingPass};
 #[cfg(not(target_arch = "wasm32"))]
 use super::types::{
     EVENT_WORDS, LosslessModularFormat, ModularArtifactHeader, ModularEvent, ModularParams,
-    OUTPUT_HEADER_WORDS, SHADER,
+    ModularSourceParams, OUTPUT_HEADER_WORDS, SHADER,
 };
 use crate::EncodeError;
 use crate::LosslessModularSubmission;
@@ -177,6 +177,27 @@ mod native_tests {
         )
         .validate(&module)
         .expect("Modular WGSL validates with portable WebGPU capabilities");
+        for (name, size, offsets) in [
+            ("Source", 24, vec![0, 4, 8, 12, 16, 20]),
+            ("Params", 256, vec![0, 4, 8, 12, 16, 20, 24, 28, 32, 128]),
+        ] {
+            let (_, ty) = module
+                .types
+                .iter()
+                .find(|(_, ty)| ty.name.as_deref() == Some(name))
+                .unwrap();
+            let naga::TypeInner::Struct { members, span } = &ty.inner else {
+                panic!("expected ABI struct");
+            };
+            assert_eq!(*span, size);
+            assert_eq!(
+                members
+                    .iter()
+                    .map(|member| member.offset)
+                    .collect::<Vec<_>>(),
+                offsets
+            );
+        }
     }
 
     #[test]
@@ -186,19 +207,25 @@ mod native_tests {
         let params = ModularParams {
             width: 1,
             height: 2,
-            row_stride: 3,
-            byte_offset: 4,
-            output_word_offset: 5,
-            channel: 6,
-            channels: 7,
-            bytes_per_sample: 8,
-            sample_mask: 9,
-            use_rct: 10,
-            _padding: [0; 54],
+            output_word_offset: 3,
+            channel: 4,
+            channels: 5,
+            sample_mask: 6,
+            use_rct: 7,
+            big_endian: 8,
+            sources: std::array::from_fn(|index| ModularSourceParams {
+                row_stride: 9 + index as u32 * 6,
+                byte_offset: 10 + index as u32 * 6,
+                pixel_stride: 11 + index as u32 * 6,
+                word_bytes: 12 + index as u32 * 6,
+                bit_shift: 13 + index as u32 * 6,
+                plane: 14 + index as u32 * 6,
+            }),
+            _padding: [0; 32],
         };
         let words = bytemuck::cast::<ModularParams, [u32; 64]>(params);
-        assert_eq!(&words[..10], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-        assert!(words[10..].iter().all(|&word| word == 0));
+        assert_eq!(&words[..32], &(1..=32).collect::<Vec<_>>());
+        assert!(words[32..].iter().all(|&word| word == 0));
     }
 
     #[test]
@@ -272,8 +299,8 @@ mod native_tests {
         assert!(LosslessModularFormat::Gray.pixel_format(32).is_err());
         for format in [
             PixelFormat::non_color(jxl_gpu_formats::SampleKind::Float, 64, &[Channel::X]),
-            PixelFormat::rgb_f32(RgbChannelOrder::Bgra, false, ColorSpecification::Undefined),
-            PixelFormat::rgb_f32(RgbChannelOrder::Rgba, true, ColorSpecification::Undefined),
+            PixelFormat::non_color(SampleKind::Signed, 16, &[Channel::X]),
+            PixelFormat::non_color(SampleKind::Unsigned, 32, &[Channel::X]),
         ] {
             assert!(matches!(
                 lossless_modular_source_spec(&format),
@@ -282,23 +309,20 @@ mod native_tests {
                 ))
             ));
         }
-        assert!(
-            lossless_modular_source_spec(&PixelFormat::rgb8(
-                RgbChannelOrder::Rgb,
-                true,
-                ColorSpecification::Undefined,
-            ))
-            .is_err()
-        );
-        for order in [RgbChannelOrder::Bgr, RgbChannelOrder::Bgra] {
-            assert!(
-                lossless_modular_source_spec(&PixelFormat::rgb8(
-                    order,
-                    false,
-                    ColorSpecification::Undefined
-                ))
-                .is_err()
-            );
+        for order in [
+            RgbChannelOrder::Rgb,
+            RgbChannelOrder::Rgba,
+            RgbChannelOrder::Bgr,
+            RgbChannelOrder::Bgra,
+        ] {
+            for planar in [false, true] {
+                for format in [
+                    PixelFormat::rgb8(order, planar, ColorSpecification::Undefined),
+                    PixelFormat::rgb_f32(order, planar, ColorSpecification::Undefined),
+                ] {
+                    lossless_modular_source_spec(&format).unwrap();
+                }
+            }
         }
         let defined = ColorSpecification::Defined(jxl_gpu_formats::ColorSpec::bt709(
             jxl_gpu_formats::ColorRange::Full,

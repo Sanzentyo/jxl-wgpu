@@ -127,7 +127,7 @@ name shown in parentheses.
 | `jxl_wgpu_encode/vardct_encoder/control.wgsl` | `VarDctArtifactHeader` / header words | status/live counts, AC-presence marker, LF section ranges/total bits, source/block geometry, topology, 19-bin DC histogram, LF descriptors/grid/count, AC descriptor offset/count and fragment offset/stride/word count, 13 pads | 256 | 4 | storage/readback record |
 | `jxl_wgpu_encode/vardct_encoder/control.wgsl` | `DcFragmentDescriptor` / two words | `bit_offset, bit_len` for one row-major LF group | 8 | 4 | storage/readback element |
 | `jxl_wgpu_encode/vardct_encoder/transforms.wgsl` | four host words / `QuantizationEntry` | three f32 dequantization scales followed by one u32 natural-order position | 16 | Rust 4 / WGSL 16 | read-only storage element |
-| `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularParams` / `Params` | `width, height, row_stride, byte_offset, output_word_offset, channel, channels, bytes_per_sample, sample_mask, use_rct`; 54 pads | 256 | 4 | read-only storage element |
+| `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularParams` / `Params` | `width, height, output_word_offset, channel, channels, sample_mask, use_rct, big_endian`; four 24-byte source records (`row_stride, byte_offset, pixel_stride, word_bytes, bit_shift, plane`); 32 pads | 256 | 4 | read-only storage element |
 | `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularArtifactHeader` / `output_words[0..67]` | `event_count, raw_counts[33], lz77_counts[33]` | 268 | 4 | storage/readback record |
 | `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularEvent` / four-word event | `kind, token, extra_bit_count, extra_bits` | 16 | 4 | storage/readback element |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | entropy prefix/window, group geometry, sample/channel counts, channel-layout offset, output kind/transfer/range, channels/order/depth, 4 plane offset/stride pairs, chroma geometry/size/mapping, status/stream/fixed-leaf/weighted-predictor fields; canvas width/height and orientation | 256 | 4 | read-only storage element |
@@ -286,7 +286,7 @@ The table below states the default workgroup configuration for each entry point:
 | decoder `lossless_gray8` | codestream/prefix RO, reconstructed/output/status RW, 256-byte parameter records RO, 16-byte dispatch U | 64x1 | Tier A (`KernelVariant` 1-D) | bounded `jwgp` index, aligned token words plus sentinel, per-group MA metadata base, channel-layout tables, four planes/final addresses, packed-row alignment, sample/output ranges and status allocation are prevalidated; one invocation per group lane; channel-fixed Gradient groups may resume through 16-byte-overlapped stream segments using one aligned 32-byte state record per lane |
 | decoder `vardct_pass_group` | bounded stream/entropy bundle RO, quantized-LF plus disjoint LZ/state slices/status RW, 160-byte pass params RO; artifact/order RO, coefficients RW, sink U | 1x1 | Tier B (fixed) | one serial invocation per pass-group window; eight storage bindings meet the portable stage limit; a 464-byte aligned state retains common entropy, nested coefficient progress, sink failure and the 96-word nonzero grid; the 48-byte block-context table ABI addresses QF and signed X/Y/B LF thresholds |
 | `vardct_dct8` | coefficients/tasks/resources RO, X/Y/B RW, U | 8x8 | Tier B (fixed) | exactly one workgroup per validated task; task count and all upload bindings are device-bounded |
-| encoder `lossless_modular` | source words RO, artifact RW, 256-byte parameter records RO | 1x1 | Tier B (fixed) | one invocation per 256×256 PassGroup/channel; source subrange/alignment/u32 address and each group's artifact capacity are prevalidated; 1–31-bit integers use 1/2/4-byte native words, IEEE binary16/binary32 use 2/4-byte words |
+| encoder `lossless_modular` | four source-plane bindings RO (0/3/4/5), artifact RW (1), 256-byte parameter records RO (2) | 1x1 | Tier B (fixed) | one invocation per 256×256 PassGroup/channel; each plane window/alignment/u32 address and artifact capacity are prevalidated; per-component 1–4-byte words, bit positions and Native/Little/Big endian loads preserve 1–31-bit integer or IEEE binary16/binary32 fields; six storage bindings are required |
 
 The decoder entropy shaders share a nested host/WGSL ABI rather than duplicating an untyped word
 prefix. `EntropyStreamParams` is a 12-byte, four-byte-aligned `repr(C)`/`Pod` record of three `u32`
@@ -395,10 +395,16 @@ against device limits prior to pipeline compilation and dispatch recording.
   storage is padded to a word and includes a four-byte sentinel; its 16-byte status is parsed as a
   checked `DecodeStatus` record.
   IEEE binary16/binary32 encoder input uses integer bit loads and signed working-word prediction,
-  preserving all source bits without floating arithmetic. `use_rct` at byte 36 selects YCoCg only
+  preserving all source bits without floating arithmetic. `use_rct` at byte 24 selects YCoCg only
   for integer RGB(A); floating channels serialize with no Modular transform. The 256-byte parameter
-  stride, artifact sizes, submissions and ownership budget are unchanged. Host precision metadata
-  carries total and exponent bits through both resident and streamed assembly.
+  stride and artifact sizes are unchanged. Source-window limits may now split additional batches,
+  each retaining the same parameter/artifact/readback ownership contract. The source records begin
+  at byte 32 with a 24-byte stride; each logical component selects one of four independently
+  rebased bindings. Unused bindings alias plane zero. Addressed-byte accounting takes the union
+  of bound ranges, excluding plane gaps and duplicate alignment prefixes. Public layout fields
+  are revalidated, including precision, channel identity, full-resolution geometry, row width,
+  overlap, logical size and final addressable words. Host precision metadata carries total and
+  exponent bits through both resident and streamed assembly.
 - Gray8 decoder output allocation is rounded to four bytes while `logical_size` remains explicit.
   RGBA/BGRA pixels and odd-width YUYV/UYVY pairs use aligned whole-word stores; byte and 16-bit
   plane writers bounds-check each addressed byte against `logical_size`.

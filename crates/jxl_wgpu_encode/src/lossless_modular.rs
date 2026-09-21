@@ -6,6 +6,7 @@ mod dispatch;
 mod grid;
 mod memory;
 mod serializer;
+mod source;
 mod streaming;
 #[cfg(test)]
 mod tests;

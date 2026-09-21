@@ -1,19 +1,36 @@
+struct Source {
+    row_stride: u32,
+    byte_offset: u32,
+    pixel_stride: u32,
+    word_bytes: u32,
+    bit_shift: u32,
+    plane: u32,
+}
+
 struct Params {
     width: u32,
     height: u32,
-    row_stride: u32,
-    byte_offset: u32,
     output_word_offset: u32,
     channel: u32,
     channels: u32,
-    bytes_per_sample: u32,
     sample_mask: u32,
     use_rct: u32,
-    _padding: array<u32, 54>,
+    big_endian: u32,
+    sources: array<Source, 4>,
+    _padding: array<u32, 32>,
 }
 
 @group(0) @binding(0)
 var<storage, read> source_words: array<u32>;
+
+@group(0) @binding(3)
+var<storage, read> source_words_1: array<u32>;
+
+@group(0) @binding(4)
+var<storage, read> source_words_2: array<u32>;
+
+@group(0) @binding(5)
+var<storage, read> source_words_3: array<u32>;
 
 // Word 0 is the event count, words 1..34 are raw-token counts, words
 // 34..67 are LZ77-token counts, and the remaining words are four-word events
@@ -28,25 +45,27 @@ const OUTPUT_HEADER_WORDS: u32 = 67u;
 const EVENT_WORDS: u32 = 4u;
 const EVENT_OVERFLOW: u32 = 0xffffffffu;
 
-fn source_byte(byte_index: u32) -> u32 {
-    let word = source_words[byte_index >> 2u];
+fn source_byte(plane: u32, byte_index: u32) -> u32 {
+    var word: u32;
+    switch plane {
+        case 0u: { word = source_words[byte_index >> 2u]; }
+        case 1u: { word = source_words_1[byte_index >> 2u]; }
+        case 2u: { word = source_words_2[byte_index >> 2u]; }
+        default: { word = source_words_3[byte_index >> 2u]; }
+    }
     let shift = (byte_index & 3u) * 8u;
     return (word >> shift) & 255u;
 }
 
 fn source_component(params: Params, x: u32, y: u32, component: u32) -> i32 {
-    let sample_index = x * params.channels + component;
-    let byte_index = params.byte_offset + y * params.row_stride
-        + sample_index * params.bytes_per_sample;
-    var value = source_byte(byte_index);
-    if params.bytes_per_sample >= 2u {
-        value |= source_byte(byte_index + 1u) << 8u;
+    let source = params.sources[component];
+    let byte_index = source.byte_offset + y * source.row_stride + x * source.pixel_stride;
+    var value = 0u;
+    for (var byte = 0u; byte < source.word_bytes; byte += 1u) {
+        let shift = select(byte, source.word_bytes - 1u - byte, params.big_endian != 0u) * 8u;
+        value |= source_byte(source.plane, byte_index + byte) << shift;
     }
-    if params.bytes_per_sample == 4u {
-        value |= source_byte(byte_index + 2u) << 16u;
-        value |= source_byte(byte_index + 3u) << 24u;
-    }
-    return bitcast<i32>(value & params.sample_mask);
+    return bitcast<i32>((value >> source.bit_shift) & params.sample_mask);
 }
 
 // JPEG XL's reversible color transform type 0 maps RGB to YCoCg. Computing it

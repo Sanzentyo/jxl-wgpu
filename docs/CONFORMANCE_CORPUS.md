@@ -315,7 +315,7 @@ Resident 257×9 and streamed 16,384×1 RGBA32 cases with local trees check one-b
 exact admission, buffer-pool reuse, exact submission accounting, blocking/Future byte identity,
 independent oracles and whole/bounded GPU output. The resident case additionally checks concurrent
 backpressure and abandoned completion releasing its lease and reservation. Invalid precision,
-numeric-type/exponent mismatches, binary64, BGR and associated-alpha layouts retain typed rejection.
+numeric-type/exponent mismatches and binary64 retain typed rejection. Source alpha remains unassociated; the following checkpoint adds BGR and broader buffer layouts.
 The existing integer matrices and unchanged 609-byte Gray8 fixture remain regression gates.
 No checked-in source or reference images are regenerated for these procedural tests.
 
@@ -328,6 +328,44 @@ cargo test --locked --workspace --all-features --test lossless_float -- --test-t
 This target separates floating development checks; capability changes still require the
 [full gates](DEVELOPMENT.md#capability-change-gates). Browser/WASM compilation verifies the shared
 precision metadata/state machine, not browser execution.
+
+## Lossless Modular buffer layouts
+
+[`lossless_layouts`](../crates/jxl_wgpu_encode/tests/lossless_layouts/main.rs) generates 102 still
+layout cases: 62 integer streams span every depth 1–31 under shared/local trees, 24 IEEE streams
+cover binary16/binary32 Gray/RGB/RGBA in planar and split storage, and 16 streams exercise shared
+RGB10/RGBA7 words, three-byte RGB24 words and mixed 8/16/24/32-bit component storage. RGB/BGR and
+ARGB swizzles, per-component shifts, poisoned padding, Native/Little/Big byte order, independent
+unaligned pitches and physically reversed planes retain exactly the canonical encoder's container
+bytes. Extents include 1/255/256/257 group boundaries. No checked-in fixture is replaced.
+
+Retained jxl-oxide 0.12.6 / jxl-render 0.12.4 integer working planes independently match every
+original integer or IEEE word. Required libjxl 0.12.0 original output checks integer normalization
+at the existing `2e-7` bound, or exact F32 words for IEEE sources. Explicit binary16/F32 pairs cover
+signed zero, subnormals, infinities and NaN payloads. Whole and bounded fragmented GPU decodes
+match all integer samples or native IEEE words; retained outputs survive session drop.
+
+Four three-frame RGBA animations use 8/31-bit integer and binary16/binary32 sources. Each changes
+layout and byte order between frames, completes out of order and preserves exact words, duration,
+timecodes and retained GPU output. Planar RGBA31 at 257×9 and 16K×1 checks source-gap accounting,
+exact byte admission, one-byte pressure, resident and streamed abandonment, blocking/Future byte
+identity and pool reuse. Cancellation waits for the native worker's unique source owner to retire,
+so a transient zero reservation before its first batch cannot masquerade as completion.
+
+Host tests enumerate every integer field position in 8/16/24/32-bit words, rebase plane offsets
+above 4 GiB into bounded windows and count overlapping alignment prefixes once. Actual GPU tests
+force source-span-driven batch splitting at a 40 KiB binding limit, retain the canonical bytes
+and independently decode the result; an oversized single group is rejected. A device configured
+for five storage bindings receives a typed rejection before pipeline creation. Malformed public
+layout fields, overlap, missing/duplicate channels and arithmetic overflow fail before admission.
+
+```console
+JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossless_layouts -- --test-threads=2
+cargo test --locked -p jxl_wgpu_encode --lib lossless_modular -- --test-threads=2
+```
+
+These checks extend `ENC-01`, `IO-02`, `FRAME-05` and `QA-03/06`; they do not complete encoder input,
+extra-channel, color metadata, texture or encoder quality coverage.
 
 ## Procedural VarDCT encoder matrix
 

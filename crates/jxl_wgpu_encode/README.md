@@ -1,7 +1,7 @@
 # jxl_wgpu_encode
 
 GPU-required JPEG XL encoding orchestration for `wgpu`. This crate does not contain a CPU pixel
-encoder or a CPU fallback. `LosslessModularEncoder` reads packed Gray, RGB, or RGBA integer or
+encoder or a CPU fallback. `LosslessModularEncoder` reads Gray, RGB, or RGBA integer or
 IEEE floating-point pitch-linear storage directly on the GPU and emits a standards-compatible lossless
 Modular codestream or `jxlc` container.
 
@@ -19,7 +19,8 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
 
 - Extents are `1..2^30` on each axis, further bounded by the selected WebGPU device's storage
   binding, buffer, and dispatch limits.
-- Valid sample depths are every integer in `1..=31`. `1..=8` use one native `u8` word per
+- Valid sample depths are every integer in `1..=31`. The canonical constructor stores `1..=8`
+  in one native `u8` word per
   component; `9..=16` use `u16`, and `17..=31` use `u32`. The valid sample occupies the low
   bits and high padding bits are ignored. `LosslessModularFormat::pixel_format` constructs this
   explicit storage/valid-bits contract, including native-U16 10/12-bit and native-U32 24/31-bit layouts.
@@ -27,9 +28,21 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   constructs these layouts. Encoding preserves every bit, including signed zero, subnormals,
   infinities and NaN payloads, without floating-point arithmetic. Other floating precisions and
   binary64 input remain unsupported.
-- Gray uses one `X` plane. RGB and RGBA use one interleaved plane in canonical
-  RGB/RGBA order. Row pitch and plane offset may contain arbitrary padding. Planar RGB, BGR/BGRA,
-  MSB-aligned partial words, and explicitly defined non-sRGB color specifications are rejected.
+- Custom `PixelFormat` layouts may partition Gray/RGB/RGBA components among one through four
+  full-resolution planes in the same buffer. Packed, planar and split color/alpha layouts are
+  supported, including BGR/BGRA and arbitrary bijective component swizzles. Gray also accepts
+  `ColorModel::Gray` with `X001` and Default/Undefined color metadata.
+- Each independently endian-addressed 8/16/24/32-bit word may contain multiple equally precise
+  components and padding. Integer fields may occupy any bit position, including MSB alignment;
+  floating fields contain exactly 16 or 32 IEEE bits. Native, Little and Big byte order are supported.
+  All components retain the same declared precision. Missing, duplicated or discarded components,
+  signed samples, subsampling and unsupported color metadata are rejected.
+- Plane offsets and row pitches may be unaligned, independently padded and physically reordered.
+  Every public layout field is revalidated before admission. Four read-only source bindings
+  address the planes directly; unused bindings alias the first. The kernel requires six storage
+  bindings including parameters/artifacts, with typed rejection on devices configured below that
+  count. Batches split at either source-plane or artifact binding limits, without a normalized
+  image allocation or host pixel conversion.
 - `Default` and `Undefined` RGB color specifications are interpreted as sRGB, matching the compact
   all-default JPEG XL color header. RGBA is written as one unassociated alpha extra channel at the
   same declared sample precision as RGB.
@@ -59,13 +72,14 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   multiple bounded artifact batches through blocking and runtime-neutral completion.
 
 `LosslessModularEncoder::memory_plan` reports the detected valid bits, exponent width (zero for
-integers), component storage bytes,
-full and peak source binding ranges, peak parameter/artifact/readback bytes, diagnostic total
+integers), largest component storage-word width,
+full and peak unions of source plane binding ranges, peak parameter/artifact/readback bytes, diagnostic total
 artifact bytes, batch count, exact GPU submission count, streaming mode, total encoder-owned live
 bytes, and the group grid before submission. Streamed jobs report exactly twice the batch count:
 one histogram and one serialization submission per batch. Every live batch uses the same shared
 `MemoryBudget`. Its exclusive buffer-pool lease and reservation survive until the map callback and
 mapped-range consumer are both finished, including when the returned future is abandoned.
+Source range accounting excludes gaps between planes and counts shared alignment prefixes once.
 
 The returned `LosslessModularSubmission` implements `Future` without depending on an async runtime;
 native callers may instead use `wait`. Browser builds intentionally reject blocking `wait`, because

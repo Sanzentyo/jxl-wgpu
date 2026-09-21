@@ -11,13 +11,13 @@ pub struct LosslessModularMemoryPlan {
     pub bits_per_sample: u8,
     /// Zero for integer samples, five for binary16, or eight for binary32.
     pub exponent_bits_per_sample: u8,
-    /// Native storage bytes occupied by every component (`1`, `2`, or `4`).
+    /// Largest storage word containing a component (`1`, `2`, `3`, or `4` bytes).
     pub bytes_per_sample: u8,
     /// Number of independently tokenized Modular channels (1, 3, or 4).
     pub channel_count: u32,
-    /// Full source byte range addressed by the logical frame.
+    /// Union of the full source plane binding ranges, excluding gaps between planes.
     pub source_binding_bytes: u64,
-    /// Largest source window bound for any one streamed GPU batch.
+    /// Largest union of source binding ranges in one GPU batch. Each plane has its own binding.
     pub peak_source_binding_bytes: u64,
     /// Largest parameter allocation used by one streamed GPU batch.
     pub parameter_storage_bytes: u64,

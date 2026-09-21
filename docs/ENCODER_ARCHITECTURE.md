@@ -32,9 +32,9 @@ implementation audits.
 | Property | Implemented value |
 |---|---|
 | Coding mode | Modular lossless |
-| Color models | Gray (one NonColor `X000` plane), RGB (`Rgb`/`XYZ1`), RGBA (`Rgb`/`XYZW`); RGBA alpha is one unassociated extra channel |
-| Sample depths | every integer `1..=31` (`1..=8` in `u8` words, `9..=16` in `u16`, `17..=31` in `u32`) |
-| Input | pitch-linear `wgpu::Buffer`; single-plane, unsigned, native byte order, `ChromaSubsampling::None` |
+| Color models | Gray (`NonColor`/`X000` or `Gray`/`X001`), RGB/RGBA with bijective component swizzles; RGBA alpha is one unassociated extra channel |
+| Sample depths | every integer `1..=31` or IEEE binary16/binary32, with equal precision across components |
+| Input | one pitch-linear `wgpu::Buffer`, one through four packed/planar/split planes, 8/16/24/32-bit words, arbitrary field positions, Native/Little/Big byte order, `ChromaSubsampling::None` |
 | Extent | `1..2^30` per axis, further bounded by device limits |
 | Frame/group layout | standard 256x256 PassGroups, multi-group, row-major TOC |
 | Animation | `true` (5 blend modes, signed crop, 4 reference slots, timecodes) |
@@ -42,14 +42,14 @@ implementation audits.
 | Progressive passes | `max_progressive_passes = 1` |
 | Implemented stages | `ColorTransform`, `ModularTransform`, `ModularPrediction`, `ModularResidualTokenization`, `HistogramReduction` |
 | Predictor | JPEG XL Gradient predictor |
-| Modular transforms | fixed reversible YCoCg for RGB(A); none for Gray |
+| Modular transforms | fixed reversible YCoCg for integer RGB(A); none for Gray or IEEE samples |
 | Entropy | JPEG XL prefix code with LZ77 distance 1, not ANS; fixed MA tree |
 | Filters | Gaborish off, EPF zero iterations |
 | Output | raw codestream or standard `jxlc` container; private `jwgp` index emitted only for single-group Gray8 containers |
 
-The backend rejects textures, planar RGB, BGR/BGRA, non-native byte order, chroma subsampling,
-YUV/NV12, MSB-aligned partial words, explicit non-sRGB color specifications, and progressive
-passes > 1. YUV/NV12 ingestion is not implemented.
+The backend rejects textures, chroma subsampling, YUV/NV12, signed samples, unsupported color
+metadata, non-bijective/missing channels, mismatched component precision and progressive passes > 1.
+Storage normalization remains fused into GPU token production; no intermediate image is allocated.
 
 ### GPU artifact ABI
 
@@ -74,35 +74,37 @@ plane is copied into a private container box. The ABI is bounded before allocati
 The parameter ABI is one `#[repr(C)]`, `bytemuck::Pod` Rust value and the matching WGSL structure:
 
 ```text
+ModularSourceParams / Source = {
+    row_stride, byte_offset, pixel_stride, word_bytes, bit_shift, plane: u32,
+}
+size = 24 bytes, alignment = 4 bytes
+
 ModularParams / Params = {
-    width: u32,
-    height: u32,
-    row_stride: u32,
-    byte_offset: u32,
-    output_word_offset: u32,
-    channel: u32,
-    channels: u32,
-    bytes_per_sample: u32,
-    sample_mask: u32,
-    _padding: array<u32, 55>, // [u32; 55] in Rust
+    width, height, output_word_offset, channel, channels, sample_mask, use_rct, big_endian: u32,
+    sources: array<Source, 4>,
+    _padding: array<u32, 32>,
 }
 size = 256 bytes, alignment = 4 bytes
 ```
 
-A compile-time size assertion and a test for size, alignment, byte order, field order, and the WGSL
-declaration prevent accidental ABI drift. An explicit 256-byte array stride keeps every batch
-boundary valid for portable storage-buffer offset alignment. The source is never bound as an
-unchecked whole buffer. Admission computes the final sampled byte with checked
-`offset + (height - 1) * row_stride + width * channels * bytes_per_sample`, checks arithmetic for
-overflow, rounds the final u32 load up to four bytes, and binds only the enclosing range. The
-binding base is rounded down to both the device's `min_storage_buffer_offset_alignment` and u32 word
-alignment; WGSL receives the resulting relative offset. Its final address must fit WGSL's u32
-address space.
+Compile-time and shader validation tests check the ABI. The 256-byte array stride keeps each
+batch parameter range aligned. Source bindings 0/3/4/5 address individual planes; bindings 1/2
+retain artifacts and parameters. Unused sources alias the first plane, and configurations below
+six storage bindings are rejected before pipeline creation. Each component carries its own
+word offset, byte stride, field shift and source-plane selector. Word loads preserve IEEE bits.
+
+Admission revalidates every public image-layout field and its final addressable word. Each group
+uses checked `offset + (height - 1) * row_stride + (width - 1) * pixel_stride + word_bytes`, rounds
+its enclosing plane window to the device/storage-word alignment, and supplies relative u32
+addresses to WGSL. Batches split before either any source-plane binding or the artifact binding
+exceeds the device limit. A single oversized group remains a typed resource rejection. Source
+accounting takes the union of bound ranges, omitting plane gaps and duplicate alignment prefixes;
+there is no additional source copy or normalized image.
 
 Artifact and MAP_READ allocations use checked word/byte arithmetic, are four-byte copy aligned, and
 must fit both `max_storage_buffer_binding_size` and `max_buffer_size`. The public
-`LosslessModularEncoder::memory_plan` reports valid bits, component storage bytes, channel count,
-format, group grid, full and peak source binding ranges, parameter storage, peak artifact storage,
+`LosslessModularEncoder::memory_plan` reports valid bits/exponent width, largest component storage-word width, channel count,
+format, group grid, full and peak unions of source binding ranges, parameter storage, peak artifact storage,
 diagnostic total artifact bytes, readback bytes, batch count, exact GPU submission count, streaming
 mode, owned bytes per job, and addressed bytes per job. `for_in_flight(n)` reports checked aggregate
 bytes for a caller-selected concurrency ceiling, while `memory_limits` exposes the relevant device
