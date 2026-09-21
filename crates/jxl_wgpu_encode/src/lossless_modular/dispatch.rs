@@ -64,7 +64,7 @@ pub(super) struct ModularDispatchPlan {
 
 /// GPU lossless integer/IEEE floating Modular encoding with row-major 256x256 pass groups.
 ///
-/// It never reads source pixels on the CPU. Gray, RGB and RGBA components may occupy packed,
+/// It never reads source pixels on the CPU. Gray, GrayAlpha, RGB and RGBA components may occupy packed,
 /// planar or split storage with explicit swizzles, bit positions and word byte order. Samples
 /// have one common 1-31-bit integer or binary16/binary32 precision.
 /// Integer RGB samples use reversible YCoCg; floating samples retain their raw bits. The GPU
@@ -619,7 +619,7 @@ pub(super) fn validate_modular_frame_request(
                 )
             {
                 return Err(EncodeError::InvalidConfiguration(
-                    "alpha-weighted animation blending requires an RGBA source",
+                    "alpha-weighted animation blending requires a GrayAlpha or RGBA source",
                 ));
             }
             let color_uses_clamp = request.options.color_blend.mode == crate::BlendMode::Multiply

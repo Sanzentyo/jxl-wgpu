@@ -7,7 +7,7 @@ use jxl_gpu_bitstream::{
     write_container_with_boxes,
 };
 
-use super::color::{LosslessModularColorOptions, ModularColorEncoding, ModularColorMetadata};
+use super::color::{LosslessModularColorOptions, ModularColorEncoding, ModularImageMetadata};
 use super::dispatch::frame_covers_canvas;
 use super::dispatch::{LosslessModularBackend, ModularGroupPlan};
 use super::grid::{LosslessModularGroup, LosslessModularGroupGrid};
@@ -15,8 +15,8 @@ use super::memory::{LosslessModularMemoryLimits, LosslessModularMemoryPlan};
 use super::source::lossless_modular_source_spec;
 use super::streaming::LosslessModularJob;
 use super::types::{
-    LosslessModularFormat, LosslessModularTreeMode, ModularArtifactHeader, ModularEvent,
-    modular_sample_depth,
+    AlphaAssociation, LosslessModularFormat, LosslessModularTreeMode, ModularArtifactHeader,
+    ModularEvent, modular_sample_depth,
 };
 use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS};
 use crate::{
@@ -36,10 +36,11 @@ pub(super) struct ModularFrameHeader {
     pub(super) is_last: bool,
 }
 /// Convenience API that produces a complete raw codestream or deterministic
-/// `jxlc` container from a GPU-resident Gray, RGB, or RGBA integer/IEEE floating buffer.
+/// `jxlc` container from a GPU-resident Gray, GrayAlpha, RGB, or RGBA integer/IEEE floating buffer.
 pub struct LosslessModularEncoder {
     encoder: GpuEncoder<LosslessModularBackend>,
     color_options: LosslessModularColorOptions,
+    alpha_association: AlphaAssociation,
 }
 
 impl LosslessModularEncoder {
@@ -49,6 +50,7 @@ impl LosslessModularEncoder {
         Self {
             encoder: GpuEncoder::new(context, backend),
             color_options: LosslessModularColorOptions::default(),
+            alpha_association: AlphaAssociation::default(),
         }
     }
 
@@ -59,6 +61,7 @@ impl LosslessModularEncoder {
         Self {
             encoder: GpuEncoder::new(context, backend),
             color_options: LosslessModularColorOptions::default(),
+            alpha_association: AlphaAssociation::default(),
         }
     }
 
@@ -73,6 +76,7 @@ impl LosslessModularEncoder {
         Self {
             encoder: GpuEncoder::new(context, backend),
             color_options: LosslessModularColorOptions::default(),
+            alpha_association: AlphaAssociation::default(),
         }
     }
 
@@ -85,6 +89,14 @@ impl LosslessModularEncoder {
         options.validate()?;
         self.color_options = options;
         Ok(self)
+    }
+
+    /// Declares how source color is associated with alpha; no source samples are changed.
+    /// Associated input requires GrayAlpha or RGBA, and is checked before job admission.
+    #[must_use]
+    pub fn with_alpha_association(mut self, association: AlphaAssociation) -> Self {
+        self.alpha_association = association;
+        self
     }
 
     #[must_use]
@@ -103,7 +115,9 @@ impl LosslessModularEncoder {
         &self,
         source: &crate::BufferImageSource,
     ) -> Result<LosslessModularMemoryPlan, EncodeError> {
-        self.encoder.backend().memory_plan(source)
+        let plan = self.encoder.backend().memory_plan(source)?;
+        self.alpha_association.validate(plan.format)?;
+        Ok(plan)
     }
 
     #[must_use]
@@ -170,7 +184,9 @@ impl LosslessModularEncoder {
             descriptor.bits_per_sample,
             descriptor.exponent_bits_per_sample,
             descriptor.animation,
-            descriptor.color.metadata(self.color_options),
+            descriptor
+                .color
+                .metadata(self.color_options, self.alpha_association),
         )?;
         let session = self.encoder.begin_session(SessionDescriptor {
             profile: EncodeProfile::ModularLossless {
@@ -226,7 +242,9 @@ impl LosslessModularEncoder {
             source_spec.bits_per_sample,
             source_spec.exponent_bits_per_sample,
             AnimationHeader::Still,
-            source_spec.color.metadata(self.color_options),
+            source_spec
+                .color
+                .metadata(self.color_options, self.alpha_association),
         )?;
         let frame = self
             .encoder
@@ -343,7 +361,7 @@ impl LosslessModularAnimationDescriptor {
             bits_per_sample,
             exponent_bits_per_sample,
             animation,
-            ModularColorMetadata::default(),
+            ModularImageMetadata::default(),
         )?;
         Ok(Self {
             canvas_width,
@@ -652,7 +670,7 @@ pub(super) fn build_prefix_codes(
     let unused = PrefixCode::fixed_unused_channel();
     let mut codes = [unused.clone(), unused.clone(), unused.clone(), unused];
     for channel in 0..channels {
-        let transformed_extra_token = u8::from(format != LosslessModularFormat::Gray);
+        let transformed_extra_token = u8::from(format.color_channel_count() == 3);
         let wide_samples = bits_per_sample > 14;
         let max_raw_token = if (15..=16).contains(&bits_per_sample) {
             18
@@ -1207,9 +1225,10 @@ pub(super) fn image_header(
     bits_per_sample: u8,
     exponent_bits_per_sample: u8,
     animation: AnimationHeader,
-    color: ModularColorMetadata,
+    color: ModularImageMetadata,
 ) -> Result<BitFragment, EncodeError> {
     color.options.validate()?;
+    color.alpha.validate(format)?;
     let extra_fields = animation.is_animation() || color.options.extra_fields();
     let mut output = BitWriter::new();
     output.write_bits(0x0aff, 16)?;
@@ -1234,7 +1253,10 @@ pub(super) fn image_header(
     )?;
     if format.has_alpha() {
         output.write_bits(1, 2)?; // one alpha extra channel
-        if bits_per_sample == 8 && exponent_bits_per_sample == 0 {
+        if bits_per_sample == 8
+            && exponent_bits_per_sample == 0
+            && color.alpha == AlphaAssociation::Unassociated
+        {
             output.write_bits(1, 1)?; // default 8-bit, unassociated alpha metadata
         } else {
             output.write_bits(0, 1)?; // explicit alpha metadata
@@ -1242,7 +1264,7 @@ pub(super) fn image_header(
             write_sample_bit_depth(&mut output, bits_per_sample, exponent_bits_per_sample)?;
             output.write_bits(0, 2)?; // full-resolution dim_shift
             output.write_bits(0, 2)?; // empty name
-            output.write_bits(0, 1)?; // unassociated alpha
+            output.write_bits(u64::from(color.alpha == AlphaAssociation::Associated), 1)?;
         }
     } else {
         output.write_bits(0, 2)?;

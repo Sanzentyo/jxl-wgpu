@@ -12,7 +12,7 @@ use jxl_gpu_protocol::{
     icc::IccRenderingIntent,
 };
 
-use super::types::LosslessModularFormat;
+use super::types::{AlphaAssociation, LosslessModularFormat};
 use crate::{EncodeError, UnsupportedFeature};
 
 /// Image-wide declarations for lossless Modular stills and animations.
@@ -70,9 +70,10 @@ pub(super) struct ModularColorEncoding {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct ModularColorMetadata {
+pub(super) struct ModularImageMetadata {
     pub(super) encoding: ModularColorEncoding,
     pub(super) options: LosslessModularColorOptions,
+    pub(super) alpha: AlphaAssociation,
 }
 
 impl ModularColorEncoding {
@@ -157,10 +158,15 @@ impl ModularColorEncoding {
         })
     }
 
-    pub(super) fn metadata(self, options: LosslessModularColorOptions) -> ModularColorMetadata {
-        ModularColorMetadata {
+    pub(super) fn metadata(
+        self,
+        options: LosslessModularColorOptions,
+        alpha: AlphaAssociation,
+    ) -> ModularImageMetadata {
+        ModularImageMetadata {
             encoding: self,
             options,
+            alpha,
         }
     }
 
@@ -170,7 +176,7 @@ impl ModularColorEncoding {
         format: LosslessModularFormat,
         intent: IccRenderingIntent,
     ) -> Result<(), EncodeError> {
-        let gray = format == LosslessModularFormat::Gray;
+        let gray = format.color_channel_count() == 1;
         let compact = !gray && self == Self::default() && intent == IccRenderingIntent::Relative;
         output.write_bits(u64::from(compact), 1)?;
         if compact {

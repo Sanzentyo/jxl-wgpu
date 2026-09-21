@@ -32,7 +32,7 @@ implementation audits.
 | Property | Implemented value |
 |---|---|
 | Coding mode | Modular lossless |
-| Color models | Gray (`NonColor`/`X000` or `Gray`/`X001`), RGB/RGBA with bijective component swizzles; RGBA alpha is one unassociated extra channel |
+| Color models | Gray (`NonColor`/`X000` or `Gray`/`X001`), GrayAlpha (`Gray`/`X00W`), RGB/RGBA with bijective component swizzles; alpha is one extra channel with declared association |
 | Sample depths | every integer `1..=31` or IEEE binary16/binary32, with equal precision across components |
 | Input | one pitch-linear `wgpu::Buffer`, one through four packed/planar/split planes, 8/16/24/32-bit words, arbitrary field positions, Native/Little/Big byte order, `ChromaSubsampling::None` |
 | Source color | full-range enumerated RGB/Gray, standard/custom primaries and white, Linear/sRGB/BT.709/PQ/HLG/DCI/Gamma; four intents and positive binary16 image white |
@@ -43,7 +43,7 @@ implementation audits.
 | Progressive passes | `max_progressive_passes = 1` |
 | Implemented stages | `ColorTransform`, `ModularTransform`, `ModularPrediction`, `ModularResidualTokenization`, `HistogramReduction` |
 | Predictor | JPEG XL Gradient predictor |
-| Modular transforms | fixed reversible YCoCg for integer RGB(A); none for Gray or IEEE samples |
+| Modular transforms | fixed reversible YCoCg for integer RGB(A); none for Gray/GrayAlpha or IEEE samples |
 | Entropy | JPEG XL prefix code with LZ77 distance 1, not ANS; fixed MA tree |
 | Filters | Gaborish off, EPF zero iterations |
 | Output | raw codestream or standard `jxlc` container; private `jwgp` index emitted only for single-group Gray8 containers with default color/intent/intensity |
@@ -59,6 +59,14 @@ exact positive binary16 unit-white luminance, defaulting to Relative/255 cd/m².
 continues to preserve source words. Animation descriptors bind logical channels, precision and
 serialized color across physical layout changes. The crate README owns the API and rejected cases;
 [source-color conformance](CONFORMANCE_CORPUS.md#lossless-modular-source-color) records its evidence.
+
+GrayAlpha maps the gray and alpha swizzle outputs to logical channels 0/1 in the existing source
+parameter array. Its image header declares grayscale and one alpha extra channel, while RGB(A)
+keeps its existing channel order and transform rules. `AlphaAssociation` only controls the
+image-wide extra-channel declaration; the token kernel preserves all supplied words, including
+nonzero color at zero alpha. It does not change bindings, artifact ABI, GPU ownership or sample
+precision. [Alpha-input conformance](CONFORMANCE_CORPUS.md#lossless-modular-alpha-input) separates
+exact raw-sample preservation from arithmetic composition and final alpha presentation.
 
 ### GPU artifact ABI
 
@@ -334,8 +342,9 @@ cargo clippy -p jxl_wgpu_encode --all-targets -- -D warnings
 
 - **Multi-group Modular (Slice 3)**: Standard 256x256 PassGroups, multi-group row-major TOC layout,
   two-pass streaming with global histogram aggregation, and out-of-order group completion.
-- **Lossless RGB and RGBA (Slice 4 half)**: Interleaved unsigned RGB and RGBA at depths `1..=31`
-  with GPU-side reversible color transform (YCoCg) and unassociated alpha extra-channel support.
+- **Lossless color and alpha inputs (Slice 4 partial)**: Gray/GrayAlpha/RGB/RGBA at integer depths
+  `1..=31` or IEEE binary16/binary32, with packed/planar/split addressing and declared alpha
+  association. Integer RGB(A) uses the GPU-side reversible YCoCg transform.
 - **Lossless Modular animation (Slice 6)**: Multi-frame `LosslessModularAnimationSession` supporting
   standard timebases, exact durations and timecodes, signed crop rectangles, all 5 blend modes,
   alpha blending, and 4 reference slots with runtime-neutral in-flight futures.

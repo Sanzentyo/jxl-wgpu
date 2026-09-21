@@ -24,4 +24,7 @@ pub use serializer::{
     LosslessModularSubmission,
 };
 pub use streaming::LosslessModularJob;
-pub use types::{LOSSLESS_MODULAR_GROUP_DIMENSION, LosslessModularFormat, LosslessModularTreeMode};
+pub use types::{
+    AlphaAssociation, LOSSLESS_MODULAR_GROUP_DIMENSION, LosslessModularFormat,
+    LosslessModularTreeMode,
+};

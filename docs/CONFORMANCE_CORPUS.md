@@ -402,8 +402,51 @@ JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossl
 cargo test --locked -p jxl_wgpu_encode --lib lossless_modular::color -- --test-threads=2
 ```
 
-`ENC-01`, `IO-02`, `FRAME-05` and `QA-03/06` remain **Partial**. Embedded ICC, associated input
-alpha, arbitrary extras, YUV/textures and broader composition/precision combinations remain open.
+`ENC-01`, `IO-02`, `FRAME-05` and `QA-03/06` remain **Partial**. Embedded ICC, arbitrary extras,
+YUV/textures and broader composition/precision combinations remain open. The following checkpoint
+adds associated input alpha.
+
+## Lossless Modular alpha input
+
+The [`lossless_layouts::alpha`](../crates/jxl_wgpu_encode/tests/lossless_layouts/alpha.rs) matrix
+generates 198 still containers: GrayAlpha with either association and associated RGBA, each at
+all 31 integer depths plus binary16/binary32 and both MA-tree modes. Packed/planar sources reverse
+components, use big-endian words, unaligned offsets/pitches and poisoned padding at 257×3.
+Canonical storage produces identical bytes. Parsed headers retain grayscale, alpha precision and
+association; jxl-oxide working planes and whole/bounded GPU numeric selection match every source
+word exactly, including invisible colors and IEEE special values. Required libjxl 0.12.0 original
+output uses the existing `2e-7` integer bound and exact IEEE comparison. Six additional 1×257
+GrayAlpha cases cover shared words, 24-bit words and mixed storage widths under both associations.
+
+Sixteen finite GrayAlpha/RGBA stills cross both associations with integer 8/31 and IEEE16/32.
+Preserve, Unassociated and Associated RGBA-F32 presentation is checked against native preserved
+values and independent source arithmetic. Explicit native unpremultiplication independently
+checks Unassociated output. The established source-scale bounds remain `3e-6` for color and
+`4e-7` for alpha; unpremultiplied color is scaled back by `max(alpha, 2^-26)`. The data includes
+zero/tiny alpha and nonzero invisible color. Exact numeric samples are checked separately.
+
+The same 16 format/association/precision combinations produce six-frame animations covering
+Replace, Add, Blend, Multiply and MultiplyAdd with independent color/alpha background slots,
+negative and positive crops, changing layout/endianness, reverse completion order and alternating
+blocking/Future completion. Native libjxl checks all three output policies; Rust jxl 0.6 checks
+Preserve because its default output retains source-associated color. No arithmetic tolerance is
+widened. Both CPU oracles independently compose every frame. Whole and bounded fragmented GPU
+outputs are identical, with exact frame count, duration, timecode and presentation ticks; retained
+outputs remain readable after session destruction and release all reservations when dropped.
+
+Resident 257×9 and streamed 16K×1 associated GrayAlpha31 jobs verify exact and one-byte-short
+admission, cancellation through unique source-owner retirement, deterministic blocking/Future
+output and pool reuse. Invalid/non-bijective gray swizzles and association without alpha reject
+before allocation, including animation creation. GrayAlpha uses the existing two-channel GPU
+path; bindings, artifacts and byte-budget rules are unchanged.
+
+```console
+JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossless_layouts alpha:: -- --test-threads=2
+```
+
+`ENC-01`, `IO-02`, `FRAME-05` and `QA-03/06` remain **Partial**. Alpha still shares color's declared
+precision; independent extra precision/types, resampling/shift policies, embedded ICC, YUV/textures
+and the remaining encoder capabilities retain their separate gates.
 
 ## Procedural VarDCT encoder matrix
 

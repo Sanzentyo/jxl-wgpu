@@ -351,6 +351,7 @@ fn rust_frames(case: &Case, encoded: &[u8]) -> Vec<(Option<f64>, Vec<u16>)> {
     decoder.set_pixel_format(JxlPixelFormat {
         color_type: match case.format {
             LosslessModularFormat::Gray => JxlColorType::Grayscale,
+            LosslessModularFormat::GrayAlpha => JxlColorType::GrayscaleAlpha,
             LosslessModularFormat::Rgb => JxlColorType::Rgb,
             LosslessModularFormat::Rgba => JxlColorType::Rgba,
         },
@@ -404,6 +405,7 @@ fn rust_float_frames(encoded: &[u8], format: LosslessModularFormat) -> Vec<Vec<f
     decoder.set_pixel_format(JxlPixelFormat {
         color_type: match format {
             LosslessModularFormat::Gray => JxlColorType::Grayscale,
+            LosslessModularFormat::GrayAlpha => JxlColorType::GrayscaleAlpha,
             LosslessModularFormat::Rgb => JxlColorType::Rgb,
             LosslessModularFormat::Rgba => JxlColorType::Rgba,
         },

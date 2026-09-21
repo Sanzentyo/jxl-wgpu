@@ -5,10 +5,11 @@
 //! through `wgpu`. The CPU side is limited to job coordination and deterministic
 //! JPEG XL bitstream/container assembly.
 //!
-//! [`LosslessModularEncoder`] implements standard multi-group lossless Modular Gray, RGB, and RGBA
+//! [`LosslessModularEncoder`] implements standard multi-group lossless Modular Gray/GrayAlpha/RGB/RGBA
 //! for every unsigned integer depth in `1..=31` and IEEE binary16/binary32. Packed, planar and
 //! split pitch-linear buffers support component swizzles and explicit word bit/byte order.
 //! Full-range enumerated source color is retained, with explicit intent and image-white options.
+//! [`AlphaAssociation`] declares source association without changing samples or invisible color.
 //! Samples remain GPU-resident through reversible
 //! color transform, prediction, residual tokenization, and histogram collection. The generic
 //! [`GpuEncoder`] advertises only profiles implemented by its backend.
@@ -64,7 +65,7 @@ pub use gpu::{
 };
 pub use jxl_gpu_bitstream::FiniteF16;
 pub use lossless_modular::{
-    LOSSLESS_MODULAR_GROUP_DIMENSION, LosslessModularAnimationDescriptor,
+    AlphaAssociation, LOSSLESS_MODULAR_GROUP_DIMENSION, LosslessModularAnimationDescriptor,
     LosslessModularAnimationSession, LosslessModularBackend, LosslessModularColorOptions,
     LosslessModularEncoder, LosslessModularFormat, LosslessModularGroup, LosslessModularGroupGrid,
     LosslessModularInFlightMemory, LosslessModularJob, LosslessModularMemoryLimits,

@@ -1,5 +1,6 @@
 #![cfg(not(target_arch = "wasm32"))]
 
+mod alpha;
 mod animation;
 mod color;
 mod lifetime;
@@ -173,7 +174,9 @@ fn check_frame_oracles(encoded: &[u8], frames: &[&[u32]], case: &Case) -> Vec<f3
                 let value = if channel == 3 && !case.format.has_alpha() {
                     1.0f32
                 } else {
-                    let index = if case.format == LosslessModularFormat::Gray {
+                    let index = if channel == 3 {
+                        channels - 1
+                    } else if case.format.color_channel_count() == 1 {
                         0
                     } else {
                         channel
@@ -195,7 +198,7 @@ fn check_frame_oracles(encoded: &[u8], frames: &[&[u32]], case: &Case) -> Vec<f3
                 }
             }
             if case.format.has_alpha() {
-                let value = case.normalized(expected[pixel * channels + 3]);
+                let value = case.normalized(expected[pixel * channels + channels - 1]);
                 let actual = native[pixels * 4 + pixel];
                 if case.kind == SampleKind::Float {
                     assert_eq!(actual.to_bits(), value.to_bits());

@@ -816,7 +816,7 @@ mod native_tests {
         let order = match format {
             LosslessModularFormat::Rgb => RgbChannelOrder::Rgb,
             LosslessModularFormat::Rgba => RgbChannelOrder::Rgba,
-            LosslessModularFormat::Gray => unreachable!(),
+            LosslessModularFormat::Gray | LosslessModularFormat::GrayAlpha => unreachable!(),
         };
         let pixel_format = PixelFormat::rgb8(order, false, ColorSpecification::Undefined);
         let layout = ImageLayout::from_planes(
@@ -1241,6 +1241,11 @@ mod native_tests {
             },
             LosslessModularFormat::Rgb => JxlPixelFormat::rgb8(0),
             LosslessModularFormat::Rgba => JxlPixelFormat::rgba8(1),
+            LosslessModularFormat::GrayAlpha => JxlPixelFormat {
+                color_type: JxlColorType::GrayscaleAlpha,
+                color_data_format: Some(JxlDataFormat::U8 { bit_depth: 8 }),
+                extra_channel_format: vec![None],
+            },
         };
         decoder.set_pixel_format(pixel_format);
         let channels = usize::try_from(format.channel_count())
@@ -1314,7 +1319,7 @@ mod native_tests {
         let pixel_format = match format {
             LosslessModularFormat::Rgb => JxlPixelFormat::rgb8(0),
             LosslessModularFormat::Rgba => JxlPixelFormat::rgba8(1),
-            LosslessModularFormat::Gray => {
+            LosslessModularFormat::Gray | LosslessModularFormat::GrayAlpha => {
                 return Err("color decoder helper requires RGB or RGBA".into());
             }
         };
@@ -1401,6 +1406,7 @@ mod native_tests {
         };
         let color_type = match format {
             LosslessModularFormat::Gray => JxlColorType::Grayscale,
+            LosslessModularFormat::GrayAlpha => JxlColorType::GrayscaleAlpha,
             LosslessModularFormat::Rgb => JxlColorType::Rgb,
             LosslessModularFormat::Rgba => JxlColorType::Rgba,
         };

@@ -140,14 +140,14 @@ fn numeric_request(case: &Case, channel: u32) -> GpuOutputRequest {
         )
         .unwrap()
     };
-    if channel == 3 {
+    if channel == case.format.color_channel_count() {
         request.with_extra_channel(0).unwrap()
     } else {
         request.with_color_channel(channel).unwrap()
     }
 }
 
-fn check_numeric(rig: &Rig, encoded: &[u8], frames: &[Vec<u32>], case: &Case) {
+pub(super) fn check_numeric(rig: &Rig, encoded: &[u8], frames: &[Vec<u32>], case: &Case) {
     let channels = case.format.channel_count() as usize;
     for channel in 0..channels {
         let mut baseline = None;

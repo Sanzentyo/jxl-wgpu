@@ -126,6 +126,15 @@ pub(super) fn upload(
     };
     pixel_format.byte_order = case.byte_order;
     let mut order: Vec<_> = (0..channels).collect();
+    if case.reversed && case.format == LosslessModularFormat::GrayAlpha {
+        order.reverse();
+        pixel_format.swizzle = Swizzle::Xyzw([
+            SwizzleComponent::W,
+            SwizzleComponent::Zero,
+            SwizzleComponent::Zero,
+            SwizzleComponent::X,
+        ]);
+    }
     if case.reversed && channels >= 3 {
         order[..3].reverse();
         pixel_format.swizzle = if channels == 4 {
@@ -143,7 +152,11 @@ pub(super) fn upload(
             ]);
         }
     }
-    let ids = [Channel::X, Channel::Y, Channel::Z, Channel::W];
+    let ids = if case.format == LosslessModularFormat::GrayAlpha {
+        [Channel::X, Channel::W, Channel::Y, Channel::Z]
+    } else {
+        [Channel::X, Channel::Y, Channel::Z, Channel::W]
+    };
     let physical_planes: Vec<Vec<usize>> = match case.storage {
         Storage::Planar => (0..channels).map(|index| vec![index]).collect(),
         Storage::Split if channels > 1 => vec![(0..channels - 1).collect(), vec![channels - 1]],

@@ -47,14 +47,26 @@ pub(super) fn lossless_modular_source_spec(
         return Err(UnsupportedFeature::InputFormat.into());
     };
     let logical_format = match (format.model, format.swizzle, &format.color_spec) {
-        (ColorModel::NonColor, Swizzle::X000, ColorSpecification::Undefined)
-        | (
+        (ColorModel::NonColor, Swizzle::X000, ColorSpecification::Undefined) => {
+            LosslessModularFormat::Gray
+        }
+        (
             ColorModel::Gray,
-            Swizzle::X001,
-            ColorSpecification::Default
-            | ColorSpecification::Undefined
-            | ColorSpecification::Defined(_),
+            Swizzle::Xyzw(
+                [
+                    _,
+                    SwizzleComponent::Zero,
+                    SwizzleComponent::Zero,
+                    SwizzleComponent::One,
+                ],
+            ),
+            _,
         ) => LosslessModularFormat::Gray,
+        (
+            ColorModel::Gray,
+            Swizzle::Xyzw([_, SwizzleComponent::Zero, SwizzleComponent::Zero, alpha]),
+            _,
+        ) if component_index(alpha).is_some() => LosslessModularFormat::GrayAlpha,
         (ColorModel::Rgb, _, _) => {
             if swizzle[3] == SwizzleComponent::One {
                 LosslessModularFormat::Rgb
@@ -137,7 +149,13 @@ pub(super) fn lossless_modular_source_spec(
         .take(logical_format.channel_count() as usize)
         .enumerate()
     {
-        let index = component_index(swizzle[logical]).ok_or(UnsupportedFeature::InputFormat)?;
+        let swizzle_index = if logical == logical_format.color_channel_count() as usize {
+            3 // Gray+alpha's second logical channel selects the canonical alpha component.
+        } else {
+            logical
+        };
+        let index =
+            component_index(swizzle[swizzle_index]).ok_or(UnsupportedFeature::InputFormat)?;
         *component = stored[index]
             .take()
             .ok_or(UnsupportedFeature::InputFormat)?;

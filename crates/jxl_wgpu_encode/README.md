@@ -1,7 +1,7 @@
 # jxl_wgpu_encode
 
 GPU-required JPEG XL encoding orchestration for `wgpu`. This crate does not contain a CPU pixel
-encoder or a CPU fallback. `LosslessModularEncoder` reads Gray, RGB, or RGBA integer or
+encoder or a CPU fallback. `LosslessModularEncoder` reads Gray, GrayAlpha, RGB, or RGBA integer or
 IEEE floating-point pitch-linear storage directly on the GPU and emits a standards-compatible lossless
 Modular codestream or `jxlc` container.
 
@@ -28,10 +28,11 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   constructs these layouts. Encoding preserves every bit, including signed zero, subnormals,
   infinities and NaN payloads, without floating-point arithmetic. Other floating precisions and
   binary64 input remain unsupported.
-- Custom `PixelFormat` layouts may partition Gray/RGB/RGBA components among one through four
+- Custom `PixelFormat` layouts may partition Gray/GrayAlpha/RGB/RGBA components among one through four
   full-resolution planes in the same buffer. Packed, planar and split color/alpha layouts are
   supported, including BGR/BGRA and arbitrary bijective component swizzles. Gray also accepts
-  `ColorModel::Gray` with `X001` and the color declarations below.
+  `ColorModel::Gray` with `X001` and the color declarations below. GrayAlpha uses `ColorModel::Gray`
+  with `X00W`, or another bijective gray/alpha component pair with zero Y/Z swizzle outputs.
 - Each independently endian-addressed 8/16/24/32-bit word may contain multiple equally precise
   components and padding. Integer fields may occupy any bit position, including MSB alignment;
   floating fields contain exactly 16 or 32 IEEE bits. Native, Little and Big byte order are supported.
@@ -44,8 +45,14 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   count. Batches split at either source-plane or artifact binding limits, without a normalized
   image allocation or host pixel conversion.
 - `Default` and `Undefined` RGB color specifications are interpreted as sRGB, matching the compact
-  all-default JPEG XL color header. RGBA is written as one unassociated alpha extra channel at the
-  same declared sample precision as RGB.
+  all-default JPEG XL color header. GrayAlpha and RGBA carry one alpha extra channel at the same
+  declared sample precision as color.
+- `with_alpha_association(AlphaAssociation::Associated)` declares that supplied color values are
+  already multiplied by alpha. The default is `Unassociated`. This image-wide declaration applies
+  to stills and every animation frame; encoding never multiplies, divides or discards source
+  values, including invisible color at zero alpha. Associated input without an alpha channel is
+  rejected before GPU admission. Independent alpha precision and additional extra channels remain
+  unsupported.
 - `Defined` full-range RGB/Gray accepts BT.709, BT.2020, Display-P3 and nonsingular custom RGB
   geometry, with D65, E, DCI or custom white. Linear, sRGB (including the Sycc alias), BT.709,
   PQ, HLG, DCI and Gamma transfer declarations are serialized without changing samples.
@@ -138,7 +145,7 @@ let jxl_container = submission.wait()?;
 Single-group Gray8 containers with default color/intent/intensity additionally carry the optional
 private `jwgp` acceleration index. Explicit sRGB matching those defaults retains the same bytes.
 Its current schema represents one contiguous 8-bit single-channel token span, so other depths,
-RGB(A), and multi-group containers intentionally omit that private box; all remain ordinary
+GrayAlpha, RGB(A), and multi-group containers intentionally omit that private box; all remain ordinary
 interoperable JPEG XL containers. Conformance tests cover every depth `1..=31`, the
 1/255/256/257 group boundaries, and extreme aspect ratios. A streamed 16,384×1 RGB8 case is exact
 through both the published Rust `jxl` decoder and reference `djxl`, with identical blocking and
@@ -172,8 +179,10 @@ keep the same serialized color, precision and logical channels; mismatch leaves 
 index unchanged. The existing `new`/`new_float` descriptors select default sRGB/gray.
 The [source-color matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-source-color)
 checks independent native profile bytes, exact original samples, requested color conversion and
-Replace animations. Associated alpha, independent extras, embedded ICC, YUV and textures remain
-outside this profile.
+Replace animations. The [alpha-input matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-alpha-input)
+checks exact GrayAlpha/associated source words, all three output alpha policies and six-frame
+compositions against independent native/Rust decoders, with retained output and cancellation.
+Independent extra-channel declarations, embedded ICC, YUV and textures remain outside this profile.
 
 ## Experimental VarDCT profile
 
@@ -362,9 +371,9 @@ sample precision, tick rate, loop count, and timecode presence. Use
 `LosslessModularAnimationDescriptor::new` for integers or `new_float` for binary16/binary32.
 Each frame supplies an exact duration,
 optional timecode, optional signed crop rectangle, color blend contract, one contract per extra
-channel, and the two-bit source/destination reference slots. RGBA animation continues to carry
-alpha as the standard unassociated extra channel; alpha-weighted `Blend` and `MultiplyAdd` name
-that extra channel instead of treating alpha as a fourth color component.
+channel, and the two-bit source/destination reference slots. GrayAlpha and RGBA animation carry
+alpha as a standard extra channel with the encoder's declared association. Alpha-weighted
+`Blend` and `MultiplyAdd` name that extra channel instead of treating alpha as a color component.
 Each channel's own blend mode determines whether its source-reference field is present;
 full-canvas Replace omits that field even when another channel uses Add or Multiply.
 

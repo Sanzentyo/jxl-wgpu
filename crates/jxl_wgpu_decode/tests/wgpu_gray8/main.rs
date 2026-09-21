@@ -447,6 +447,7 @@ fn rust_jxl_decode_integer(
     decoder.set_pixel_format(JxlPixelFormat {
         color_type: match format {
             LosslessModularFormat::Gray => JxlColorType::Grayscale,
+            LosslessModularFormat::GrayAlpha => JxlColorType::GrayscaleAlpha,
             LosslessModularFormat::Rgb => JxlColorType::Rgb,
             LosslessModularFormat::Rgba => JxlColorType::Rgba,
         },

@@ -77,8 +77,32 @@ const _: () = {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LosslessModularFormat {
     Gray,
+    GrayAlpha,
     Rgb,
     Rgba,
+}
+
+/// Interpretation of caller-supplied color samples relative to the alpha plane.
+/// Encoding preserves the source words, including color at zero alpha; it never multiplies,
+/// divides or discards them. The same declaration applies to every frame in an animation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AlphaAssociation {
+    /// Color samples are independent of alpha (the default).
+    #[default]
+    Unassociated,
+    /// Color samples are already multiplied by alpha.
+    Associated,
+}
+
+impl AlphaAssociation {
+    pub(super) fn validate(self, format: LosslessModularFormat) -> Result<(), EncodeError> {
+        if self == Self::Associated && !format.has_alpha() {
+            return Err(EncodeError::InvalidConfiguration(
+                "associated source color requires an alpha channel",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Selects where a multi-group lossless Modular frame stores its MA tree and entropy tables.
@@ -100,6 +124,7 @@ impl LosslessModularFormat {
     pub const fn channel_count(self) -> u32 {
         match self {
             Self::Gray => 1,
+            Self::GrayAlpha => 2,
             Self::Rgb => 3,
             Self::Rgba => 4,
         }
@@ -107,7 +132,15 @@ impl LosslessModularFormat {
 
     #[must_use]
     pub const fn has_alpha(self) -> bool {
-        matches!(self, Self::Rgba)
+        matches!(self, Self::GrayAlpha | Self::Rgba)
+    }
+
+    #[must_use]
+    pub const fn color_channel_count(self) -> u32 {
+        match self {
+            Self::Gray | Self::GrayAlpha => 1,
+            Self::Rgb | Self::Rgba => 3,
+        }
     }
 
     /// Constructs the canonical pitch-linear source format for an unsigned integer depth.
@@ -145,6 +178,12 @@ impl LosslessModularFormat {
                 ColorSpecification::Undefined,
                 Swizzle::X000,
                 &[Channel::X],
+            ),
+            Self::GrayAlpha => (
+                ColorModel::Gray,
+                ColorSpecification::Default,
+                Swizzle::X00W,
+                &[Channel::X, Channel::W],
             ),
             Self::Rgb => (
                 ColorModel::Rgb,
