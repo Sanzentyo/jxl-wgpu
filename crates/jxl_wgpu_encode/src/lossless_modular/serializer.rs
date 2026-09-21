@@ -14,7 +14,7 @@ use super::memory::{LosslessModularMemoryLimits, LosslessModularMemoryPlan};
 use super::streaming::LosslessModularJob;
 use super::types::{
     LosslessModularFormat, LosslessModularTreeMode, ModularArtifactHeader, ModularEvent,
-    lossless_modular_source_spec,
+    lossless_modular_source_spec, modular_sample_depth,
 };
 use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS};
 use crate::{
@@ -34,7 +34,7 @@ pub(super) struct ModularFrameHeader {
     pub(super) is_last: bool,
 }
 /// Convenience API that produces a complete raw codestream or deterministic
-/// `jxlc` container from a GPU-resident packed Gray, RGB, or RGBA integer buffer.
+/// `jxlc` container from a GPU-resident packed Gray, RGB, or RGBA integer/IEEE floating buffer.
 pub struct LosslessModularEncoder {
     encoder: GpuEncoder<LosslessModularBackend>,
 }
@@ -151,11 +151,12 @@ impl LosslessModularEncoder {
             descriptor.canvas_height,
             descriptor.format,
             descriptor.bits_per_sample,
+            descriptor.exponent_bits_per_sample,
             descriptor.animation,
         )?;
         let session = self.encoder.begin_session(SessionDescriptor {
             profile: EncodeProfile::ModularLossless {
-                bits_per_sample: descriptor.bits_per_sample,
+                sample_bit_depth: descriptor.sample_bit_depth(),
             },
             progressive: ProgressivePlan::single(),
             minimum_determinism: Determinism::CrossDevice,
@@ -187,7 +188,10 @@ impl LosslessModularEncoder {
             frame_index: FrameIndex::new(0),
             is_last: true,
             profile: EncodeProfile::ModularLossless {
-                bits_per_sample: source_spec.bits_per_sample,
+                sample_bit_depth: modular_sample_depth(
+                    source_spec.bits_per_sample,
+                    source_spec.exponent_bits_per_sample,
+                ),
             },
             progressive: ProgressivePlan::single(),
             minimum_determinism: Determinism::CrossDevice,
@@ -206,12 +210,14 @@ impl LosslessModularEncoder {
                 height,
                 format,
                 source_spec.bits_per_sample,
+                source_spec.exponent_bits_per_sample,
                 AnimationHeader::Still,
             )?,
             container,
             group_grid,
             format,
             bits_per_sample: source_spec.bits_per_sample,
+            exponent_bits_per_sample: source_spec.exponent_bits_per_sample,
         })
     }
 }
@@ -223,6 +229,7 @@ pub struct LosslessModularAnimationDescriptor {
     canvas_height: u32,
     format: LosslessModularFormat,
     bits_per_sample: u8,
+    exponent_bits_per_sample: u8,
     animation: AnimationHeader,
 }
 
@@ -234,17 +241,59 @@ impl LosslessModularAnimationDescriptor {
         bits_per_sample: u8,
         animation: AnimationHeader,
     ) -> Result<Self, EncodeError> {
+        Self::with_precision(
+            canvas_width,
+            canvas_height,
+            format,
+            bits_per_sample,
+            0,
+            animation,
+        )
+    }
+
+    /// Starts an animation with native IEEE binary16 or binary32 source components.
+    pub fn new_float(
+        canvas_width: u32,
+        canvas_height: u32,
+        format: LosslessModularFormat,
+        bits_per_sample: u8,
+        animation: AnimationHeader,
+    ) -> Result<Self, EncodeError> {
+        format.float_pixel_format(bits_per_sample)?;
+        Self::with_precision(
+            canvas_width,
+            canvas_height,
+            format,
+            bits_per_sample,
+            if bits_per_sample == 16 { 5 } else { 8 },
+            animation,
+        )
+    }
+
+    fn with_precision(
+        canvas_width: u32,
+        canvas_height: u32,
+        format: LosslessModularFormat,
+        bits_per_sample: u8,
+        exponent_bits_per_sample: u8,
+        animation: AnimationHeader,
+    ) -> Result<Self, EncodeError> {
         if !animation.is_animation() {
             return Err(EncodeError::InvalidConfiguration(
                 "a Modular animation descriptor requires an animation timebase",
             ));
         }
-        format.pixel_format(bits_per_sample)?;
+        if exponent_bits_per_sample == 0 {
+            format.pixel_format(bits_per_sample)?;
+        } else {
+            format.float_pixel_format(bits_per_sample)?;
+        }
         image_header(
             canvas_width,
             canvas_height,
             format,
             bits_per_sample,
+            exponent_bits_per_sample,
             animation,
         )?;
         Ok(Self {
@@ -252,6 +301,7 @@ impl LosslessModularAnimationDescriptor {
             canvas_height,
             format,
             bits_per_sample,
+            exponent_bits_per_sample,
             animation,
         })
     }
@@ -274,6 +324,11 @@ impl LosslessModularAnimationDescriptor {
     #[must_use]
     pub const fn bits_per_sample(self) -> u8 {
         self.bits_per_sample
+    }
+
+    #[must_use]
+    pub const fn sample_bit_depth(self) -> jxl_gpu_bitstream::SampleBitDepth {
+        modular_sample_depth(self.bits_per_sample, self.exponent_bits_per_sample)
     }
 
     #[must_use]
@@ -340,9 +395,10 @@ impl LosslessModularAnimationSession {
         let spec = lossless_modular_source_spec(&source.layout.format)?;
         if spec.format != self.descriptor.format
             || spec.bits_per_sample != self.descriptor.bits_per_sample
+            || spec.exponent_bits_per_sample != self.descriptor.exponent_bits_per_sample
         {
             return Err(EncodeError::InvalidConfiguration(
-                "every animation frame must match the stream format and integer depth",
+                "every animation frame must match the stream format and sample precision",
             ));
         }
         Ok(())
@@ -357,6 +413,7 @@ pub struct LosslessModularSubmission {
     group_grid: LosslessModularGroupGrid,
     format: LosslessModularFormat,
     bits_per_sample: u8,
+    exponent_bits_per_sample: u8,
 }
 
 impl LosslessModularSubmission {
@@ -365,10 +422,15 @@ impl LosslessModularSubmission {
         self.format
     }
 
-    /// Valid low bits encoded for every integer component.
+    /// Total encoded bits per component, including floating exponent and sign bits.
     #[must_use]
     pub const fn bits_per_sample(&self) -> u8 {
         self.bits_per_sample
+    }
+
+    #[must_use]
+    pub const fn sample_bit_depth(&self) -> jxl_gpu_bitstream::SampleBitDepth {
+        modular_sample_depth(self.bits_per_sample, self.exponent_bits_per_sample)
     }
     /// Exact row-major group grid dispatched by this submission.
     #[must_use]
@@ -491,6 +553,7 @@ pub(super) struct PacketBuildInput<'a> {
     pub(super) group_grid: LosslessModularGroupGrid,
     pub(super) format: LosslessModularFormat,
     pub(super) bits_per_sample: u8,
+    pub(super) exponent_bits_per_sample: u8,
     pub(super) tree_mode: LosslessModularTreeMode,
     pub(super) frame: &'a ModularFrameHeader,
     pub(super) group_plans: &'a [ModularGroupPlan],
@@ -564,6 +627,7 @@ pub(super) struct ModularPacketAssembler {
     group_grid: LosslessModularGroupGrid,
     format: LosslessModularFormat,
     bits_per_sample: u8,
+    exponent_bits_per_sample: u8,
     tree_mode: LosslessModularTreeMode,
     frame: ModularFrameHeader,
     codes: [PrefixCode; 4],
@@ -579,6 +643,7 @@ pub(super) struct ModularPacketConfig {
     pub(super) group_grid: LosslessModularGroupGrid,
     pub(super) format: LosslessModularFormat,
     pub(super) bits_per_sample: u8,
+    pub(super) exponent_bits_per_sample: u8,
     pub(super) tree_mode: LosslessModularTreeMode,
     pub(super) frame: ModularFrameHeader,
 }
@@ -594,12 +659,13 @@ impl ModularPacketAssembler {
             group_grid,
             format,
             bits_per_sample,
+            exponent_bits_per_sample,
             tree_mode,
             frame,
         } = config;
         let (packets, single_group, token_bit_offset_in_group) = if group_grid.groups == 1 {
             let mut group = BitWriter::new();
-            write_dc_global(&mut group, &codes, format)?;
+            write_dc_global(&mut group, &codes, format, exponent_bits_per_sample == 0)?;
             let token_bit_offset = u64::try_from(group.bit_len())
                 .map_err(|_| EncodeError::Backend("gray8 token offset overflow".into()))?;
             (Vec::new(), Some(group), token_bit_offset)
@@ -607,7 +673,12 @@ impl ModularPacketAssembler {
             let layout = FrameGroupLayout::new(group_grid.lf_groups, group_grid.groups, 1)?;
             let mut packets = Vec::with_capacity(layout.toc_entries());
             let mut dc_global = BitWriter::new();
-            write_dc_global(&mut dc_global, &codes, format)?;
+            write_dc_global(
+                &mut dc_global,
+                &codes,
+                format,
+                exponent_bits_per_sample == 0,
+            )?;
             dc_global.align_to_byte()?;
             packets.push(GroupPacket::new(
                 GroupPacketKind::DcGlobal,
@@ -629,6 +700,7 @@ impl ModularPacketAssembler {
             group_grid,
             format,
             bits_per_sample,
+            exponent_bits_per_sample,
             tree_mode,
             frame,
             codes,
@@ -713,7 +785,8 @@ impl ModularPacketAssembler {
                 )],
             )?;
             let acceleration = (self.format == LosslessModularFormat::Gray
-                && self.bits_per_sample == 8)
+                && self.bits_per_sample == 8
+                && self.exponent_bits_per_sample == 0)
                 .then(|| GpuAccelerationArtifact::Gray8Prefix {
                     width: self.width,
                     height: self.height,
@@ -745,6 +818,7 @@ pub(super) fn build_packets(
         group_grid,
         format,
         bits_per_sample,
+        exponent_bits_per_sample,
         tree_mode,
         frame,
         group_plans,
@@ -800,6 +874,7 @@ pub(super) fn build_packets(
             group_grid,
             format,
             bits_per_sample,
+            exponent_bits_per_sample,
             tree_mode,
             frame: frame.clone(),
         },
@@ -997,6 +1072,7 @@ fn write_dc_global(
     output: &mut BitWriter,
     codes: &[PrefixCode; 4],
     format: LosslessModularFormat,
+    use_rct: bool,
 ) -> Result<(), EncodeError> {
     // Handcrafted Modular metadata adapted from zune-jpegxl 0.5.2. See this crate's
     // `THIRD_PARTY.md` and `LICENSES/zune-jpegxl-MIT.txt`.
@@ -1005,7 +1081,7 @@ fn write_dc_global(
     write_ma_config(output, codes)?;
     output.write_bits(1, 1)?;
     output.write_bits(1, 1)?;
-    if format.channel_count() > 2 {
+    if use_rct && format.channel_count() > 2 {
         output.write_bits(1, 2)?; // one transform
         output.write_bits(0, 2)?; // reversible color transform
         output.write_bits(0, 5)?; // begin channel 0
@@ -1076,6 +1152,7 @@ pub(super) fn image_header(
     height: u32,
     format: LosslessModularFormat,
     bits_per_sample: u8,
+    exponent_bits_per_sample: u8,
     animation: AnimationHeader,
 ) -> Result<BitFragment, EncodeError> {
     let mut output = BitWriter::new();
@@ -1092,16 +1169,19 @@ pub(super) fn image_header(
         output.write_bits(1, 1)?; // animation metadata follows
         write_animation_header(&mut output, animation)?;
     }
-    write_integer_bit_depth(&mut output, bits_per_sample)?;
-    output.write_bits(u64::from(bits_per_sample <= 14), 1)?;
+    write_sample_bit_depth(&mut output, bits_per_sample, exponent_bits_per_sample)?;
+    output.write_bits(
+        u64::from(exponent_bits_per_sample == 0 && bits_per_sample <= 14),
+        1,
+    )?;
     if format.has_alpha() {
         output.write_bits(1, 2)?; // one alpha extra channel
-        if bits_per_sample == 8 {
+        if bits_per_sample == 8 && exponent_bits_per_sample == 0 {
             output.write_bits(1, 1)?; // default 8-bit, unassociated alpha metadata
         } else {
             output.write_bits(0, 1)?; // explicit alpha metadata
             output.write_bits(0, 2)?; // alpha extra-channel type
-            write_integer_bit_depth(&mut output, bits_per_sample)?;
+            write_sample_bit_depth(&mut output, bits_per_sample, exponent_bits_per_sample)?;
             output.write_bits(0, 2)?; // full-resolution dim_shift
             output.write_bits(0, 2)?; // empty name
             output.write_bits(0, 1)?; // unassociated alpha
@@ -1201,7 +1281,26 @@ pub(super) fn write_animation_header(
     Ok(())
 }
 
-fn write_integer_bit_depth(output: &mut BitWriter, bits_per_sample: u8) -> Result<(), EncodeError> {
+fn write_sample_bit_depth(
+    output: &mut BitWriter,
+    bits_per_sample: u8,
+    exponent_bits_per_sample: u8,
+) -> Result<(), EncodeError> {
+    if exponent_bits_per_sample != 0 {
+        let selector = match (bits_per_sample, exponent_bits_per_sample) {
+            (16, 5) => 1,
+            (32, 8) => 0,
+            _ => {
+                return Err(EncodeError::InvalidConfiguration(
+                    "lossless Modular floating precision must be binary16 or binary32",
+                ));
+            }
+        };
+        output.write_bits(1, 1)?;
+        output.write_bits(selector, 2)?;
+        output.write_bits(u64::from(exponent_bits_per_sample - 1), 4)?;
+        return Ok(());
+    }
     if !(1..=31).contains(&bits_per_sample) {
         return Err(EncodeError::InvalidConfiguration(
             "lossless Modular integer depth must be in 1..=31",
@@ -1276,7 +1375,7 @@ pub(super) fn frame_header(
         &mut output,
         frame.options.color_blend,
         format.has_alpha(),
-        frame.options.color_blend.mode == BlendMode::Replace && full_frame,
+        full_frame,
     )?;
     if format.has_alpha() {
         let alpha_blend = frame
@@ -1285,12 +1384,7 @@ pub(super) fn frame_header(
             .first()
             .copied()
             .unwrap_or_default();
-        write_blending_info(
-            &mut output,
-            alpha_blend,
-            true,
-            frame.options.color_blend.mode == BlendMode::Replace && full_frame,
-        )?;
+        write_blending_info(&mut output, alpha_blend, true, full_frame)?;
     }
 
     if let AnimationHeader::Animation { have_timecodes, .. } = frame.animation {
@@ -1330,7 +1424,7 @@ fn write_blending_info(
     output: &mut BitWriter,
     blend: FrameBlend,
     has_alpha: bool,
-    resets_canvas: bool,
+    full_frame: bool,
 ) -> Result<(), EncodeError> {
     write_blend_mode(output, blend.mode)?;
     let uses_alpha = matches!(blend.mode, BlendMode::Blend | BlendMode::MultiplyAdd);
@@ -1344,7 +1438,8 @@ fn write_blending_info(
             "the selected JPEG XL blend mode has no clamp field",
         ));
     }
-    if !resets_canvas {
+    // Each channel's own mode determines whether its reference source is present.
+    if blend.mode != BlendMode::Replace || !full_frame {
         output.write_bits(u64::from(blend.source_reference.get()), 2)?;
     }
     Ok(())

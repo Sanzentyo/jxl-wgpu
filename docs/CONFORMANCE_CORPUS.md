@@ -282,6 +282,53 @@ cargo test --locked -p jxl_wgpu_encode --test lossless_wide -- --test-threads=1
 This target isolates high-depth development checks; advertised changes still require the
 [full capability gates](DEVELOPMENT.md#capability-change-gates).
 
+## IEEE floating-point Modular encoding
+
+[`jxl_wgpu_encode/tests/lossless_float`](../crates/jxl_wgpu_encode/tests/lossless_float/main.rs)
+generates 48 still containers: Gray/RGB/RGBA × binary16/binary32 × shared/local trees ×
+1×1, 1×257, 257×3 and 2051×1 extents. Native 2/4-byte source words use a three-byte offset,
+unaligned rows and poisoned padding. Samples include both signed zeros, subnormals, finite
+extremes, infinities, signaling/quiet NaN payloads, signed values, zero runs and deterministic
+arbitrary words. Four additional streams enumerate all 65,536 binary16 words and both signs ×
+all 256 binary32 exponents × eight mantissas under both tree modes.
+
+Every stream requires jxl-oxide 0.12.6/jxl-render 0.12.4 retained integer working planes to match
+the raw source IEEE words exactly, before conversion to F32. Native libjxl 0.12.0 independently
+checks original RGBA and alpha output against exact F32 bits; binary16 conversion is defined by
+integer sign/exponent/mantissa expansion. Zero error includes NaN payloads and signed zero.
+Whole input and 43-byte fragments through 256-byte GPU windows check native-float selection of
+every component, independent alpha and original RGBA F32 output. Headers retain the color and
+alpha exponent widths and disable Modular 16-bit buffers for floating channels.
+
+Six three-frame full-canvas Replace animations cover both precisions and all three formats,
+timebase/loops/durations/timecodes, reversed completion/insertion and mixed blocking/Future
+completion. Every presentation satisfies both independent oracles. GPU images remain readable
+after session teardown and release their byte reservations with the last owner.
+Two four-frame RGBA animations use exact finite dyadic inputs for crop/Add, Multiply with
+Replace alpha, and Replace color with Add alpha. Native libjxl and Rust `jxl` 0.6.0 check composed
+RGBA and independent alpha exactly; whole/bounded GPU runs match all color/numeric outputs.
+These mixed modes also regress the encoder's per-channel source-reference field rule.
+The older jxl-oxide reader uses the color mode for that field, so it is not the composition oracle.
+Arithmetic composition is a floating result, not preservation of pre-composition source words.
+
+Resident 257×9 and streamed 16,384×1 RGBA32 cases with local trees check one-byte-deficient and
+exact admission, buffer-pool reuse, exact submission accounting, blocking/Future byte identity,
+independent oracles and whole/bounded GPU output. The resident case additionally checks concurrent
+backpressure and abandoned completion releasing its lease and reservation. Invalid precision,
+numeric-type/exponent mismatches, binary64, BGR and associated-alpha layouts retain typed rejection.
+The existing integer matrices and unchanged 609-byte Gray8 fixture remain regression gates.
+No checked-in source or reference images are regenerated for these procedural tests.
+
+Focused command (GPU tests remain serial):
+
+```console
+cargo test --locked --workspace --all-features --test lossless_float -- --test-threads=1
+```
+
+This target separates floating development checks; capability changes still require the
+[full gates](DEVELOPMENT.md#capability-change-gates). Browser/WASM compilation verifies the shared
+precision metadata/state machine, not browser execution.
+
 ## Procedural VarDCT encoder matrix
 
 All 27 single-transform strategies now emit real AC. The shared forward primitive has 667

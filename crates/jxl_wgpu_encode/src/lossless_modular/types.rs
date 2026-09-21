@@ -24,9 +24,10 @@ pub(super) struct ModularParams {
     pub(super) channels: u32,
     pub(super) bytes_per_sample: u32,
     pub(super) sample_mask: u32,
+    pub(super) use_rct: u32,
     // An explicit 256-byte array stride keeps every batch boundary valid for the portable
     // storage-buffer offset alignment without hidden Rust padding.
-    pub(super) _padding: [u32; 55],
+    pub(super) _padding: [u32; 54],
 }
 
 /// Fixed storage-buffer header written by `lossless_modular.wgsl`.
@@ -108,6 +109,23 @@ impl LosslessModularFormat {
                 "lossless Modular integer depth must be in 1..=31",
             ));
         }
+        Ok(self.packed_pixel_format(bits_per_sample, SampleKind::Unsigned))
+    }
+
+    /// Constructs native IEEE binary16 or binary32 storage, preserving every source bit.
+    ///
+    /// Components remain in the declared sRGB/gray domain. No floating-point arithmetic,
+    /// normalization or alpha association is performed by the lossless encoder.
+    pub fn float_pixel_format(self, bits_per_sample: u8) -> Result<PixelFormat, EncodeError> {
+        if !matches!(bits_per_sample, 16 | 32) {
+            return Err(EncodeError::InvalidConfiguration(
+                "lossless Modular floating storage must be binary16 or binary32",
+            ));
+        }
+        Ok(self.packed_pixel_format(bits_per_sample, SampleKind::Float))
+    }
+
+    fn packed_pixel_format(self, bits_per_sample: u8, sample_kind: SampleKind) -> PixelFormat {
         let storage_bits = bits_per_sample.next_power_of_two().max(8);
         let (model, color_spec, swizzle, channels): (_, _, _, &[Channel]) = match self {
             Self::Gray => (
@@ -141,11 +159,11 @@ impl LosslessModularFormat {
                 PackingWord { fields }
             })
             .collect();
-        Ok(PixelFormat {
+        PixelFormat {
             model,
             color_spec,
             chroma_subsampling: ChromaSubsampling::None,
-            sample_kind: SampleKind::Unsigned,
+            sample_kind,
             byte_order: ByteOrder::Native,
             swizzle,
             planes: vec![PlaneFormat {
@@ -153,7 +171,7 @@ impl LosslessModularFormat {
                 pixels_per_element: 1,
                 words,
             }],
-        })
+        }
     }
 }
 
@@ -162,12 +180,29 @@ pub(super) struct LosslessModularSourceSpec {
     pub(super) format: LosslessModularFormat,
     pub(super) bits_per_sample: u8,
     pub(super) bytes_per_sample: u8,
+    pub(super) exponent_bits_per_sample: u8,
+}
+
+pub(super) const fn modular_sample_depth(
+    bits: u8,
+    exponent: u8,
+) -> jxl_gpu_bitstream::SampleBitDepth {
+    if exponent == 0 {
+        jxl_gpu_bitstream::SampleBitDepth::Integer {
+            bits_per_sample: bits as u32,
+        }
+    } else {
+        jxl_gpu_bitstream::SampleBitDepth::Float {
+            bits_per_sample: bits as u32,
+            exponent_bits_per_sample: exponent as u32,
+        }
+    }
 }
 
 pub(super) fn lossless_modular_source_spec(
     format: &PixelFormat,
 ) -> Result<LosslessModularSourceSpec, EncodeError> {
-    if format.sample_kind != SampleKind::Unsigned
+    if !matches!(format.sample_kind, SampleKind::Unsigned | SampleKind::Float)
         || format.byte_order != ByteOrder::Native
         || format.chroma_subsampling != ChromaSubsampling::None
         || format.planes.len() != 1
@@ -221,8 +256,13 @@ pub(super) fn lossless_modular_source_spec(
         let word_bits = padding
             .checked_add(channel_bits)
             .ok_or(UnsupportedFeature::InputFormat)?;
+        let supported_depth = if format.sample_kind == SampleKind::Float {
+            matches!(channel_bits, 16 | 32)
+        } else {
+            (1..=31).contains(&channel_bits)
+        };
         if channel != *expected_channel
-            || !(1..=31).contains(&channel_bits)
+            || !supported_depth
             || word_bits != channel_bits.next_power_of_two().max(8)
             || bits_per_sample.is_some_and(|bits| bits != channel_bits)
             || storage_bits.is_some_and(|bits| bits != word_bits)
@@ -238,5 +278,10 @@ pub(super) fn lossless_modular_source_spec(
         format: logical_format,
         bits_per_sample,
         bytes_per_sample: storage_bits / 8,
+        exponent_bits_per_sample: if format.sample_kind == SampleKind::Float {
+            if bits_per_sample == 16 { 5 } else { 8 }
+        } else {
+            0
+        },
     })
 }

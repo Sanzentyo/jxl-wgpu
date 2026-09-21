@@ -32,8 +32,12 @@ pub enum KernelStage {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EncodeProfile {
-    ModularLossless { bits_per_sample: u8 },
-    VarDct { quantization: VarDctQuantization },
+    ModularLossless {
+        sample_bit_depth: jxl_gpu_bitstream::SampleBitDepth,
+    },
+    VarDct {
+        quantization: VarDctQuantization,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -41,6 +45,8 @@ pub enum ProfileCapability {
     ModularLossless {
         min_bits_per_sample: u8,
         max_bits_per_sample: u8,
+        /// Zero for integer samples, otherwise the declared floating exponent width.
+        exponent_bits_per_sample: u8,
     },
     VarDct {
         quantization: VarDctQuantization,
@@ -55,9 +61,26 @@ impl ProfileCapability {
                 Self::ModularLossless {
                     min_bits_per_sample,
                     max_bits_per_sample,
+                    exponent_bits_per_sample,
                 },
-                EncodeProfile::ModularLossless { bits_per_sample },
-            ) => (min_bits_per_sample..=max_bits_per_sample).contains(&bits_per_sample),
+                EncodeProfile::ModularLossless { sample_bit_depth },
+            ) => {
+                let (bits, exponent) = match (sample_bit_depth, exponent_bits_per_sample) {
+                    (jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample }, 0) => {
+                        (bits_per_sample, 0)
+                    }
+                    (
+                        jxl_gpu_bitstream::SampleBitDepth::Float {
+                            bits_per_sample,
+                            exponent_bits_per_sample,
+                        },
+                        exponent,
+                    ) if exponent != 0 => (bits_per_sample, exponent_bits_per_sample),
+                    _ => return false,
+                };
+                (u32::from(min_bits_per_sample)..=u32::from(max_bits_per_sample)).contains(&bits)
+                    && exponent == u32::from(exponent_bits_per_sample)
+            }
             (
                 Self::VarDct { quantization },
                 EncodeProfile::VarDct {
@@ -190,11 +213,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn modular_profiles_distinguish_numeric_type_and_exponent_width() {
+        use jxl_gpu_bitstream::SampleBitDepth::{Float, Integer};
+
+        let profiles = [(1, 31, 0), (16, 16, 5), (32, 32, 8)].map(|(min, max, exponent)| {
+            ProfileCapability::ModularLossless {
+                min_bits_per_sample: min,
+                max_bits_per_sample: max,
+                exponent_bits_per_sample: exponent,
+            }
+        });
+        for (sample_bit_depth, expected) in [
+            (
+                Integer {
+                    bits_per_sample: 16,
+                },
+                [true, false, false],
+            ),
+            (
+                Integer {
+                    bits_per_sample: 32,
+                },
+                [false, false, false],
+            ),
+            (
+                Float {
+                    bits_per_sample: 16,
+                    exponent_bits_per_sample: 5,
+                },
+                [false, true, false],
+            ),
+            (
+                Float {
+                    bits_per_sample: 32,
+                    exponent_bits_per_sample: 8,
+                },
+                [false, false, true],
+            ),
+            (
+                Float {
+                    bits_per_sample: 16,
+                    exponent_bits_per_sample: 0,
+                },
+                [false, false, false],
+            ),
+            (
+                Float {
+                    bits_per_sample: 16,
+                    exponent_bits_per_sample: 8,
+                },
+                [false, false, false],
+            ),
+            (
+                Float {
+                    bits_per_sample: 24,
+                    exponent_bits_per_sample: 8,
+                },
+                [false, false, false],
+            ),
+        ] {
+            let request = EncodeProfile::ModularLossless { sample_bit_depth };
+            assert_eq!(profiles.map(|profile| profile.supports(request)), expected);
+        }
+    }
+
+    #[test]
     fn animation_header_is_negotiated_even_for_frame_zero() {
         let capabilities = EncoderCapabilities {
             profiles: vec![ProfileCapability::ModularLossless {
                 min_bits_per_sample: 8,
                 max_bits_per_sample: 8,
+                exponent_bits_per_sample: 0,
             }],
             max_progressive_passes: 1,
             animation: false,
@@ -204,7 +293,9 @@ mod tests {
         let request = FrameEncodeRequest {
             frame_index: FrameIndex::new(0),
             is_last: true,
-            profile: EncodeProfile::ModularLossless { bits_per_sample: 8 },
+            profile: EncodeProfile::ModularLossless {
+                sample_bit_depth: jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample: 8 },
+            },
             progressive: ProgressivePlan::single(),
             minimum_determinism: Determinism::Assembly,
             animation: AnimationHeader::Animation {

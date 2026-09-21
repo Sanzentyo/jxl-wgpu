@@ -39,6 +39,12 @@ copies its retained integer planes through jxl-render 0.12.4. It rejects F32 pla
 rounding them back to integers, so exact 17–31-bit encoder checks include the low sample bits.
 The [wide-integer encoder matrix](../../docs/CONFORMANCE_CORPUS.md#wide-integer-modular-encoding)
 also requires the libjxl 0.12.0 original-component oracle for independent normalized output.
+The same retained integer working planes expose raw IEEE binary16/binary32 words before
+conversion to F32. The [floating encoder matrix](../../docs/CONFORMANCE_CORPUS.md#ieee-floating-point-modular-encoding)
+compares those words exactly, including NaN payloads and signed zero, and independently checks
+libjxl's original F32 output. Finite arithmetic composition uses the Rust `jxl` F32 oracle in
+addition to libjxl; the older jxl-oxide header reader does not implement the per-channel
+reference-field rule for mixed full-frame blend modes.
 Neither oracle is a production dependency or a fallback.
 
 `fixtures::icc_spots` reads a typed manifest for native ICC/enumerated RGB/Gray sources, both

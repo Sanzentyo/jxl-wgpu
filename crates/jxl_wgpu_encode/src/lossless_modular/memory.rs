@@ -7,8 +7,10 @@ use crate::EncodeError;
 pub struct LosslessModularMemoryPlan {
     pub group_grid: LosslessModularGroupGrid,
     pub format: LosslessModularFormat,
-    /// Valid low bits in every unsigned integer component (`1..=31`).
+    /// Valid bits in each integer component, or total IEEE floating-point width.
     pub bits_per_sample: u8,
+    /// Zero for integer samples, five for binary16, or eight for binary32.
+    pub exponent_bits_per_sample: u8,
     /// Native storage bytes occupied by every component (`1`, `2`, or `4`).
     pub bytes_per_sample: u8,
     /// Number of independently tokenized Modular channels (1, 3, or 4).
@@ -56,6 +58,11 @@ pub struct LosslessModularMemoryLimits {
 }
 
 impl LosslessModularMemoryPlan {
+    #[must_use]
+    pub const fn sample_bit_depth(&self) -> jxl_gpu_bitstream::SampleBitDepth {
+        super::types::modular_sample_depth(self.bits_per_sample, self.exponent_bits_per_sample)
+    }
+
     pub fn for_in_flight(
         self,
         max_in_flight_jobs: u32,

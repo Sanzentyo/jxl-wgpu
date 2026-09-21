@@ -16,7 +16,7 @@ use super::streaming::{
 use super::types::{
     EVENT_WORDS, LosslessModularFormat, LosslessModularTreeMode,
     MAX_DISPATCHES_PER_ARTIFACT_BINDING, ModularParams, OUTPUT_HEADER_WORDS, SHADER,
-    lossless_modular_source_spec,
+    lossless_modular_source_spec, modular_sample_depth,
 };
 use crate::buffer_pool::EncoderBufferPool;
 use crate::{
@@ -53,6 +53,7 @@ pub(super) struct ModularDispatchPlan {
     pub(super) group_grid: LosslessModularGroupGrid,
     pub(super) format: LosslessModularFormat,
     pub(super) bits_per_sample: u8,
+    pub(super) exponent_bits_per_sample: u8,
     pub(super) tree_mode: LosslessModularTreeMode,
     pub(super) parameters: Vec<ModularParams>,
     pub(super) groups: Vec<ModularGroupPlan>,
@@ -61,12 +62,12 @@ pub(super) struct ModularDispatchPlan {
     pub(super) memory: LosslessModularMemoryPlan,
 }
 
-/// GPU lossless 1-31-bit integer Modular encoding with row-major 256x256 pass groups.
+/// GPU lossless integer/IEEE floating Modular encoding with row-major 256x256 pass groups.
 ///
 /// It never reads source pixels on the CPU. The source buffer may contain packed Gray, RGB, or
-/// RGBA unsigned samples in canonical native `u8`/`u16`/`u32` storage. RGB samples use the normative
-/// reversible YCoCg transform in WGSL before prediction. The GPU emits predictor
-/// residual tokens and histograms; the host only serializes those artifacts.
+/// RGBA samples in canonical native storage: 1-31-bit integers or binary16/binary32 words.
+/// Integer RGB samples use reversible YCoCg; floating samples retain their raw bits. The GPU
+/// emits predictor residual tokens and histograms; the host only serializes those artifacts.
 pub struct LosslessModularBackend {
     pub(super) pipeline: Arc<wgpu::ComputePipeline>,
     pub(super) buffer_pool: Arc<EncoderBufferPool>,
@@ -109,10 +110,17 @@ impl LosslessModularBackend {
             pipeline,
             buffer_pool: EncoderBufferPool::new(DEFAULT_ENCODER_BUFFER_POOL_BYTES),
             capabilities: EncoderCapabilities {
-                profiles: vec![ProfileCapability::ModularLossless {
-                    min_bits_per_sample: 1,
-                    max_bits_per_sample: 31,
-                }],
+                profiles: [(1, 31, 0), (16, 16, 5), (32, 32, 8)]
+                    .map(
+                        |(min_bits_per_sample, max_bits_per_sample, exponent_bits_per_sample)| {
+                            ProfileCapability::ModularLossless {
+                                min_bits_per_sample,
+                                max_bits_per_sample,
+                                exponent_bits_per_sample,
+                            }
+                        },
+                    )
+                    .to_vec(),
                 max_progressive_passes: 1,
                 animation: true,
                 determinism: Determinism::CrossDevice,
@@ -391,8 +399,9 @@ impl LosslessModularBackend {
                     channel,
                     channels,
                     bytes_per_sample: u32::from(source_spec.bytes_per_sample),
-                    sample_mask: (1u32 << source_spec.bits_per_sample) - 1,
-                    _padding: [0; 55],
+                    sample_mask: u32::MAX >> (32 - source_spec.bits_per_sample),
+                    use_rct: u32::from(channels > 2 && source_spec.exponent_bits_per_sample == 0),
+                    _padding: [0; 54],
                 });
                 groups.push(ModularGroupPlan {
                     width,
@@ -498,6 +507,7 @@ impl LosslessModularBackend {
             group_grid,
             format,
             bits_per_sample: source_spec.bits_per_sample,
+            exponent_bits_per_sample: source_spec.exponent_bits_per_sample,
             bytes_per_sample: source_spec.bytes_per_sample,
             channel_count: channels,
             source_binding_bytes,
@@ -519,6 +529,7 @@ impl LosslessModularBackend {
             group_grid,
             format,
             bits_per_sample: source_spec.bits_per_sample,
+            exponent_bits_per_sample: source_spec.exponent_bits_per_sample,
             tree_mode: self.tree_mode,
             parameters,
             groups,
@@ -828,7 +839,10 @@ impl GpuEncodeBackend for LosslessModularBackend {
         validate_modular_frame_request(request, &plan)?;
         if request.profile
             != (EncodeProfile::ModularLossless {
-                bits_per_sample: plan.bits_per_sample,
+                sample_bit_depth: modular_sample_depth(
+                    plan.bits_per_sample,
+                    plan.exponent_bits_per_sample,
+                ),
             })
         {
             return Err(EncodeError::InvalidConfiguration(
@@ -982,6 +996,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
                 groups: plan.groups,
                 format: plan.format,
                 bits_per_sample: plan.bits_per_sample,
+                exponent_bits_per_sample: plan.exponent_bits_per_sample,
                 tree_mode: plan.tree_mode,
                 width: plan.width,
                 height: plan.height,

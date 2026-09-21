@@ -8,7 +8,8 @@ struct Params {
     channels: u32,
     bytes_per_sample: u32,
     sample_mask: u32,
-    _padding: array<u32, 55>,
+    use_rct: u32,
+    _padding: array<u32, 54>,
 }
 
 @group(0) @binding(0)
@@ -45,14 +46,16 @@ fn source_component(params: Params, x: u32, y: u32, component: u32) -> i32 {
         value |= source_byte(byte_index + 2u) << 16u;
         value |= source_byte(byte_index + 3u) << 24u;
     }
-    return i32(value & params.sample_mask);
+    return bitcast<i32>(value & params.sample_mask);
 }
 
 // JPEG XL's reversible color transform type 0 maps RGB to YCoCg. Computing it
 // in the token kernel avoids both an intermediate image and a CPU color path.
 fn sample_at(params: Params, x: u32, y: u32) -> i32 {
-    if params.channels == 1u {
-        return source_component(params, x, y, 0u);
+    // Floating input carries raw IEEE words through integer prediction and entropy. Keeping
+    // the channels independent preserves signed zero, subnormals and every NaN payload.
+    if params.use_rct == 0u {
+        return source_component(params, x, y, params.channel);
     }
     if params.channel == 3u {
         return source_component(params, x, y, 3u);

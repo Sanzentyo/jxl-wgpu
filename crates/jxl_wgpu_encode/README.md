@@ -1,8 +1,8 @@
 # jxl_wgpu_encode
 
 GPU-required JPEG XL encoding orchestration for `wgpu`. This crate does not contain a CPU pixel
-encoder or a CPU fallback. `LosslessModularEncoder` reads packed Gray, RGB, or RGBA unsigned
-integer pitch-linear storage directly on the GPU and emits a standards-compatible lossless
+encoder or a CPU fallback. `LosslessModularEncoder` reads packed Gray, RGB, or RGBA integer or
+IEEE floating-point pitch-linear storage directly on the GPU and emits a standards-compatible lossless
 Modular codestream or `jxlc` container.
 
 The complete encoder backlog, dependencies, and acceptance gates are tracked in
@@ -23,14 +23,19 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   component; `9..=16` use `u16`, and `17..=31` use `u32`. The valid sample occupies the low
   bits and high padding bits are ignored. `LosslessModularFormat::pixel_format` constructs this
   explicit storage/valid-bits contract, including native-U16 10/12-bit and native-U32 24/31-bit layouts.
-- Gray uses one unsigned `X` plane. RGB and RGBA use one unsigned interleaved plane in canonical
+- IEEE binary16 and binary32 use native 16/32-bit words. `LosslessModularFormat::float_pixel_format`
+  constructs these layouts. Encoding preserves every bit, including signed zero, subnormals,
+  infinities and NaN payloads, without floating-point arithmetic. Other floating precisions and
+  binary64 input remain unsupported.
+- Gray uses one `X` plane. RGB and RGBA use one interleaved plane in canonical
   RGB/RGBA order. Row pitch and plane offset may contain arbitrary padding. Planar RGB, BGR/BGRA,
   MSB-aligned partial words, and explicitly defined non-sRGB color specifications are rejected.
 - `Default` and `Undefined` RGB color specifications are interpreted as sRGB, matching the compact
   all-default JPEG XL color header. RGBA is written as one unassociated alpha extra channel at the
-  same declared integer depth as RGB.
-- RGB(A) is converted to JPEG XL reversible color transform type 0 (YCoCg) in WGSL. No transformed
-  image or source pixels are read by the CPU.
+  same declared sample precision as RGB.
+- Integer RGB(A) uses JPEG XL reversible color transform type 0 (YCoCg) in WGSL. Floating
+  channels retain their raw IEEE words without a color transform. No transformed image or source
+  pixels are read by the CPU.
 - The frame is split into standard 256x256 PassGroups. Edge groups may be one pixel wide or high.
 - One GPU invocation handles each PassGroup/channel pair. Dispatch parameters and artifacts use
   group-major, channel-major order. Small jobs use one mapped artifact allocation. Larger jobs use
@@ -53,7 +58,8 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   independent per-group tree learning. A streamed 16K×1 RGB8 test exercises this mode across
   multiple bounded artifact batches through blocking and runtime-neutral completion.
 
-`LosslessModularEncoder::memory_plan` reports the detected valid bits, component storage bytes,
+`LosslessModularEncoder::memory_plan` reports the detected valid bits, exponent width (zero for
+integers), component storage bytes,
 full and peak source binding ranges, peak parameter/artifact/readback bytes, diagnostic total
 artifact bytes, batch count, exact GPU submission count, streaming mode, total encoder-owned live
 bytes, and the group grid before submission. Streamed jobs report exactly twice the batch count:
@@ -83,10 +89,12 @@ let encoder = LosslessModularEncoder::with_tree_mode(
 );
 let plan = encoder.memory_plan(&source)?;
 assert_eq!(plan.group_grid.groups, plan.group_grid.columns * plan.group_grid.rows);
-assert!((1..=31).contains(&plan.bits_per_sample));
+assert!((1..=32).contains(&plan.bits_per_sample));
+let precision = plan.sample_bit_depth();
 
 // Use this descriptor when constructing a packed native-U16 RGB10 source layout.
 let _rgb10 = LosslessModularFormat::Rgb.pixel_format(10)?;
+let _rgba_half = LosslessModularFormat::Rgba.float_pixel_format(16)?;
 
 let submission = encoder.submit_container(source)?;
 let source_format = submission.format();
@@ -95,7 +103,7 @@ for group in submission.ordered_groups() {
     let _rectangle = (group.x, group.y, group.width, group.height);
 }
 let jxl_container = submission.wait()?;
-# let _ = (jxl_container, source_format);
+# let _ = (jxl_container, source_format, precision);
 # Ok(())
 # }
 ```
@@ -118,6 +126,20 @@ beyond F32's exact integer range. Full-canvas Replace animations cover 17/24/31-
 retained output; streamed 16K×1 and resident RGBA31 cases cover exact budget admission,
 cancellation and reuse.
 This exact-word claim does not extend to floating-point animation composition.
+
+The [IEEE floating-point matrix](../../docs/CONFORMANCE_CORPUS.md#ieee-floating-point-modular-encoding)
+checks raw working words with jxl-oxide and original F32 output with libjxl, including every
+binary16 word and both signs at every binary32 exponent. Whole and bounded GPU output matches
+exact F32 bits for all selected components, independent alpha and RGBA presentation. Replace
+animations preserve those words and retained outputs; finite crop/Add/Multiply animations match
+both CPU decoders and the GPU. Arithmetic composition follows floating-point blend semantics;
+it is not a promise to preserve original source words after arithmetic. Resident and streamed
+RGBA32 jobs retain the existing exact admission, cancellation and pool-reuse contract.
+
+`EncodeProfile::ModularLossless` carries `sample_bit_depth: SampleBitDepth`, distinguishing
+integer depth from floating depth and exponent width. Matching storage widths do not permit
+changing numeric type between frames. Associated alpha, independent extra planes, explicit
+color/ICC metadata, planar buffers and textures remain outside this profile.
 
 ## Experimental VarDCT profile
 
@@ -302,11 +324,15 @@ encoder.encode(source_13_by_21)
 
 `LosslessModularEncoder::begin_animation` writes one standard stream-wide animation header and
 keeps a reusable GPU session open for multiple frames. The descriptor fixes the canvas, format,
-integer depth, tick rate, loop count, and timecode presence. Each frame supplies an exact duration,
+sample precision, tick rate, loop count, and timecode presence. Use
+`LosslessModularAnimationDescriptor::new` for integers or `new_float` for binary16/binary32.
+Each frame supplies an exact duration,
 optional timecode, optional signed crop rectangle, color blend contract, one contract per extra
 channel, and the two-bit source/destination reference slots. RGBA animation continues to carry
 alpha as the standard unassociated extra channel; alpha-weighted `Blend` and `MultiplyAdd` name
 that extra channel instead of treating alpha as a fourth color component.
+Each channel's own blend mode determines whether its source-reference field is present;
+full-canvas Replace omits that field even when another channel uses Add or Multiply.
 
 Frame submissions own their GPU work and therefore do not borrow the session. Callers may keep
 multiple frames in flight, complete each with blocking `wait` or await the same runtime-neutral

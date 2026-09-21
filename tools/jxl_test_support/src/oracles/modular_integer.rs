@@ -1,8 +1,9 @@
-//! Exact original integer planes from jxl-oxide, before any floating-point conversion.
+//! Exact original working words from jxl-oxide, before any floating-point conversion.
 
 /// Decode one original-color Modular presentation with its declared color encoding.
 ///
-/// This oracle intentionally requires retained integer planes. A filtered or composed F32
+/// Integer samples and raw floating-point representations both use integer Modular storage.
+/// This oracle intentionally requires those retained planes. A filtered or composed F32
 /// result cannot prove exact high-depth source words and is rejected instead of rounded back.
 pub fn original_planes(data: &[u8], frame_index: usize) -> Vec<Vec<i32>> {
     let mut image = jxl_oxide::JxlImage::read_with_defaults(data).unwrap();

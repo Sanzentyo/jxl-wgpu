@@ -193,11 +193,12 @@ mod native_tests {
             channels: 7,
             bytes_per_sample: 8,
             sample_mask: 9,
-            _padding: [0; 55],
+            use_rct: 10,
+            _padding: [0; 54],
         };
         let words = bytemuck::cast::<ModularParams, [u32; 64]>(params);
-        assert_eq!(&words[..9], &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        assert!(words[9..].iter().all(|&word| word == 0));
+        assert_eq!(&words[..10], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert!(words[10..].iter().all(|&word| word == 0));
     }
 
     #[test]
@@ -252,9 +253,35 @@ mod native_tests {
                     Some(PackingFieldKind::Channel(Channel::X))
                 ));
             }
+            for (bits, exponent) in [(16, 5), (32, 8)] {
+                let pixel_format = format.float_pixel_format(bits).unwrap();
+                let spec = lossless_modular_source_spec(&pixel_format).unwrap();
+                assert_eq!(spec.format, format);
+                assert_eq!(spec.bits_per_sample, bits);
+                assert_eq!(spec.bytes_per_sample, bits / 8);
+                assert_eq!(spec.exponent_bits_per_sample, exponent);
+            }
+            for bits in [0, 8, 24, 64] {
+                assert!(matches!(
+                    format.float_pixel_format(bits),
+                    Err(EncodeError::InvalidConfiguration(_))
+                ));
+            }
         }
         assert!(LosslessModularFormat::Gray.pixel_format(0).is_err());
         assert!(LosslessModularFormat::Gray.pixel_format(32).is_err());
+        for format in [
+            PixelFormat::non_color(jxl_gpu_formats::SampleKind::Float, 64, &[Channel::X]),
+            PixelFormat::rgb_f32(RgbChannelOrder::Bgra, false, ColorSpecification::Undefined),
+            PixelFormat::rgb_f32(RgbChannelOrder::Rgba, true, ColorSpecification::Undefined),
+        ] {
+            assert!(matches!(
+                lossless_modular_source_spec(&format),
+                Err(EncodeError::Unsupported(
+                    crate::UnsupportedFeature::InputFormat
+                ))
+            ));
+        }
         assert!(
             lossless_modular_source_spec(&PixelFormat::rgb8(
                 RgbChannelOrder::Rgb,
@@ -291,7 +318,7 @@ mod native_tests {
             num_loops: 7,
             have_timecodes: true,
         };
-        let header = image_header(4, 3, LosslessModularFormat::Rgba, 12, animation).unwrap();
+        let header = image_header(4, 3, LosslessModularFormat::Rgba, 12, 0, animation).unwrap();
         let mut assembler = CodestreamAssembler::new(header).unwrap();
         let slot_one = crate::ReferenceSlot::new(1).unwrap();
         let first = ModularFrameHeader {
