@@ -2,6 +2,7 @@
 // from the permissively licensed zune-jpegxl 0.5.2 encoder. See `THIRD_PARTY.md` and
 // `LICENSES/zune-jpegxl-MIT.txt` in this crate.
 
+mod color;
 mod dispatch;
 mod grid;
 mod memory;
@@ -12,6 +13,7 @@ mod streaming;
 mod tests;
 mod types;
 
+pub use color::LosslessModularColorOptions;
 pub use dispatch::LosslessModularBackend;
 pub use grid::{LosslessModularGroup, LosslessModularGroupGrid};
 pub use memory::{

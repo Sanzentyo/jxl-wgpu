@@ -35,6 +35,7 @@ implementation audits.
 | Color models | Gray (`NonColor`/`X000` or `Gray`/`X001`), RGB/RGBA with bijective component swizzles; RGBA alpha is one unassociated extra channel |
 | Sample depths | every integer `1..=31` or IEEE binary16/binary32, with equal precision across components |
 | Input | one pitch-linear `wgpu::Buffer`, one through four packed/planar/split planes, 8/16/24/32-bit words, arbitrary field positions, Native/Little/Big byte order, `ChromaSubsampling::None` |
+| Source color | full-range enumerated RGB/Gray, standard/custom primaries and white, Linear/sRGB/BT.709/PQ/HLG/DCI/Gamma; four intents and positive binary16 image white |
 | Extent | `1..2^30` per axis, further bounded by device limits |
 | Frame/group layout | standard 256x256 PassGroups, multi-group, row-major TOC |
 | Animation | `true` (5 blend modes, signed crop, 4 reference slots, timecodes) |
@@ -45,11 +46,19 @@ implementation audits.
 | Modular transforms | fixed reversible YCoCg for integer RGB(A); none for Gray or IEEE samples |
 | Entropy | JPEG XL prefix code with LZ77 distance 1, not ANS; fixed MA tree |
 | Filters | Gaborish off, EPF zero iterations |
-| Output | raw codestream or standard `jxlc` container; private `jwgp` index emitted only for single-group Gray8 containers |
+| Output | raw codestream or standard `jxlc` container; private `jwgp` index emitted only for single-group Gray8 containers with default color/intent/intensity |
 
 The backend rejects textures, chroma subsampling, YUV/NV12, signed samples, unsupported color
 metadata, non-bijective/missing channels, mismatched component precision and progressive passes > 1.
 Storage normalization remains fused into GPU token production; no intermediate image is allocated.
+
+Source color lowering is bounded host metadata work. It validates full range and RGB/gray semantics,
+quantizes custom xy to `1e-6` and Gamma OETF exponents to `1e-7`, and rechecks the quantized geometry.
+Image headers are complete before GPU submission; encoder options declare rendering intent and
+exact positive binary16 unit-white luminance, defaulting to Relative/255 cd/m². The token kernel
+continues to preserve source words. Animation descriptors bind logical channels, precision and
+serialized color across physical layout changes. The crate README owns the API and rejected cases;
+[source-color conformance](CONFORMANCE_CORPUS.md#lossless-modular-source-color) records its evidence.
 
 ### GPU artifact ABI
 

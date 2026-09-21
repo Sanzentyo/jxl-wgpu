@@ -955,6 +955,7 @@ mod source_window_tests {
                 8,
                 0,
                 AnimationHeader::Still,
+                Default::default(),
             )
             .unwrap(),
         )

@@ -7,6 +7,7 @@ use jxl_gpu_bitstream::{
     write_container_with_boxes,
 };
 
+use super::color::{LosslessModularColorOptions, ModularColorEncoding, ModularColorMetadata};
 use super::dispatch::frame_covers_canvas;
 use super::dispatch::{LosslessModularBackend, ModularGroupPlan};
 use super::grid::{LosslessModularGroup, LosslessModularGroupGrid};
@@ -35,9 +36,10 @@ pub(super) struct ModularFrameHeader {
     pub(super) is_last: bool,
 }
 /// Convenience API that produces a complete raw codestream or deterministic
-/// `jxlc` container from a GPU-resident packed Gray, RGB, or RGBA integer/IEEE floating buffer.
+/// `jxlc` container from a GPU-resident Gray, RGB, or RGBA integer/IEEE floating buffer.
 pub struct LosslessModularEncoder {
     encoder: GpuEncoder<LosslessModularBackend>,
+    color_options: LosslessModularColorOptions,
 }
 
 impl LosslessModularEncoder {
@@ -46,6 +48,7 @@ impl LosslessModularEncoder {
         let backend = LosslessModularBackend::new(&context);
         Self {
             encoder: GpuEncoder::new(context, backend),
+            color_options: LosslessModularColorOptions::default(),
         }
     }
 
@@ -55,6 +58,7 @@ impl LosslessModularEncoder {
         let backend = LosslessModularBackend::with_tree_mode(&context, tree_mode);
         Self {
             encoder: GpuEncoder::new(context, backend),
+            color_options: LosslessModularColorOptions::default(),
         }
     }
 
@@ -68,7 +72,19 @@ impl LosslessModularEncoder {
         backend.set_buffer_pool_limit(limit_bytes);
         Self {
             encoder: GpuEncoder::new(context, backend),
+            color_options: LosslessModularColorOptions::default(),
         }
+    }
+
+    /// Selects the declaration shared by subsequent stills and animations.
+    /// Source primaries/white/transfer continue to come from each source format.
+    pub fn with_color_options(
+        mut self,
+        options: LosslessModularColorOptions,
+    ) -> Result<Self, EncodeError> {
+        options.validate()?;
+        self.color_options = options;
+        Ok(self)
     }
 
     #[must_use]
@@ -154,6 +170,7 @@ impl LosslessModularEncoder {
             descriptor.bits_per_sample,
             descriptor.exponent_bits_per_sample,
             descriptor.animation,
+            descriptor.color.metadata(self.color_options),
         )?;
         let session = self.encoder.begin_session(SessionDescriptor {
             profile: EncodeProfile::ModularLossless {
@@ -201,19 +218,24 @@ impl LosslessModularEncoder {
             canvas_height: height,
             options: FrameOptions::default(),
         };
+        // Finish validating image metadata before any GPU admission or submission.
+        let codestream_header = image_header(
+            width,
+            height,
+            format,
+            source_spec.bits_per_sample,
+            source_spec.exponent_bits_per_sample,
+            AnimationHeader::Still,
+            source_spec.color.metadata(self.color_options),
+        )?;
         let frame = self
             .encoder
             .submit_frame(GpuFrameSource::Buffer(source), request)?;
         Ok(LosslessModularSubmission {
             frame: Some(frame),
-            codestream_header: image_header(
-                width,
-                height,
-                format,
-                source_spec.bits_per_sample,
-                source_spec.exponent_bits_per_sample,
-                AnimationHeader::Still,
-            )?,
+            codestream_header,
+            default_color: source_spec.color == ModularColorEncoding::default()
+                && self.color_options == LosslessModularColorOptions::default(),
             container,
             group_grid,
             format,
@@ -232,9 +254,34 @@ pub struct LosslessModularAnimationDescriptor {
     bits_per_sample: u8,
     exponent_bits_per_sample: u8,
     animation: AnimationHeader,
+    color: ModularColorEncoding,
 }
 
 impl LosslessModularAnimationDescriptor {
+    /// Infers stream components, precision and color from a supported source format.
+    ///
+    /// Frame storage may differ, but every submitted frame must have the same encoded color
+    /// declaration (custom xy rounded to 1e-6 and gamma to 1e-7). Image white and rendering
+    /// intent come from the encoder's [`LosslessModularColorOptions`].
+    pub fn from_pixel_format(
+        canvas_width: u32,
+        canvas_height: u32,
+        format: &jxl_gpu_formats::PixelFormat,
+        animation: AnimationHeader,
+    ) -> Result<Self, EncodeError> {
+        let spec = lossless_modular_source_spec(format)?;
+        let mut descriptor = Self::with_precision(
+            canvas_width,
+            canvas_height,
+            spec.format,
+            spec.bits_per_sample,
+            spec.exponent_bits_per_sample,
+            animation,
+        )?;
+        descriptor.color = spec.color;
+        Ok(descriptor)
+    }
+
     pub fn new(
         canvas_width: u32,
         canvas_height: u32,
@@ -296,6 +343,7 @@ impl LosslessModularAnimationDescriptor {
             bits_per_sample,
             exponent_bits_per_sample,
             animation,
+            ModularColorMetadata::default(),
         )?;
         Ok(Self {
             canvas_width,
@@ -304,6 +352,7 @@ impl LosslessModularAnimationDescriptor {
             bits_per_sample,
             exponent_bits_per_sample,
             animation,
+            color: ModularColorEncoding::default(),
         })
     }
 
@@ -397,9 +446,10 @@ impl LosslessModularAnimationSession {
         if spec.format != self.descriptor.format
             || spec.bits_per_sample != self.descriptor.bits_per_sample
             || spec.exponent_bits_per_sample != self.descriptor.exponent_bits_per_sample
+            || spec.color != self.descriptor.color
         {
             return Err(EncodeError::InvalidConfiguration(
-                "every animation frame must match the stream format and sample precision",
+                "every animation frame must match the stream format, sample precision and color",
             ));
         }
         Ok(())
@@ -415,6 +465,7 @@ pub struct LosslessModularSubmission {
     format: LosslessModularFormat,
     bits_per_sample: u8,
     exponent_bits_per_sample: u8,
+    default_color: bool,
 }
 
 impl LosslessModularSubmission {
@@ -454,7 +505,8 @@ impl LosslessModularSubmission {
     }
 
     fn assemble(&self, frame: GpuFrameArtifacts) -> Result<Vec<u8>, EncodeError> {
-        let acceleration = frame.acceleration;
+        // The private Gray8 shortcut remains restricted to its original default color contract.
+        let acceleration = frame.acceleration.filter(|_| self.default_color);
         let fused_group_size = acceleration
             .as_ref()
             .map(|_| {
@@ -1155,20 +1207,25 @@ pub(super) fn image_header(
     bits_per_sample: u8,
     exponent_bits_per_sample: u8,
     animation: AnimationHeader,
+    color: ModularColorMetadata,
 ) -> Result<BitFragment, EncodeError> {
+    color.options.validate()?;
+    let extra_fields = animation.is_animation() || color.options.extra_fields();
     let mut output = BitWriter::new();
     output.write_bits(0x0aff, 16)?;
     output.write_bits(0, 1)?;
     write_size(&mut output, height, true)?;
     write_size(&mut output, width, false)?;
     output.write_bits(0, 1)?;
-    output.write_bits(u64::from(animation.is_animation()), 1)?;
-    if animation.is_animation() {
+    output.write_bits(u64::from(extra_fields), 1)?;
+    if extra_fields {
         output.write_bits(0, 3)?; // identity orientation minus one
         output.write_bits(0, 1)?; // no intrinsic size
         output.write_bits(0, 1)?; // no preview
-        output.write_bits(1, 1)?; // animation metadata follows
-        write_animation_header(&mut output, animation)?;
+        output.write_bits(u64::from(animation.is_animation()), 1)?;
+        if animation.is_animation() {
+            write_animation_header(&mut output, animation)?;
+        }
     }
     write_sample_bit_depth(&mut output, bits_per_sample, exponent_bits_per_sample)?;
     output.write_bits(
@@ -1191,20 +1248,11 @@ pub(super) fn image_header(
         output.write_bits(0, 2)?;
     }
     output.write_bits(0, 1)?;
-    if format.channel_count() > 2 {
-        output.write_bits(1, 1)?; // default sRGB color encoding
-    } else {
-        output.write_bits(0, 1)?;
-        output.write_bits(0, 1)?;
-        output.write_bits(1, 2)?;
-        output.write_bits(1, 2)?;
-        output.write_bits(0, 1)?;
-        output.write_bits(0b10, 2)?;
-        output.write_bits(11, 4)?;
-        output.write_bits(1, 2)?;
-    }
-    if animation.is_animation() {
-        output.write_bits(1, 1)?; // all-default SDR tone mapping
+    color
+        .encoding
+        .write(&mut output, format, color.options.rendering_intent)?;
+    if extra_fields {
+        color.options.write_tone(&mut output)?;
     }
     output.write_bits(0, 2)?;
     output.write_bits(1, 1)?;

@@ -342,7 +342,16 @@ mod native_tests {
             num_loops: 7,
             have_timecodes: true,
         };
-        let header = image_header(4, 3, LosslessModularFormat::Rgba, 12, 0, animation).unwrap();
+        let header = image_header(
+            4,
+            3,
+            LosslessModularFormat::Rgba,
+            12,
+            0,
+            animation,
+            Default::default(),
+        )
+        .unwrap();
         let mut assembler = CodestreamAssembler::new(header).unwrap();
         let slot_one = crate::ReferenceSlot::new(1).unwrap();
         let first = ModularFrameHeader {

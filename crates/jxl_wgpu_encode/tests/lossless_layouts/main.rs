@@ -1,6 +1,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 mod animation;
+mod color;
 mod lifetime;
 mod source;
 

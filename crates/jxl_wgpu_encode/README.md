@@ -31,7 +31,7 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
 - Custom `PixelFormat` layouts may partition Gray/RGB/RGBA components among one through four
   full-resolution planes in the same buffer. Packed, planar and split color/alpha layouts are
   supported, including BGR/BGRA and arbitrary bijective component swizzles. Gray also accepts
-  `ColorModel::Gray` with `X001` and Default/Undefined color metadata.
+  `ColorModel::Gray` with `X001` and the color declarations below.
 - Each independently endian-addressed 8/16/24/32-bit word may contain multiple equally precise
   components and padding. Integer fields may occupy any bit position, including MSB alignment;
   floating fields contain exactly 16 or 32 IEEE bits. Native, Little and Big byte order are supported.
@@ -46,6 +46,19 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
 - `Default` and `Undefined` RGB color specifications are interpreted as sRGB, matching the compact
   all-default JPEG XL color header. RGBA is written as one unassociated alpha extra channel at the
   same declared sample precision as RGB.
+- `Defined` full-range RGB/Gray accepts BT.709, BT.2020, Display-P3 and nonsingular custom RGB
+  geometry, with D65, E, DCI or custom white. Linear, sRGB (including the Sycc alias), BT.709,
+  PQ, HLG, DCI and Gamma transfer declarations are serialized without changing samples.
+  Custom xy coordinates round to the nearest `1e-6`; Gamma's source OETF exponent must be in
+  `[1/8192, 1]` and rounds to `1e-7`. Out-of-range coordinates and geometry that becomes singular
+  after rounding are rejected. Gray retains white/transfer; its RGB primaries are not encoded.
+  The YCbCr encoding field must be `Undefined`. BT.2020's distinct transfer, limited range,
+  undefined transfers, ICC and non-RGB/Gray declarations remain unsupported.
+- `with_color_options(LosslessModularColorOptions)` selects all four ICC rendering intents and
+  a positive exact `FiniteF16` image white in cd/m². Defaults are Relative and 255 cd/m², also for
+  HDR; the caller explicitly selects another known source white. This declares metadata and
+  performs no tone mapping, primary conversion or alpha-association change. Image metadata is
+  validated before GPU admission. GPU storage, submission counts and byte budgets are unchanged.
 - Integer RGB(A) uses JPEG XL reversible color transform type 0 (YCoCg) in WGSL. Floating
   channels retain their raw IEEE words without a color transform. No transformed image or source
   pixels are read by the CPU.
@@ -122,7 +135,8 @@ let jxl_container = submission.wait()?;
 # }
 ```
 
-Single-group Gray8 containers additionally carry the optional private `jwgp` acceleration index.
+Single-group Gray8 containers with default color/intent/intensity additionally carry the optional
+private `jwgp` acceleration index. Explicit sRGB matching those defaults retains the same bytes.
 Its current schema represents one contiguous 8-bit single-channel token span, so other depths,
 RGB(A), and multi-group containers intentionally omit that private box; all remain ordinary
 interoperable JPEG XL containers. Conformance tests cover every depth `1..=31`, the
@@ -152,8 +166,14 @@ RGBA32 jobs retain the existing exact admission, cancellation and pool-reuse con
 
 `EncodeProfile::ModularLossless` carries `sample_bit_depth: SampleBitDepth`, distinguishing
 integer depth from floating depth and exponent width. Matching storage widths do not permit
-changing numeric type between frames. Associated alpha, independent extra planes, explicit
-color/ICC metadata, planar buffers and textures remain outside this profile.
+changing numeric type between frames. `LosslessModularAnimationDescriptor::from_pixel_format`
+also infers the stream's enumerated color declaration. Frames may change physical layout but must
+keep the same serialized color, precision and logical channels; mismatch leaves the next frame
+index unchanged. The existing `new`/`new_float` descriptors select default sRGB/gray.
+The [source-color matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-source-color)
+checks independent native profile bytes, exact original samples, requested color conversion and
+Replace animations. Associated alpha, independent extras, embedded ICC, YUV and textures remain
+outside this profile.
 
 ## Experimental VarDCT profile
 

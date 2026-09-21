@@ -365,7 +365,45 @@ cargo test --locked -p jxl_wgpu_encode --lib lossless_modular -- --test-threads=
 ```
 
 These checks extend `ENC-01`, `IO-02`, `FRAME-05` and `QA-03/06`; they do not complete encoder input,
-extra-channel, color metadata, texture or encoder quality coverage.
+extra-channel, embedded ICC, texture or encoder quality coverage.
+
+## Lossless Modular source color
+
+The [`lossless_layouts::color`](../crates/jxl_wgpu_encode/tests/lossless_layouts/color.rs) matrix
+generates 49 still declarations from seven RGB geometries/whites and seven transfer functions.
+It rotates Gray/RGB/RGBA, integer 8/12/31 and IEEE binary16/binary32, shared/local trees,
+packed/planar/split storage, all four intents, and image whites 255/1000/10000/65504 cd/m².
+Canonical storage produces identical containers. Required libjxl 0.12.0 independently encodes each
+source declaration through its public API: every original ICC profile byte matches the GPU-produced
+file. Metadata agrees with the native declaration; Gamma additionally checks the nearest `1e-7`
+source exponent because the native encoder can choose an adjacent wire code with identical ICC
+bytes. No native-produced pixel data supplies the encoder input.
+
+Retained jxl-oxide working planes preserve every input integer/IEEE word, including signed zero,
+infinities and NaN payloads. Native original F32 output retains the existing `2e-7` integer bound
+and exact IEEE comparison. Whole and bounded fragmented GPU numeric output checks every color and
+alpha plane exactly, and retained output survives session destruction. Seven further finite RGBA12
+stills compare requested linear BT.709 under Bradford and absolute white adaptation against the
+independent F64 transfer/matrix oracle at `5e-6 * (1 + abs(reference))`; bounded output is identical.
+
+Four three-frame Replace animations cover SDR/PQ/HLG, standard/custom whites, all intents,
+RGBA12/RGBA31/RGBA16F/Gray32F and changing storage/endianness. Out-of-order completion preserves
+native/Rust original planes and whole/bounded GPU output. A mismatched source declaration is
+rejected without advancing the frame index. Resident 257×9 and streamed 16K×1 BT.2020/PQ RGBA31
+jobs retain the unchanged memory plan, exact/one-byte-short admission, cancellation through source
+owner retirement, deterministic blocking/Future output and pool reuse. Default/explicit sRGB
+containers remain identical; nondefault Gray8 omits the private shortcut. Invalid range, YCbCr
+encoding, unsupported transfer, singular geometry and nonpositive image white fail before job
+allocation. Host tests also cover signed coordinate bucket limits, precision rounding, geometry
+collapse and every finite binary16 image-white sign/zero case.
+
+```console
+JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossless_layouts color:: -- --test-threads=2
+cargo test --locked -p jxl_wgpu_encode --lib lossless_modular::color -- --test-threads=2
+```
+
+`ENC-01`, `IO-02`, `FRAME-05` and `QA-03/06` remain **Partial**. Embedded ICC, associated input
+alpha, arbitrary extras, YUV/textures and broader composition/precision combinations remain open.
 
 ## Procedural VarDCT encoder matrix
 

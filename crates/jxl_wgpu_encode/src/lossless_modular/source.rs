@@ -6,6 +6,7 @@ use jxl_gpu_formats::{
     PackingFieldKind, PixelFormat, PlaneSampling, SampleKind, Swizzle, SwizzleComponent,
 };
 
+use super::color::ModularColorEncoding;
 use super::grid::LosslessModularGroup;
 use super::memory::align_up;
 use super::types::{LosslessModularFormat, ModularParams, ModularSourceParams};
@@ -14,6 +15,7 @@ use crate::{EncodeError, UnsupportedFeature};
 #[derive(Clone, Copy, Debug)]
 pub(super) struct LosslessModularSourceSpec {
     pub(super) format: LosslessModularFormat,
+    pub(super) color: ModularColorEncoding,
     pub(super) bits_per_sample: u8,
     pub(super) bytes_per_sample: u8,
     pub(super) exponent_bits_per_sample: u8,
@@ -49,9 +51,11 @@ pub(super) fn lossless_modular_source_spec(
         | (
             ColorModel::Gray,
             Swizzle::X001,
-            ColorSpecification::Default | ColorSpecification::Undefined,
+            ColorSpecification::Default
+            | ColorSpecification::Undefined
+            | ColorSpecification::Defined(_),
         ) => LosslessModularFormat::Gray,
-        (ColorModel::Rgb, _, ColorSpecification::Default | ColorSpecification::Undefined) => {
+        (ColorModel::Rgb, _, _) => {
             if swizzle[3] == SwizzleComponent::One {
                 LosslessModularFormat::Rgb
             } else if component_index(swizzle[3]).is_some() {
@@ -145,6 +149,7 @@ pub(super) fn lossless_modular_source_spec(
     let bits_per_sample = bits_per_sample.ok_or(UnsupportedFeature::InputFormat)?;
     Ok(LosslessModularSourceSpec {
         format: logical_format,
+        color: ModularColorEncoding::from_format(format)?,
         bits_per_sample,
         bytes_per_sample,
         exponent_bits_per_sample: if format.sample_kind == SampleKind::Float {
