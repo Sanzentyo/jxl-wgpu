@@ -13,6 +13,8 @@ use jxl_wgpu::ForwardVarDctMemoryPlan;
 use super::entropy::{UINT_SYMBOLS, VarDctPrefixCode};
 use crate::{EncodeError, UnsupportedFeature};
 
+pub(super) const TILED_QUANTIZATION_BYTES: u64 = 64 * 6 * 4;
+
 pub(super) const HF_QUANTIZATION: [f32; 3] = [1.25, 1.0, 1.0];
 
 pub(super) const AC_GROUP_DIM_PIXELS: u32 = 256;
@@ -273,8 +275,8 @@ pub struct VarDctMemoryPlan {
     pub parameter_storage_bytes: u64,
     pub artifact_storage_bytes: u64,
     pub readback_bytes: u64,
-    /// Tiled DCT8's X/Y/B order table; general transforms include orders in `transform`.
-    pub coefficient_order_bytes: u64,
+    /// Tiled DCT8's X/Y/B dequantization and order table; general transforms include it in `transform`.
+    pub quantization_metadata_bytes: u64,
     /// Resident forward-transform allocations, retained until submission completion.
     pub transform: Option<VarDctTransformMemoryPlan>,
     pub owned_bytes_per_job: u64,
@@ -330,22 +332,23 @@ impl VarDctMemoryPlan {
     ) -> Self {
         let parameter_storage_bytes = std::mem::size_of::<VarDctKernelParams>() as u64;
         let readback_bytes = artifact_storage_bytes;
-        let coefficient_order_bytes = if matches!(kernel_layout, VarDctKernelLayout::TiledDct8) {
-            64 * 3 * 4
+        let quantization_metadata_bytes = if matches!(kernel_layout, VarDctKernelLayout::TiledDct8)
+        {
+            TILED_QUANTIZATION_BYTES
         } else {
             0
         };
         let owned_bytes_per_job = parameter_storage_bytes
             + artifact_storage_bytes
             + readback_bytes
-            + coefficient_order_bytes;
+            + quantization_metadata_bytes;
         Self {
             kernel_layout,
             source_binding_bytes,
             parameter_storage_bytes,
             artifact_storage_bytes,
             readback_bytes,
-            coefficient_order_bytes,
+            quantization_metadata_bytes,
             transform: None,
             owned_bytes_per_job,
             addressed_bytes_per_job: source_binding_bytes + owned_bytes_per_job,

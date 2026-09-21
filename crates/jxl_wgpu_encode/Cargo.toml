@@ -16,6 +16,9 @@ thiserror = "2.0.20"
 wgpu = "30.0.1"
 
 [dev-dependencies]
+jxl-vardct.workspace = true
+jxl-threadpool.workspace = true
+jxl-oxide-common.workspace = true
 jxl.workspace = true
 jxl-bitstream.workspace = true
 jxl-coding.workspace = true

@@ -1,5 +1,4 @@
 // Image normalization and transform-parallel quantization/entropy coding.
-struct QuantizationEntry { dequant: array<f32, 3>, order: array<u32, 3> }
 struct TransformTask {
     block_x: u32, block_y: u32, coefficient_offset: u32, lf_offset: u32,
     width: u32, height: u32, metadata_offset: u32, ac_word_offset: u32,

@@ -307,8 +307,8 @@ code; blocking and runtime-neutral Future assembly are identical.
 
 The GPU executes sRGB linearization, XYB conversion, forward transforms, LF/AC quantization, the per-8×8
 clamped-Gradient DC predictor, signed tokenization, prefix packing, histogramming, and the
-standard strategy map. All 27 strategies and `TiledVarDctEncoder` use default dequantization
-matrices and natural or caller-selected coefficient orders, with one prefix distribution
+standard strategy map. All 27 strategies and `TiledVarDctEncoder` use default or caller-selected
+parametric dequantization matrices and natural or caller-selected coefficient orders, with one prefix distribution
 for all 495 coefficient contexts and no LZ77. `VarDctQuantization` validates exact global scale
 `1..=73728`, LF quantizer `1..=65536`, and a default `VarDctHfMultiplier` in `1..=256`.
 `VarDctTransform::with_hf_multiplier` overrides the default for that transform; sorting a map
@@ -327,6 +327,18 @@ The GPU quantizes every AC location and serializes each channel in its selected 
 only validates and serializes caller-supplied permutation metadata using bounded Lehmer coding;
 it neither selects orders from pixels nor reads coefficients. Config clones share immutable tables.
 Content-adaptive order selection remains a separate roadmap item.
+
+`VarDctConfig::dequant_matrices` accepts `VarDctDequantMatrices`. Its
+`with_matrix(strategy, VarDctMatrixEncoding)` selects modes 0–6 for all 17 matrix families;
+transposed strategies and AFV orientations share their family's immutable parameters.
+Parameters retain exact `FiniteF16` wire values. DCT band vectors must have equal X/Y/B
+lengths in `1..=16`; modes 1–5 require an 8×8 family. Construction rejects incompatible
+encodings and expanded scales outside the finite interval `(0, 1e8)` before GPU work.
+`Default` restores a family's standard matrix. Bounded scalar expansion is shared with the
+decoder, including the normative ×64 wire scaling of Hornuss and DCT2 parameters. The GPU
+uses the resulting scales for quantization; no image samples or coefficients are processed
+on the host. Raw Modular matrix side images (mode 7) and content-adaptive matrix selection
+remain unimplemented by the encoder.
 
 The LF and AC streams use 33-symbol raw prefix alphabets, covering every signed 32-bit value.
 The global MA tree is one Gradient leaf with no LZ77. Prefix bits retain all 15 canonical bits;
@@ -378,8 +390,9 @@ Sources use channel origins within one complete XYB binding, so small maps also 
 requiring 1024-byte storage offsets without padding each channel allocation.
 Each general-transform matrix/order entry contains three F32 scales and three U32 indices in
 24 bytes. An 8×8 DCT submission owns 12,180 bytes: 768 parameters, 3,072 artifact, 3,072 readback
-and 5,268 resident transform bytes. Tiled DCT8 instead retains a separate 768-byte X/Y/B order
-table at read-only storage binding 3, reported by `coefficient_order_bytes` and included in the
+and 5,268 resident transform bytes. Tiled DCT8 retains the same 24-byte entry layout in a
+1,536-byte matrix/order table at read-only storage binding 3, reported by
+`quantization_metadata_bytes` and included in the
 job's owned bytes. It requires four storage bindings and retains the table through completion
 or cancellation. No coefficient readback is added.
 Single transforms reserve one AC slot for three counts and at most `area - area / 64` coefficients
@@ -395,16 +408,20 @@ are checked before submission. A full 16K square therefore also depends on adapt
 capacity.
 
 Actual-GPU tests compare emitted streams with Rust `jxl`, installed `djxl`, and the stock GPU
-decoder. All 27 strategies run textured RGB8 inputs with default/custom correlation and natural/custom orders: each AC
-coefficient is checked against independent f64 transforms and pinned native basis/matrix/order
-data, and all 108 streams agree across the three decoders within one RGB8 code. The shared
+decoder. All 27 strategies run textured RGB8 inputs with default/custom correlation, natural/custom
+orders and parametric matrices: each AC coefficient is checked against independent f64 transforms,
+pinned native bases/orders and independent matrix expansion. All 135 streams agree across the
+three decoders within one RGB8 code. Modes 1/2 use pinned libjxl matrix records; modes 3–6 use
+the independent `jxl-vardct` parser. The shared
 forward primitive separately checks 667 native coefficient/LF cases, including complete impulse
 bases for all ten strategies with an 8×8 footprint. See the
 [native fixture generator](../jxl_wgpu/test-data/forward_vardct_generator/README.md).
 Procedural checkerboards, stripes, impulses, gradients, and colour patterns also exercise
 single-packet images, AC/LF boundaries, custom correlation, and a 2057×2057 four-LF-group image.
 Mixed-map cases cover all 27 strategies in one 512×512 image, a 2057×17 LF-boundary image,
-and 13×21 non-DCT8 edge replication, including native coefficient checks and all three decoders.
+and 13×21 non-DCT8 edge replication, including independent coefficient checks and all three decoders.
+The twelve maps include custom matrices combined with custom orders and LF metadata.
+Tiled custom matrices retain whole/fragmented-input agreement through 40-byte GPU windows.
 The batched forward primitive separately checks disjoint/reordered source and output ranges for
 all 27 strategies, with poisoned gaps and two transforms per batch under all five variants.
 An independent f64 cosine-sum reference checks AC values within one integer quantizer step;

@@ -2,6 +2,7 @@
 
 mod ac;
 mod artifact;
+mod matrices;
 mod mixed;
 mod native;
 mod orders;
@@ -951,7 +952,7 @@ fn abandoned_tiled_job_holds_and_releases_its_exact_budget() {
     assert_eq!(plan.kernel_layout, VarDctKernelLayout::TiledDct8);
     assert_eq!(
         plan.owned_bytes_per_job,
-        768 + 2 * plan.artifact_storage_bytes + plan.coefficient_order_bytes
+        768 + 2 * plan.artifact_storage_bytes + plan.quantization_metadata_bytes
     );
 
     let limited_context = WgpuContext::with_memory_budget(

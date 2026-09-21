@@ -195,60 +195,64 @@ fn tiled_custom_orders_preserve_pixels_across_edges_groups_windows_and_variants(
 #[test]
 fn custom_tiled_order_storage_survives_cancellation_and_obeys_exact_admission() {
     let context = test_context().expect("actual GPU required for custom order lifetime");
-    let config = VarDctConfig {
-        coefficient_orders: selected([VarDctStrategy::Dct8]),
-        ..Default::default()
-    };
-    let source = padded_rgb_source_sized(&context, 257, 17, &reference::pattern(257, 17));
-    let encoder = TiledVarDctEncoder::new_with_config(context.clone(), config.clone()).unwrap();
-    let memory = encoder.memory_plan(&source).unwrap();
-    assert_eq!(memory.coefficient_order_bytes, 768);
-    assert_eq!(
-        memory.owned_bytes_per_job,
-        memory.parameter_storage_bytes
-            + memory.artifact_storage_bytes
-            + memory.readback_bytes
-            + 768
-    );
-    for deficit in [1, 0] {
-        let limited = WgpuContext::with_memory_budget(
-            Arc::new(context.device().clone()),
-            Arc::new(context.queue().clone()),
-            NonZeroU64::new(memory.owned_bytes_per_job - deficit).unwrap(),
-        )
-        .unwrap();
-        let encoder = TiledVarDctEncoder::new_with_config(limited.clone(), config.clone()).unwrap();
-        if deficit != 0 {
-            assert!(matches!(
-                encoder.submit(source.clone()),
-                Err(EncodeError::MemoryBackpressure(_))
-            ));
-        } else {
-            let job = encoder.submit(source.clone()).unwrap();
-            assert_eq!(
-                encoder.in_flight_memory_stats().reserved_bytes,
-                memory.owned_bytes_per_job
-            );
-            drop(job);
-            let fence = limited.queue().submit([]);
-            limited
-                .device()
-                .poll(wgpu::PollType::Wait {
-                    submission_index: Some(fence),
-                    timeout: None,
-                })
-                .unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while encoder.in_flight_memory_stats().reserved_bytes != 0
-                && std::time::Instant::now() < deadline
-            {
-                limited.device().poll(wgpu::PollType::Poll).unwrap();
-                std::thread::yield_now();
+    for dequant_matrices in [Default::default(), matrices::selected()] {
+        let config = VarDctConfig {
+            dequant_matrices,
+            coefficient_orders: selected([VarDctStrategy::Dct8]),
+            ..Default::default()
+        };
+        let source = padded_rgb_source_sized(&context, 257, 17, &reference::pattern(257, 17));
+        let encoder = TiledVarDctEncoder::new_with_config(context.clone(), config.clone()).unwrap();
+        let memory = encoder.memory_plan(&source).unwrap();
+        assert_eq!(memory.quantization_metadata_bytes, 1536);
+        assert_eq!(
+            memory.owned_bytes_per_job,
+            memory.parameter_storage_bytes
+                + memory.artifact_storage_bytes
+                + memory.readback_bytes
+                + 1536
+        );
+        for deficit in [1, 0] {
+            let limited = WgpuContext::with_memory_budget(
+                Arc::new(context.device().clone()),
+                Arc::new(context.queue().clone()),
+                NonZeroU64::new(memory.owned_bytes_per_job - deficit).unwrap(),
+            )
+            .unwrap();
+            let encoder =
+                TiledVarDctEncoder::new_with_config(limited.clone(), config.clone()).unwrap();
+            if deficit != 0 {
+                assert!(matches!(
+                    encoder.submit(source.clone()),
+                    Err(EncodeError::MemoryBackpressure(_))
+                ));
+            } else {
+                let job = encoder.submit(source.clone()).unwrap();
+                assert_eq!(
+                    encoder.in_flight_memory_stats().reserved_bytes,
+                    memory.owned_bytes_per_job
+                );
+                drop(job);
+                let fence = limited.queue().submit([]);
+                limited
+                    .device()
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: Some(fence),
+                        timeout: None,
+                    })
+                    .unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while encoder.in_flight_memory_stats().reserved_bytes != 0
+                    && std::time::Instant::now() < deadline
+                {
+                    limited.device().poll(wgpu::PollType::Poll).unwrap();
+                    std::thread::yield_now();
+                }
+                assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
+                let bytes = encoder.encode(source.clone()).unwrap();
+                assert_eq!(decode_rgb8_sized(&bytes, 257, 17).len(), 257 * 17 * 3);
             }
             assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
-            let bytes = encoder.encode(source.clone()).unwrap();
-            assert_eq!(decode_rgb8_sized(&bytes, 257, 17).len(), 257 * 17 * 3);
         }
-        assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
     }
 }

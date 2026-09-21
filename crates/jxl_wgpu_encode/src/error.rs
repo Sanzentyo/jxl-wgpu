@@ -114,6 +114,8 @@ pub enum PacketError {
 
 #[derive(Debug, Error)]
 pub enum EncodeError {
+    #[error(transparent)]
+    VarDctMatrix(#[from] jxl_gpu_protocol::VarDctMatrixError),
     #[error("invalid VarDCT coefficient order for family {family}, channel {channel}: {reason}")]
     VarDctCoefficientOrder {
         family: u8,

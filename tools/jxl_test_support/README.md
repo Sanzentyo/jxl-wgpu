@@ -34,6 +34,12 @@ provides unbounded pre-OETF XYB stills; the codec's Gamma/DCI black floor makes 
 already encoded original image unsuitable for that reference. These helpers use ordinary module
 imports and stay outside production dependencies.
 
+`oracles::vardct_matrices` loads four hash-checked native Hornuss/DCT2 matrix records, including
+their exact binary16 wire parameters. The pinned libjxl parser supplies their expected values;
+the older `jxl-vardct` parser omits the required ×64 scale for these two modes. Encoder and
+decoder tests share this independent reference. Its schema and reproduction command are in the
+[native VarDCT recipe](../../crates/jxl_wgpu/test-data/forward_vardct_generator/README.md).
+
 `oracles::modular_integer` requests the declared original encoding or original embedded ICC
 from jxl-oxide 0.12.6 and
 copies its retained integer planes through jxl-render 0.12.4. It rejects F32 planes rather than

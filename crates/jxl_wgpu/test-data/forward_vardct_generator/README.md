@@ -5,16 +5,19 @@ This offline generator calls libjxl's `TransformFromPixels`, `DCFromLowestFreque
 commit `a7a9c787341cf703dede03c2009fa460cae5e5df`. Production crates never link this generator
 or read these fixtures.
 
-The two committed outputs are:
+The three committed outputs are:
 
 | File | SHA-256 |
 |---|---|
 | [`forward_vardct.bin`](../forward_vardct.bin) | `191c0f4d4be583bfcd3c4c781b71884ce66246831c485d8dc73d91b58109ad51` |
 | [`vardct_metadata.bin`](../../../jxl_gpu_protocol/test-data/vardct_metadata.bin) | `696d7dc023349024af2f97d3210bd2a3729c4cd0b9df5be706d1d2a7829ff0c9` |
+| [`parametric_matrices.bin`](../../../jxl_gpu_protocol/test-data/parametric_matrices.bin) | `f900ca5cf7f270866ae88014547006aff8047b770e67b348d8315b3460db5deb` |
 
 ## Reproduction
 
 From the repository root, with CMake, a C++17 compiler and system Highway, Brotli and LCMS2:
+reuse an existing checkout at the pinned revision and its build directory when available.
+The paths below describe a first setup.
 
 ```sh
 mkdir -p .git/codex-validation/forward-native
@@ -24,12 +27,16 @@ cmake -S crates/jxl_wgpu/test-data/forward_vardct_generator \
   -B .git/codex-validation/forward-native/build \
   -DCMAKE_BUILD_TYPE=Release \
   -DJXL_SOURCE="$PWD/.git/codex-validation/forward-native/libjxl"
-cmake --build .git/codex-validation/forward-native/build --target generate_forward_vardct -j 4
+cmake --build .git/codex-validation/forward-native/build \
+  --target generate_forward_vardct generate_parametric_matrices -j 4
 .git/codex-validation/forward-native/build/generate_forward_vardct \
   .git/codex-validation/forward-native/forward_vardct.bin \
   .git/codex-validation/forward-native/vardct_metadata.bin
+.git/codex-validation/forward-native/build/generate_parametric_matrices \
+  .git/codex-validation/forward-native/parametric_matrices.bin
 cmp crates/jxl_wgpu/test-data/forward_vardct.bin .git/codex-validation/forward-native/forward_vardct.bin
 cmp crates/jxl_gpu_protocol/test-data/vardct_metadata.bin .git/codex-validation/forward-native/vardct_metadata.bin
+cmp crates/jxl_gpu_protocol/test-data/parametric_matrices.bin .git/codex-validation/forward-native/parametric_matrices.bin
 ```
 
 Homebrew builds additionally use `-DCMAKE_PREFIX_PATH=/opt/homebrew`. CMake enforces the source
@@ -59,10 +66,20 @@ have complete independently generated basis coverage, including asymmetric input
 Native unused LLF matrix entries are preserved verbatim, including the DCT2 DC sentinel. Only AC
 entries are compared as quantization multipliers; LLF uses the separate LF quantizer.
 
+`parametric_matrices.bin` begins with `JXLPQM01`, then count 4. Each record has
+`mode, variant, parameters_per_channel`, then X/Y/B parameter words containing binary16 bits,
+then three 64-entry dequantization f32 planes. Modes 1/2 have 3/6 parameters per channel.
+Variant 0 uses `0x3c00` (one); variant 1 uses `0x4000 + ((channel + index) % 3) * 0x400`
+(two, four or eight). The generator writes these parameters literally into family 0, leaves
+the other sixteen families at default, and calls `DequantMatrices::Decode` and `EnsureComputed`.
+These four records occupy 3,348 bytes. They independently establish the ×64 scale applied to
+Hornuss/DCT2 wire parameters; the older `jxl-vardct` parser omits this scale. The unused DC value
+is preserved, including the native DCT2 sentinel, and is excluded from AC comparisons.
+
 ## Validation and limits
 
 ```sh
-cargo test -p jxl_gpu_protocol vardct:: -- --nocapture
+cargo test -p jxl_gpu_protocol vardct:: -- --test-threads=2 --nocapture
 cargo test -p jxl_wgpu forward_vardct:: -- --test-threads=2 --nocapture
 cargo test -p jxl_wgpu_encode --lib vardct_encoder::tests::single:: -- --test-threads=2 --nocapture
 ```
@@ -84,13 +101,21 @@ the observed peak is 2.3667124e-6. This comparison caught incorrect Y/B base con
 values 22389.441 and 11679.847 for those channels in both orientations.
 
 The encoder tests use textured RGB8 inputs for every strategy with default and explicit LF/HF
-correlation: 54 cases. Independent f64 color conversion and cosine sums (or the native impulse
-basis for 8×8 transforms), native matrices and native orders check every compressed AC coefficient
+correlation, natural/custom orders, and custom matrices: 135 streams. Independent f64 color
+conversion and cosine sums (or the native impulse basis for 8×8 transforms), native default
+matrices/orders and independent parametric matrices check every compressed AC coefficient
 within one integer quantizer step. Rust `jxl`, native `djxl` and the stock GPU decoder agree within
 one RGB8 code; all five workgroup variants emit identical bytes. A dense maximum-range 256×256
-fragment fills its final allocated word, and a 400 KiB device binding limit rejects oversized
+fragment fills its final allocated word, and a 500 KiB device binding limit rejects oversized
 matrix/order storage before submission.
 
+Parametric modes 1/2 compare every AC entry exactly against the native records above; modes
+3–6 compare bit for bit against the independent `jxl-vardct` parser, including 1/3/16 bands,
+all compatible families and both rectangular orientations. Equivalent constant mode-1/2/6
+streams also check native, Rust and GPU pixels to prevent encoder/decoder agreement from hiding
+a shared scaling error. The [procedural corpus](../../../../docs/CONFORMANCE_CORPUS.md#procedural-vardct-encoder-matrix)
+records the mixed-map, tiled, malformed-parameter and ownership cases.
+
 These are regression and interoperability bounds fixed before running the tests. They do not
-establish ISO precision, perceptual distance, rate control, mixed strategy selection, arbitrary
-edge transforms, adaptive entropy or progressive encoding. The full JPEG XL goal remains open.
+establish ISO precision, perceptual distance, rate control, content-adaptive strategy/matrix
+selection, raw-matrix encoding, adaptive entropy or progressive encoding. The full JPEG XL goal remains open.

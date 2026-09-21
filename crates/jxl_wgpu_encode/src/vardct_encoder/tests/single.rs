@@ -27,10 +27,17 @@ fn all_27_strategies_emit_native_checked_nonzero_ac_and_interoperate() {
     let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let readback = ImageReadbackPipeline::new(&backend);
     let oracles = native_oracles();
+    let custom_matrices = matrices::selected();
+    let matrix_oracle = matrices::oracle(&custom_matrices);
+    let mut custom_oracles = native_oracles();
+    for (strategy, oracle) in VarDctStrategy::ALL.into_iter().zip(&mut custom_oracles) {
+        oracle.dequant = matrices::oracle_scales(&matrix_oracle, strategy, &custom_matrices);
+    }
     let directory = oracle_directory();
     fs::create_dir_all(&directory).unwrap();
     let djxl = "djxl";
     let mut streams = Vec::new();
+    let mut gpu_mismatches = Vec::new();
     eprintln!("single-transform AC adapter: {info:?}; pinned native matrices and transforms");
     for (strategy, oracle) in VarDctStrategy::ALL.into_iter().zip(&oracles) {
         let Extent2d { width, height } = strategy.pixel_extent();
@@ -52,11 +59,22 @@ fn all_27_strategies_emit_native_checked_nonzero_ac_and_interoperate() {
             custom_lf_metadata(),
             VarDctLfMetadata::default(),
             custom_lf_metadata(),
+            custom_lf_metadata(),
         ]
         .into_iter()
         .enumerate()
         {
+            let oracle = if custom == 4 {
+                &custom_oracles[strategy.codestream_id() as usize]
+            } else {
+                oracle
+            };
             let config = VarDctConfig {
+                dequant_matrices: if custom == 4 {
+                    custom_matrices.clone()
+                } else {
+                    Default::default()
+                },
                 coefficient_orders: if custom >= 2 {
                     orders::selected([strategy])
                 } else {
@@ -98,7 +116,7 @@ fn all_27_strategies_emit_native_checked_nonzero_ac_and_interoperate() {
             let rust = decode_rgb8_sized(&stream, w, h);
             if custom < 2 {
                 natural_pixels.push(rust.clone());
-            } else {
+            } else if custom < 4 {
                 assert_eq!(
                     rust,
                     natural_pixels[custom - 2],
@@ -114,10 +132,9 @@ fn all_27_strategies_emit_native_checked_nonzero_ac_and_interoperate() {
             let frame = session.next_frame().unwrap().unwrap();
             let output = readback.submit(frame.output()).unwrap().wait().unwrap();
             let error = max_abs_error(&output.frame.outputs[0].bytes, &rust);
-            assert!(
-                error <= 1,
-                "{strategy:?}/{custom}: GPU/Rust max error {error}"
-            );
+            if error > 1 {
+                gpu_mismatches.push((strategy, custom, error));
+            }
             drop(frame);
             assert!(session.next_frame().unwrap().is_none());
             let input = directory.join(format!("{strategy:?}-{custom}.jxl"));
@@ -142,6 +159,10 @@ fn all_27_strategies_emit_native_checked_nonzero_ac_and_interoperate() {
             streams.push((strategy, config, pixels.clone(), stream));
         }
     }
+    assert!(
+        gpu_mismatches.is_empty(),
+        "GPU/Rust mismatches: {gpu_mismatches:?}"
+    );
     for variant in [
         KernelVariant::Scalar,
         KernelVariant::Lanes32,
@@ -167,7 +188,10 @@ fn all_27_strategies_emit_native_checked_nonzero_ac_and_interoperate() {
             assert_eq!(&actual, expected, "{strategy:?}/{variant:?}");
             assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
         }
-        eprintln!("{variant:?}: 108 single-transform codestreams are byte-identical");
+        eprintln!(
+            "{variant:?}: {} single-transform codestreams are byte-identical",
+            streams.len()
+        );
     }
     fs::remove_dir_all(directory).unwrap();
 }

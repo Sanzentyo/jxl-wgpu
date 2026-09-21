@@ -90,7 +90,8 @@ pub use session::{
 };
 pub use vardct_encoder::{
     TiledVarDctEncoder, TiledVarDctGrid, VarDctBackend, VarDctCoefficientOrders,
-    VarDctColorEncoding, VarDctConfig, VarDctEncoder, VarDctHfMultiplier, VarDctJob,
-    VarDctKernelLayout, VarDctLfMetadata, VarDctMemoryPlan, VarDctQuantization, VarDctStrategy,
-    VarDctStrategyMap, VarDctSubmission, VarDctTransform, VarDctTransformMemoryPlan,
+    VarDctColorEncoding, VarDctConfig, VarDctDequantMatrices, VarDctEncoder, VarDctHfMultiplier,
+    VarDctJob, VarDctKernelLayout, VarDctLfMetadata, VarDctMatrixEncoding, VarDctMemoryPlan,
+    VarDctQuantization, VarDctStrategy, VarDctStrategyMap, VarDctSubmission, VarDctTransform,
+    VarDctTransformMemoryPlan,
 };

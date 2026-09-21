@@ -26,6 +26,7 @@ pub use tone_mapping::{LuminanceRange, ToneMapping};
 mod gamut_mapping;
 pub use gamut_mapping::GamutMapping;
 mod vardct;
+pub use vardct::{VarDctMatrixEncoding, VarDctMatrixError};
 
 /// Stable identifier for a logical image plane in a [`RenderPlan`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

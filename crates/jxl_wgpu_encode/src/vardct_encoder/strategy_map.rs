@@ -8,7 +8,7 @@ use super::types::{
     ArtifactLayout, TiledVarDctGrid, VarDctFrameLayout, VarDctStrategy, VarDctTopology,
     VarDctTransformMemoryPlan,
 };
-use super::{VarDctCoefficientOrders, VarDctHfMultiplier, VarDctQuantization};
+use super::{VarDctConfig, VarDctHfMultiplier};
 use crate::EncodeError;
 
 /// A transform's upper-left corner, measured in 8×8 blocks of the padded image.
@@ -162,11 +162,7 @@ pub(super) struct TransformPlan {
 }
 
 impl TransformPlan {
-    pub fn new(
-        map: VarDctStrategyMap,
-        quantization: VarDctQuantization,
-        orders: &VarDctCoefficientOrders,
-    ) -> Result<Self, EncodeError> {
+    pub fn new(map: VarDctStrategyMap, config: &VarDctConfig) -> Result<Self, EncodeError> {
         let code = fixed_prefix_code()?;
         let mut metadata = Vec::new();
         let mut batches = Vec::new();
@@ -185,14 +181,9 @@ impl TransformPlan {
             offsets[id] = metadata.len() as u32;
             capacities[id] = ArtifactLayout::new(strategy, &code)?.ac_words_per_block;
             metadata.extend(
-                strategy
-                    .default_dequant_matrix()
-                    .scales
-                    .into_iter()
-                    .zip(orders.indices(strategy))
-                    .map(|([x, y, b], [ox, oy, ob])| {
-                        [x.to_bits(), y.to_bits(), b.to_bits(), ox, oy, ob]
-                    }),
+                config
+                    .dequant_matrices
+                    .metadata(strategy, &config.coefficient_orders)?,
             );
             batches.push(StrategyBatch {
                 strategy,
@@ -224,7 +215,7 @@ impl TransformPlan {
                 strategy: id as u32,
                 hf_multiplier: placement
                     .hf_multiplier
-                    .unwrap_or(quantization.hf_multiplier())
+                    .unwrap_or(config.quantization.hf_multiplier())
                     .get(),
             });
             batches

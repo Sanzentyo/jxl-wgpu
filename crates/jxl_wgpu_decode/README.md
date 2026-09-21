@@ -1317,7 +1317,9 @@ Fixed scratch/status capacity is admitted before submission; descriptor/order/wi
 the cursor are admitted through the same shared budget. `cjxl --progressive_dc=1` and
 `--progressive_dc=2` actual-GPU outputs are checked through blocking and runtime-neutral async
 completion against Rust `jxl` within one RGB8 code. Parametric matrix modes 0 through 6 populate the
-resident resource table. For raw mode 7, the sectioned global-tree path now decodes the complete
+resident resource table using the shared protocol metadata expander. Hornuss/DCT2 wire parameters
+include the normative ×64 scale, checked against pinned native matrix records and equivalent
+mode-6 streams through native, Rust and GPU pixel decoding. For raw mode 7, the sectioned global-tree path now decodes the complete
 three-channel Modular side image with the common GPU entropy executor, runs its resident
 Palette/RCT/Squeeze inverse schedule, validates a 16-byte mapped status, and overlays positive
 finite weights into each aliased strategy-matrix target before AC/render. A real cjpeg-to-cjxl

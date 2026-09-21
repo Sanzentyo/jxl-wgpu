@@ -1656,27 +1656,7 @@ fn pack_channel_extent([width, height]: [u32; 2]) -> Result<u32, BoundedVarDctPa
     Ok(width | (height << 16))
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum HfDequantMatrixEncoding {
-    Default,
-    Hornuss([[f32; 3]; 3]),
-    Dct2([[f32; 6]; 3]),
-    Dct4 {
-        params: [[f32; 2]; 3],
-        dct_params: [Vec<f32>; 3],
-    },
-    Dct4x8 {
-        params: [[f32; 1]; 3],
-        dct_params: [Vec<f32>; 3],
-    },
-    Afv {
-        params: [[f32; 9]; 3],
-        dct_params: [Vec<f32>; 3],
-        dct4x4_params: [Vec<f32>; 3],
-    },
-    Dct([Vec<f32>; 3]),
-    Raw,
-}
+use jxl_gpu_protocol::VarDctMatrixEncoding as HfDequantMatrixEncoding;
 
 #[derive(Clone, Debug, PartialEq)]
 struct HfDequantMatrixParseState {
@@ -1769,9 +1749,6 @@ fn parse_hf_dequant_matrices_from(
                 });
             }
         }
-        for first in params.iter_mut().filter_map(|values| values.first_mut()) {
-            *first *= 64.0;
-        }
         Ok(params)
     }
 
@@ -1800,12 +1777,7 @@ fn parse_hf_dequant_matrices_from(
                 dct_params: read_dct_params(reader, matrix)?,
             },
             5 => {
-                let mut params = read_fixed::<9>(reader, matrix)?;
-                for channel in &mut params {
-                    for value in &mut channel[..6] {
-                        *value *= 64.0;
-                    }
-                }
+                let params = read_fixed::<9>(reader, matrix)?;
                 HfDequantMatrixEncoding::Afv {
                     params,
                     dct_params: read_dct_params(reader, matrix)?,
@@ -1821,7 +1793,8 @@ fn parse_hf_dequant_matrices_from(
                     low_frequency_group_count,
                     global_ma_config,
                 )?;
-                state.encodings.push(HfDequantMatrixEncoding::Raw);
+                // GPU side-image decoding overlays these default placeholder words.
+                state.encodings.push(HfDequantMatrixEncoding::Default);
                 state.raw_side_images.push(plan.clone());
                 state.next_matrix = matrix + 1;
                 return Ok(HfDequantMatrixParse::SideImage {
@@ -1843,327 +1816,24 @@ fn parse_hf_dequant_matrices_from(
 fn expand_hf_dequant_matrices(
     encodings: &[HfDequantMatrixEncoding],
 ) -> Result<Vec<[u32; 4]>, BoundedVarDctPacketError> {
-    fn representative(index: usize) -> TransformKind {
-        [
-            TransformKind::Dct8,
-            TransformKind::Hornuss,
-            TransformKind::Dct2x2,
-            TransformKind::Dct4x4,
-            TransformKind::Dct16x16,
-            TransformKind::Dct32x32,
-            TransformKind::Dct8x16,
-            TransformKind::Dct8x32,
-            TransformKind::Dct16x32,
-            TransformKind::Dct4x8,
-            TransformKind::Afv0,
-            TransformKind::Dct64x64,
-            TransformKind::Dct32x64,
-            TransformKind::Dct128x128,
-            TransformKind::Dct64x128,
-            TransformKind::Dct256x256,
-            TransformKind::Dct128x256,
-        ][index]
-    }
-
-    fn interpolate(pos: f32, max: f32, bands: &[f32]) -> f32 {
-        if let [value] = bands {
-            return *value;
-        }
-        let scaled = pos * (bands.len() - 1) as f32 / max;
-        let index = (scaled as usize).min(bands.len() - 2);
-        let fraction = scaled - index as f32;
-        let left = bands[index];
-        let right = bands[index + 1];
-        left * (right / left).powf(fraction)
-    }
-
-    fn multiplier(value: f32) -> f32 {
-        if value > 0.0 {
-            1.0 + value
-        } else {
-            1.0 / (1.0 - value)
-        }
-    }
-
-    fn dct_weights(
-        params: &[f32],
-        width: u32,
-        height: u32,
-        matrix: usize,
-    ) -> Result<Vec<f32>, BoundedVarDctPacketError> {
-        let mut bands = Vec::with_capacity(params.len());
-        let mut last = *params
-            .first()
-            .ok_or(BoundedVarDctPacketError::HfDequantMatrixValue {
-                matrix,
-                reason: "DCT matrix has no bands",
-            })?;
-        bands.push(last);
-        for &value in &params[1..] {
-            last *= multiplier(value);
-            if !last.is_finite() || last <= 0.0 {
-                return Err(BoundedVarDctPacketError::HfDequantMatrixValue {
-                    matrix,
-                    reason: "DCT band is non-positive or non-finite",
-                });
-            }
-            bands.push(last);
-        }
-        let mut output = Vec::with_capacity((width * height) as usize);
-        for y in 0..height {
-            for x in 0..width {
-                let dx = x as f32 / (width - 1) as f32;
-                let dy = y as f32 / (height - 1) as f32;
-                output.push(interpolate(
-                    (dx * dx + dy * dy).sqrt(),
-                    std::f32::consts::SQRT_2 + 1e-6,
-                    &bands,
-                ));
-            }
-        }
-        Ok(output)
-    }
-
-    fn expand(
-        encoding: &HfDequantMatrixEncoding,
-        transform: TransformKind,
-        matrix: usize,
-    ) -> Result<[Vec<f32>; 3], BoundedVarDctPacketError> {
-        let output = match encoding {
-            HfDequantMatrixEncoding::Default | HfDequantMatrixEncoding::Raw => {
-                unreachable!("defaults and raw overlays are expanded separately")
-            }
-            HfDequantMatrixEncoding::Dct(params) => {
-                let extent = transform.pixel_extent();
-                [
-                    dct_weights(&params[0], extent.width, extent.height, matrix)?,
-                    dct_weights(&params[1], extent.width, extent.height, matrix)?,
-                    dct_weights(&params[2], extent.width, extent.height, matrix)?,
-                ]
-            }
-            HfDequantMatrixEncoding::Hornuss(params) => params.map(|params| {
-                let mut values = vec![params[0]; 64];
-                values[0] = 1.0;
-                values[1] = params[1];
-                values[8] = params[1];
-                values[9] = params[2];
-                values
-            }),
-            HfDequantMatrixEncoding::Dct2(params) => params.map(|params| {
-                let mut values = vec![0.0; 64];
-                values[0] = 1.0;
-                for (index, value) in params.into_iter().enumerate() {
-                    let shift = index / 2;
-                    let dimension = 1_usize << shift;
-                    if index % 2 == 0 {
-                        for y in 0..dimension {
-                            for x in dimension..dimension * 2 {
-                                values[y * 8 + x] = value;
-                                values[x * 8 + y] = value;
-                            }
-                        }
-                    } else {
-                        for y in dimension..dimension * 2 {
-                            for x in dimension..dimension * 2 {
-                                values[y * 8 + x] = value;
-                            }
-                        }
-                    }
-                }
-                values
-            }),
-            HfDequantMatrixEncoding::Dct4 { params, dct_params } => {
-                let mut output = [Vec::new(), Vec::new(), Vec::new()];
-                for (output, (params, dct)) in output.iter_mut().zip(params.iter().zip(dct_params))
-                {
-                    let matrix = dct_weights(dct, 4, 4, matrix)?;
-                    *output = vec![0.0; 64];
-                    for y in 0..4 {
-                        for x in 0..4 {
-                            output[y * 16 + x * 2] = matrix[y * 4 + x];
-                            output[y * 16 + x * 2 + 1] = matrix[y * 4 + x];
-                            output[(y * 2 + 1) * 8 + x * 2] = matrix[y * 4 + x];
-                            output[(y * 2 + 1) * 8 + x * 2 + 1] = matrix[y * 4 + x];
-                        }
-                    }
-                    output[1] /= params[0];
-                    output[8] /= params[0];
-                    output[9] /= params[1];
-                }
-                output
-            }
-            HfDequantMatrixEncoding::Dct4x8 { params, dct_params } => {
-                let mut output = [Vec::new(), Vec::new(), Vec::new()];
-                for (output, (params, dct)) in output.iter_mut().zip(params.iter().zip(dct_params))
-                {
-                    let matrix = dct_weights(dct, 8, 4, matrix)?;
-                    *output = matrix
-                        .as_chunks::<8>()
-                        .0
-                        .iter()
-                        .flat_map(|row| [row, row])
-                        .flatten()
-                        .copied()
-                        .collect();
-                    output[8] /= params[0];
-                }
-                output
-            }
-            HfDequantMatrixEncoding::Afv {
-                params,
-                dct_params,
-                dct4x4_params,
-            } => {
-                const FREQUENCIES: [f32; 16] = [
-                    0.0, 0.0, 0.8517779, 5.3777843, 0.0, 0.0, 4.734748, 5.4492455, 1.659827, 4.0,
-                    7.275749, 10.423227, 2.6629324, 7.6306577, 8.962389, 12.971662,
-                ];
-                let mut output = [Vec::new(), Vec::new(), Vec::new()];
-                for (output, ((params, dct), dct4)) in output
-                    .iter_mut()
-                    .zip(params.iter().zip(dct_params).zip(dct4x4_params))
-                {
-                    let weights_4x8 = dct_weights(dct, 8, 4, matrix)?;
-                    let weights_4x4 = dct_weights(dct4, 4, 4, matrix)?;
-                    let mut bands = [params[5], 0.0, 0.0, 0.0];
-                    for index in 1..4 {
-                        bands[index] = bands[index - 1] * multiplier(params[index + 5]);
-                    }
-                    *output = vec![0.0; 64];
-                    for y in 0..4 {
-                        for x in 0..4 {
-                            output[16 * y + 2 * x] = match (x, y) {
-                                (0, 0) => 1.0,
-                                (0, 1) => params[2],
-                                (1, 0) => params[3],
-                                (1, 1) => params[4],
-                                _ => interpolate(
-                                    FREQUENCIES[y * 4 + x] - FREQUENCIES[2],
-                                    FREQUENCIES[15] - FREQUENCIES[2] + 1e-6,
-                                    &bands,
-                                ),
-                            };
-                        }
-                    }
-                    for (y, ((rows, weights_8), weights_4)) in output
-                        .as_chunks_mut::<16>()
-                        .0
-                        .iter_mut()
-                        .zip(weights_4x8.as_chunks::<8>().0.iter())
-                        .zip(weights_4x4.as_chunks::<4>().0.iter())
-                        .enumerate()
-                    {
-                        let (row0, row1) = rows.split_at_mut(8);
-                        for (x, (value, &weight)) in row1.iter_mut().zip(weights_8).enumerate() {
-                            *value = if y == 0 && x == 0 { params[0] } else { weight };
-                        }
-                        for (x, (pair, &weight)) in row0
-                            .as_chunks_mut::<2>()
-                            .0
-                            .iter_mut()
-                            .zip(weights_4)
-                            .enumerate()
-                        {
-                            pair[1] = if y == 0 && x == 0 { params[1] } else { weight };
-                        }
-                    }
-                }
-                output
-            }
-        };
-        let mut output = output;
-        for value in output.iter_mut().flatten() {
-            *value = 1.0 / *value;
-            if !value.is_finite() || *value <= 0.0 || *value >= 1e8 {
-                return Err(BoundedVarDctPacketError::HfDequantMatrixValue {
-                    matrix,
-                    reason: "expanded value is non-positive, non-finite, or too large",
-                });
-            }
-        }
-        Ok(output)
-    }
-
-    fn transpose(channels: &[Vec<f32>; 3], width: u32, height: u32) -> [Vec<f32>; 3] {
-        std::array::from_fn(|channel| {
-            let mut output = vec![0.0; channels[channel].len()];
-            for y in 0..height {
-                for x in 0..width {
-                    output[(x * height + y) as usize] = channels[channel][(y * width + x) as usize];
-                }
-            }
-            output
-        })
-    }
-
     let mut packed = Vec::new();
     for transform in TransformKind::ALL {
-        let index = crate::vardct_resource::hf_matrix_param_index(transform);
-        let extent = transform.pixel_extent();
-        let channels = match &encodings[index] {
-            HfDequantMatrixEncoding::Default | HfDequantMatrixEncoding::Raw => {
-                packed.extend(
-                    transform
-                        .default_dequant_matrix()
-                        .scales
-                        .into_iter()
-                        .map(|[x, y, b]| [x.to_bits(), y.to_bits(), b.to_bits(), 0]),
-                );
-                continue;
-            }
-            encoding => {
-                let representative = representative(index);
-                let channels = expand(encoding, representative, index)?;
-                if transform.needs_transpose() {
-                    let representative_extent = representative.pixel_extent();
-                    transpose(
-                        &channels,
-                        representative_extent.width,
-                        representative_extent.height,
-                    )
-                } else {
-                    channels
+        let expanded = encodings[transform.dequant_matrix_index()]
+            .expand(transform)
+            .map_err(|error| match error {
+                jxl_gpu_protocol::VarDctMatrixError::Encoding { matrix, encoding } => {
+                    BoundedVarDctPacketError::HfDequantMatrixEncoding { matrix, encoding }
                 }
-            }
-        };
-        let matrix_len = usize::try_from(extent.width.checked_mul(extent.height).ok_or(
-            BoundedVarDctPacketError::ArithmeticOverflow {
-                field: "HF dequantization matrix area",
-            },
-        )?)
-        .map_err(|_| BoundedVarDctPacketError::ArithmeticOverflow {
-            field: "HF dequantization matrix area",
-        })?;
-        if channels.iter().any(|channel| channel.len() != matrix_len) {
-            return Err(BoundedVarDctPacketError::HfDequantMatrixValue {
-                matrix: index,
-                reason: "expanded matrix dimensions do not match the transform",
-            });
-        }
-        let base = packed.len();
-        packed.resize(
-            base.checked_add(matrix_len)
-                .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
-                    field: "HF dequantization matrix packing",
-                })?,
-            [0; 4],
+                jxl_gpu_protocol::VarDctMatrixError::Value { matrix, reason } => {
+                    BoundedVarDctPacketError::HfDequantMatrixValue { matrix, reason }
+                }
+            })?;
+        packed.extend(
+            expanded
+                .scales
+                .into_iter()
+                .map(|[x, y, b]| [x.to_bits(), y.to_bits(), b.to_bits(), 0]),
         );
-        for frequency_y in 0..extent.height {
-            for frequency_x in 0..extent.width {
-                let raster = (frequency_y * extent.width + frequency_x) as usize;
-                let backend_index = if transform.is_special() || extent.height < extent.width {
-                    frequency_y * extent.width + frequency_x
-                } else {
-                    frequency_x * extent.height + frequency_y
-                } as usize;
-                packed[base + backend_index] = [
-                    channels[0][raster].to_bits(),
-                    channels[1][raster].to_bits(),
-                    channels[2][raster].to_bits(),
-                    0,
-                ];
-            }
-        }
     }
     Ok(packed)
 }
@@ -3520,7 +3190,7 @@ mod tests {
     }
 
     #[test]
-    fn every_parametric_hf_matrix_mode_matches_the_jxl_vardct_oracle() {
+    fn every_parametric_hf_matrix_mode_matches_independent_oracles() {
         fn write_f16_ones(writer: &mut BitWriter, count: usize) {
             for _ in 0..count {
                 writer.write_bits(0x3c00, 16).unwrap();
@@ -3607,6 +3277,17 @@ mod tests {
                         channels[2][raster].to_bits(),
                         0,
                     ];
+                    // jxl-vardct 0.11.1 omits the normative ×64 conversion for modes 1/2.
+                    // Compare their AC values to pinned libjxl Decode/Matrix outputs instead.
+                    let mode = modes[transform.dequant_matrix_index()];
+                    if matches!(mode, 1 | 2) && backend_index != 0 {
+                        let native = jxl_test_support::oracles::vardct_matrices::records()
+                            .iter()
+                            .find(|record| u64::from(record.mode) == mode && record.variant == 0)
+                            .unwrap();
+                        let [x, y, b] = native.scales[backend_index];
+                        expected[base + backend_index] = [x.to_bits(), y.to_bits(), b.to_bits(), 0];
+                    }
                 }
             }
         }

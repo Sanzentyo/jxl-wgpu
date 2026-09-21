@@ -82,7 +82,7 @@ fn maps_reject_holes_overlap_bounds_and_group_crossing_and_canonicalize_order() 
     let mut reversed = map.transforms().to_vec();
     reversed.reverse();
     assert_eq!(VarDctStrategyMap::new(512, 512, reversed).unwrap(), map);
-    let plan = TransformPlan::new(map, VarDctQuantization::default(), &Default::default()).unwrap();
+    let plan = TransformPlan::new(map, &Default::default()).unwrap();
     assert_eq!(plan.batches.len(), 27);
     assert_eq!(plan.memory.forward.parameter_bytes, 27 * 64);
     assert_eq!(
@@ -120,6 +120,12 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
     let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let readback = ImageReadbackPipeline::new(&backend);
     let oracles = native::native_oracles();
+    let custom_matrices = matrices::selected();
+    let matrix_oracle = matrices::oracle(&custom_matrices);
+    let mut custom_oracles = native::native_oracles();
+    for (strategy, oracle) in VarDctStrategy::ALL.into_iter().zip(&mut custom_oracles) {
+        oracle.dequant = matrices::oracle_scales(&matrix_oracle, strategy, &custom_matrices);
+    }
     let directory = oracle_directory();
     fs::create_dir_all(&directory).unwrap();
     let quantized_map = |width, height, all| {
@@ -164,6 +170,7 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
         quantized_map(2057, 17, false),
     ];
     maps.extend_from_within(..3);
+    maps.extend_from_within(..3);
     let mut streams = Vec::new();
     for (case, map) in maps.into_iter().enumerate() {
         let Extent2d { width, height } = map.extent();
@@ -174,7 +181,13 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
         } else {
             VarDctLfMetadata::default()
         };
+        let oracles = if case >= 9 { &custom_oracles } else { &oracles };
         let config = VarDctConfig {
+            dequant_matrices: if case >= 9 {
+                custom_matrices.clone()
+            } else {
+                Default::default()
+            },
             lf_metadata: metadata,
             quantization: if case >= 4 {
                 VarDctQuantization::new(13000, 257, crate::VarDctHfMultiplier::new(19).unwrap())
@@ -188,8 +201,7 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
                 Default::default()
             },
         };
-        let plan = TransformPlan::new(map.clone(), config.quantization, &config.coefficient_orders)
-            .unwrap();
+        let plan = TransformPlan::new(map.clone(), &config).unwrap();
         let encoder =
             VarDctBackend::new_with_strategy_map(&context, map.clone(), config.clone()).unwrap();
 
@@ -337,11 +349,23 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
 #[test]
 fn mixed_jobs_admit_exact_memory_reject_wrong_extents_and_release_after_cancellation() {
     let context = test_context().expect("actual GPU required for mixed memory evidence");
-    for coefficient_orders in [Default::default(), orders::selected(VarDctStrategy::ALL)] {
+    for (case, coefficient_orders) in [
+        Default::default(),
+        orders::selected(VarDctStrategy::ALL),
+        orders::selected(VarDctStrategy::ALL),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let map = packed_map(512, 512, true);
         let metadata = VarDctLfMetadata::default();
         let custom = VarDctConfig {
             coefficient_orders,
+            dequant_matrices: if case == 2 {
+                matrices::selected()
+            } else {
+                Default::default()
+            },
             ..config_with_lf(metadata)
         };
         let pixels = reference::pattern(512, 512);

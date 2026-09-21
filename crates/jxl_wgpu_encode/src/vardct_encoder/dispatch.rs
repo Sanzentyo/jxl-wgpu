@@ -81,6 +81,7 @@ pub struct VarDctBackend {
     hf_entropy: HfEntropyPlan,
     topology: VarDctTopology,
     transform_plan: Option<Arc<TransformPlan>>,
+    tiled_metadata: Option<Vec<[u32; 6]>>,
     config: VarDctConfig,
     capabilities: EncoderCapabilities,
     max_storage_binding_size: u64,
@@ -131,7 +132,7 @@ impl VarDctBackend {
         map: VarDctStrategyMap,
         config: VarDctConfig,
     ) -> Result<Self, EncodeError> {
-        let plan = TransformPlan::new(map, config.quantization, &config.coefficient_orders)?;
+        let plan = TransformPlan::new(map, &config)?;
         let mut backend = Self::new_with_topology(context, VarDctTopology::StrategyMap, config)?;
         backend.transform_plan = Some(Arc::new(plan));
         Ok(backend)
@@ -152,7 +153,11 @@ impl VarDctBackend {
             ),
             ("max_buffer_size", limits.max_buffer_size),
         ] {
-            let required = std::mem::size_of::<VarDctKernelParams>() as u64;
+            let required = if topology == VarDctTopology::TiledDct8 {
+                super::types::TILED_QUANTIZATION_BYTES
+            } else {
+                std::mem::size_of::<VarDctKernelParams>() as u64
+            };
             if required > available {
                 return Err(UnsupportedFeature::DeviceLimit {
                     name,
@@ -162,6 +167,13 @@ impl VarDctBackend {
                 .into());
             }
         }
+        let tiled_metadata = (topology == VarDctTopology::TiledDct8)
+            .then(|| {
+                config
+                    .dequant_matrices
+                    .metadata(VarDctStrategy::Dct8, &config.coefficient_orders)
+            })
+            .transpose()?;
         let (kernel_key, default_variant, workgroup_storage_bytes) =
             if topology == VarDctTopology::TiledDct8 {
                 (
@@ -230,8 +242,7 @@ impl VarDctBackend {
                         hf_multiplier: None,
                     }],
                 )?,
-                config.quantization,
-                &config.coefficient_orders,
+                &config,
             )?))
         } else {
             None
@@ -243,6 +254,7 @@ impl VarDctBackend {
             hf_entropy,
             topology,
             transform_plan,
+            tiled_metadata,
             config: config.clone(),
             capabilities: EncoderCapabilities {
                 profiles: vec![ProfileCapability::VarDct {
@@ -645,14 +657,12 @@ impl GpuEncodeBackend for VarDctBackend {
             .queue()
             .write_buffer(&parameters, 0, bytemuck::bytes_of(&plan.kernel.params));
 
-        let tiled_orders = (self.topology == VarDctTopology::TiledDct8).then(|| {
+        let tiled_quantization = self.tiled_metadata.as_ref().map(|metadata| {
             context
                 .device()
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("tiled VarDCT coefficient orders"),
-                    contents: bytemuck::cast_slice(
-                        &self.config.coefficient_orders.indices(VarDctStrategy::Dct8),
-                    ),
+                    label: Some("tiled VarDCT matrices and coefficient orders"),
+                    contents: bytemuck::cast_slice(metadata),
                     usage: wgpu::BufferUsages::STORAGE,
                 })
         });
@@ -695,9 +705,9 @@ impl GpuEncodeBackend for VarDctBackend {
                         },
                         wgpu::BindGroupEntry {
                             binding: 3,
-                            resource: tiled_orders
+                            resource: tiled_quantization
                                 .as_ref()
-                                .expect("tiled coefficient orders")
+                                .expect("tiled quantization metadata")
                                 .as_entire_binding(),
                         },
                     ],
@@ -806,7 +816,7 @@ impl GpuEncodeBackend for VarDctBackend {
             _parameters: parameters,
             _artifact: artifact,
             _transform: transform_scratch,
-            _tiled_orders: tiled_orders,
+            _tiled_quantization: tiled_quantization,
             readback,
             _memory_permit: memory_permit,
             mapped: AtomicBool::new(false),
@@ -911,7 +921,7 @@ impl VarDctMapCompletion {
 
 struct VarDctJobLifetime {
     _transform: Option<transforms::Scratch>,
-    _tiled_orders: Option<wgpu::Buffer>,
+    _tiled_quantization: Option<wgpu::Buffer>,
     _parameters: Arc<wgpu::Buffer>,
     _artifact: Arc<wgpu::Buffer>,
     readback: Arc<wgpu::Buffer>,

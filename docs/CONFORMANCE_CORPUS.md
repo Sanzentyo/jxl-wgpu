@@ -693,8 +693,9 @@ code is in `tests/native.rs`; there are no path-based module remappings.
 
 `vardct_encoder/tests/single.rs` adds textured images for all 27 strategies with default and custom
 LF/HF correlation. Each compressed AC value is checked against independent f64 color conversion,
-cosine sums or native impulse bases, and native matrices/orders within one integer quantizer step.
-All 108 natural/custom-order streams agree across Rust `jxl`, `djxl` and the stock GPU decoder within one RGB8 code,
+cosine sums or native impulse bases, native orders and independent default/parametric matrices within one integer quantizer step.
+All 135 default/custom-matrix and natural/custom-order streams agree across Rust `jxl`, `djxl`
+and the stock GPU decoder within one RGB8 code,
 and their bytes are identical under Scalar/32/64/128/256 lanes. Large-transform decoding now
 accepts the frequency-CfL requirement implemented by the resident renderer, while unknown
 capability bits remain errors. A maximum-magnitude 256x256 fragment uses 6,967,356 bits in its
@@ -707,7 +708,7 @@ Reverse, rotated and shuffled AC ranks extend through 65,536 coefficients; the L
 fixed. Length, duplicate/range and moved-LF inputs are rejected before GPU work. Identity orders
 restore the default, transposed rectangles share a class, and special 8×8 orders do not change DCT8.
 
-The single-transform matrix crosses both correlation choices with natural/custom orders, checks
+The order-only single-transform submatrix crosses both correlation choices with natural/custom orders, checks
 every AC value against the unchanged native/f64 references, and requires identical decoded pixels
 between order choices. Three additional mixed maps (512×512, 2057×17 and 13×21) carry custom
 orders, including all 13 families in one image. All nine maps and all 108 single-transform streams
@@ -715,7 +716,26 @@ retain Scalar/32/64/128/256 byte identity and the one-RGB8-code native/Rust/GPU 
 Tiled custom-order cases cover 1×1, 13×21, 257×17 and 2057×17 with custom correlation, blocking/Future
 identity, five variants and exact natural/custom pixel equality. Whole and seven-byte-fragmented
 input through 40-byte GPU windows produce identical GPU output. Exact/one-byte-deficient budgets,
-abandoned completion and successful reuse cover both the tiled order buffer and mixed arenas.
+abandoned completion and successful reuse cover both the tiled matrix/order buffer and mixed arenas.
+
+`vardct_encoder/tests/matrices.rs` checks parametric modes 0–6 in all 17 compatible matrix
+families, including 1/3/16-band vectors and every transform orientation. Modes 3–6 match the
+independent `jxl-vardct` expansion bit for bit. Modes 1/2 instead compare every AC scale exactly
+with four pinned libjxl records in `parametric_matrices.bin`: the older Rust parser omits their
+normative ×64 wire scaling. The production decoder now applies that scale. Equivalent constant
+mode-1/2/6 matrices on DCT8, Hornuss and DCT2 require exact Rust pixel equality and the unchanged
+one-RGB8-code native/GPU bound under whole input and 40-byte GPU windows. The unused DC entries
+retain each implementation's convention; they do not participate in HF quantization.
+
+Twenty-seven additional single-transform streams combine custom matrices, custom orders and
+custom LF metadata. Three additional mixed maps bring the total to twelve; each compares every
+AC coefficient against independent transforms and matrices and checks all three decoders and
+five workgroup variants. Tiled matrix cases cover 1×1, 13×21, 257×17 and 2057×17, blocking/Future
+byte identity and seven-byte input fragments through 40-byte GPU windows. Typed negative tests
+cover incompatible modes, empty/oversized/mismatched bands, invalid expanded weights and HF
+integer overflow. Exact/one-byte-deficient budgets, cancellation and reuse include the combined
+1,536-byte tiled matrix/order table and custom-matrix mixed arenas. Default reset restores the
+one-bit all-default matrix encoding. Raw mode-7 matrix encoding remains open.
 
 The all-family mixed case exposed a decoder metadata cursor limit inherited from MA trees. Its
 replacement is the declared permutation grammar's bound, at most 387,867 values for all families.
@@ -748,7 +768,7 @@ Rust `jxl` and installed `djxl` must decode each emitted codestream, while the s
 explicit readback must differ from Rust `jxl` by at most one RGB8 code.
 
 Single-transform and tiled DCT8 both encode real AC. GPU tile workgroups run the DCT8 forward
-transform/default-matrix quantizer, then pack natural-order Y/X/B tokens through one prefix
+transform/selected-matrix quantizer, then pack selected-order Y/X/B tokens through one prefix
 cluster for all 495 coefficient contexts. Tiled coefficients remain in workgroup memory; only
 complete bit fragments and their lengths are stored. The host checks those fragments and joins
 them in group order. Partial final words are not inserted into the codestream as block padding.

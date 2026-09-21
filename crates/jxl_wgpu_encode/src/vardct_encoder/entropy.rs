@@ -59,22 +59,21 @@ impl HfEntropyPlan {
         output: &mut BitWriter,
         ac_groups: u32,
         coefficient_payload: bool,
-        orders: &super::VarDctCoefficientOrders,
+        config: &super::VarDctConfig,
     ) -> Result<(), EncodeError> {
+        config.dequant_matrices.write(output)?;
         if !coefficient_payload {
             // The historical zero-HF artifact has no coefficient order-dependent payload.
             // Prefix single-symbol distributions consume no pass-group payload bits.
-            output.write_bits(1, 1)?;
             let histogram_bits = ac_groups.next_power_of_two().trailing_zeros() as u8;
             output.write_bits(0, histogram_bits)?;
             output.write_bits(0x124a, 17)?;
             return Ok(());
         }
 
-        output.write_bits(1, 1)?; // all default dequantization matrices
         let preset_bits = ac_groups.next_power_of_two().trailing_zeros() as u8;
         output.write_bits(0, preset_bits)?; // one HF preset
-        orders.write(output)?;
+        config.coefficient_orders.write(output)?;
 
         write_prefix_config(output, &self.code, 495)
     }

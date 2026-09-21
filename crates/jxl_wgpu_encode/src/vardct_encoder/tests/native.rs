@@ -6,7 +6,7 @@ use jxl_gpu_bitstream::BitReader;
 pub(super) struct Oracle {
     strategy: VarDctStrategy,
     order: Vec<usize>,
-    dequant: [Vec<f64>; 3],
+    pub(super) dequant: [Vec<f64>; 3],
     basis: Vec<f64>,
 }
 

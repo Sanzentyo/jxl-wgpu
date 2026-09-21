@@ -1,5 +1,5 @@
 // Tiled DCT8: one workgroup owns each replicated 8x8 input block and AC fragment.
-@group(0) @binding(3) var<storage, read> coefficient_orders: array<array<u32, 3>, 64>;
+@group(0) @binding(3) var<storage, read> quantization: array<QuantizationEntry, 64>;
 
 // Both vec3 arrays have a 16-byte stride: exactly 2,048 workgroup bytes.
 // AC coefficients live only here, never in storage or mapped readback buffers.
@@ -21,11 +21,11 @@ fn serialize_block_ac(block: u32) {
         let channel = array<u32, 3>(1u, 0u, 2u)[channel_index];
         var nonzero = 0u;
         for (var order = 1u; order < 64u; order += 1u) {
-            nonzero += u32(block_ac[coefficient_orders[order][channel]][channel] != 0);
+            nonzero += u32(block_ac[quantization[order].order[channel]][channel] != 0);
         }
         bit_offset = encode_ac_unsigned(base, params.ac_words_per_block, nonzero, bit_offset);
         for (var order = 1u; order < 64u && nonzero != 0u; order += 1u) {
-            let value = block_ac[coefficient_orders[order][channel]][channel];
+            let value = block_ac[quantization[order].order[channel]][channel];
             bit_offset = encode_ac_unsigned(base, params.ac_words_per_block, zigzag_signed(value), bit_offset);
             nonzero -= u32(value != 0);
         }
@@ -103,4 +103,22 @@ fn quantize_blocks(
         artifact_words[params.dc_offset + 2u * block_count + block] = bitcast<u32>(quantized_b);
         serialize_block_ac(block);
     }
+}
+
+fn quantize_dct8_ac(coefficient: vec3<f32>, frequency_x: u32, frequency_y: u32) -> vec3<i32> {
+    let decorrelated = vec3<f32>(
+        fma(-coefficient.y, params.hf_correlation[0], coefficient.x),
+        coefficient.y,
+        fma(-coefficient.y, params.hf_correlation[1], coefficient.z),
+    );
+    let scale = f32(params.global_scale) * f32(params.hf_multiplier) / 65536.0;
+    var quantized = vec3<i32>(0);
+    for (var channel = 0u; channel < 3u; channel += 1u) {
+        let value = decorrelated[channel]
+            * scale
+            * params.hf_quantization[channel]
+            / quantization[frequency_x * 8u + frequency_y].dequant[channel];
+        quantized[channel] = quantize_checked(value, HF_QUANTIZATION_OVERFLOW);
+    }
+    return quantized;
 }

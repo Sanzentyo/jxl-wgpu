@@ -1,7 +1,9 @@
 //! Shared strategy constants and bounded metadata expansion for both codecs.
 //! No image samples or coefficients enter this module.
 
+mod matrices;
 mod quantization;
+pub use matrices::{VarDctMatrixEncoding, VarDctMatrixError};
 #[cfg(test)]
 mod tests;
 

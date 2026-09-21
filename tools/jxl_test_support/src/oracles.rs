@@ -11,3 +11,4 @@ pub mod modular_integer;
 pub mod patches;
 pub mod progressive;
 pub mod tone_mapping;
+pub mod vardct_matrices;
