@@ -34,8 +34,12 @@ described below.
 `FrameIndexLimits` and `FrameSeekLimits`. They bind an optional `jxli` to complete input headers,
 or generate a conservative index, restore required LF/reference versions on GPU, and expose only
 the target through `GpuSeekSession`. Its blocking/async frame and progressive-update APIs preserve
-original timing, physical IDs and output ownership. Input acquisition remains whole-file;
-incremental seek handoff and non-coalesced layers remain open.
+original timing, physical IDs and output ownership. `stream_seek(request, index_limits)` accepts
+the same borrowed transport events as `stream`, collects bounded index metadata, and transfers its
+shared spans with `finish(target, seek_limits)` after authoritative End. Input byte/span pressure
+is retryable without advancing either frontend; malformed indexes release owned input and cannot
+be ignored. Early previews retain independent ownership. Seeking still requires all input;
+byte-range acquisition and non-coalesced layers remain open.
 [Index validation, dependency bounds and evidence](../../docs/FRAME_SEEKING.md).
 
 `GpuOutputRequest::with_image_selection(ImageSelection::Preview)` selects the embedded preview.

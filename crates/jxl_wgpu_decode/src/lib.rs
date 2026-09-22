@@ -128,7 +128,7 @@ pub use session::{
     NextGpuUpdate, PrefetchBackpressure, PrefetchGpuFrames, PrefetchProgress, PreparedGpuSession,
     SubmittedGpuFrame, SubmittedGpuUpdate,
 };
-pub use session::{GpuSeekSession, NextSeekFrame};
+pub use session::{GpuDecodeSeekStream, GpuSeekSession, NextSeekFrame};
 pub use vardct_engine::{
     GpuJpegCoefficients, GpuJpegFrame, JpegCoefficientError, JpegCoefficientLayout,
     JpegCoefficientLimits, JpegCoefficientPending, JpegCoefficientPlane, JpegCoefficientSession,

@@ -11,6 +11,16 @@ other driver-private allocations cannot be measured portably and are not include
 
 ## ABI rules
 
+Incremental seeking adds no shader bindings. `FrameIndexCollector` owns at most the caller's
+`FrameIndexLimits` payload and entry bounds, with geometric capped payload growth and fixed-size
+state for unrelated boxes. Encoded bytes are released after parsing; event failure drops encoded
+and parsed storage. These host metadata allocations are separate from the input byte/span budget.
+`GpuDecodeSeekStream` admits input before either observer mutates, and moves the existing source
+tokens into the bounded seek session only after transport End and index/dependency checks.
+Failure or cancellation releases its input ownership; independently taken previews keep their
+intersecting tokens. GPU completion and retained-output accounting use the ordinary decode path.
+[API and ownership contract](FRAME_SEEKING.md#incremental-input).
+
 Opaque container metadata has separate host ownership in
 [`MetadataCollector` / `Metadata`](CONTAINER_METADATA.md). Selected encoded bytes and box count
 are bounded independently of input spans and GPU allocations; decompression additionally bounds

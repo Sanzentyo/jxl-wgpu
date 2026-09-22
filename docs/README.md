@@ -23,7 +23,7 @@ not as a prerequisite reading sequence for every edit.
 |---|---|
 | How do complete input, early previews, and main-image selection differ? | [Decoder executable profile](../crates/jxl_wgpu_decode/README.md#executable-profile) |
 | When are LF/pass images valid, and when does animation time advance? | [Intermediate LF and pass images](../crates/jxl_wgpu_decode/README.md#intermediate-lf-and-pass-images) |
-| How are `jxli` indexes validated and reference dependencies restored for a seek? | [Frame indexes and bounded GPU seeking](FRAME_SEEKING.md) |
+| How are whole or incrementally received `jxli` indexes validated and reference dependencies restored for a seek? | [Frame indexes and bounded GPU seeking](FRAME_SEEKING.md) |
 | What do source precision, numeric channels, alpha, and orientation mean? | [Decoder sample/output contracts](../crates/jxl_wgpu_decode/README.md#integer-source-samples) and the following output sections |
 | What does incremental transport retain and validate? | [Bitstream scanner and inventory](../crates/jxl_gpu_bitstream/README.md) |
 | Does standard decoding depend on the private acceleration box? | [Lossless Modular profile](../crates/jxl_wgpu_encode/README.md#lossless-modular-profile); `jwgp` is optional |

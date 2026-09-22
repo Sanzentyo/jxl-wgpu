@@ -6,6 +6,9 @@ use std::task::{Context, Poll};
 
 use jxl_gpu_bitstream::FrameIndexLimits;
 
+mod stream;
+pub use stream::GpuDecodeSeekStream;
+
 use super::{
     GpuDecodeSession, GpuDecoder, GpuFrameLease, GpuSubmissionEngine, GpuSubmissionSession,
 };
@@ -68,23 +71,21 @@ impl<E: GpuSubmissionEngine> GpuDecoder<E> {
         )?;
         let bound = BoundFrameIndex::new(inventory, index, index_limits)?;
         let plan = bound.seek(target, seek_limits)?;
-        self.open_seek_plan(codestream, request, plan)
+        open_seek_plan(self.engine.as_ref(), codestream, request, plan)
     }
+}
 
-    fn open_seek_plan(
-        &self,
-        codestream: crate::GpuCodestream,
-        request: GpuOutputRequest,
-        plan: FrameSeekPlan,
-    ) -> Result<GpuSeekSession<E::Session>> {
-        let prepared = self
-            .engine
-            .open(codestream, &request, plan.selection.clone())?;
-        Ok(GpuSeekSession::new(
-            GpuDecodeSession::new(prepared, request)?,
-            plan,
-        ))
-    }
+fn open_seek_plan<E: GpuSubmissionEngine>(
+    engine: &E,
+    codestream: crate::GpuCodestream,
+    request: GpuOutputRequest,
+    plan: FrameSeekPlan,
+) -> Result<GpuSeekSession<E::Session>> {
+    let prepared = engine.open(codestream, &request, plan.selection.clone())?;
+    Ok(GpuSeekSession::new(
+        GpuDecodeSession::new(prepared, request)?,
+        plan,
+    ))
 }
 
 /// Decodes and drops the bounded preroll, then exposes only the requested presentation.

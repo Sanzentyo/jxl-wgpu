@@ -1,6 +1,8 @@
 #![cfg(not(target_arch = "wasm32"))]
 //! Engine-boundary tests: no pixel codec or GPU device is needed to audit retained source ranges.
 
+mod seek;
+
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};

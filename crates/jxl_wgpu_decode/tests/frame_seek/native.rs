@@ -27,6 +27,13 @@ fn native_indexes_preserve_offsets_and_bad_native_clocks_cannot_authorize_seekin
         assert_eq!(presentation, plan.presentations.len());
         if mode == "still" {
             BoundFrameIndex::new(source.clone(), Some(index), Default::default()).unwrap();
+            let stream = streaming::receive(&decoder, &data, request());
+            let mut seek = stream.finish(0, Default::default()).unwrap();
+            let frame = seek.next_frame().unwrap().unwrap();
+            assert_eq!(frame.metadata.index, 0);
+            assert!(frame.is_complete());
+            drop((frame, seek));
+            released(&backend);
         } else {
             // Unmodified 0.12.0 writes a zero first interval despite a nonzero frame duration.
             // Keep this as a rejection witness, not a compatibility relaxation or oracle repair.
@@ -42,6 +49,16 @@ fn native_indexes_preserve_offsets_and_bad_native_clocks_cannot_authorize_seekin
                     FrameSeekError::Duration { entry: 0 }
                 ))
             ));
+            assert!(matches!(
+                streaming::receive(&decoder, &data, request()).finish(0, Default::default()),
+                Err(jxl_wgpu_decode::Error::FrameSeek(
+                    FrameSeekError::Duration { entry: 0 }
+                ))
+            ));
+            assert_eq!(
+                decoder.incremental_input_budget().snapshot().reserved_bytes,
+                0
+            );
             released(&backend);
         }
         let generated = BoundFrameIndex::new(source, None, Default::default()).unwrap();

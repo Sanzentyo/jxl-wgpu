@@ -21,7 +21,7 @@ use crate::{
 
 mod seek;
 mod update;
-pub use seek::{GpuSeekSession, NextSeekFrame};
+pub use seek::{GpuDecodeSeekStream, GpuSeekSession, NextSeekFrame};
 pub use update::{FrameProgression, NextGpuUpdate, SubmittedGpuUpdate};
 
 /// GPU-resident frame returned by an engine before bounded lease wrapping.
@@ -628,6 +628,14 @@ impl<E: GpuSubmissionEngine> GpuDecodeStream<E> {
     /// Consumes the authoritative event stream and opens the same GPU session used by contiguous
     /// input. No complete host codestream is assembled.
     pub fn finish(mut self) -> Result<GpuDecodeSession<E::Session>> {
+        let (codestream, inventory) = self.finish_parts()?;
+        let inventory =
+            crate::SelectedImageInventory::new(inventory, self.request.image_selection())?;
+        let prepared = self.engine.open(codestream, &self.request, inventory)?;
+        GpuDecodeSession::new(prepared, self.request)
+    }
+
+    fn finish_parts(&mut self) -> Result<(GpuCodestream, Arc<CodestreamInventory>)> {
         if self.failed {
             return Err(Error::IncrementalInputPoisoned);
         }
@@ -657,10 +665,7 @@ impl<E: GpuSubmissionEngine> GpuDecodeStream<E> {
                 "incremental source length differs from authoritative transport end",
             ));
         }
-        let inventory =
-            crate::SelectedImageInventory::new(inventory, self.request.image_selection())?;
-        let prepared = self.engine.open(codestream, &self.request, inventory)?;
-        GpuDecodeSession::new(prepared, self.request)
+        Ok((codestream, inventory))
     }
 
     fn handle_inventory_events(

@@ -24,7 +24,8 @@ pub mod metadata;
 mod stream;
 
 pub use frame_index::{
-    FRAME_INDEX_BOX_TYPE, FrameIndex, FrameIndexEntry, FrameIndexError, FrameIndexLimits,
+    FRAME_INDEX_BOX_TYPE, FrameIndex, FrameIndexCollector, FrameIndexCollectorStats,
+    FrameIndexEntry, FrameIndexError, FrameIndexLimits,
 };
 
 #[cfg(test)]

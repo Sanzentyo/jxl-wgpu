@@ -5,6 +5,9 @@ use std::sync::Arc;
 
 use crate::ParsedJxl;
 
+mod collector;
+pub use collector::{FrameIndexCollector, FrameIndexCollectorStats};
+
 pub const FRAME_INDEX_BOX_TYPE: [u8; 4] = *b"jxli";
 const MAX_VARINT: u64 = i64::MAX as u64;
 
@@ -70,8 +73,16 @@ pub enum FrameIndexError {
     DuplicateBox,
     #[error("compressed jxli boxes are not supported")]
     CompressedBox,
-    #[error("allocation failed for bounded jxli entries")]
+    #[error("allocation failed for bounded jxli metadata")]
     Allocation,
+    #[error("frame-index collector has failed")]
+    CollectorFailed,
+    #[error("frame-index collector already received transport end")]
+    CollectorFinished,
+    #[error("frame-index collection requires complete transport")]
+    IncompleteTransport,
+    #[error("invalid frame-index transport event sequence")]
+    EventContract,
 }
 
 impl FrameIndex {

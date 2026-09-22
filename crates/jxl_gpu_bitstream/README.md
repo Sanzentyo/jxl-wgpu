@@ -17,7 +17,11 @@ streams are joined.
 `FrameIndex` parses and emits bounded plain `jxli` payloads and rejects duplicate boxes or
 unsupported compressed indexes. It retains logical offsets, rational tick units and displayed
 frame intervals without authorizing a restart. Header/dependency binding and GPU seeking belong
-to `jxl_wgpu_decode`. [Index contract and remaining scope](../../docs/FRAME_SEEKING.md).
+to `jxl_wgpu_decode`. `FrameIndexCollector` observes borrowed transport events, retains only bounded
+index metadata, and requires authoritative End before handoff. Known payload limits apply before
+allocation; byte-drip growth is geometric. Failures drop encoded and parsed storage, and unrelated
+boxes never retain their payload or caller allocation.
+[Index contract and remaining scope](../../docs/FRAME_SEEKING.md).
 
 The public `metadata` module retains Exif, XMP, JUMBF and unknown auxiliary payloads by explicit
 selection. `MetadataCollector` consumes borrowed transport events without retaining their source

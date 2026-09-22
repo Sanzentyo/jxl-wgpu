@@ -16,6 +16,7 @@ use jxl_wgpu_decode::{
 mod native;
 mod ownership;
 mod planning;
+mod streaming;
 
 fn source(name: &str) -> Vec<u8> {
     jxl_test_support::offline::hex::unhex(

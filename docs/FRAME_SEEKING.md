@@ -19,6 +19,35 @@ renumbered. The reconstruction view preserves original frame finality and refere
 semantics; the stock engine also preserves the full animation's choice of surface renderer.
 This keeps seek output bit-identical to sequential GPU output for the covered paths.
 
+## Incremental input
+
+`GpuDecoder::stream_seek(request, index_limits)` returns `GpuDecodeSeekStream`. Feed borrowed
+events from `ContainerStreamScanner` under `decoder.container_stream_limits()`, including the
+events returned by `finish_input()`. Then `finish(target, seek_limits)` transfers the retained
+shared codestream spans into the same `GpuSeekSession` used by contiguous input. It never joins
+the complete host codestream. Raw input, compact/extended/to-end index boxes, ordered `jxlp`,
+and version-1 out-of-order fragments follow the existing scanner's transport contract.
+
+`FrameIndexCollector` observes those events alongside header inventory. It copies only the bounded
+plain index payload, drops its encoded storage after parsing, and keeps parsed entries until End.
+Other boxes retain fixed-size state only; a four-byte `brob` probe rejects compressed `jxli`.
+Duplicate, malformed, oversized or inconsistent indexes cannot fall back to a generated index.
+`finish` on the collector requires authoritative End, and header/dependency binding still occurs
+before the GPU engine opens. `stats()` and `index_stats()` report separate input and metadata
+ownership. The index's host bounds are independent of `IncrementalInputBudget` and GPU memory.
+
+Input byte/span admission precedes both frontends: capacity exhaustion leaves the borrowed event
+unconsumed and retryable after another owner releases capacity. Other event errors poison the
+stream and release its retained input spans and encoded/parsed index. A failed consuming `finish`
+also releases its input ownership. An upstream scanner failure requires dropping the frontend;
+events from a failed scanner cannot establish transport completion.
+
+`is_preview_ready` and `take_preview` retain the ordinary incremental preview contract. A complete
+preview can decode and validate on GPU before main input ends, sharing only intersecting input
+tokens. Later index or main-stream failure cannot invalidate that independently validated output.
+Main-image seeking waits for the complete transport and header inventory even if the target's
+bytes arrived earlier. Byte-range fetching and seeking before main-input completion remain open.
+
 ## Index metadata and binding
 
 `jxl_gpu_bitstream::FrameIndex` reads at most one plain `jxli` through `from_container`, or
@@ -87,8 +116,8 @@ libjxl revision `a7a9c787341cf703dede03c2009fa460cae5e5df`,
 [`encode_internal.h`](https://github.com/libjxl/libjxl/blob/a7a9c787341cf703dede03c2009fa460cae5e5df/lib/jxl/encode_internal.h)
 and its `EncodeFrameIndexBox` implementation in `encode.cc`.
 
-This API requires complete input. Byte-range acquisition, incremental index collection and seek
-handoff, compressed-index policy, non-coalesced layer output, and broader container/feature
+Seeking requires complete input, received contiguously or incrementally. Byte-range acquisition,
+compressed-index policy, non-coalesced layer output, and broader container/feature
 conformance remain open. Skipped frame entropy is deliberately not validated or reported as
 validated; a valid target lease only attests to that target and the dependencies actually decoded.
 `CONT-03` and `FRAME-04` remain **Partial**, and no CPU codec fallback is introduced.

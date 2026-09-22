@@ -404,6 +404,13 @@ interval. The planner resolves exact LF/reference versions before GPU work, reta
 frame attributes and the full animation's output path, and suppresses preroll presentations.
 The seek operation's end is separate from bitstream frame finality.
 
+`stream_seek` combines the ordinary incremental input owner with a bounded `FrameIndexCollector`.
+Input byte/span admission occurs before either observer advances. After authoritative transport
+End, exact header/index/dependency checks precede the same engine-open boundary; shared source
+tokens transfer without host concatenation. Fatal event errors drop both owners, while independent
+preview prefixes retain only their existing shared ranges. The [seek contract](FRAME_SEEKING.md)
+defines completion and the remaining byte-range boundary.
+
 Physical producers can retain codec components before inverse color conversion for patch
 references. This is an explicit private surface domain, independent of the RGB output layout.
 Patch dictionaries execute in bounded GPU count/validate and command-emission passes; the host

@@ -51,6 +51,27 @@ all truncated prefixes, nonminimal/overflowing varints, offset/count/time overfl
 denominator, duplicate offsets/boxes, forbidden compressed indexes, exact caps and canonical
 emission. Default and fragmented containers preserve logical offsets.
 
+The incremental collector adds every two-chunk split and one-byte delivery for compact, extended
+and to-end `jxli`, including indexes between ordered or version-1 reordered fragments. Exact and
+one-short payload/entry/frame caps, malformed prefixes, duplicate/compressed indexes, event order,
+missing or repeated End, and zero retention for unrelated large boxes preserve typed failure.
+Caller-allocation weak references confirm the collector does not keep borrowed event storage.
+
+`stream_preview::seek` audits the seek engine boundary without decoding pixels: every raw/indexed
+two-chunk split retains original source ranges and physical inventories; missing End, wrong index,
+target/work bounds and engine-open failure release source tokens. Byte and span pressure retries
+the identical event without advancing index or input state. Late malformed index metadata releases
+main input while an independently taken preview retains exactly its intersecting tokens.
+
+`frame_seek::streaming` compares all target updates against contiguous GPU seeking and final pixels
+against native libjxl for six unchanged Modular, composed alpha, recursive-DC, noise, patch and
+preview-animation sources. Input arrives in 43-byte chunks, with plain-index `jxlc` and version-1
+`jxlp` carrying a future final fragment before fragment 0 and an index between them. GPU entropy
+windows stay at 256 bytes. Pending cancellation, retained target updates, completion, admission
+retry and corrupted required/preroll entropy check both GPU and incremental-input reservations.
+Native still indexes also take this event-fed path; native dense/sparse clock errors remain errors
+at handoff before GPU work.
+
 The decoder's `frame_seek` target compares every presentation of 21 unchanged source streams
 against sequential GPU RGBA8 output exactly and libjxl output within the existing one-code bound.
 Sources include Gray/RGB/high-depth alpha Modular, VarDCT, recursive DC, mixed JPEG/Modular,
@@ -83,8 +104,8 @@ preserve all exact source RGB8 words, native pixels and original timing. The nat
 development-only and existing fixtures are unchanged.
 
 The target requires an actual GPU; Apple M5/Metal is the recorded adapter, with two libtest threads
-and sequential test processes. Full-input parsing, conservatively bounded GPU restart and index
-generation are the supported slice. Incremental index collection/handoff, byte-range input,
+and sequential test processes. Complete contiguous or incrementally received input, bounded GPU
+restart and index generation are the supported slice. Byte-range input,
 compressed indexes, non-coalesced layers and broader conformance remain open.
 [API and bounds](FRAME_SEEKING.md).
 
