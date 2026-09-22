@@ -97,9 +97,11 @@ impl Default for VarDctQuantization {
     }
 }
 
-/// Quantizers, matrices, LF metadata and coefficient orders shared by all VarDCT encoders.
+/// Quantizers, matrices, LF metadata, coefficient orders and AC passes for all VarDCT encoders.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct VarDctConfig {
+    /// Spectral/quantized AC progression; defaults to one complete pass.
+    pub progressive: crate::ProgressivePlan,
     pub quantization: VarDctQuantization,
     pub lf_metadata: VarDctLfMetadata,
     /// Immutable caller-selected permutations; defaults to natural order for every size class.

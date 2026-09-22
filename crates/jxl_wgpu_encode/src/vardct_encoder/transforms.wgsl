@@ -95,21 +95,25 @@ fn serialize_transforms_ac(@builtin(workgroup_id) group: vec3<u32>) {
     let task = tasks[task_index];
     let area = task.width * task.height;
     let llf = area / 64u;
-    let base = params.ac_fragment_offset + task.ac_word_offset;
-    var bit_offset = 0u;
-    for (var channel_index = 0u; channel_index < 3u; channel_index += 1u) {
-        let channel = array<u32, 3>(1u, 0u, 2u)[channel_index];
-        let offset = task.coefficient_offset + channel * area;
-        var nonzero = 0u;
-        for (var order = llf; order < area; order += 1u) {
-            nonzero += u32(quantized_coefficients[offset + quantization[task.metadata_offset + order].order[channel]] != 0);
+    for (var pass_index = 0u; pass_index < params.ac_pass_count; pass_index += 1u) {
+        let base = params.ac_fragment_offset + pass_index * params.ac_pass_words + task.ac_word_offset;
+        var bit_offset = 0u;
+        for (var channel_index = 0u; channel_index < 3u; channel_index += 1u) {
+            let channel = array<u32, 3>(1u, 0u, 2u)[channel_index];
+            let offset = task.coefficient_offset + channel * area;
+            var nonzero = 0u;
+            for (var order = llf; order < area; order += 1u) {
+                let index = quantization[task.metadata_offset + order].order[channel];
+                nonzero += u32(progressive_value(quantized_coefficients[offset + index], index, task.width, task.height, pass_index) != 0);
+            }
+            bit_offset = encode_ac_unsigned(base, task.ac_word_capacity, nonzero, bit_offset);
+            for (var order = llf; order < area && nonzero != 0u; order += 1u) {
+                let index = quantization[task.metadata_offset + order].order[channel];
+                let value = progressive_value(quantized_coefficients[offset + index], index, task.width, task.height, pass_index);
+                bit_offset = encode_ac_unsigned(base, task.ac_word_capacity, zigzag_signed(value), bit_offset);
+                nonzero -= u32(value != 0);
+            }
         }
-        bit_offset = encode_ac_unsigned(base, task.ac_word_capacity, nonzero, bit_offset);
-        for (var order = llf; order < area && nonzero != 0u; order += 1u) {
-            let value = quantized_coefficients[offset + quantization[task.metadata_offset + order].order[channel]];
-            bit_offset = encode_ac_unsigned(base, task.ac_word_capacity, zigzag_signed(value), bit_offset);
-            nonzero -= u32(value != 0);
-        }
+        artifact_words[params.ac_descriptor_offset + pass_index * params.ac_descriptor_len + task_index] = bit_offset;
     }
-    artifact_words[params.ac_descriptor_offset + task_index] = bit_offset;
 }

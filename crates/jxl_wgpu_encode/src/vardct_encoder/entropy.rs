@@ -76,9 +76,11 @@ impl HfEntropyPlan {
 
         let preset_bits = ac_groups.next_power_of_two().trailing_zeros() as u8;
         output.write_bits(0, preset_bits)?; // one HF preset
-        config.coefficient_orders.write(output)?;
-
-        write_prefix_config(output, &self.code, 495)
+        for _ in config.progressive.passes() {
+            config.coefficient_orders.write(output)?;
+            write_prefix_config(output, &self.code, 495)?;
+        }
+        Ok(())
     }
 }
 

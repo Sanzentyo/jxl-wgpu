@@ -173,6 +173,8 @@ impl VarDctColorEncoding {
 pub struct TiledVarDctGrid {
     pub width: u32,
     pub height: u32,
+    /// AC pass count; `new` selects one, while the encoder's `grid` uses its configuration.
+    pub passes: u8,
     pub block_columns: u32,
     pub block_rows: u32,
     pub ac_group_columns: u32,
@@ -207,6 +209,7 @@ impl TiledVarDctGrid {
         let grid = Self {
             width,
             height,
+            passes: 1,
             block_columns: width.div_ceil(8),
             block_rows: height.div_ceil(8),
             ac_group_columns: width.div_ceil(Self::AC_GROUP_DIMENSION),
@@ -237,14 +240,21 @@ impl TiledVarDctGrid {
         )
     }
 
-    /// One fused packet for a single AC group; otherwise DC global, every DC
-    /// group, AC global, then one pass packet per AC group.
+    /// One fused packet for one AC group and one pass; otherwise DC global, every DC
+    /// group, AC global, then one packet per AC group in every pass.
     pub fn toc_entries(self) -> Result<u32, EncodeError> {
-        if self.ac_group_count()? == 1 {
+        if !(1..=crate::ProgressivePlan::MAX_PASSES as u8).contains(&self.passes) {
+            return Err(EncodeError::InvalidConfiguration(
+                "invalid VarDCT pass count",
+            ));
+        }
+        if self.ac_group_count()? == 1 && self.passes == 1 {
             return Ok(1);
         }
-        self.lf_group_count()?
-            .checked_add(self.ac_group_count()?)
+        let lf_groups = self.lf_group_count()?;
+        self.ac_group_count()?
+            .checked_mul(u32::from(self.passes))
+            .and_then(|groups| groups.checked_add(lf_groups))
             .and_then(|groups| groups.checked_add(2))
             .ok_or(EncodeError::InvalidConfiguration(
                 "VarDCT TOC entry count overflow",
@@ -406,7 +416,10 @@ pub(super) struct VarDctKernelParams {
     pub(super) ac_words_per_block: u32,
     pub(super) ac_fragment_words: u32,
     pub(super) workgroups_x: u32,
-    pub(super) padding: [u32; 22],
+    pub(super) ac_pass_count: u32,
+    pub(super) ac_pass_words: u32,
+    pub(super) progressive: [u32; 11],
+    pub(super) padding: [u32; 9],
 }
 
 #[repr(C)]
@@ -445,7 +458,8 @@ pub(super) struct VarDctArtifactHeader {
     pub(super) ac_fragment_offset: u32,
     pub(super) ac_words_per_block: u32,
     pub(super) ac_fragment_words: u32,
-    pub(super) padding: [u32; 3],
+    pub(super) ac_pass_count: u32,
+    pub(super) padding: [u32; 2],
 }
 
 #[repr(C)]
@@ -468,6 +482,7 @@ const _: () = {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ArtifactLayout {
+    pub(super) ac_pass_count: u32,
     pub(super) fragment_descriptor_offset: u32,
     pub(super) fragment_descriptor_len: u32,
     pub(super) strategy_offset: u32,
@@ -490,6 +505,43 @@ pub(super) struct ArtifactLayout {
 }
 
 impl ArtifactLayout {
+    pub(super) fn with_passes(mut self, count: usize) -> Result<Self, EncodeError> {
+        let overflow = || EncodeError::InvalidConfiguration("VarDCT pass arena overflow");
+        if !(1..=crate::ProgressivePlan::MAX_PASSES).contains(&count) || self.ac_pass_count != 1 {
+            return Err(EncodeError::InvalidConfiguration(
+                "invalid VarDCT pass count",
+            ));
+        }
+        if count == 1 {
+            return Ok(self);
+        }
+        if self.ac_descriptor_len == 0 {
+            return Err(EncodeError::InvalidConfiguration(
+                "progressive frame has no AC slots",
+            ));
+        }
+        self.ac_pass_count = count as u32;
+        let descriptors = self
+            .ac_descriptor_len
+            .checked_mul(self.ac_pass_count)
+            .ok_or_else(overflow)?;
+        self.ac_fragment_offset = align_words(
+            self.ac_descriptor_offset
+                .checked_add(descriptors)
+                .ok_or_else(overflow)?,
+        )?;
+        self.ac_fragment_words = self
+            .ac_fragment_words
+            .checked_mul(self.ac_pass_count)
+            .ok_or_else(overflow)?;
+        self.artifact_words = align_words(
+            self.ac_fragment_offset
+                .checked_add(self.ac_fragment_words)
+                .ok_or_else(overflow)?,
+        )?;
+        Ok(self)
+    }
+
     pub(super) fn for_strategy_map(
         frame: VarDctFrameLayout,
         code: &VarDctPrefixCode,
@@ -608,6 +660,7 @@ impl ArtifactLayout {
             )?)?;
         Ok(Self {
             fragment_descriptor_offset,
+            ac_pass_count: 1,
             fragment_descriptor_len,
             strategy_offset,
             strategy_len,

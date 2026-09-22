@@ -119,4 +119,7 @@ records the mixed-map, tiled, malformed-parameter and ownership cases.
 These are regression and interoperability bounds fixed before running the tests. They do not
 establish ISO precision, perceptual distance, rate control, content-adaptive strategy/matrix
 selection, adaptive entropy or progressive encoding. Raw-matrix encoding has separate GPU entropy,
-malformed-input and ownership evidence in the procedural corpus. The full JPEG XL goal remains open.
+malformed-input and ownership evidence in the procedural corpus. Spectral/quantized AC encoding has
+separate coefficient, intermediate-image and ownership gates in the
+[progressive encoder corpus](../../../../docs/CONFORMANCE_CORPUS.md#progressive-vardct-encoding).
+The full JPEG XL goal remains open.

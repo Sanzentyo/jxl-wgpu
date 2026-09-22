@@ -15,22 +15,26 @@ fn serialize_block_ac(block: u32) {
     // Fixed word-sized slots have disjoint writes even when adjacent blocks
     // finish mid-word. All 495 contexts use one prefix distribution, so the
     // complete block token sequences can be joined without entropy state.
-    let base = params.ac_fragment_offset + block * params.ac_words_per_block;
-    var bit_offset = 0u;
-    for (var channel_index = 0u; channel_index < 3u; channel_index += 1u) {
-        let channel = array<u32, 3>(1u, 0u, 2u)[channel_index];
-        var nonzero = 0u;
-        for (var order = 1u; order < 64u; order += 1u) {
-            nonzero += u32(block_ac[quantization[order].order[channel]][channel] != 0);
+    for (var pass_index = 0u; pass_index < params.ac_pass_count; pass_index += 1u) {
+        let base = params.ac_fragment_offset + pass_index * params.ac_pass_words + block * params.ac_words_per_block;
+        var bit_offset = 0u;
+        for (var channel_index = 0u; channel_index < 3u; channel_index += 1u) {
+            let channel = array<u32, 3>(1u, 0u, 2u)[channel_index];
+            var nonzero = 0u;
+            for (var order = 1u; order < 64u; order += 1u) {
+                let index = quantization[order].order[channel];
+                nonzero += u32(progressive_value(block_ac[index][channel], index, 8u, 8u, pass_index) != 0);
+            }
+            bit_offset = encode_ac_unsigned(base, params.ac_words_per_block, nonzero, bit_offset);
+            for (var order = 1u; order < 64u && nonzero != 0u; order += 1u) {
+                let index = quantization[order].order[channel];
+                let value = progressive_value(block_ac[index][channel], index, 8u, 8u, pass_index);
+                bit_offset = encode_ac_unsigned(base, params.ac_words_per_block, zigzag_signed(value), bit_offset);
+                nonzero -= u32(value != 0);
+            }
         }
-        bit_offset = encode_ac_unsigned(base, params.ac_words_per_block, nonzero, bit_offset);
-        for (var order = 1u; order < 64u && nonzero != 0u; order += 1u) {
-            let value = block_ac[quantization[order].order[channel]][channel];
-            bit_offset = encode_ac_unsigned(base, params.ac_words_per_block, zigzag_signed(value), bit_offset);
-            nonzero -= u32(value != 0);
-        }
+        artifact_words[params.ac_descriptor_offset + pass_index * params.ac_descriptor_len + block] = bit_offset;
     }
-    artifact_words[params.ac_descriptor_offset + block] = bit_offset;
 }
 
 @compute @workgroup_size(wg_x, 1, 1)

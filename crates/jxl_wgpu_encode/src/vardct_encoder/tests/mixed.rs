@@ -12,7 +12,7 @@ fn placement(x: u32, y: u32, strategy: VarDctStrategy) -> VarDctTransform {
     VarDctTransform::new(x, y, strategy)
 }
 
-fn packed_map(width: u32, height: u32, include_all: bool) -> VarDctStrategyMap {
+pub(super) fn packed_map(width: u32, height: u32, include_all: bool) -> VarDctStrategyMap {
     let (w, h) = (width.div_ceil(8), height.div_ceil(8));
     let mut occupied = vec![false; (w * h) as usize];
     let mut transforms = Vec::new();
@@ -194,6 +194,7 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
             &oracles
         };
         let config = VarDctConfig {
+            progressive: Default::default(),
             dequant_matrices: if case >= 12 {
                 raw_matrices::selected(map.transforms().iter().map(|task| task.strategy))
             } else if case >= 9 {
@@ -367,6 +368,7 @@ fn mixed_jobs_admit_exact_memory_reject_wrong_extents_and_release_after_cancella
         orders::selected(VarDctStrategy::ALL),
         orders::selected(VarDctStrategy::ALL),
         orders::selected(VarDctStrategy::ALL),
+        orders::selected(VarDctStrategy::ALL),
     ]
     .into_iter()
     .enumerate()
@@ -374,8 +376,13 @@ fn mixed_jobs_admit_exact_memory_reject_wrong_extents_and_release_after_cancella
         let map = packed_map(512, 512, true);
         let metadata = VarDctLfMetadata::default();
         let custom = VarDctConfig {
+            progressive: if case == 4 {
+                progressive::combined()
+            } else {
+                Default::default()
+            },
             coefficient_orders,
-            dequant_matrices: if case == 3 {
+            dequant_matrices: if case >= 3 {
                 raw_matrices::selected(VarDctStrategy::ALL)
             } else if case == 2 {
                 matrices::selected()

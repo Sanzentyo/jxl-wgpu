@@ -1055,6 +1055,60 @@ window without touching its host-parsed descriptor and must return typed
 quant-matrix scales; a lower-level actual-GPU artifact test observes non-default scale multipliers
 for all three channels directly in the resident resource vectors.
 
+## Progressive VarDCT encoding
+
+`vardct_encoder/tests/progressive.rs` and its child modules exercise GPU spectral and quantized
+AC splitting with the existing fixed prefix policy. All 27 strategies use textured RGB8,
+custom orders, raw matrices and LF metadata. For each, three schedules produce 81 additional
+streams: spectral `(2,0)/(4,0)/(8,0)`, quantized `(8,3)/(8,1)/(8,0)`, and combined
+`(2,2)/(4,3)/(4,0)/(8,1)/(8,0)`. Pairs denote spectral size and shift. Independent `jxl_coding`
+entropy decoding recovers every pass's coefficients; an i64 specification tracks the finest
+included quantization at each frequency and requires exact accumulated values after every pass.
+Final coefficients equal the single-pass baseline exactly, whose original f64/native transform
+check remains unchanged. Rust final RGB8 is byte-identical to the baseline; native libjxl and
+GPU outputs stay within the existing one-code bound.
+
+A separate GPU probe checks 78,408 split values: 27 transform extents, eleven frequency
+positions, eleven signed values including both i32 endpoints, and five schedules totaling
+24 passes. The extra schedules cover an initially empty AC rectangle `(1,3)/(8,0)` and the
+maximum eleven passes, including odd spectral sizes and every legal shift. Expected results
+use i64 cumulative targets rather than the shader's residual loop. Zero/excessive pass counts,
+invalid shifts/order/finality, duplicated arena expansion, sixteen-K square arena overflow,
+request/config mismatch and an actual 64-KiB device binding limit have rejection evidence.
+
+Five tiled images cover 17×1/two passes, 13×21/three spectral passes, 257×17/three quantized
+passes, 2057×17/five combined passes and 1×1/eleven passes. They combine raw DCT8 with other
+parametric families, custom orders and LF metadata. Native scalar libjxl supplies every DC,
+intermediate AC and final linear RGBA-F32 image. Bounds remain `1e-5` for DC, `2e-4` for
+intermediate AC and `1e-4` for the final image. Normal native SIMD is also required for every
+stage, including progression metadata, finite samples and at most one code after independent
+linear-to-sRGB8 conversion. Independent jxl-oxide additionally checks the final linear image
+at `1e-4`. Whole input and seven-byte transport fragments through 40/256-byte windows are
+byte-identical. Held outputs remain immutable, final-only decoding equals the last update,
+and GPU/input reservations return to zero. The reported pass count and TOC match the physical
+inventory; blocking/Future encoding and all five workgroup variants produce identical bytes.
+
+The scalar oracle uses the unchanged libjxl 0.12.0 source at
+`a7a9c787341cf703dede03c2009fa460cae5e5df`, compiled completely with `HWY_COMPILE_ONLY_SCALAR`.
+On Apple M5/Metal, the 13×21 raw-matrix image exposes native SIMD's documented
+`ApproximateReciprocal` in `lib/jxl/quantizer-inl.h`: final linear GPU/SIMD maxAE is
+`0.0001397133`, also present in native final-only decoding. Scalar native/GPU maxAE is
+`0.0000029206`; independent jxl-oxide/GPU is `0.0000030994`. The scalar build preserves the
+original floating bound and the original input, while the SIMD RGB8 comparison remains.
+The [oracle recipe](../tools/jxl_test_support/README.md#scalar-progressive-oracle) requires the
+pinned build and verifies its runtime version; unavailable or mismatched native tools fail.
+No codec arithmetic is changed to imitate reciprocal-estimate error.
+
+Three further mixed maps (all strategies at 512×512, an LF boundary at 2057×17, and replicated
+non-DCT8 edges at 13×21) combine five passes with all 17 raw families, custom orders and LF
+metadata. Final Rust pixels equal the single-pass baseline; native and GPU retain the one-code
+bound. Blocking/Future and all five forward variants preserve bytes. Artifact corruption tests
+check first and last slots in every pass at counts 1/3/11. Exact-budget, one-byte-deficient,
+abandoned-completion and successful-reuse checks cover eleven-pass tiled and five-pass mixed
+jobs, including raw-matrix storage. These are spectral/quantized AC interoperability and
+ownership gates. Separate DC progressive frames, reduced-resolution stopping hints,
+center-first/saliency ordering and full ISO precision remain open.
+
 ## Modular orientation and semantic header admission
 
 `testsrc_modular_orientation_*.jxl.hex` contains 23 synthetic lossless images generated with

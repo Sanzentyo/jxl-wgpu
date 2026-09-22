@@ -102,7 +102,39 @@ libjxl 0.12.0, requests the declared encoding and verifies the actual output col
 require this oracle; missing tools or version mismatches fail. Existing fixtures and references
 are read without replacement. See the [intent recipe](../../crates/jxl_wgpu_decode/test-data/original_color_generator/README.md#original-intent-variants).
 
-Run the workspace checks from the repository root with Rust 1.98 or later:
+## Scalar progressive oracle
+
+`oracles::progressive::scalar_linear_updates` requires libjxl 0.12.0 compiled entirely with
+`HWY_COMPILE_ONLY_SCALAR`. Its inverse quantizer uses ordinary division rather than SIMD
+reciprocal estimates. The [progressive encoder corpus](../../docs/CONFORMANCE_CORPUS.md#progressive-vardct-encoding)
+records a raw-matrix image where that distinction exceeds the existing final linear-F32 bound.
+The scalar reference keeps that bound and all inputs; normal native SIMD still checks every
+pass's RGB8 precision independently. Other `native_updates*` entry points retain their existing
+system-library behavior.
+
+Reuse the existing pinned libjxl checkout and scalar native build, when available. The existing
+Modular YCbCr CMake project supplies the shared scalar library and now also builds
+`decode_progressive_scalar` from the unchanged pass-decoding algorithm in `decode_progressive.c`.
+No fixture regeneration or extra Cargo target directory is required:
+
+```sh
+JXL_NATIVE_SOURCE=/absolute/path/to/pinned/libjxl
+JXL_SCALAR_BUILD=/absolute/path/to/existing/scalar-build
+cmake -S crates/jxl_wgpu_decode/test-data/modular_ycbcr_generator \
+  -B "$JXL_SCALAR_BUILD" -DCMAKE_BUILD_TYPE=Release -DJXL_SCALAR_ONLY=ON \
+  -DJXL_SOURCE="$JXL_NATIVE_SOURCE"
+cmake --build "$JXL_SCALAR_BUILD" --target decode_progressive_scalar --parallel 4
+export JXL_PROGRESSIVE_SCALAR_ORACLE="$JXL_SCALAR_BUILD/decode_progressive_scalar"
+cargo test --locked -p jxl_wgpu_encode --lib vardct_encoder::tests::progressive -- --test-threads=2
+```
+
+CMake rejects revisions other than `a7a9c787341cf703dede03c2009fa460cae5e5df` and applies the
+scalar definition to libjxl and its helper together. The helper checks build/runtime version
+0.12.0; Rust verifies its scalar identity before using it. Missing or mismatched helpers fail
+instead of selecting another reference or skipping. This is development-only CPU oracle work.
+
+Run the workspace checks from the repository root with Rust 1.98 or later, keeping that oracle
+environment available:
 
 ```sh
 cargo check --workspace --all-targets --all-features

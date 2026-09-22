@@ -47,7 +47,7 @@ pub(super) fn image_header(width: u32, height: u32) -> Result<BitFragment, Encod
     Ok(BitFragment::byte_aligned(output.into_bytes())?)
 }
 
-fn frame_header() -> Result<BitFragment, EncodeError> {
+fn frame_header(progressive: &crate::ProgressivePlan) -> Result<BitFragment, EncodeError> {
     let mut output = BitWriter::new();
     output.write_bits(0, 1)?; // non-default so restoration can be disabled
     output.write_bits(0, 2)?; // regular frame
@@ -56,7 +56,18 @@ fn frame_header() -> Result<BitFragment, EncodeError> {
     output.write_bits(0, 2)?; // no upsampling
     output.write_bits(3, 3)?; // default X quant-matrix scale
     output.write_bits(2, 3)?; // default B quant-matrix scale
-    output.write_bits(0, 2)?; // one pass
+    let passes = progressive.passes();
+    write_u32(
+        &mut output,
+        passes.len() as u32,
+        [(1, 0), (2, 0), (3, 0), (4, 3)],
+    )?;
+    if passes.len() > 1 {
+        output.write_bits(0, 2)?; // no reduced-resolution stopping hints
+        for pass in &passes[..passes.len() - 1] {
+            output.write_bits(u64::from(pass.shift), 2)?;
+        }
+    }
     output.write_bits(0, 1)?; // full-canvas frame
     output.write_bits(0, 2)?; // replace blending
     output.write_bits(1, 1)?; // final frame
@@ -337,7 +348,11 @@ pub(super) fn build_frame_packet(
     let ac_groups = frame.ac_group_count()?;
     let lf_groups = frame.lf_group_count()?;
     let coefficient_payload = artifact.has_ac_payload();
-    if ac_groups == 1 && lf_groups == 1 {
+    let passes = config.progressive.passes().len() as u8;
+    if passes > 1 && !coefficient_payload {
+        return Err(BackendError::InvalidArtifact("progressive frame has no AC payload").into());
+    }
+    if ac_groups == 1 && lf_groups == 1 && passes == 1 {
         let mut group = BitWriter::new();
         write_lf_global(&mut group, code, hf_entropy, coefficient_payload, config)?;
         write_lf_group(&mut group, code, artifact, frame, 0, config.quantization)?;
@@ -348,10 +363,10 @@ pub(super) fn build_frame_packet(
             config,
             artifact.raw_matrices,
         )?;
-        artifact.ac.append_group(&mut group, frame, 0)?;
+        artifact.ac.append_group(&mut group, frame, 0, 0)?;
         group.align_to_byte()?;
         return Ok(FramePacketSet::new(
-            frame_header()?,
+            frame_header(&config.progressive)?,
             FrameGroupLayout::new(1, 1, 1)?,
             [GroupPacket::new(
                 GroupPacketKind::Single,
@@ -380,9 +395,14 @@ pub(super) fn build_frame_packet(
     ac_global.align_to_byte()?;
 
     let mut packets = Vec::with_capacity(
-        usize::try_from(ac_groups.checked_add(lf_groups).ok_or(
-            EncodeError::InvalidConfiguration("VarDCT packet count overflow"),
-        )?)
+        usize::try_from(
+            ac_groups
+                .checked_mul(u32::from(passes))
+                .and_then(|groups| groups.checked_add(lf_groups))
+                .ok_or(EncodeError::InvalidConfiguration(
+                    "VarDCT packet count overflow",
+                ))?,
+        )
         .map_err(|_| EncodeError::InvalidConfiguration("VarDCT packet count overflow"))?
             + 2,
     );
@@ -410,18 +430,22 @@ pub(super) fn build_frame_packet(
         GroupPacketKind::AcGlobal,
         ac_global.into_bytes(),
     ));
-    for group in 0..ac_groups {
-        let mut output = BitWriter::new();
-        artifact.ac.append_group(&mut output, frame, group)?;
-        output.align_to_byte()?;
-        packets.push(GroupPacket::new(
-            GroupPacketKind::AcGroup { pass: 0, group },
-            output.into_bytes(),
-        ));
+    for pass in 0..passes {
+        for group in 0..ac_groups {
+            let mut output = BitWriter::new();
+            artifact
+                .ac
+                .append_group(&mut output, frame, group, u32::from(pass))?;
+            output.align_to_byte()?;
+            packets.push(GroupPacket::new(
+                GroupPacketKind::AcGroup { pass, group },
+                output.into_bytes(),
+            ));
+        }
     }
     Ok(FramePacketSet::new(
-        frame_header()?,
-        FrameGroupLayout::new(lf_groups, ac_groups, 1)?,
+        frame_header(&config.progressive)?,
+        FrameGroupLayout::new(lf_groups, ac_groups, passes)?,
         packets,
     )?)
 }

@@ -271,7 +271,7 @@ impl VarDctBackend {
                 profiles: vec![ProfileCapability::VarDct {
                     quantization: config.quantization,
                 }],
-                max_progressive_passes: 1,
+                max_progressive_passes: ProgressivePlan::MAX_PASSES as u8,
                 animation: false,
                 determinism: Determinism::SameDevice,
                 implemented_stages: vec![
@@ -428,7 +428,8 @@ impl VarDctBackend {
                 VarDctTopology::TiledDct8 => {
                     ArtifactLayout::for_tiled_grid(frame, &self.code, &self.hf_entropy)?
                 }
-            };
+            }
+            .with_passes(self.config.progressive.passes().len())?;
             let required_workgroup_axis = match frame.topology {
                 VarDctTopology::TiledDct8 => blocks_x.max(blocks_y),
                 VarDctTopology::SingleTransform(_) | VarDctTopology::StrategyMap => {
@@ -502,7 +503,19 @@ impl VarDctBackend {
                         workgroups_x: (frame.blocks_x * frame.blocks_y * 64)
                             .div_ceil(self.workgroup_variant.workgroup_size().0)
                             .min(self.max_compute_workgroups_per_dimension),
-                        padding: [0; 22],
+                        ac_pass_count: layout.ac_pass_count,
+                        ac_pass_words: layout.ac_fragment_words / layout.ac_pass_count,
+                        progressive: std::array::from_fn(|index| {
+                            self.config
+                                .progressive
+                                .passes()
+                                .get(index)
+                                .map_or(0, |pass| {
+                                    u32::from(pass.coefficient_square.get())
+                                        | u32::from(pass.shift) << 8
+                                })
+                        }),
+                        padding: [0; 9],
                     },
                     layout,
                 },
@@ -619,7 +632,7 @@ fn validate_tiled_device_limits(limits: &wgpu::Limits) -> Result<(), EncodeError
 fn validate_vardct_request(
     request: &FrameEncodeRequest,
     frame: VarDctFrameLayout,
-    quantization: VarDctQuantization,
+    config: &VarDctConfig,
 ) -> Result<(), EncodeError> {
     if request.frame_index != FrameIndex::new(0)
         || !request.is_last
@@ -627,13 +640,21 @@ fn validate_vardct_request(
         || request.canvas_width != frame.width
         || request.canvas_height != frame.height
         || request.options != FrameOptions::default()
-        || request.progressive != ProgressivePlan::single()
     {
         return Err(EncodeError::InvalidConfiguration(
             "the VarDCT profile requires one full-canvas final transform-sized still frame",
         ));
     }
-    if request.profile != (EncodeProfile::VarDct { quantization }) {
+    if request.progressive != config.progressive {
+        return Err(EncodeError::InvalidConfiguration(
+            "the requested VarDCT passes do not match the backend configuration",
+        ));
+    }
+    if request.profile
+        != (EncodeProfile::VarDct {
+            quantization: config.quantization,
+        })
+    {
         return Err(EncodeError::InvalidConfiguration(
             "the requested VarDCT quantization does not match the backend configuration",
         ));
@@ -665,7 +686,7 @@ impl GpuEncodeBackend for VarDctBackend {
             return Err(UnsupportedFeature::InputFormat.into());
         };
         let plan = self.dispatch_plan(&source)?;
-        validate_vardct_request(request, plan.frame, self.config.quantization)?;
+        validate_vardct_request(request, plan.frame, &self.config)?;
         let memory_permit = context
             .memory_budget()
             .try_reserve(plan.memory.owned_bytes_per_job)?;
@@ -1036,7 +1057,7 @@ impl VarDctJob {
         let lengths = artifact_words(
             all_words,
             layout.ac_descriptor_offset,
-            layout.ac_descriptor_len,
+            layout.ac_descriptor_len * layout.ac_pass_count,
         )?
         .to_vec();
         drop(mapped);
@@ -1210,6 +1231,7 @@ pub(super) fn validate_artifact<'a>(
         || header.ac_fragment_offset != layout.ac_fragment_offset
         || header.ac_words_per_block != layout.ac_words_per_block
         || header.ac_fragment_words != layout.ac_fragment_words
+        || header.ac_pass_count != layout.ac_pass_count
     {
         return Err(BackendError::InvalidArtifact(
             "VarDCT status, live counts, orientation, or layout metadata mismatch",
@@ -1288,7 +1310,7 @@ pub(super) fn validate_artifact<'a>(
         validate_zero_gap(words, dc_end, layout.ac_descriptor_offset)?;
         validate_zero_gap(
             words,
-            layout.ac_descriptor_offset + layout.ac_descriptor_len,
+            layout.ac_descriptor_offset + layout.ac_descriptor_len * layout.ac_pass_count,
             layout.ac_fragment_offset,
         )?;
         validate_zero_gap(
@@ -1296,14 +1318,22 @@ pub(super) fn validate_artifact<'a>(
             layout.ac_fragment_offset + layout.ac_fragment_words,
             layout.artifact_words,
         )?;
-        let bit_lengths =
-            artifact_words(words, layout.ac_descriptor_offset, layout.ac_descriptor_len)?;
+        let bit_lengths = artifact_words(
+            words,
+            layout.ac_descriptor_offset,
+            layout.ac_descriptor_len * layout.ac_pass_count,
+        )?;
         let ac_words = artifact_words(words, layout.ac_fragment_offset, layout.ac_fragment_words)?;
         match frame.topology {
             VarDctTopology::StrategyMap => {
                 let plan =
                     transform_plan.ok_or(BackendError::Invariant("missing transform map"))?;
-                plan.validate_ac(ac_words, bit_lengths, hf_entropy)?;
+                for (words, lengths) in ac_words
+                    .chunks_exact((layout.ac_fragment_words / layout.ac_pass_count) as usize)
+                    .zip(bit_lengths.chunks_exact(layout.ac_descriptor_len as usize))
+                {
+                    plan.validate_ac(words, lengths, hf_entropy)?;
+                }
                 AcFragments::StrategyMap {
                     words: ac_words,
                     bit_lengths,
@@ -1328,9 +1358,8 @@ pub(super) fn validate_artifact<'a>(
                 )?;
                 AcFragments::Single {
                     words: ac_words,
-                    bit_len: *bit_lengths.first().ok_or(BackendError::InvalidArtifact(
-                        "missing single-transform AC length",
-                    ))?,
+                    bit_lengths,
+                    words_per_pass: layout.ac_words_per_block,
                 }
             }
         }
@@ -1648,7 +1677,7 @@ impl VarDctEncoder {
             profile: EncodeProfile::VarDct {
                 quantization: self.encoder.backend().config.quantization,
             },
-            progressive: ProgressivePlan::single(),
+            progressive: self.encoder.backend().config.progressive.clone(),
             minimum_determinism: Determinism::SameDevice,
             animation: AnimationHeader::Still,
             canvas_width: width,
@@ -1738,7 +1767,10 @@ impl TiledVarDctEncoder {
 
     pub fn grid(&self, source: &BufferImageSource) -> Result<TiledVarDctGrid, EncodeError> {
         self.memory_plan(source)?;
-        TiledVarDctGrid::new(source.layout.extent.width, source.layout.extent.height)
+        Ok(TiledVarDctGrid {
+            passes: self.encoder.backend().config.progressive.passes().len() as u8,
+            ..TiledVarDctGrid::new(source.layout.extent.width, source.layout.extent.height)?
+        })
     }
 
     pub fn submit(&self, source: BufferImageSource) -> Result<VarDctSubmission, EncodeError> {
@@ -1774,7 +1806,7 @@ impl TiledVarDctEncoder {
             profile: EncodeProfile::VarDct {
                 quantization: self.encoder.backend().config.quantization,
             },
-            progressive: ProgressivePlan::single(),
+            progressive: self.encoder.backend().config.progressive.clone(),
             minimum_determinism: Determinism::SameDevice,
             animation: AnimationHeader::Still,
             canvas_width: frame.width,

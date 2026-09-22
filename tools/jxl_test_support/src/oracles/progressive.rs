@@ -17,6 +17,29 @@ pub fn native_updates(encoded: &[u8], linear: bool) -> Option<Vec<NativeUpdate>>
     native_updates_oriented(encoded, linear, false)
 }
 
+/// Required, pinned scalar libjxl reference for linear pass-image precision.
+///
+/// Its exact division avoids SIMD reciprocal-estimate error in inverse quantization.
+/// Build `decode_progressive_scalar` using the recipe in this crate's README and set
+/// `JXL_PROGRESSIVE_SCALAR_ORACLE` to that executable. This never changes the native
+/// SIMD oracle selected by the other entry points.
+pub fn scalar_linear_updates(encoded: &[u8]) -> Vec<NativeUpdate> {
+    static BINARY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let binary = BINARY.get_or_init(|| {
+        let path = std::env::var_os("JXL_PROGRESSIVE_SCALAR_ORACLE")
+            .map(std::path::PathBuf::from)
+            .expect("set JXL_PROGRESSIVE_SCALAR_ORACLE; see jxl_test_support/README.md");
+        let identity = std::process::Command::new(&path)
+            .arg("--version")
+            .output()
+            .expect("run the required scalar pass oracle");
+        assert!(identity.status.success(), "scalar oracle identity failed");
+        assert_eq!(identity.stdout, b"libjxl,0.12.0,scalar\n");
+        path
+    });
+    run_updates(binary, encoded, true, false, false, true, false)
+}
+
 pub fn native_updates_oriented(
     encoded: &[u8],
     linear: bool,
@@ -64,7 +87,6 @@ fn decode_updates(
 ) -> Option<Vec<NativeUpdate>> {
     use std::process::Command;
     static BINARY: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let binary = BINARY
         .get_or_init(|| {
             let flags = Command::new("pkg-config")
@@ -96,6 +118,28 @@ fn decode_updates(
             Some(binary)
         })
         .as_ref()?;
+    Some(run_updates(
+        binary,
+        encoded,
+        linear,
+        keep,
+        flush_prefix,
+        render_spots,
+        extra_planes,
+    ))
+}
+
+fn run_updates(
+    binary: &std::path::Path,
+    encoded: &[u8],
+    linear: bool,
+    keep: bool,
+    flush_prefix: bool,
+    render_spots: bool,
+    extra_planes: bool,
+) -> Vec<NativeUpdate> {
+    use std::process::Command;
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let directory = std::env::temp_dir().join(format!(
         "jxl-wgpu-pass-input-{}-{}",
         std::process::id(),
@@ -169,5 +213,5 @@ fn decode_updates(
         });
     }
     std::fs::remove_dir_all(directory).unwrap();
-    Some(updates)
+    updates
 }

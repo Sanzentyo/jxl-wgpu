@@ -351,6 +351,19 @@ the fragments against the caller's bounded matrix metadata before appending thei
 HF-global. Default, parametric and raw families can be interleaved. Content-adaptive matrix
 selection remains unimplemented.
 
+`VarDctConfig::progressive` selects a validated `ProgressivePlan` of 1–11 spectral/quantized
+AC passes; the default is one complete pass and preserves the existing single-pass bytes.
+Each `ProgressivePass::coefficient_square` is a size in `1..=8`, measured in eighths of both
+canonical frequency axes, with the longer axis horizontal. `shift` is in `0..=3`. A pass adds
+frequencies or reduces the shift at its current size; the last entry must be `(8, 0)`.
+The GPU divides the remaining signed coefficients by `2^shift` toward zero and emits each
+contribution independently of the caller's coefficient order. Prior contributions are subtracted
+only where their spectral rectangle included that coefficient. Thus increasing spectral size
+can also increase shift without losing newly introduced frequencies, and all passes reconstruct
+the exact single-pass quantized coefficients. Separate DC progressive frames, reduced-resolution
+stopping hints and adaptive group ordering remain unimplemented. Encoding still completes one
+whole frame per submission; progressive syntax does not imply an early encoder byte-stream API.
+
 The LF and AC streams use 33-symbol raw prefix alphabets, covering every signed 32-bit value.
 The global MA tree is one Gradient leaf with no LZ77. Prefix bits retain all 15 canonical bits;
 Modular lossless retains its separate raw-plus-LZ77 policy. Quantization multiplies scalar
@@ -371,26 +384,28 @@ serve development oracles. Production defaults no longer instantiate a CPU decod
 parser; common metadata dependencies may still use the latter two transitively.
 
 `TiledVarDctEncoder` accepts nonzero RGB8 dimensions through the checked 16,384-pixel per-axis
-bound. Partial edge blocks replicate the final source row/column on GPU. A single AC group uses
+bound. Partial edge blocks replicate the final source row/column on GPU. A single AC group with one pass uses
 the standard fused packet, including tiny and odd images; larger images carry every
 `ceil(width / 256) * ceil(height / 256)` AC group and
 `ceil(width / 2048) * ceil(height / 2048)` LF group. Each block is an independent DCT8 transform.
 The first pass dispatches a two-dimensional block grid, with 64 lanes by default. Each workgroup
 uses 2,048 bytes for 64 XYB pixels and 64 quantized AC vectors, plus a four-byte quantization error flag. Coefficients stay in shared
-memory and are immediately packed into one word-aligned block fragment; adjacent workgroups never
+memory and are immediately packed into one word-aligned block fragment per AC pass; adjacent workgroups never
 write the same storage word. The second pass predicts and packs DC, resetting Gradient at LF-group
 boundaries and writing a checked descriptor per LF group. Ending the first compute pass is the
 global visibility boundary before the control pass publishes the completed artifact.
 
 The host validates status, every layout field, live counts, DC residuals/histogram, AC counts and
 coefficient ranges, exact fragment consumption, and zero padding. It appends the GPU-owned block
-bits in AC-group raster order (Y, X, B inside each block), with byte alignment only at packet ends.
+bits in pass-major, AC-group raster order (Y, X, B inside each block), with byte alignment only at packet ends.
 There is no host transform, quantization, source padding, coefficient re-encoding, or pixel-codec
 fallback. The independently concatenable block format relies on the single-distribution prefix
 policy; future contextual or ANS encoders must maintain their state on GPU.
 
 `VarDctMemoryPlan::kernel_layout` distinguishes `SingleTransform`, `StrategyMap` and `TiledDct8`. All use
-768-byte parameters and a runtime-sized artifact with a 272-byte header. LF descriptors
+768-byte parameters and a runtime-sized artifact with a 272-byte header. The former carries
+the pass count, per-pass word stride and eleven spectral/shift descriptors; the latter records
+the pass count. Both record sizes remain unchanged. LF descriptors
 follow the header; the subsequent strategy, sample and entropy sections align to 256 bytes. Single-transform plans additionally report exact XYB, raw coefficient,
 LF, quantized coefficient, matrix/order, transform-task and forward scratch allocations in `transform`.
 Mapped plans report their aggregate allocation sizes: basis/uniform storage is shared per strategy,
@@ -419,6 +434,10 @@ strategy-specific bound per transform, with one length word each and no maximum-
 for smaller transforms. Tiled artifacts add one length word and a
 214-word AC slot per block, with each section aligned to 256 bytes. The slot bound comes from
 the actual prefix lengths for three counts and at most 63 signed coefficients per channel.
+Every AC pass reserves its own length array and complete slot arena; shared quantized coefficients,
+LF, raw-matrix fragments and matrix/order metadata are retained once. `grid().passes` and
+`toc_entries()` include the configured pass count, including non-fused tiny progressive frames.
+All pass fragments validate before assembly, using the same one submission and aggregate map.
 The complete parameter + artifact + readback + resident transform reservation remains live through validation or
 abandoned-job cleanup; caller-owned source bytes are reported separately. Source binding,
 artifact and transform bindings, buffer size, workgroup storage, invocation count, and per-axis dispatch limits
@@ -450,7 +469,11 @@ all 27 strategies, with poisoned gaps and two transforms per batch under all fiv
 An independent f64 cosine-sum reference checks AC values within one integer quantizer step;
 this is a numerical regression bound, not ISO precision or perceptual-quality certification.
 Blocking/Future assembly and all supported linear workgroup variants produce identical bytes.
-The suite also rejects malformed or missing GPU AC output, checks an insufficient device binding,
+The [progressive encoder matrix](../../docs/CONFORMANCE_CORPUS.md#progressive-vardct-encoding)
+adds 81 single-transform streams with exact coefficient accumulation, mixed maps, signed integer
+endpoints, native intermediate images and whole/fragmented convergence. F32 references use the
+pinned scalar libjxl oracle; normal native SIMD retains its independent RGB8 comparisons.
+The suite also rejects malformed or missing GPU AC output in every pass, checks an insufficient device binding,
 and tests exact budgets, one-byte backpressure, abandoned completion, and successful reuse.
 
 Contexts created with `WgpuContext::from_backend` inherit that backend's adapter-validated
@@ -477,16 +500,27 @@ encoder.encode(source_16_by_8)
 The tiled API has the same blocking, container, and executor-neutral `Future` completion forms:
 
 ```rust,no_run
-# use jxl_wgpu_encode::{BufferImageSource, TiledVarDctEncoder, WgpuContext};
+# use std::num::NonZeroU8;
+# use jxl_wgpu_encode::{BufferImageSource, ProgressivePass, ProgressivePlan, TiledVarDctEncoder, VarDctConfig, WgpuContext};
 # fn encode_tiled(
 #     context: WgpuContext,
 #     source_768_by_513: BufferImageSource,
 # ) -> Result<Vec<u8>, jxl_wgpu_encode::EncodeError> {
-let encoder = TiledVarDctEncoder::new(context)?;
+let progressive = ProgressivePlan::new(
+    [2, 4, 8].into_iter().map(|size| ProgressivePass {
+        coefficient_square: NonZeroU8::new(size).unwrap(),
+        shift: 0,
+    }).collect(),
+)?;
+let encoder = TiledVarDctEncoder::new_with_config(
+    context, VarDctConfig { progressive, ..Default::default() },
+)?;
 let plan = encoder.memory_plan(&source_768_by_513)?;
 let grid = encoder.grid(&source_768_by_513)?;
 assert_eq!(plan.kernel_layout, jxl_wgpu_encode::VarDctKernelLayout::TiledDct8);
 assert_eq!(grid.ac_group_count()?, 3 * 3);
+assert_eq!(grid.passes, 3);
+assert_eq!(grid.toc_entries()?, 1 + 2 + 3 * 9);
 encoder.encode(source_768_by_513)
 # }
 ```

@@ -17,7 +17,8 @@ pub(super) enum AcFragments<'a> {
     Empty,
     Single {
         words: &'a [u32],
-        bit_len: u32,
+        bit_lengths: &'a [u32],
+        words_per_pass: u32,
     },
     Dct8Blocks {
         words: &'a [u32],
@@ -32,6 +33,7 @@ impl AcFragments<'_> {
         output: &mut BitWriter,
         frame: VarDctFrameLayout,
         group: u32,
+        pass: u32,
     ) -> Result<(), EncodeError> {
         if group >= frame.ac_group_count()? {
             return Err(BackendError::Invariant("VarDCT AC group is out of range").into());
@@ -42,6 +44,14 @@ impl AcFragments<'_> {
                 bit_lengths,
                 plan,
             } => {
+                let count = plan.tasks.len();
+                let passes = bit_lengths.len() / count;
+                if pass as usize >= passes {
+                    return Err(BackendError::Invariant("VarDCT AC pass is out of range").into());
+                }
+                let pass_words = words.len() / passes;
+                let words = &words[pass as usize * pass_words..(pass as usize + 1) * pass_words];
+                let bit_lengths = &bit_lengths[pass as usize * count..(pass as usize + 1) * count];
                 for &index in &plan.ac_groups[group as usize] {
                     let task = &plan.tasks[index];
                     let start = task.ac_word_offset as usize;
@@ -51,13 +61,26 @@ impl AcFragments<'_> {
                 Ok(())
             }
             Self::Empty => Ok(()),
-            Self::Single { words, bit_len } => {
+            Self::Single {
+                words,
+                bit_lengths,
+                words_per_pass,
+            } => {
                 if frame.ac_group_count()? != 1 {
                     return Err(
                         BackendError::Invariant("single AC fragment in a tiled frame").into(),
                     );
                 }
-                append_gpu_fragment(output, words, 0, bit_len)
+                let bit_len = *bit_lengths
+                    .get(pass as usize)
+                    .ok_or(BackendError::Invariant("VarDCT AC pass is out of range"))?;
+                let start = pass as usize * words_per_pass as usize;
+                append_gpu_fragment(
+                    output,
+                    &words[start..start + words_per_pass as usize],
+                    0,
+                    bit_len,
+                )
             }
             Self::Dct8Blocks {
                 words,
@@ -69,9 +92,12 @@ impl AcFragments<'_> {
                 let y0 = group / frame.ac_groups_x * side;
                 let x1 = (x0 + side).min(frame.blocks_x);
                 let y1 = (y0 + side).min(frame.blocks_y);
+                let pass_base = pass
+                    .checked_mul(frame.blocks_x * frame.blocks_y)
+                    .ok_or(BackendError::Invariant("VarDCT AC pass offset overflow"))?;
                 for y in y0..y1 {
                     for x in x0..x1 {
-                        let block = (y * frame.blocks_x + x) as usize;
+                        let block = (pass_base + y * frame.blocks_x + x) as usize;
                         let bit_len = *bit_lengths
                             .get(block)
                             .ok_or(BackendError::Invariant("missing VarDCT AC block length"))?;

@@ -94,12 +94,15 @@ impl ProfileCapability {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ProgressivePass {
+    /// Spectral rectangle size in eighths of each canonical transform axis (1..=8).
+    /// The longer axis is horizontal, independently of the serialized coefficient order.
     pub coefficient_square: NonZeroU8,
+    /// Divide the remaining signed coefficients by `2^shift`, rounding toward zero (0..=3).
     pub shift: u8,
 }
 
 /// Spectral/quantized AC passes. JPEG XL permits at most 11 passes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProgressivePlan {
     passes: Vec<ProgressivePass>,
 }
@@ -127,11 +130,12 @@ impl ProgressivePlan {
         for pass in &passes {
             let coefficients = pass.coefficient_square.get();
             if coefficients > 8
+                || pass.shift > 3
                 || coefficients < previous.0
                 || (coefficients == previous.0 && pass.shift >= previous.1)
             {
                 return Err(EncodeError::InvalidConfiguration(
-                    "progressive passes must add coefficients or reduce shift",
+                    "progressive passes require shifts in 0..=3 and must add coefficients or reduce shift",
                 ));
             }
             previous = (coefficients, pass.shift);
@@ -148,6 +152,12 @@ impl ProgressivePlan {
     #[must_use]
     pub fn passes(&self) -> &[ProgressivePass] {
         &self.passes
+    }
+}
+
+impl Default for ProgressivePlan {
+    fn default() -> Self {
+        Self::single()
     }
 }
 

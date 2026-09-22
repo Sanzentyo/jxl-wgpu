@@ -13,7 +13,21 @@
 #include <math.h>
 #include <string.h>
 
+#ifdef JXL_PROGRESSIVE_SCALAR
+#include <jxl/version.h>
+#if !defined(HWY_COMPILE_ONLY_SCALAR) || JPEGXL_MAJOR_VERSION != 0 || JPEGXL_MINOR_VERSION != 12 || JPEGXL_PATCH_VERSION != 0
+#error "The scalar pass oracle requires a complete scalar libjxl 0.12.0 build"
+#endif
+#endif
+
 int main(int argc, char **argv) {
+#ifdef JXL_PROGRESSIVE_SCALAR
+  if (JxlDecoderVersion() != 12000) return 3;
+  if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+    puts("libjxl,0.12.0,scalar");
+    return 0;
+  }
+#endif
   if (argc < 2 || argc > 9) return 2;
   int linear = 0, keep = 0, flush_prefix = 0, spots = 1, extras = 0;
   for (int arg = 4; arg < argc; ++arg) {

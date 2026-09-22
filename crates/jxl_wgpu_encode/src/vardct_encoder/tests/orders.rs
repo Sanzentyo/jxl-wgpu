@@ -195,12 +195,21 @@ fn tiled_custom_orders_preserve_pixels_across_edges_groups_windows_and_variants(
 #[test]
 fn custom_tiled_order_storage_survives_cancellation_and_obeys_exact_admission() {
     let context = test_context().expect("actual GPU required for custom order lifetime");
-    for dequant_matrices in [
+    for (case, dequant_matrices) in [
         Default::default(),
         matrices::selected(),
         raw_matrices::selected(VarDctStrategy::ALL),
-    ] {
+        raw_matrices::selected(VarDctStrategy::ALL),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let config = VarDctConfig {
+            progressive: if case == 3 {
+                progressive::maximum()
+            } else {
+                Default::default()
+            },
             dequant_matrices,
             coefficient_orders: selected([VarDctStrategy::Dct8]),
             ..Default::default()

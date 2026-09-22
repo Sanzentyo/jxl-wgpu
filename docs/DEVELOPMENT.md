@@ -40,6 +40,11 @@ ownership exceptions use narrowly scoped, reason-bearing `expect` attributes.
 
 ## Capability-change gates
 
+Prepare the [scalar progressive oracle](../tools/jxl_test_support/README.md#scalar-progressive-oracle)
+for the encoder's intermediate-image precision checks and retain its
+`JXL_PROGRESSIVE_SCALAR_ORACLE` environment variable. Reuse the existing pinned native checkout
+and scalar build; a missing required oracle is a failed check.
+
 Run from the repository root while CI is disabled:
 
 ```console

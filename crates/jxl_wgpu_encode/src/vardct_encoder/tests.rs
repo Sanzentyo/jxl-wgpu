@@ -6,6 +6,7 @@ mod matrices;
 mod mixed;
 mod native;
 mod orders;
+mod progressive;
 mod quantization;
 mod raw_matrices;
 mod reference;
@@ -485,6 +486,9 @@ fn abi_records_are_pod_and_word_aligned() {
     params.ac_words_per_block = 0x110;
     params.ac_fragment_words = 0x111;
     params.workgroups_x = 0x112;
+    params.ac_pass_count = 0x113;
+    params.ac_pass_words = 0x114;
+    params.progressive[10] = 0x124;
     let params = [params];
     let parameter_words = bytemuck::cast_slice::<VarDctKernelParams, u32>(&params);
     assert_eq!(&parameter_words[84..88], &[0x55, 0x56, 0x57, 0x58]);
@@ -492,6 +496,8 @@ fn abi_records_are_pod_and_word_aligned() {
         &parameter_words[164..170],
         &[0x107, 0x108, 0x109, 0x110, 0x111, 0x112]
     );
+    assert_eq!(&parameter_words[170..172], &[0x113, 0x114]);
+    assert_eq!(parameter_words[182], 0x124);
 
     let mut header: VarDctArtifactHeader = bytemuck::Zeroable::zeroed();
     header.fragment_descriptor_offset = 0x41;
@@ -504,10 +510,12 @@ fn abi_records_are_pod_and_word_aligned() {
     header.ac_fragment_offset = 0x48;
     header.ac_words_per_block = 0x49;
     header.ac_fragment_words = 0x50;
+    header.ac_pass_count = 0x51;
     let headers = [header];
     let header_words = bytemuck::cast_slice::<VarDctArtifactHeader, u32>(&headers);
     assert_eq!(&header_words[55..60], &[0x41, 0x42, 0x43, 0x44, 0x45]);
     assert_eq!(&header_words[60..65], &[0x46, 0x47, 0x48, 0x49, 0x50]);
+    assert_eq!(header_words[65], 0x51);
 }
 
 #[test]

@@ -37,7 +37,10 @@ struct Params {
     ac_words_per_block: u32,
     ac_fragment_words: u32,
     workgroups_x: u32,
-    padding: array<u32, 22>,
+    ac_pass_count: u32,
+    ac_pass_words: u32,
+    progressive: array<u32, 11>,
+    padding: array<u32, 9>,
 }
 
 @group(0) @binding(0)
@@ -228,5 +231,30 @@ fn serialize_control() {
     artifact_words[62] = params.ac_fragment_offset;
     artifact_words[63] = params.ac_words_per_block;
     artifact_words[64] = params.ac_fragment_words;
+    artifact_words[65] = params.ac_pass_count;
     artifact_words[0] = ARTIFACT_READY;
+}
+
+// Split in canonical frequency coordinates, independent of serialized coefficient order.
+// Signed division rounds toward zero, including i32::MIN. Earlier contributions
+// are subtracted only where their spectral rectangle actually included this value.
+fn progressive_value(value: i32, index: u32, width: u32, height: u32, pass_index: u32) -> i32 {
+    if params.ac_pass_count == 1u { return value; }
+    let columns = max(width, height);
+    let rows = min(width, height);
+    let x = index % columns;
+    let y = index / columns;
+    let current = params.progressive[pass_index];
+    let square = current & 255u;
+    if x >= columns / 8u * square || y >= rows / 8u * square { return 0i; }
+    var residual = value;
+    for (var previous = 0u; previous < pass_index; previous += 1u) {
+        let spec = params.progressive[previous];
+        let side = spec & 255u;
+        if x < columns / 8u * side && y < rows / 8u * side {
+            let step = i32(1u << (spec >> 8u));
+            residual -= (residual / step) * step;
+        }
+    }
+    return residual / i32(1u << (current >> 8u));
 }
