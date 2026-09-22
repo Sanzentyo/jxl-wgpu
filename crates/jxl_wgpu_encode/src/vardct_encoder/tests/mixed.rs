@@ -195,6 +195,7 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
         };
         let config = VarDctConfig {
             progressive: Default::default(),
+            group_order: Default::default(),
             dequant_matrices: if case >= 12 {
                 raw_matrices::selected(map.transforms().iter().map(|task| task.strategy))
             } else if case >= 9 {
@@ -376,6 +377,11 @@ fn mixed_jobs_admit_exact_memory_reject_wrong_extents_and_release_after_cancella
         let map = packed_map(512, 512, true);
         let metadata = VarDctLfMetadata::default();
         let custom = VarDctConfig {
+            group_order: if case == 4 {
+                crate::VarDctGroupOrder::explicit(vec![2, 3, 1, 0]).unwrap()
+            } else {
+                Default::default()
+            },
             progressive: if case == 4 {
                 progressive::combined()
             } else {

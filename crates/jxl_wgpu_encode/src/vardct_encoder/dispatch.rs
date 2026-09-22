@@ -338,6 +338,7 @@ impl VarDctBackend {
                 VarDctFrameLayout::tiled_dct8(extent.width, extent.height)?
             }
         };
+        self.config.group_order.validate(frame)?;
         if source.layout.format != VarDctColorEncoding::SrgbD65.pixel_format()
             || source.layout.planes.len() != 1
             || !source.buffer.usage().contains(wgpu::BufferUsages::STORAGE)

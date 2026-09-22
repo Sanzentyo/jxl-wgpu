@@ -79,6 +79,29 @@ fn progressive_storage_and_request_mismatches_reject_before_admission() {
     assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
 
     let source = padded_rgb_source_sized(&context, 8, 8, &reference::pattern(8, 8));
+    for group_order in [
+        VarDctGroupOrder::centered_at(8, 0),
+        VarDctGroupOrder::centered_at(0, 8),
+        VarDctGroupOrder::explicit(vec![1, 0]).unwrap(),
+    ] {
+        let encoder = TiledVarDctEncoder::new_with_config(
+            context.clone(),
+            VarDctConfig {
+                group_order,
+                ..config.clone()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            encoder.memory_plan(&source),
+            Err(EncodeError::InvalidConfiguration(_))
+        ));
+        assert!(matches!(
+            encoder.submit(source.clone()),
+            Err(EncodeError::InvalidConfiguration(_))
+        ));
+        assert_eq!(context.memory_budget().snapshot().reserved_bytes, 0);
+    }
     let backend =
         VarDctBackend::new_with_config(&context, VarDctStrategy::Dct8, config.clone()).unwrap();
     let request = FrameEncodeRequest {

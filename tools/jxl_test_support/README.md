@@ -112,6 +112,11 @@ The scalar reference keeps that bound and all inputs; normal native SIMD still c
 pass's RGB8 precision independently. Other `native_updates*` entry points retain their existing
 system-library behavior.
 
+`scalar_linear_prefix_updates` uses the same pinned executable to flush incomplete input at
+complete AC-pass boundaries. It requests the helper's existing `prefix` mode; coefficient
+decoding and color arithmetic are unchanged. The encoder tests compare the flushed pixels
+and intended resolution with the corresponding whole-input pass, including permuted TOCs.
+
 Reuse the existing pinned libjxl checkout and scalar native build, when available. The existing
 Modular YCbCr CMake project supplies the shared scalar library and now also builds
 `decode_progressive_scalar` from the unchanged pass-decoding algorithm in `decode_progressive.c`.

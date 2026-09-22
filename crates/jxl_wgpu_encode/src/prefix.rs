@@ -326,6 +326,18 @@ pub(crate) struct RawPrefixCode<const N: usize> {
 }
 
 impl<const N: usize> RawPrefixCode<N> {
+    pub(crate) fn write_unsigned(
+        &self,
+        writer: &mut BitWriter,
+        value: u32,
+    ) -> Result<(), EncodeError> {
+        if value == 0 {
+            return self.write_raw(writer, 0, 0, 0);
+        }
+        let bits = 31 - value.leading_zeros();
+        self.write_raw(writer, bits + 1, bits, value - (1 << bits))
+    }
+
     pub(crate) fn from_counts(raw_counts: &[u64; N]) -> Result<Self, EncodeError> {
         Self::from_counts_bounded(raw_counts, 15)
     }
@@ -428,6 +440,27 @@ impl<const N: usize> RawPrefixCode<N> {
         writer.write_bits(u64::from(self.raw_bits[token]), self.raw_nbits[token])?;
         writer.write_bits(u64::from(bits), nbits as u8)?;
         Ok(())
+    }
+}
+
+impl RawPrefixCode<RAW_SYMBOLS> {
+    /// One raw prefix distribution shared by every context, with split exponent zero.
+    pub(crate) fn write_stream_config(
+        &self,
+        output: &mut BitWriter,
+        contexts: u32,
+    ) -> Result<(), EncodeError> {
+        output.write_bits(0, 1)?; // LZ77 disabled
+        if contexts > 1 {
+            output.write_bits(1, 1)?; // simple clustering
+            output.write_bits(0, 2)?; // every context uses distribution zero
+        }
+        output.write_bits(1, 1)?; // prefix code
+        output.write_bits(0, 4)?; // hybrid integer split exponent zero
+        output.write_bits(1, 1)?; // explicit alphabet size
+        output.write_bits(5, 4)?;
+        output.write_bits(0, 5)?; // 1 + 2^5 = 33 symbols, covering every u32
+        self.write_raw_tree(output)
     }
 }
 

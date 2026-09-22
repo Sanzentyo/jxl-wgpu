@@ -94,6 +94,10 @@ pub enum PacketError {
     Duplicate(crate::GroupPacketKind),
     #[error("packet {0:?} is missing")]
     Missing(crate::GroupPacketKind),
+    #[error("packet order requires {expected} entries, received {actual}")]
+    OrderLength { expected: usize, actual: usize },
+    #[error("packet {0:?} occurs more than once in the requested order")]
+    DuplicateOrder(crate::GroupPacketKind),
     #[error("group packet is larger than the JPEG XL TOC representation")]
     PacketTooLarge,
     #[error("bitstream size arithmetic overflow")]

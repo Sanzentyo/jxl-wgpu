@@ -1,6 +1,7 @@
 //! Spectral/refinement entropy, native pass images and GPU ownership.
 
 use super::super::dispatch::VarDctBackend;
+mod delivery;
 mod images;
 mod limits;
 mod probes;
@@ -8,7 +9,8 @@ mod probes;
 use super::*;
 use crate::{
     AnimationHeader, Determinism, EncodeProfile, FrameEncodeRequest, FrameIndex, FrameOptions,
-    GpuEncodeBackend, GpuFrameSource, ProgressivePass, ProgressivePlan,
+    GpuEncodeBackend, GpuFrameSource, ProgressiveDownsampling, ProgressivePass, ProgressivePlan,
+    VarDctGroupOrder,
 };
 
 fn plan(passes: &[(u8, u8)]) -> ProgressivePlan {

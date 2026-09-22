@@ -1076,17 +1076,42 @@ use i64 cumulative targets rather than the shader's residual loop. Zero/excessiv
 invalid shifts/order/finality, duplicated arena expansion, sixteen-K square arena overflow,
 request/config mismatch and an actual 64-KiB device binding limit have rejection evidence.
 
-Five tiled images cover 17×1/two passes, 13×21/three spectral passes, 257×17/three quantized
-passes, 2057×17/five combined passes and 1×1/eleven passes. They combine raw DCT8 with other
+Seven tiled images cover 17×1/two passes, 13×21/three spectral passes, 257×17/three quantized
+passes, 2057×17/five combined passes, 1×1/eleven passes, 513×257/three center-first passes and
+2057×1/five explicitly ordered passes. The last two carry resolution stopping points and
+nonidentity TOC permutations. They combine raw DCT8 with other
 parametric families, custom orders and LF metadata. Native scalar libjxl supplies every DC,
 intermediate AC and final linear RGBA-F32 image. Bounds remain `1e-5` for DC, `2e-4` for
 intermediate AC and `1e-4` for the final image. Normal native SIMD is also required for every
 stage, including progression metadata, finite samples and at most one code after independent
 linear-to-sRGB8 conversion. Independent jxl-oxide additionally checks the final linear image
-at `1e-4`. Whole input and seven-byte transport fragments through 40/256-byte windows are
+at `1e-4`. Whole input and seven-byte transport fragments through 40/256/1024-byte windows are
 byte-identical. Held outputs remain immutable, final-only decoding equals the last update,
 and GPU/input reservations return to zero. The reported pass count and TOC match the physical
 inventory; blocking/Future encoding and all five workgroup variants produce identical bytes.
+For the center/explicit cases, native scalar decoding also receives byte prefixes ending
+exactly after each nonfinal AC pass. Flush output equals that pass's whole-input image byte
+for byte, with the declared intended resolution. This proves those complete-pass prefixes
+are displayable by native libjxl; it does not assert incomplete-main-input GPU readiness.
+
+Five small eleven-pass streams separately cover all zero-to-four downsampling endpoint counts,
+all factors `8/4/2/1`, and wire pass-index buckets `0/1/2/7`. Scalar and normal native progression
+metadata agree, and changing only the hints leaves every scalar pass image identical. Negative
+configuration tests reject invalid/nondecreasing factors, out-of-range/nonincreasing pass
+indices, too many endpoints and endpoints on a single-pass plan. Group-order tests cover
+integer center ties, odd and one-pixel axes, maximum 16K geometry, malformed explicit
+permutations, out-of-image centers and grid mismatches before GPU admission.
+
+Generic packet tests independently decode entropy-coded TOC permutations with `jxl_coding`,
+including reverse, rotation and deterministic shuffle at one entry, eleven passes and the
+maximum 65,536 entries. Unaligned frame headers, zero/variable payload sizes and inverse
+canonical-to-physical mapping must recover each original payload exactly. Canonical access
+remains unchanged; explicit identity emits the original bytes. Missing/extra/duplicate/invalid
+identities, unbounded producers and publicly mutated packet layouts are rejected. A 257×17
+single-pass nonidentity stream also matches native/Rust/GPU final pixels. Damaged final-pass
+entropy in a permuted three-pass stream yields `HfCoefficientGpu`, then `SessionPoisoned`,
+without exposing that pass, under whole input and 256-byte windows. Earlier retained DC/AC
+images remain unchanged after session destruction, and all GPU/input reservations release.
 
 The scalar oracle uses the unchanged libjxl 0.12.0 source at
 `a7a9c787341cf703dede03c2009fa460cae5e5df`, compiled completely with `HWY_COMPILE_ONLY_SCALAR`.
@@ -1101,13 +1126,14 @@ No codec arithmetic is changed to imitate reciprocal-estimate error.
 
 Three further mixed maps (all strategies at 512×512, an LF boundary at 2057×17, and replicated
 non-DCT8 edges at 13×21) combine five passes with all 17 raw families, custom orders and LF
-metadata. Final Rust pixels equal the single-pass baseline; native and GPU retain the one-code
+metadata, reversed AC-group order and resolution hints. Final Rust pixels equal the raster
+single-pass baseline; native and GPU retain the one-code
 bound. Blocking/Future and all five forward variants preserve bytes. Artifact corruption tests
 check first and last slots in every pass at counts 1/3/11. Exact-budget, one-byte-deficient,
 abandoned-completion and successful-reuse checks cover eleven-pass tiled and five-pass mixed
-jobs, including raw-matrix storage. These are spectral/quantized AC interoperability and
-ownership gates. Separate DC progressive frames, reduced-resolution stopping hints,
-center-first/saliency ordering and full ISO precision remain open.
+jobs, including raw-matrix storage and center/explicit group order. These are spectral/quantized
+AC interoperability, delivery-order and ownership gates. Separate DC progressive frames,
+adaptive saliency selection and full ISO precision remain open.
 
 ## Modular orientation and semantic header admission
 

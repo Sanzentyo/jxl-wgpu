@@ -52,6 +52,7 @@ mod error;
 mod gpu;
 mod lossless_modular;
 mod packet;
+mod permutation;
 mod prefix;
 mod session;
 mod vardct_encoder;
@@ -61,7 +62,7 @@ pub use buffer_pool::{
 };
 pub use capability::{
     Determinism, EncodeProfile, EncoderCapabilities, KernelStage, ProfileCapability,
-    ProgressivePass, ProgressivePlan,
+    ProgressiveDownsampling, ProgressivePass, ProgressivePlan,
 };
 pub use error::{BackendError, EncodeError, PacketError, UnsupportedFeature};
 pub use gpu::{
@@ -90,8 +91,8 @@ pub use session::{
 };
 pub use vardct_encoder::{
     TiledVarDctEncoder, TiledVarDctGrid, VarDctBackend, VarDctCoefficientOrders,
-    VarDctColorEncoding, VarDctConfig, VarDctDequantMatrices, VarDctEncoder, VarDctHfMultiplier,
-    VarDctJob, VarDctKernelLayout, VarDctLfMetadata, VarDctMatrixEncoding, VarDctMemoryPlan,
-    VarDctQuantization, VarDctRawMatrix, VarDctStrategy, VarDctStrategyMap, VarDctSubmission,
-    VarDctTransform, VarDctTransformMemoryPlan,
+    VarDctColorEncoding, VarDctConfig, VarDctDequantMatrices, VarDctEncoder, VarDctGroupOrder,
+    VarDctHfMultiplier, VarDctJob, VarDctKernelLayout, VarDctLfMetadata, VarDctMatrixEncoding,
+    VarDctMemoryPlan, VarDctQuantization, VarDctRawMatrix, VarDctStrategy, VarDctStrategyMap,
+    VarDctSubmission, VarDctTransform, VarDctTransformMemoryPlan,
 };

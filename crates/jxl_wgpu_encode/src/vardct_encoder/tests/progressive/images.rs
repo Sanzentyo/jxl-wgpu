@@ -17,15 +17,52 @@ fn progressive_updates_match_native_and_bounded_input_under_all_variants() {
     let context = WgpuContext::from_backend(&backend);
     let readback = ImageReadbackPipeline::new(&backend);
     let mut streams = Vec::new();
-    for (width, height, progressive, cap) in [
-        (17, 1, plan(&[(1, 3), (8, 0)]), 40),
-        (13, 21, plan(&[(2, 0), (4, 0), (8, 0)]), 40),
-        (257, 17, plan(&[(8, 3), (8, 1), (8, 0)]), 256),
-        (2057, 17, combined(), 256),
-        (1, 1, maximum(), 40),
+    for (width, height, progressive, group_order, cap) in [
+        (
+            17,
+            1,
+            plan(&[(1, 3), (8, 0)]),
+            VarDctGroupOrder::default(),
+            40,
+        ),
+        (
+            13,
+            21,
+            plan(&[(2, 0), (4, 0), (8, 0)]),
+            VarDctGroupOrder::default(),
+            40,
+        ),
+        (
+            257,
+            17,
+            plan(&[(8, 3), (8, 1), (8, 0)]),
+            VarDctGroupOrder::default(),
+            256,
+        ),
+        (2057, 17, combined(), VarDctGroupOrder::default(), 256),
+        (1, 1, maximum(), VarDctGroupOrder::default(), 40),
+        (
+            513,
+            257,
+            plan(&[(2, 0), (4, 0), (8, 0)])
+                .with_downsampling(delivery::endpoints(&[(4, 0), (2, 1)]))
+                .unwrap(),
+            VarDctGroupOrder::center_first(),
+            1024,
+        ),
+        (
+            2057,
+            1,
+            combined()
+                .with_downsampling(delivery::endpoints(&[(8, 0), (4, 1), (2, 2), (1, 3)]))
+                .unwrap(),
+            VarDctGroupOrder::explicit(vec![8, 0, 7, 1, 6, 2, 5, 3, 4]).unwrap(),
+            256,
+        ),
     ] {
         let config = VarDctConfig {
             progressive,
+            group_order,
             coefficient_orders: orders::selected([VarDctStrategy::Dct8]),
             dequant_matrices: matrices::selected()
                 .with_raw_matrix(
@@ -60,6 +97,12 @@ fn progressive_updates_match_native_and_bounded_input_under_all_variants() {
             native_updates(&bytes, true).expect("native SIMD progressive oracle is required");
         assert_eq!(native.len(), simd.len());
         assert_eq!(native.len(), config.progressive.passes().len() + 1);
+        delivery::check_file_order_and_native_prefixes(
+            &bytes,
+            &config,
+            &inventory.frames[0],
+            &native,
+        );
         // A third independent decoder checks the complete linear image, including raw matrices.
         let mut oxide = jxl_oxide::JxlImage::read_with_defaults(bytes.as_slice()).unwrap();
         oxide.request_color_encoding(jxl_oxide::EnumColourEncoding::srgb_linear(
@@ -110,6 +153,10 @@ fn progressive_updates_match_native_and_bounded_input_under_all_variants() {
                 assert_eq!(expected.complete, simd.complete);
                 assert_eq!(expected.step, simd.step);
                 assert_eq!(expected.ratio, simd.ratio);
+                assert_eq!(
+                    expected.ratio,
+                    delivery::expected_ratio(&config.progressive, stage)
+                );
                 assert_eq!(frame.is_complete(), expected.complete);
                 assert_eq!(expected.step, stage);
                 if let Some(progress) = frame.progression() {
@@ -287,7 +334,15 @@ fn progressive_mixed_maps_preserve_all_strategies_and_lf_boundaries() {
                 .encode(source.clone())
                 .unwrap();
         let config = VarDctConfig {
-            progressive: combined(),
+            progressive: combined()
+                .with_downsampling(delivery::endpoints(&[(4, 1), (2, 2)]))
+                .unwrap(),
+            group_order: VarDctGroupOrder::explicit(
+                (0..(width.div_ceil(256) * height.div_ceil(256)) as u32)
+                    .rev()
+                    .collect(),
+            )
+            .unwrap(),
             ..config
         };
         let encoder =

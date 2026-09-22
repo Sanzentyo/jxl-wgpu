@@ -63,9 +63,27 @@ fn frame_header(progressive: &crate::ProgressivePlan) -> Result<BitFragment, Enc
         [(1, 0), (2, 0), (3, 0), (4, 3)],
     )?;
     if passes.len() > 1 {
-        output.write_bits(0, 2)?; // no reduced-resolution stopping hints
+        write_u32(
+            &mut output,
+            progressive.downsampling().len() as u32,
+            [(0, 0), (1, 0), (2, 0), (3, 1)],
+        )?;
         for pass in &passes[..passes.len() - 1] {
             output.write_bits(u64::from(pass.shift), 2)?;
+        }
+        for point in progressive.downsampling() {
+            write_u32(
+                &mut output,
+                u32::from(point.factor),
+                [(1, 0), (2, 0), (4, 0), (8, 0)],
+            )?;
+        }
+        for point in progressive.downsampling() {
+            write_u32(
+                &mut output,
+                u32::from(point.last_pass),
+                [(0, 0), (1, 0), (2, 0), (0, 3)],
+            )?;
         }
     }
     output.write_bits(0, 1)?; // full-canvas frame
@@ -172,12 +190,7 @@ pub(super) fn write_unsigned_token(
     code: &VarDctPrefixCode,
     value: u32,
 ) -> Result<(), EncodeError> {
-    if value == 0 {
-        return code.write_raw(output, 0, 0, 0);
-    }
-    let nbits = 31 - value.leading_zeros();
-    let token = nbits + 1;
-    code.write_raw(output, token, nbits, value - (1 << nbits))
+    code.write_unsigned(output, value)
 }
 
 pub(super) fn pack_signed_control(value: i32) -> u32 {
@@ -345,6 +358,7 @@ pub(super) fn build_frame_packet(
     frame: VarDctFrameLayout,
     config: &VarDctConfig,
 ) -> Result<FramePacketSet, EncodeError> {
+    config.group_order.validate(frame)?;
     let ac_groups = frame.ac_group_count()?;
     let lf_groups = frame.lf_group_count()?;
     let coefficient_payload = artifact.has_ac_payload();
@@ -443,9 +457,12 @@ pub(super) fn build_frame_packet(
             ));
         }
     }
-    Ok(FramePacketSet::new(
-        frame_header(&config.progressive)?,
-        FrameGroupLayout::new(lf_groups, ac_groups, passes)?,
-        packets,
-    )?)
+    config.group_order.apply(
+        FramePacketSet::new(
+            frame_header(&config.progressive)?,
+            FrameGroupLayout::new(lf_groups, ac_groups, passes)?,
+            packets,
+        )?,
+        frame,
+    )
 }

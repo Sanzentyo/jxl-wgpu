@@ -160,15 +160,5 @@ pub(super) fn write_prefix_config(
     code: &VarDctPrefixCode,
     contexts: u32,
 ) -> Result<(), EncodeError> {
-    output.write_bits(0, 1)?; // LZ77 disabled
-    if contexts > 1 {
-        output.write_bits(1, 1)?; // simple clustering
-        output.write_bits(0, 2)?; // every context uses distribution zero
-    }
-    output.write_bits(1, 1)?; // prefix code
-    output.write_bits(0, 4)?; // hybrid integer split exponent zero
-    output.write_bits(1, 1)?; // explicit alphabet size
-    output.write_bits(5, 4)?;
-    output.write_bits(0, 5)?; // 1 + 2^5 = 33 symbols, covering every u32
-    code.write_raw_tree(output)
+    code.write_stream_config(output, contexts)
 }

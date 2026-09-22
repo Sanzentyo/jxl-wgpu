@@ -105,6 +105,16 @@ pub struct ProgressivePass {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProgressivePlan {
     passes: Vec<ProgressivePass>,
+    downsampling: Vec<ProgressiveDownsampling>,
+}
+
+/// A completed AC pass after which a decoder may stop at the intended resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ProgressiveDownsampling {
+    /// Intended downsampling factor: 1, 2, 4 or 8.
+    pub factor: u8,
+    /// Zero-based last required pass, limited by the wire syntax to 0..=7.
+    pub last_pass: u8,
 }
 
 impl ProgressivePlan {
@@ -117,6 +127,7 @@ impl ProgressivePlan {
                 coefficient_square: NonZeroU8::new(8).expect("eight is non-zero"),
                 shift: 0,
             }],
+            downsampling: Vec::new(),
         }
     }
 
@@ -146,7 +157,49 @@ impl ProgressivePlan {
                 "final progressive pass must contain the full unshifted 8x8 spectrum",
             ));
         }
-        Ok(Self { passes })
+        Ok(Self {
+            passes,
+            downsampling: Vec::new(),
+        })
+    }
+
+    /// Replaces the optional resolution stopping points without changing coefficient passes.
+    /// Factors must decrease and their last-pass indices must increase. The final full-resolution
+    /// endpoint and initial DC downsampling of eight remain implicit when not specified.
+    pub fn with_downsampling(
+        mut self,
+        downsampling: Vec<ProgressiveDownsampling>,
+    ) -> Result<Self, EncodeError> {
+        if downsampling.len() > 4
+            || downsampling.len() > self.passes.len()
+            || (self.passes.len() == 1 && !downsampling.is_empty())
+        {
+            return Err(EncodeError::InvalidConfiguration(
+                "progressive downsampling requires a multi-pass plan and at most four endpoints",
+            ));
+        }
+        let mut previous = None::<ProgressiveDownsampling>;
+        for &point in &downsampling {
+            if !matches!(point.factor, 1 | 2 | 4 | 8)
+                || point.last_pass > 7
+                || usize::from(point.last_pass) >= self.passes.len()
+                || previous.is_some_and(|old| {
+                    point.factor >= old.factor || point.last_pass <= old.last_pass
+                })
+            {
+                return Err(EncodeError::InvalidConfiguration(
+                    "progressive factors must decrease through 8/4/2/1 at increasing encoded pass indices",
+                ));
+            }
+            previous = Some(point);
+        }
+        self.downsampling = downsampling;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn downsampling(&self) -> &[ProgressiveDownsampling] {
+        &self.downsampling
     }
 
     #[must_use]

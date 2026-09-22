@@ -24,6 +24,15 @@ pub fn native_updates(encoded: &[u8], linear: bool) -> Option<Vec<NativeUpdate>>
 /// `JXL_PROGRESSIVE_SCALAR_ORACLE` to that executable. This never changes the native
 /// SIMD oracle selected by the other entry points.
 pub fn scalar_linear_updates(encoded: &[u8]) -> Vec<NativeUpdate> {
+    scalar_updates(encoded, false)
+}
+
+/// Flushes an incomplete input prefix using the same required scalar reference.
+pub fn scalar_linear_prefix_updates(encoded: &[u8]) -> Vec<NativeUpdate> {
+    scalar_updates(encoded, true)
+}
+
+fn scalar_updates(encoded: &[u8], flush_prefix: bool) -> Vec<NativeUpdate> {
     static BINARY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     let binary = BINARY.get_or_init(|| {
         let path = std::env::var_os("JXL_PROGRESSIVE_SCALAR_ORACLE")
@@ -37,7 +46,7 @@ pub fn scalar_linear_updates(encoded: &[u8]) -> Vec<NativeUpdate> {
         assert_eq!(identity.stdout, b"libjxl,0.12.0,scalar\n");
         path
     });
-    run_updates(binary, encoded, true, false, false, true, false)
+    run_updates(binary, encoded, true, false, flush_prefix, true, false)
 }
 
 pub fn native_updates_oriented(

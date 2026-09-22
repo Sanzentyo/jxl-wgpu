@@ -205,6 +205,11 @@ fn custom_tiled_order_storage_survives_cancellation_and_obeys_exact_admission() 
     .enumerate()
     {
         let config = VarDctConfig {
+            group_order: if case == 3 {
+                crate::VarDctGroupOrder::centered_at(256, 0)
+            } else {
+                Default::default()
+            },
             progressive: if case == 3 {
                 progressive::maximum()
             } else {

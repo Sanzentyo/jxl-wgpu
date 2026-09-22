@@ -360,9 +360,35 @@ The GPU divides the remaining signed coefficients by `2^shift` toward zero and e
 contribution independently of the caller's coefficient order. Prior contributions are subtracted
 only where their spectral rectangle included that coefficient. Thus increasing spectral size
 can also increase shift without losing newly introduced frequencies, and all passes reconstruct
-the exact single-pass quantized coefficients. Separate DC progressive frames, reduced-resolution
-stopping hints and adaptive group ordering remain unimplemented. Encoding still completes one
-whole frame per submission; progressive syntax does not imply an early encoder byte-stream API.
+the exact single-pass quantized coefficients.
+
+`ProgressivePlan::with_downsampling` adds up to four `ProgressiveDownsampling` stopping points
+to a multi-pass plan. Factors decrease through `8`, `4`, `2`, `1`; zero-based `last_pass` indices
+increase, are less than the pass count, and fit the wire syntax's `0..=7` range. These declarations
+do not change coefficient splitting. Initial DC detail of eight and final detail of one remain
+implicit. An empty list preserves the previous header bytes.
+
+`VarDctConfig::group_order` defaults to raster order. `VarDctGroupOrder::center_first()` starts
+at the group containing the middle image pixel; `centered_at(x, y)` uses a caller-selected
+source pixel. Both visit concentric Chebyshev group rings, then sort by squared distance from
+that pixel to the clipped group's center, breaking ties by raster ID. Integer geometry makes
+the order deterministic. `explicit(Vec<u32>)` accepts each raster AC-group ID exactly once,
+with at most 4096 groups and an exact match to the submitted image's grid. Invalid centers or
+grid lengths fail before GPU admission. LF-global, LF groups and HF-global remain first;
+every AC pass repeats the selected group order. A standard entropy-coded TOC permutation
+records the physical order. Identity order preserves the existing bytes. Caller metadata and
+geometry drive this bounded host assembly; there is no CPU image analysis.
+
+`FramePacketSet::with_order` also accepts a complete physical sequence of packet identities
+for generic frame assembly. `packets()` remains canonical, while `packets_in_file_order()`
+follows the requested sequence. Every packet must appear exactly once; malformed orders are
+typed errors. `assemble_frame` writes TOC sizes and payloads in physical order with the inverse
+canonical-to-physical permutation.
+
+Separate DC progressive frames and adaptive saliency selection remain unimplemented. Encoding
+still completes one whole frame per submission; progressive syntax does not imply an early
+encoder byte-stream API. Native decoders can display byte prefixes ending at a complete AC
+pass; the GPU frontend's whole-input and bounded-window progression are tested separately.
 
 The LF and AC streams use 33-symbol raw prefix alphabets, covering every signed 32-bit value.
 The global MA tree is one Gradient leaf with no LZ77. Prefix bits retain all 15 canonical bits;
@@ -471,7 +497,8 @@ this is a numerical regression bound, not ISO precision or perceptual-quality ce
 Blocking/Future assembly and all supported linear workgroup variants produce identical bytes.
 The [progressive encoder matrix](../../docs/CONFORMANCE_CORPUS.md#progressive-vardct-encoding)
 adds 81 single-transform streams with exact coefficient accumulation, mixed maps, signed integer
-endpoints, native intermediate images and whole/fragmented convergence. F32 references use the
+endpoints, resolution stopping points, center/explicit group order, native partial-input images
+and whole/fragmented convergence. F32 references use the
 pinned scalar libjxl oracle; normal native SIMD retains its independent RGB8 comparisons.
 The suite also rejects malformed or missing GPU AC output in every pass, checks an insufficient device binding,
 and tests exact budgets, one-byte backpressure, abandoned completion, and successful reuse.
@@ -501,7 +528,7 @@ The tiled API has the same blocking, container, and executor-neutral `Future` co
 
 ```rust,no_run
 # use std::num::NonZeroU8;
-# use jxl_wgpu_encode::{BufferImageSource, ProgressivePass, ProgressivePlan, TiledVarDctEncoder, VarDctConfig, WgpuContext};
+# use jxl_wgpu_encode::{BufferImageSource, ProgressiveDownsampling, ProgressivePass, ProgressivePlan, TiledVarDctEncoder, VarDctConfig, VarDctGroupOrder, WgpuContext};
 # fn encode_tiled(
 #     context: WgpuContext,
 #     source_768_by_513: BufferImageSource,
@@ -511,9 +538,16 @@ let progressive = ProgressivePlan::new(
         coefficient_square: NonZeroU8::new(size).unwrap(),
         shift: 0,
     }).collect(),
-)?;
+)?.with_downsampling(vec![
+    ProgressiveDownsampling { factor: 4, last_pass: 0 },
+    ProgressiveDownsampling { factor: 2, last_pass: 1 },
+])?;
 let encoder = TiledVarDctEncoder::new_with_config(
-    context, VarDctConfig { progressive, ..Default::default() },
+    context, VarDctConfig {
+        progressive,
+        group_order: VarDctGroupOrder::center_first(),
+        ..Default::default()
+    },
 )?;
 let plan = encoder.memory_plan(&source_768_by_513)?;
 let grid = encoder.grid(&source_768_by_513)?;

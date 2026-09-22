@@ -847,6 +847,17 @@ and readback remain reserved through validation or abandoned completion. Tests c
 first/last slots in every pass, checked arena overflow, actual 64-KiB binding rejection,
 exact/one-byte-deficient budgets, cancellation and successful reuse for tiled and mixed maps.
 
+Resolution stopping points and physical AC-group order are bounded host control metadata.
+They do not add GPU buffers, change the 768-byte parameters or 272-byte artifact header, or
+add submissions/maps. Group-order centers and exact grid lengths are validated before
+admission. Generic frame assembly accepts at most 65,536 TOC entries; VarDCT's image grid has
+at most 4096 AC groups, repeated in each of at most eleven passes. A bounded Fenwick tree
+encodes the canonical-to-physical permutation in O(N log N) work, shared with coefficient-order
+metadata. Packet payloads remain in their validated ownership and are borrowed in physical
+order during final assembly. Tiled/mixed cancellation and exact-admission cases also exercise
+non-raster order; corrupt late permuted AC packets cannot publish an unvalidated update, and
+retained earlier outputs remain immutable after the failed session is dropped.
+
 ## Shader write bounds fixed by this audit
 
 Each Modular encoder group/channel artifact consists of 100 header words followed by four-word

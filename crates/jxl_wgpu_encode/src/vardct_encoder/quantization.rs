@@ -102,6 +102,8 @@ impl Default for VarDctQuantization {
 pub struct VarDctConfig {
     /// Spectral/quantized AC progression; defaults to one complete pass.
     pub progressive: crate::ProgressivePlan,
+    /// Physical AC group order, repeated per pass; defaults to raster order.
+    pub group_order: super::VarDctGroupOrder,
     pub quantization: VarDctQuantization,
     pub lf_metadata: VarDctLfMetadata,
     /// Immutable caller-selected permutations; defaults to natural order for every size class.

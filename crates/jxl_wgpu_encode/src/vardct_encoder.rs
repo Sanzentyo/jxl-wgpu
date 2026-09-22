@@ -8,6 +8,7 @@ mod ac;
 mod bitstream;
 mod dispatch;
 mod entropy;
+mod group_order;
 mod matrices;
 mod orders;
 mod quantization;
@@ -20,6 +21,7 @@ mod types;
 mod tests;
 
 pub use dispatch::{TiledVarDctEncoder, VarDctBackend, VarDctEncoder, VarDctJob, VarDctSubmission};
+pub use group_order::VarDctGroupOrder;
 pub use matrices::{VarDctDequantMatrices, VarDctMatrixEncoding, VarDctRawMatrix};
 pub use orders::VarDctCoefficientOrders;
 pub use quantization::{VarDctConfig, VarDctHfMultiplier, VarDctQuantization};

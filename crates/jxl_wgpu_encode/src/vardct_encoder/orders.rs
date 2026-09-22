@@ -5,9 +5,7 @@ use std::sync::Arc;
 use jxl_gpu_bitstream::BitWriter;
 
 use super::VarDctStrategy;
-use super::bitstream::write_unsigned_token;
-use super::entropy::{fixed_prefix_code, write_prefix_config};
-use crate::EncodeError;
+use crate::{EncodeError, permutation};
 
 // JPEG XL size classes, including the separate special-8x8 class. Normative mapping:
 // libjxl v0.12.0 lib/jxl/coeff_order.h, kStrategyOrder.
@@ -135,46 +133,12 @@ impl VarDctCoefficientOrders {
         }
         // All eight permutation contexts share one stateless prefix distribution. These are
         // caller-supplied control permutations, never image-domain entropy jobs.
-        let code = fixed_prefix_code()?;
-        write_prefix_config(output, &code, 8)?;
+        let code = permutation::write_config(output)?;
         for orders in self.families.iter().flatten() {
             for order in orders.iter() {
-                let lehmer = lehmer_tail(order);
-                write_unsigned_token(output, &code, lehmer.len() as u32)?;
-                for rank in lehmer {
-                    write_unsigned_token(output, &code, rank)?;
-                }
+                permutation::write(output, &code, order, order.len() / 64)?;
             }
         }
         Ok(())
     }
-}
-
-/// Rank among the remaining AC entries, using bounded O(N log N) metadata work.
-fn lehmer_tail(order: &[u32]) -> Vec<u32> {
-    let skip = order.len() / 64;
-    let len = order.len() - skip;
-    let mut counts = (0..=len)
-        .map(|index| index.isolate_lowest_one() as u32)
-        .collect::<Vec<_>>();
-    let mut result = Vec::with_capacity(len);
-    for &rank in &order[skip..] {
-        let value = rank as usize - skip;
-        let mut position = value;
-        let mut lower = 0;
-        while position != 0 {
-            lower += counts[position];
-            position &= position - 1;
-        }
-        result.push(lower);
-        position = value + 1;
-        while position <= len {
-            counts[position] -= 1;
-            position += position.isolate_lowest_one();
-        }
-    }
-    while result.last() == Some(&0) {
-        result.pop();
-    }
-    result
 }

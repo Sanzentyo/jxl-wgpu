@@ -4,6 +4,9 @@ use jxl_gpu_bitstream::BitWriter;
 
 use crate::PacketError;
 
+#[cfg(test)]
+mod ordering_tests;
+
 const MAX_TOC_ENTRIES: usize = 65_536;
 const TOC_BUCKETS: [(u32, u8); 4] = [(0, 10), (1_024, 14), (17_408, 22), (4_211_712, 30)];
 
@@ -200,6 +203,7 @@ pub struct FramePacketSet {
     pub frame_header: BitFragment,
     pub layout: FrameGroupLayout,
     packets: Vec<GroupPacket>,
+    file_order: Option<Vec<usize>>,
 }
 
 impl FramePacketSet {
@@ -232,7 +236,76 @@ impl FramePacketSet {
             frame_header,
             layout,
             packets: ordered,
+            file_order: None,
         })
+    }
+
+    /// Selects physical packet order; packet identities and `packets()` remain canonical.
+    /// Every packet must appear exactly once. Identity order keeps the permutation bit absent.
+    pub fn with_order(
+        mut self,
+        order: impl IntoIterator<Item = GroupPacketKind>,
+    ) -> Result<Self, PacketError> {
+        self.validate_layout()?;
+        let count = self.layout.toc_entries();
+        let mut seen = vec![false; count];
+        let mut indices = Vec::with_capacity(count);
+        for kind in order {
+            if indices.len() == count {
+                return Err(PacketError::OrderLength {
+                    expected: count,
+                    actual: count + 1,
+                });
+            }
+            let index = self
+                .layout
+                .canonical_index(kind)
+                .ok_or(PacketError::InvalidKind {
+                    kind,
+                    layout: self.layout,
+                })?;
+            if std::mem::replace(&mut seen[index], true) {
+                return Err(PacketError::DuplicateOrder(kind));
+            }
+            indices.push(index);
+        }
+        if indices.len() != count {
+            return Err(PacketError::OrderLength {
+                expected: count,
+                actual: indices.len(),
+            });
+        }
+        self.file_order = if indices.iter().copied().eq(0..count) {
+            None
+        } else {
+            Some(indices)
+        };
+        Ok(self)
+    }
+
+    /// Physical packet sequence described by the emitted TOC permutation.
+    pub fn packets_in_file_order(&self) -> impl ExactSizeIterator<Item = &GroupPacket> {
+        (0..self.packets.len()).map(|index| {
+            &self.packets[self.file_order.as_ref().map_or(index, |order| order[index])]
+        })
+    }
+
+    fn validate_layout(&self) -> Result<(), PacketError> {
+        if self.packets.len() != self.layout.toc_entries() {
+            return Err(PacketError::OrderLength {
+                expected: self.layout.toc_entries(),
+                actual: self.packets.len(),
+            });
+        }
+        for (index, packet) in self.packets.iter().enumerate() {
+            if self.layout.canonical_index(packet.kind) != Some(index) {
+                return Err(PacketError::InvalidKind {
+                    kind: packet.kind,
+                    layout: self.layout,
+                });
+            }
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -264,19 +337,31 @@ impl EncodedFrame {
     }
 }
 
-/// Serializes frame header bits, an absent TOC permutation, canonical TOC
+/// Serializes frame header bits, optional TOC permutation, physical TOC
 /// sizes, and byte-aligned group packets. Image and coefficient work is not
 /// performed here.
 pub fn assemble_frame(packet_set: FramePacketSet) -> Result<EncodedFrame, PacketError> {
+    packet_set.validate_layout()?;
     let mut writer = BitWriter::new();
     append_fragment(&mut writer, &packet_set.frame_header)?;
     writer
-        .write_bits(0, 1)
+        .write_bits(u64::from(packet_set.file_order.is_some()), 1)
         .map_err(|_| PacketError::SizeOverflow)?;
+    if let Some(order) = &packet_set.file_order {
+        // Wire permutation maps each canonical identity to its physical position.
+        let mut inverse = vec![0u32; order.len()];
+        for (physical, &canonical) in order.iter().enumerate() {
+            inverse[canonical] = physical as u32;
+        }
+        let code =
+            crate::permutation::write_config(&mut writer).map_err(|_| PacketError::SizeOverflow)?;
+        crate::permutation::write(&mut writer, &code, &inverse, 0)
+            .map_err(|_| PacketError::SizeOverflow)?;
+    }
     writer
         .align_to_byte()
         .map_err(|_| PacketError::SizeOverflow)?;
-    for packet in &packet_set.packets {
+    for packet in packet_set.packets_in_file_order() {
         let size = u32::try_from(packet.payload.len()).map_err(|_| PacketError::PacketTooLarge)?;
         write_toc_size(&mut writer, size)?;
     }
@@ -295,7 +380,7 @@ pub fn assemble_frame(packet_set: FramePacketSet) -> Result<EncodedFrame, Packet
     bytes
         .try_reserve(payload_bytes)
         .map_err(|_| PacketError::SizeOverflow)?;
-    for packet in packet_set.packets {
+    for packet in packet_set.packets_in_file_order() {
         bytes.extend_from_slice(&packet.payload);
     }
     Ok(EncodedFrame {
