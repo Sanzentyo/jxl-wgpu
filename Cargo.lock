@@ -956,6 +956,7 @@ dependencies = [
  "jxl",
  "jxl-bitstream",
  "jxl-coding",
+ "jxl-oxide",
  "jxl-oxide-common",
  "jxl-threadpool",
  "jxl-vardct",

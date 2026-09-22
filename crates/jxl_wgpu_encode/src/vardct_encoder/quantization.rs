@@ -104,6 +104,6 @@ pub struct VarDctConfig {
     pub lf_metadata: VarDctLfMetadata,
     /// Immutable caller-selected permutations; defaults to natural order for every size class.
     pub coefficient_orders: VarDctCoefficientOrders,
-    /// Validated parametric HF matrices; defaults to the standard matrices for all 17 families.
+    /// Validated parametric/raw HF matrices; defaults to the standard matrices for all 17 families.
     pub dequant_matrices: VarDctDequantMatrices,
 }

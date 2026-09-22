@@ -19,6 +19,20 @@ fn packet(bytes: &[u8]) -> BoundedVarDctPacketPlan {
 }
 
 pub(super) fn assert_decoders_agree(bytes: &[u8], width: usize, height: usize) -> Vec<u8> {
+    assert_decoders_agree_with_reference(
+        bytes,
+        width,
+        height,
+        &decode_rgb8_sized(bytes, width, height),
+    )
+}
+
+pub(super) fn assert_decoders_agree_with_reference(
+    bytes: &[u8],
+    width: usize,
+    height: usize,
+    reference: &[u8],
+) -> Vec<u8> {
     let (device, queue, info) =
         test_device().expect("actual GPU required for quantizer validation");
     let backend = WgpuBackend::from_device(
@@ -74,7 +88,7 @@ pub(super) fn assert_decoders_agree(bytes: &[u8], width: usize, height: usize) -
             0
         );
     }
-    let rust = decode_rgb8_sized(bytes, width, height);
+    let reference = reference.to_vec();
     let gpu = whole.unwrap();
     let directory = oracle_directory();
     fs::create_dir_all(&directory).unwrap();
@@ -92,18 +106,18 @@ pub(super) fn assert_decoders_agree(bytes: &[u8], width: usize, height: usize) -
     );
     let native = read_ppm_rgb8(&output, width, height);
     eprintln!(
-        "endpoint {:?}: GPU/Rust {}, native/Rust {}, GPU/native {}, files {}",
+        "endpoint {:?}: GPU/reference {}, native/reference {}, GPU/native {}, files {}",
         (packet(bytes).global_scale, packet(bytes).quant_lf),
-        max_abs_error(&gpu, &rust),
-        max_abs_error(&native, &rust),
+        max_abs_error(&gpu, &reference),
+        max_abs_error(&native, &reference),
         max_abs_error(&gpu, &native),
         input.display()
     );
-    assert!(max_abs_error(&native, &rust) <= 1);
-    assert!(max_abs_error(&gpu, &rust) <= 1);
+    assert!(max_abs_error(&native, &reference) <= 1);
+    assert!(max_abs_error(&gpu, &reference) <= 1);
 
     fs::remove_dir_all(directory).unwrap();
-    rust
+    reference
 }
 
 #[test]
@@ -163,8 +177,14 @@ fn signed_hf_metadata_endpoints_interoperate_through_whole_and_fragmented_packet
         for value in [0, 0, 0, raw, 0] {
             sample(&mut group, value);
         }
-        hf.write_global(&mut group, 1, false, &Default::default())
-            .unwrap();
+        hf.write_global(
+            &mut group,
+            1,
+            false,
+            &Default::default(),
+            Default::default(),
+        )
+        .unwrap();
         group.align_to_byte().unwrap();
         let packets = FramePacketSet::new(
             header.clone(),

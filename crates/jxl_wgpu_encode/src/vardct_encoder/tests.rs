@@ -7,6 +7,7 @@ mod mixed;
 mod native;
 mod orders;
 mod quantization;
+mod raw_matrices;
 mod reference;
 mod single;
 
@@ -57,6 +58,7 @@ struct DcFixture {
 impl DcFixture {
     fn artifact(&self) -> super::types::VarDctArtifactData<'_> {
         super::types::VarDctArtifactData {
+            raw_matrices: Default::default(),
             transform_plan: None,
             strategy: 0,
             dc_fragment_words: &self.words,
@@ -510,9 +512,12 @@ fn abi_records_are_pod_and_word_aligned() {
 
 #[test]
 fn naga_validates_vardct_shaders() {
-    for source in [TILED_SHADER, include_str!("transforms.wgsl")] {
-        let module =
-            naga::front::wgsl::parse_str(&shader_source(source)).expect("VarDCT WGSL parses");
+    for source in [
+        shader_source(TILED_SHADER),
+        shader_source(include_str!("transforms.wgsl")),
+        include_str!("raw_matrices.wgsl").to_owned(),
+    ] {
+        let module = naga::front::wgsl::parse_str(&source).expect("VarDCT WGSL parses");
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::empty(),

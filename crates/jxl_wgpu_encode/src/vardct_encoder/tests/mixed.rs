@@ -123,6 +123,10 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
     let custom_matrices = matrices::selected();
     let matrix_oracle = matrices::oracle(&custom_matrices);
     let mut custom_oracles = native::native_oracles();
+    let mut raw_oracles = native::native_oracles();
+    for (strategy, oracle) in VarDctStrategy::ALL.into_iter().zip(&mut raw_oracles) {
+        oracle.dequant = raw_matrices::oracle_scales(strategy);
+    }
     for (strategy, oracle) in VarDctStrategy::ALL.into_iter().zip(&mut custom_oracles) {
         oracle.dequant = matrices::oracle_scales(&matrix_oracle, strategy, &custom_matrices);
     }
@@ -171,6 +175,7 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
     ];
     maps.extend_from_within(..3);
     maps.extend_from_within(..3);
+    maps.extend_from_within(..3);
     let mut streams = Vec::new();
     for (case, map) in maps.into_iter().enumerate() {
         let Extent2d { width, height } = map.extent();
@@ -181,9 +186,17 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
         } else {
             VarDctLfMetadata::default()
         };
-        let oracles = if case >= 9 { &custom_oracles } else { &oracles };
+        let oracles = if case >= 12 {
+            &raw_oracles
+        } else if case >= 9 {
+            &custom_oracles
+        } else {
+            &oracles
+        };
         let config = VarDctConfig {
-            dequant_matrices: if case >= 9 {
+            dequant_matrices: if case >= 12 {
+                raw_matrices::selected(map.transforms().iter().map(|task| task.strategy))
+            } else if case >= 9 {
                 custom_matrices.clone()
             } else {
                 Default::default()
@@ -353,6 +366,7 @@ fn mixed_jobs_admit_exact_memory_reject_wrong_extents_and_release_after_cancella
         Default::default(),
         orders::selected(VarDctStrategy::ALL),
         orders::selected(VarDctStrategy::ALL),
+        orders::selected(VarDctStrategy::ALL),
     ]
     .into_iter()
     .enumerate()
@@ -361,7 +375,9 @@ fn mixed_jobs_admit_exact_memory_reject_wrong_extents_and_release_after_cancella
         let metadata = VarDctLfMetadata::default();
         let custom = VarDctConfig {
             coefficient_orders,
-            dequant_matrices: if case == 2 {
+            dequant_matrices: if case == 3 {
+                raw_matrices::selected(VarDctStrategy::ALL)
+            } else if case == 2 {
                 matrices::selected()
             } else {
                 Default::default()

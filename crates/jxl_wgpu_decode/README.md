@@ -1338,8 +1338,14 @@ YCbCr-to-RGB conversion. Actual-GPU RGB8 differs from Rust `jxl` and optional `d
 code. Global- and local-MA raw images also match whole input byte-for-byte with 40/64/256-byte caps
 and seven-byte transport chunks, including a stream with local LF/HF trees and no global MA tree.
 The final aggregate validator tracks the actual HF-metadata entry point through that late raw
-stage. Larger/transformed raw matrices, uncommon asymmetric component sampling, and subsampled
-restoration still need conformance coverage.
+stage. Raw matrix headers use the normative raster with the shorter axis horizontal, including
+8×16 through 128×256 rectangles; earlier rectangle dimensions were reversed. GPU-encoded raw
+streams now cover all 17 families and all 27 strategies, with native/Rust/GPU pixel agreement,
+mixed maps and interleaved parametric/raw metadata through 40-byte windows. Wide-sample cases
+add native and independent `jxl-oxide` checks; see the documented Rust `jxl` discrepancy in the
+[corpus](../../docs/CONFORMANCE_CORPUS.md#procedural-vardct-encoder-matrix).
+Broader transformed raw-matrix and precision conformance, uncommon asymmetric component
+sampling, and subsampled restoration still need coverage.
 
 `ModularSideImagePlan` and `wgpu_engine::side_image::modular` now own the shared substream
 descriptor, bounded entropy/inverse recording, exact allocation size and mapped absolute cursor.

@@ -277,6 +277,10 @@ pub struct VarDctMemoryPlan {
     pub readback_bytes: u64,
     /// Tiled DCT8's X/Y/B dequantization and order table; general transforms include it in `transform`.
     pub quantization_metadata_bytes: u64,
+    /// Raw-matrix GPU sample/descriptor/prefix input, zero when all matrices are parametric.
+    pub raw_matrix_input_bytes: u64,
+    /// Raw-matrix entropy/status storage; its readback is included in `readback_bytes`.
+    pub raw_matrix_artifact_bytes: u64,
     /// Resident forward-transform allocations, retained until submission completion.
     pub transform: Option<VarDctTransformMemoryPlan>,
     pub owned_bytes_per_job: u64,
@@ -350,6 +354,8 @@ impl VarDctMemoryPlan {
             readback_bytes,
             quantization_metadata_bytes,
             transform: None,
+            raw_matrix_input_bytes: 0,
+            raw_matrix_artifact_bytes: 0,
             owned_bytes_per_job,
             addressed_bytes_per_job: source_binding_bytes + owned_bytes_per_job,
         }
@@ -847,6 +853,7 @@ pub(super) fn align_words(words: u32) -> Result<u32, EncodeError> {
 
 #[derive(Clone, Copy)]
 pub(super) struct VarDctArtifactData<'a> {
+    pub(super) raw_matrices: super::raw_matrices::Fragments<'a>,
     pub(super) transform_plan: Option<&'a super::strategy_map::TransformPlan>,
     pub(super) strategy: u32,
     pub(super) dc_fragment_words: &'a [u32],

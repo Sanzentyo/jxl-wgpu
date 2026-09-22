@@ -308,7 +308,7 @@ code; blocking and runtime-neutral Future assembly are identical.
 The GPU executes sRGB linearization, XYB conversion, forward transforms, LF/AC quantization, the per-8×8
 clamped-Gradient DC predictor, signed tokenization, prefix packing, histogramming, and the
 standard strategy map. All 27 strategies and `TiledVarDctEncoder` use default or caller-selected
-parametric dequantization matrices and natural or caller-selected coefficient orders, with one prefix distribution
+parametric/raw dequantization matrices and natural or caller-selected coefficient orders, with one prefix distribution
 for all 495 coefficient contexts and no LZ77. `VarDctQuantization` validates exact global scale
 `1..=73728`, LF quantizer `1..=65536`, and a default `VarDctHfMultiplier` in `1..=256`.
 `VarDctTransform::with_hf_multiplier` overrides the default for that transform; sorting a map
@@ -337,8 +337,19 @@ encodings and expanded scales outside the finite interval `(0, 1e8)` before GPU 
 `Default` restores a family's standard matrix. Bounded scalar expansion is shared with the
 decoder, including the normative ×64 wire scaling of Hornuss and DCT2 parameters. The GPU
 uses the resulting scales for quantization; no image samples or coefficients are processed
-on the host. Raw Modular matrix side images (mode 7) and content-adaptive matrix selection
-remain unimplemented by the encoder.
+on the host.
+
+`with_raw_matrix(strategy, denominator, [x, y, b])` selects mode 7 for the same shared families.
+Each channel contains exactly `transform_width * transform_height` positive `i32` samples in
+the wire raster, whose width is `min(transform_width, transform_height)`. Transposed strategies
+share these samples without transposing the flattened matrix. The positive `FiniteF16`
+denominator times each sample must be finite and in `(0, 1e8)`. `raw_matrix(strategy)` exposes
+the validated `VarDctRawMatrix`; `encoding(strategy)` returns only parametric metadata.
+GPU work performs Gradient prediction, signed tokenization and prefix packing for each raw
+Modular side image, using the global tree without transforms or LZ77. Host validation checks
+the fragments against the caller's bounded matrix metadata before appending their bits to
+HF-global. Default, parametric and raw families can be interleaved. Content-adaptive matrix
+selection remains unimplemented.
 
 The LF and AC streams use 33-symbol raw prefix alphabets, covering every signed 32-bit value.
 The global MA tree is one Gradient leaf with no LZ77. Prefix bits retain all 15 canonical bits;
@@ -395,6 +406,13 @@ and 5,268 resident transform bytes. Tiled DCT8 retains the same 24-byte entry la
 `quantization_metadata_bytes` and included in the
 job's owned bytes. It requires four storage bindings and retains the table through completion
 or cancellation. No coefficient readback is added.
+Mode-7 selections add `raw_matrix_input_bytes` for immutable sample/descriptor/prefix storage
+and `raw_matrix_artifact_bytes` for compressed fragments and status. `readback_bytes` includes
+those fragments at the end of the existing mapped buffer. All three allocations belong to the
+same job reservation, submission and completion callback, including abandoned jobs. Families
+without raw matrices incur none of this storage; image parameters and artifact layouts stay
+unchanged. The [memory contract](../../docs/WGSL_MEMORY.md#raw-vardct-matrix-encoding)
+defines the bounded sizes and word ownership.
 Single transforms reserve one AC slot for three counts and at most `area - area / 64` coefficients
 per channel; the largest 256×256 slot has 217,730 words. Mixed maps reserve the exact
 strategy-specific bound per transform, with one length word each and no maximum-size slot
@@ -409,8 +427,8 @@ capacity.
 
 Actual-GPU tests compare emitted streams with Rust `jxl`, installed `djxl`, and the stock GPU
 decoder. All 27 strategies run textured RGB8 inputs with default/custom correlation, natural/custom
-orders and parametric matrices: each AC coefficient is checked against independent f64 transforms,
-pinned native bases/orders and independent matrix expansion. All 135 streams agree across the
+orders and parametric/raw matrices: each AC coefficient is checked against independent f64 transforms,
+pinned native bases/orders and independent matrix expansion. All 162 streams agree across the
 three decoders within one RGB8 code. Modes 1/2 use pinned libjxl matrix records; modes 3–6 use
 the independent `jxl-vardct` parser. The shared
 forward primitive separately checks 667 native coefficient/LF cases, including complete impulse
@@ -420,8 +438,13 @@ Procedural checkerboards, stripes, impulses, gradients, and colour patterns also
 single-packet images, AC/LF boundaries, custom correlation, and a 2057×2057 four-LF-group image.
 Mixed-map cases cover all 27 strategies in one 512×512 image, a 2057×17 LF-boundary image,
 and 13×21 non-DCT8 edge replication, including independent coefficient checks and all three decoders.
-The twelve maps include custom matrices combined with custom orders and LF metadata.
-Tiled custom matrices retain whole/fragmented-input agreement through 40-byte GPU windows.
+The fifteen maps include parametric and raw matrices combined with custom orders and LF metadata.
+Tiled custom matrices and interleaved rectangular raw/parametric families retain whole/fragmented-input
+agreement through 40-byte GPU windows. Independent entropy reconstruction checks every raw sample
+in all 17 families, including `i32::MAX`, and malformed GPU fragments are rejected before assembly.
+Two additional wide-sample images use independent `jxl-oxide` and native `djxl` with the same
+one-code bound because Rust `jxl` 0.6.0 disagrees on those cases; the
+[corpus](../../docs/CONFORMANCE_CORPUS.md#procedural-vardct-encoder-matrix) records the discrepancy.
 The batched forward primitive separately checks disjoint/reordered source and output ranges for
 all 27 strategies, with poisoned gaps and two transforms per batch under all five variants.
 An independent f64 cosine-sum reference checks AC values within one integer quantizer step;

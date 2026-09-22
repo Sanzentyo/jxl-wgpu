@@ -101,9 +101,9 @@ the observed peak is 2.3667124e-6. This comparison caught incorrect Y/B base con
 values 22389.441 and 11679.847 for those channels in both orientations.
 
 The encoder tests use textured RGB8 inputs for every strategy with default and explicit LF/HF
-correlation, natural/custom orders, and custom matrices: 135 streams. Independent f64 color
+correlation, natural/custom orders, and parametric/raw matrices: 162 streams. Independent f64 color
 conversion and cosine sums (or the native impulse basis for 8×8 transforms), native default
-matrices/orders and independent parametric matrices check every compressed AC coefficient
+matrices/orders, independent parametric matrices and scalar raw sample/denominator products check every compressed AC coefficient
 within one integer quantizer step. Rust `jxl`, native `djxl` and the stock GPU decoder agree within
 one RGB8 code; all five workgroup variants emit identical bytes. A dense maximum-range 256×256
 fragment fills its final allocated word, and a 500 KiB device binding limit rejects oversized
@@ -118,4 +118,5 @@ records the mixed-map, tiled, malformed-parameter and ownership cases.
 
 These are regression and interoperability bounds fixed before running the tests. They do not
 establish ISO precision, perceptual distance, rate control, content-adaptive strategy/matrix
-selection, raw-matrix encoding, adaptive entropy or progressive encoding. The full JPEG XL goal remains open.
+selection, adaptive entropy or progressive encoding. Raw-matrix encoding has separate GPU entropy,
+malformed-input and ownership evidence in the procedural corpus. The full JPEG XL goal remains open.

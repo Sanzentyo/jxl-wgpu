@@ -693,8 +693,8 @@ code is in `tests/native.rs`; there are no path-based module remappings.
 
 `vardct_encoder/tests/single.rs` adds textured images for all 27 strategies with default and custom
 LF/HF correlation. Each compressed AC value is checked against independent f64 color conversion,
-cosine sums or native impulse bases, native orders and independent default/parametric matrices within one integer quantizer step.
-All 135 default/custom-matrix and natural/custom-order streams agree across Rust `jxl`, `djxl`
+cosine sums or native impulse bases, native orders and independent default/parametric/raw matrices within one integer quantizer step.
+All 162 default/custom-matrix and natural/custom-order streams agree across Rust `jxl`, `djxl`
 and the stock GPU decoder within one RGB8 code,
 and their bytes are identical under Scalar/32/64/128/256 lanes. Large-transform decoding now
 accepts the frequency-CfL requirement implemented by the resident renderer, while unknown
@@ -727,15 +727,52 @@ mode-1/2/6 matrices on DCT8, Hornuss and DCT2 require exact Rust pixel equality 
 one-RGB8-code native/GPU bound under whole input and 40-byte GPU windows. The unused DC entries
 retain each implementation's convention; they do not participate in HF quantization.
 
-Twenty-seven additional single-transform streams combine custom matrices, custom orders and
-custom LF metadata. Three additional mixed maps bring the total to twelve; each compares every
+The parametric-matrix submatrix adds 27 single-transform streams combining custom matrices,
+custom orders and custom LF metadata. Its three mixed maps bring that subtotal to twelve; each compares every
 AC coefficient against independent transforms and matrices and checks all three decoders and
 five workgroup variants. Tiled matrix cases cover 1×1, 13×21, 257×17 and 2057×17, blocking/Future
 byte identity and seven-byte input fragments through 40-byte GPU windows. Typed negative tests
 cover incompatible modes, empty/oversized/mismatched bands, invalid expanded weights and HF
 integer overflow. Exact/one-byte-deficient budgets, cancellation and reuse include the combined
 1,536-byte tiled matrix/order table and custom-matrix mixed arenas. Default reset restores the
-one-bit all-default matrix encoding. Raw mode-7 matrix encoding remains open.
+one-bit all-default matrix encoding.
+
+`vardct_encoder/tests/raw_matrices.rs` adds mode-7 encoding for all 17 matrix families. The
+GPU performs clamped-Gradient prediction, signed tokenization and prefix packing from the
+caller's positive signed-32-bit matrix samples, using the global MA tree without transforms or
+LZ77. Independent `jxl_coding` entropy decoding and scalar i64 reconstruction recover every
+sample exactly in all 17 families together, including alternating `1` and `i32::MAX`. Tests
+reject incorrect channel lengths, nonpositive samples/denominators and scales outside `(0, 1e8)`;
+they check shared transposed/AFV families and default reset. Seven corruptions cover status,
+task identity, sample count, bit length, payload, padding and truncation. Missing GPU fragments
+cannot be serialized; storage/buffer/dispatch limits fail before submission.
+
+Raw matrices add 27 single-transform streams and three mixed maps, bringing the complete
+matrices to 162 streams and fifteen maps. Each checks every AC coefficient against the
+independent f64/native transform with scalar `sample / 16384` weights; native/Rust/GPU pixels
+retain the one-RGB8-code bound and all five variants retain byte identity. Four tiled images
+(1×1, 13×21, 257×17 and 2057×17) combine raw DCT8 with parametric families, custom orders and
+LF metadata. They require blocking/Future byte identity and whole/seven-byte fragmented GPU
+input equality through 40-byte windows. Four additional rectangle cases interleave raw and
+parametric families at DCT16×8, DCT8×16, DCT32×8 and DCT8×32. Native comparison exposed and
+corrected the decoder's reversed raw-image dimensions: the wire raster's shorter axis is
+horizontal, and its flattened entries already use the canonical coefficient order. This fixes
+all six rectangular matrix families through 128×256 without a sample transpose.
+
+Two additional 8×8 raw-matrix images test wide samples with denominator binary16 bits `0x0001`.
+The first cycles `[1, 127, 128, 255, 256, 65536, 16777215, i32::MAX]` with channel offsets;
+the second uses constant `131072`, giving dequantization scale `1/128`. Rust `jxl` 0.6.0
+differs from independent `jxl-oxide` 0.12.6 by 68 and 56 RGB8 codes respectively; the cause
+has not been established. On Apple M5/Metal, GPU and `jxl-oxide` output agree exactly on both,
+and native `djxl` 0.12.0 differs from each by at most one code. These two cases therefore use
+native plus `jxl-oxide` at the unchanged one-code bound; existing cases continue using Rust
+`jxl`. Both whole and bounded GPU input must agree, and reservations return to zero.
+
+Exact/one-byte-deficient admission, abandoned completion and reuse include all 17 raw families
+in tiled and mixed encoders. Their input and artifact buffers plus the raw readback tail are
+charged to the existing job permit and retained through its single completion map. No extra
+submission, map or image-coefficient readback is introduced. This is fixed-policy raw matrix
+encoding and interoperability evidence, not full transformed-raw-image or ISO precision conformance.
 
 The all-family mixed case exposed a decoder metadata cursor limit inherited from MA trees. Its
 replacement is the declared permutation grammar's bound, at most 387,867 values for all families.
@@ -798,7 +835,7 @@ truncation. Actual-GPU admission tests check a source that fits a 1 MiB device b
 AC artifact does not, exact and one-byte-deficient in-flight budgets, and abandoned nonzero work
 followed by successful reuse. ABI tests fix the five AC parameter fields at words 107–111 and
 header fields at words 46–50, with the single-transform linearized X dispatch at parameter word
-112. Mixed strategy maps, adaptive clustering, ANS/LZ77 and progressive encoding remain incomplete.
+112. Adaptive strategy selection, clustering, ANS/LZ77 and progressive encoding remain incomplete.
 
 An additional generated 8x8 patterned case serializes non-default exact-binary16 LF
 dequantization, colour factor 256, non-default X/B base correlations, and signed LF factors. The

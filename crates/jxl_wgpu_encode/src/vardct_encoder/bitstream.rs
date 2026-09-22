@@ -341,7 +341,13 @@ pub(super) fn build_frame_packet(
         let mut group = BitWriter::new();
         write_lf_global(&mut group, code, hf_entropy, coefficient_payload, config)?;
         write_lf_group(&mut group, code, artifact, frame, 0, config.quantization)?;
-        hf_entropy.write_global(&mut group, ac_groups, coefficient_payload, config)?;
+        hf_entropy.write_global(
+            &mut group,
+            ac_groups,
+            coefficient_payload,
+            config,
+            artifact.raw_matrices,
+        )?;
         artifact.ac.append_group(&mut group, frame, 0)?;
         group.align_to_byte()?;
         return Ok(FramePacketSet::new(
@@ -364,7 +370,13 @@ pub(super) fn build_frame_packet(
     )?;
     dc_global.align_to_byte()?;
     let mut ac_global = BitWriter::new();
-    hf_entropy.write_global(&mut ac_global, ac_groups, coefficient_payload, config)?;
+    hf_entropy.write_global(
+        &mut ac_global,
+        ac_groups,
+        coefficient_payload,
+        config,
+        artifact.raw_matrices,
+    )?;
     ac_global.align_to_byte()?;
 
     let mut packets = Vec::with_capacity(

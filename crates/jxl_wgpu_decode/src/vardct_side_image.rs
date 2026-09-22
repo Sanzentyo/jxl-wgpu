@@ -112,15 +112,15 @@ pub(crate) const fn raw_matrix_extent(matrix_index: usize) -> Option<[u32; 2]> {
         0 | 1 | 2 | 3 | 9 | 10 => [8, 8],
         4 => [16, 16],
         5 => [32, 32],
-        6 => [16, 8],
-        7 => [32, 8],
-        8 => [32, 16],
+        6 => [8, 16],
+        7 => [8, 32],
+        8 => [16, 32],
         11 => [64, 64],
-        12 => [64, 32],
+        12 => [32, 64],
         13 => [128, 128],
-        14 => [128, 64],
+        14 => [64, 128],
         15 => [256, 256],
-        16 => [256, 128],
+        16 => [128, 256],
         _ => return None,
     })
 }
@@ -162,9 +162,9 @@ mod tests {
     #[test]
     fn raw_matrix_extents_match_the_normative_representatives() {
         assert_eq!(raw_matrix_extent(0), Some([8, 8]));
-        assert_eq!(raw_matrix_extent(6), Some([16, 8]));
-        assert_eq!(raw_matrix_extent(14), Some([128, 64]));
-        assert_eq!(raw_matrix_extent(16), Some([256, 128]));
+        assert_eq!(raw_matrix_extent(6), Some([8, 16]));
+        assert_eq!(raw_matrix_extent(14), Some([64, 128]));
+        assert_eq!(raw_matrix_extent(16), Some([128, 256]));
         assert_eq!(raw_matrix_extent(17), None);
     }
 
@@ -186,10 +186,10 @@ mod tests {
                 .iter()
                 .map(|plane| [plane.width, plane.height])
                 .collect::<Vec<_>>(),
-            [[16, 8]; 3]
+            [[8, 16]; 3]
         );
         assert_eq!(plan.image.decoded_words, 16 * 8 * 3);
-        assert_eq!(plan.image.maximum_width, 16);
+        assert_eq!(plan.image.maximum_width, 8);
         assert_eq!(plan.image.inverse_plan.jobs(), &[]);
         assert!(!plan.image.needs_self_correcting);
     }

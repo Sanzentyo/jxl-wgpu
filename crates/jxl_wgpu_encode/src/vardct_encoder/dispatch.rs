@@ -18,13 +18,13 @@ use super::entropy::{
 };
 use super::entropy::{UINT_SYMBOLS, VarDctPrefixCode};
 use super::strategy_map::{TransformPlan, VarDctStrategyMap, VarDctTransform};
-use super::transforms;
 use super::types::{
     ARTIFACT_READY, ArtifactLayout, DcFragmentDescriptor, HEADER_WORDS, HF_QUANTIZATION,
     TiledVarDctGrid, VarDctArtifactData, VarDctArtifactHeader, VarDctColorEncoding,
     VarDctFrameLayout, VarDctKernelParams, VarDctLfMetadata, VarDctMemoryPlan, VarDctStrategy,
     VarDctTopology,
 };
+use super::{raw_matrices, transforms};
 use crate::{
     AnimationHeader, BackendError, BitFragment, BufferImageSource, Determinism, EncodeError,
     EncodeProfile, EncoderCapabilities, FrameEncodeRequest, FrameIndex, FrameOptions,
@@ -82,6 +82,8 @@ pub struct VarDctBackend {
     topology: VarDctTopology,
     transform_plan: Option<Arc<TransformPlan>>,
     tiled_metadata: Option<Vec<[u32; 6]>>,
+    raw_matrix_plan: Option<Arc<raw_matrices::Plan>>,
+    raw_matrix_pipeline: Option<raw_matrices::Pipeline>,
     config: VarDctConfig,
     capabilities: EncoderCapabilities,
     max_storage_binding_size: u64,
@@ -146,6 +148,11 @@ impl VarDctBackend {
         let code = fixed_prefix_code()?;
         let hf_entropy = HfEntropyPlan::single_cluster_prefix()?;
         let limits = context.device().limits();
+        let raw_matrix_plan =
+            raw_matrices::Plan::new(&config.dequant_matrices, &code)?.map(Arc::new);
+        if let Some(plan) = &raw_matrix_plan {
+            plan.validate_limits(&limits)?;
+        }
         for (name, available) in [
             (
                 "max_storage_buffer_binding_size",
@@ -248,6 +255,10 @@ impl VarDctBackend {
             None
         };
         Ok(Self {
+            raw_matrix_pipeline: raw_matrix_plan
+                .as_ref()
+                .map(|_| raw_matrices::Pipeline::new(context.device())),
+            raw_matrix_plan,
             pipelines,
             workgroup_variant,
             code,
@@ -502,6 +513,32 @@ impl VarDctBackend {
                 ),
             )
         };
+        if let Some(raw) = &self.raw_matrix_plan {
+            memory.raw_matrix_input_bytes = raw.input_bytes();
+            memory.raw_matrix_artifact_bytes = raw.artifact_bytes();
+            memory.readback_bytes = memory
+                .readback_bytes
+                .checked_add(raw.artifact_bytes())
+                .ok_or(EncodeError::InvalidConfiguration(
+                    "raw matrix readback size overflow",
+                ))?;
+            if memory.readback_bytes > self.max_buffer_size {
+                return Err(UnsupportedFeature::DeviceLimit {
+                    name: "max_buffer_size",
+                    required: memory.readback_bytes,
+                    available: self.max_buffer_size,
+                }
+                .into());
+            }
+            let extra = raw.input_bytes() + 2 * raw.artifact_bytes();
+            memory.owned_bytes_per_job = memory.owned_bytes_per_job.checked_add(extra).ok_or(
+                EncodeError::InvalidConfiguration("raw matrix ownership size overflow"),
+            )?;
+            memory.addressed_bytes_per_job =
+                memory.addressed_bytes_per_job.checked_add(extra).ok_or(
+                    EncodeError::InvalidConfiguration("raw matrix addressed size overflow"),
+                )?;
+        }
         if let Some(plan) = &self.transform_plan {
             let transform = plan.memory;
             memory.owned_bytes_per_job += transform.total_bytes;
@@ -809,6 +846,19 @@ impl GpuEncodeBackend for VarDctBackend {
             plan.memory.artifact_storage_bytes,
         );
 
+        let raw_scratch = self
+            .raw_matrix_plan
+            .as_ref()
+            .zip(self.raw_matrix_pipeline.as_ref())
+            .map(|(raw, pipeline)| {
+                pipeline.encode(
+                    context.device(),
+                    &mut commands,
+                    raw,
+                    &readback,
+                    plan.memory.artifact_storage_bytes,
+                )
+            });
         let completion = Arc::new(VarDctMapCompletion::default());
         let callback_completion = Arc::clone(&completion);
         let readback_for_map = Arc::clone(&readback);
@@ -817,6 +867,7 @@ impl GpuEncodeBackend for VarDctBackend {
             _artifact: artifact,
             _transform: transform_scratch,
             _tiled_quantization: tiled_quantization,
+            _raw_matrices: raw_scratch,
             readback,
             _memory_permit: memory_permit,
             mapped: AtomicBool::new(false),
@@ -851,6 +902,7 @@ impl GpuEncodeBackend for VarDctBackend {
             config: self.config.clone(),
             frame_layout: plan.frame,
             transform_plan: self.transform_plan.clone(),
+            raw_matrix_plan: self.raw_matrix_plan.clone(),
             artifact_layout: job_layout,
             frame_index: request.frame_index,
             is_last: request.is_last,
@@ -920,6 +972,7 @@ impl VarDctMapCompletion {
 }
 
 struct VarDctJobLifetime {
+    _raw_matrices: Option<raw_matrices::Scratch>,
     _transform: Option<transforms::Scratch>,
     _tiled_quantization: Option<wgpu::Buffer>,
     _parameters: Arc<wgpu::Buffer>,
@@ -938,6 +991,7 @@ impl Drop for VarDctJobLifetime {
 }
 
 pub struct VarDctJob {
+    raw_matrix_plan: Option<Arc<raw_matrices::Plan>>,
     lifetime: Option<Arc<VarDctJobLifetime>>,
     completion: Arc<VarDctMapCompletion>,
     code: VarDctPrefixCode,
@@ -964,7 +1018,7 @@ impl VarDctJob {
             .get_mapped_range()
             .map_err(BackendError::ArtifactRange)?;
         validate_artifact(
-            &mapped,
+            &mapped[..self.artifact_layout.artifact_bytes() as usize],
             self.artifact_layout,
             &self.code,
             &self.hf_entropy,
@@ -1018,14 +1072,20 @@ impl VarDctJob {
             }
         };
         let result = (|| {
-            let artifact = validate_artifact(
-                &mapped,
+            let boundary = self.artifact_layout.artifact_bytes() as usize;
+            let mut artifact = validate_artifact(
+                &mapped[..boundary],
                 self.artifact_layout,
                 &self.code,
                 &self.hf_entropy,
                 self.frame_layout,
                 self.transform_plan.as_deref(),
             )?;
+            if let Some(raw) = &self.raw_matrix_plan {
+                artifact.raw_matrices = raw.validate(&mapped[boundary..])?;
+            } else if mapped.len() != boundary {
+                return Err(BackendError::InvalidArtifact("unexpected raw matrix artifact").into());
+            }
             Ok(GpuFrameArtifacts {
                 frame_index: self.frame_index,
                 is_last: self.is_last,
@@ -1398,6 +1458,7 @@ pub(super) fn validate_artifact<'a>(
     }
     validate_fragment_padding(fragment_words, header.dc_fragment_bit_len)?;
     Ok(VarDctArtifactData {
+        raw_matrices: Default::default(),
         transform_plan,
         strategy: expected_strategy,
         dc_fragment_words: fragment_words,

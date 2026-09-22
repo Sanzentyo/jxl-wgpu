@@ -195,7 +195,11 @@ fn tiled_custom_orders_preserve_pixels_across_edges_groups_windows_and_variants(
 #[test]
 fn custom_tiled_order_storage_survives_cancellation_and_obeys_exact_admission() {
     let context = test_context().expect("actual GPU required for custom order lifetime");
-    for dequant_matrices in [Default::default(), matrices::selected()] {
+    for dequant_matrices in [
+        Default::default(),
+        matrices::selected(),
+        raw_matrices::selected(VarDctStrategy::ALL),
+    ] {
         let config = VarDctConfig {
             dequant_matrices,
             coefficient_orders: selected([VarDctStrategy::Dct8]),
@@ -210,6 +214,8 @@ fn custom_tiled_order_storage_survives_cancellation_and_obeys_exact_admission() 
             memory.parameter_storage_bytes
                 + memory.artifact_storage_bytes
                 + memory.readback_bytes
+                + memory.raw_matrix_input_bytes
+                + memory.raw_matrix_artifact_bytes
                 + 1536
         );
         for deficit in [1, 0] {

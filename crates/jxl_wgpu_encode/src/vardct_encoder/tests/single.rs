@@ -30,6 +30,10 @@ fn all_27_strategies_emit_native_checked_nonzero_ac_and_interoperate() {
     let custom_matrices = matrices::selected();
     let matrix_oracle = matrices::oracle(&custom_matrices);
     let mut custom_oracles = native_oracles();
+    let mut raw_oracles = native_oracles();
+    for (strategy, oracle) in VarDctStrategy::ALL.into_iter().zip(&mut raw_oracles) {
+        oracle.dequant = raw_matrices::oracle_scales(strategy);
+    }
     for (strategy, oracle) in VarDctStrategy::ALL.into_iter().zip(&mut custom_oracles) {
         oracle.dequant = matrices::oracle_scales(&matrix_oracle, strategy, &custom_matrices);
     }
@@ -60,17 +64,22 @@ fn all_27_strategies_emit_native_checked_nonzero_ac_and_interoperate() {
             VarDctLfMetadata::default(),
             custom_lf_metadata(),
             custom_lf_metadata(),
+            custom_lf_metadata(),
         ]
         .into_iter()
         .enumerate()
         {
-            let oracle = if custom == 4 {
+            let oracle = if custom == 5 {
+                &raw_oracles[strategy.codestream_id() as usize]
+            } else if custom == 4 {
                 &custom_oracles[strategy.codestream_id() as usize]
             } else {
                 oracle
             };
             let config = VarDctConfig {
-                dequant_matrices: if custom == 4 {
+                dequant_matrices: if custom == 5 {
+                    raw_matrices::selected([strategy])
+                } else if custom == 4 {
                     custom_matrices.clone()
                 } else {
                     Default::default()

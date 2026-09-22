@@ -60,8 +60,11 @@ impl HfEntropyPlan {
         ac_groups: u32,
         coefficient_payload: bool,
         config: &super::VarDctConfig,
+        raw_matrices: super::raw_matrices::Fragments<'_>,
     ) -> Result<(), EncodeError> {
-        config.dequant_matrices.write(output)?;
+        config
+            .dequant_matrices
+            .write_with_raw(output, raw_matrices)?;
         if !coefficient_payload {
             // The historical zero-HF artifact has no coefficient order-dependent payload.
             // Prefix single-symbol distributions consume no pass-group payload bits.

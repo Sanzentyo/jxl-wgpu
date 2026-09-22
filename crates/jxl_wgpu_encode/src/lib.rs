@@ -92,6 +92,6 @@ pub use vardct_encoder::{
     TiledVarDctEncoder, TiledVarDctGrid, VarDctBackend, VarDctCoefficientOrders,
     VarDctColorEncoding, VarDctConfig, VarDctDequantMatrices, VarDctEncoder, VarDctHfMultiplier,
     VarDctJob, VarDctKernelLayout, VarDctLfMetadata, VarDctMatrixEncoding, VarDctMemoryPlan,
-    VarDctQuantization, VarDctStrategy, VarDctStrategyMap, VarDctSubmission, VarDctTransform,
-    VarDctTransformMemoryPlan,
+    VarDctQuantization, VarDctRawMatrix, VarDctStrategy, VarDctStrategyMap, VarDctSubmission,
+    VarDctTransform, VarDctTransformMemoryPlan,
 };
