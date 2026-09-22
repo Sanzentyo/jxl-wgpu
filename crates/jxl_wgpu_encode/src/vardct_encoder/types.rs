@@ -285,6 +285,8 @@ pub struct VarDctMemoryPlan {
     pub parameter_storage_bytes: u64,
     pub artifact_storage_bytes: u64,
     pub readback_bytes: u64,
+    /// Local-contrast records and alignment, already included in artifact/readback bytes.
+    pub saliency_metadata_bytes: u64,
     /// Tiled DCT8's X/Y/B dequantization and order table; general transforms include it in `transform`.
     pub quantization_metadata_bytes: u64,
     /// Raw-matrix GPU sample/descriptor/prefix input, zero when all matrices are parametric.
@@ -362,6 +364,7 @@ impl VarDctMemoryPlan {
             parameter_storage_bytes,
             artifact_storage_bytes,
             readback_bytes,
+            saliency_metadata_bytes: 0,
             quantization_metadata_bytes,
             transform: None,
             raw_matrix_input_bytes: 0,
@@ -419,7 +422,9 @@ pub(super) struct VarDctKernelParams {
     pub(super) ac_pass_count: u32,
     pub(super) ac_pass_words: u32,
     pub(super) progressive: [u32; 11],
-    pub(super) padding: [u32; 9],
+    pub(super) saliency_offset: u32,
+    pub(super) saliency_groups: u32,
+    pub(super) padding: [u32; 7],
 }
 
 #[repr(C)]
@@ -459,7 +464,8 @@ pub(super) struct VarDctArtifactHeader {
     pub(super) ac_words_per_block: u32,
     pub(super) ac_fragment_words: u32,
     pub(super) ac_pass_count: u32,
-    pub(super) padding: [u32; 2],
+    pub(super) saliency_offset: u32,
+    pub(super) saliency_groups: u32,
 }
 
 #[repr(C)]
@@ -482,6 +488,8 @@ const _: () = {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ArtifactLayout {
+    pub(super) saliency_offset: u32,
+    pub(super) saliency_groups: u32,
     pub(super) ac_pass_count: u32,
     pub(super) fragment_descriptor_offset: u32,
     pub(super) fragment_descriptor_len: u32,
@@ -505,9 +513,26 @@ pub(super) struct ArtifactLayout {
 }
 
 impl ArtifactLayout {
+    pub(super) fn with_saliency(mut self, groups: u32) -> Result<Self, EncodeError> {
+        if self.saliency_groups != 0 || !(1..=4096).contains(&groups) {
+            return Err(EncodeError::InvalidConfiguration(
+                "invalid VarDCT saliency group count",
+            ));
+        }
+        self.saliency_offset = self.artifact_words;
+        self.saliency_groups = groups;
+        self.artifact_words = align_words(self.artifact_words.checked_add(groups * 4).ok_or(
+            EncodeError::InvalidConfiguration("VarDCT saliency arena overflow"),
+        )?)?;
+        Ok(self)
+    }
+
     pub(super) fn with_passes(mut self, count: usize) -> Result<Self, EncodeError> {
         let overflow = || EncodeError::InvalidConfiguration("VarDCT pass arena overflow");
-        if !(1..=crate::ProgressivePlan::MAX_PASSES).contains(&count) || self.ac_pass_count != 1 {
+        if !(1..=crate::ProgressivePlan::MAX_PASSES).contains(&count)
+            || self.ac_pass_count != 1
+            || self.saliency_groups != 0
+        {
             return Err(EncodeError::InvalidConfiguration(
                 "invalid VarDCT pass count",
             ));
@@ -660,6 +685,8 @@ impl ArtifactLayout {
             )?)?;
         Ok(Self {
             fragment_descriptor_offset,
+            saliency_offset: 0,
+            saliency_groups: 0,
             ac_pass_count: 1,
             fragment_descriptor_len,
             strategy_offset,
@@ -906,6 +933,7 @@ pub(super) fn align_words(words: u32) -> Result<u32, EncodeError> {
 
 #[derive(Clone, Copy)]
 pub(super) struct VarDctArtifactData<'a> {
+    pub(super) saliency: Option<&'a [super::saliency::Record]>,
     pub(super) raw_matrices: super::raw_matrices::Fragments<'a>,
     pub(super) transform_plan: Option<&'a super::strategy_map::TransformPlan>,
     pub(super) strategy: u32,

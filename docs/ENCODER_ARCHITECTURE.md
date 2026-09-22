@@ -389,18 +389,28 @@ cargo clippy -p jxl_wgpu_encode --all-targets -- -D warnings
   passes; tiled DCT8 keeps each block in 2 KiB workgroup storage. The single `TransformKind`
   alphabet and shared matrix/order metadata are used by both encoder and decoder. Its
   `HfEntropyPlan` currently selects one prefix cluster for all 495 coefficient contexts,
-  disables LZ77, and emits one pass. That plan is a stable policy boundary rather than a temporary
-  wire format: future adaptive clustering, ANS/LZ, content-adaptive order selection, and pass selection can use
+  disables LZ77, and emits 1–11 configured spectral/quantized AC passes. That plan is a stable policy boundary rather than a temporary
+  wire format: future adaptive clustering, ANS/LZ, content-adaptive coefficient-order selection, and pass selection can use
   different plans while retaining the GPU artifact contract. Native coefficient/LF fixtures and
   independent f64 compressed-coefficient checks cover every strategy with default/custom correlation.
+
+VarDCT delivery separates coefficient order from physical AC-group order. Validated caller
+orders and center geometry remain host metadata. Optional `saliency_first` computes local
+RGB edge contrast on the GPU with an integer workgroup reduction, then reads only four words
+per group through the existing artifact/map. Host sorting compares those bounded statistics
+exactly; it never reads source pixels. The same permutation repeats in each AC pass after
+LF/HF metadata. [The encoder contract](../crates/jxl_wgpu_encode/README.md#experimental-vardct-profile)
+and [memory layout](WGSL_MEMORY.md#progressive-vardct-encoding) define the heuristic, limits
+and cancellation ownership. Local contrast is distinct from content-adaptive transform or
+quantizer search and does not establish production perceptual quality.
 
 ### Remaining work
 
 The authoritative encoder items, dependencies, priorities, and acceptance gates are the `MOD-E`,
 `VDCT-E`, `ENT-E`, `ENC`, and encoder-facing `IO` rows in
 [`FULL_JPEG_XL_ROADMAP.md`](FULL_JPEG_XL_ROADMAP.md). After the structural-refactoring gate, the
-nearest work remains parallel Modular token production, native YUV/NV12-family ingestion, mixed
-image-wide VarDCT strategy maps, broader entropy/progression and the rate/quality control built on top.
+nearest work remains parallel Modular token production, native YUV/NV12-family ingestion,
+broader entropy/progression and the rate/quality control built on top.
 Batched codec submission and advanced performance instrumentation stay separate from
 format-completeness claims.
 

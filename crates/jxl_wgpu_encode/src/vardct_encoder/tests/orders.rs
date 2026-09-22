@@ -200,6 +200,7 @@ fn custom_tiled_order_storage_survives_cancellation_and_obeys_exact_admission() 
         matrices::selected(),
         raw_matrices::selected(VarDctStrategy::ALL),
         raw_matrices::selected(VarDctStrategy::ALL),
+        raw_matrices::selected(VarDctStrategy::ALL),
     ]
     .into_iter()
     .enumerate()
@@ -207,10 +208,12 @@ fn custom_tiled_order_storage_survives_cancellation_and_obeys_exact_admission() 
         let config = VarDctConfig {
             group_order: if case == 3 {
                 crate::VarDctGroupOrder::centered_at(256, 0)
+            } else if case == 4 {
+                crate::VarDctGroupOrder::saliency_first()
             } else {
                 Default::default()
             },
-            progressive: if case == 3 {
+            progressive: if case >= 3 {
                 progressive::maximum()
             } else {
                 Default::default()
@@ -222,6 +225,28 @@ fn custom_tiled_order_storage_survives_cancellation_and_obeys_exact_admission() 
         let source = padded_rgb_source_sized(&context, 257, 17, &reference::pattern(257, 17));
         let encoder = TiledVarDctEncoder::new_with_config(context.clone(), config.clone()).unwrap();
         let memory = encoder.memory_plan(&source).unwrap();
+        assert_eq!(
+            memory.saliency_metadata_bytes,
+            if case == 4 { 256 } else { 0 }
+        );
+        if case == 4 {
+            let raster = TiledVarDctEncoder::new_with_config(
+                context.clone(),
+                VarDctConfig {
+                    group_order: Default::default(),
+                    ..config.clone()
+                },
+            )
+            .unwrap()
+            .memory_plan(&source)
+            .unwrap();
+            assert_eq!(
+                memory.artifact_storage_bytes,
+                raster.artifact_storage_bytes + 256
+            );
+            assert_eq!(memory.readback_bytes, raster.readback_bytes + 256);
+            assert_eq!(memory.owned_bytes_per_job, raster.owned_bytes_per_job + 512);
+        }
         assert_eq!(memory.quantization_metadata_bytes, 1536);
         assert_eq!(
             memory.owned_bytes_per_job,

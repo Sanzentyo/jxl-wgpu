@@ -40,7 +40,9 @@ struct Params {
     ac_pass_count: u32,
     ac_pass_words: u32,
     progressive: array<u32, 11>,
-    padding: array<u32, 9>,
+    saliency_offset: u32,
+    saliency_groups: u32,
+    padding: array<u32, 7>,
 }
 
 @group(0) @binding(0)
@@ -232,6 +234,8 @@ fn serialize_control() {
     artifact_words[63] = params.ac_words_per_block;
     artifact_words[64] = params.ac_fragment_words;
     artifact_words[65] = params.ac_pass_count;
+    artifact_words[66] = params.saliency_offset;
+    artifact_words[67] = params.saliency_groups;
     artifact_words[0] = ARTIFACT_READY;
 }
 

@@ -25,6 +25,7 @@ pub enum KernelStage {
     ForwardTransform,
     Quantization,
     ProgressiveSplit,
+    GroupOrderSelection,
     ModularResidualTokenization,
     CoefficientTokenization,
     HistogramReduction,

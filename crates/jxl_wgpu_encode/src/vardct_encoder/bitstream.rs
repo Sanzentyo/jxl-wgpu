@@ -359,6 +359,9 @@ pub(super) fn build_frame_packet(
     config: &VarDctConfig,
 ) -> Result<FramePacketSet, EncodeError> {
     config.group_order.validate(frame)?;
+    config
+        .group_order
+        .validate_scores(frame, artifact.saliency)?;
     let ac_groups = frame.ac_group_count()?;
     let lf_groups = frame.lf_group_count()?;
     let coefficient_payload = artifact.has_ac_payload();
@@ -464,5 +467,6 @@ pub(super) fn build_frame_packet(
             packets,
         )?,
         frame,
+        artifact.saliency,
     )
 }

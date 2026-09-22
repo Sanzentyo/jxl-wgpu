@@ -24,7 +24,7 @@ use super::types::{
     VarDctFrameLayout, VarDctKernelParams, VarDctLfMetadata, VarDctMemoryPlan, VarDctStrategy,
     VarDctTopology,
 };
-use super::{raw_matrices, transforms};
+use super::{raw_matrices, saliency, transforms};
 use crate::{
     AnimationHeader, BackendError, BitFragment, BufferImageSource, Determinism, EncodeError,
     EncodeProfile, EncoderCapabilities, FrameEncodeRequest, FrameIndex, FrameOptions,
@@ -84,6 +84,7 @@ pub struct VarDctBackend {
     tiled_metadata: Option<Vec<[u32; 6]>>,
     raw_matrix_plan: Option<Arc<raw_matrices::Plan>>,
     raw_matrix_pipeline: Option<raw_matrices::Pipeline>,
+    saliency_pipeline: Option<saliency::Pipeline>,
     config: VarDctConfig,
     capabilities: EncoderCapabilities,
     max_storage_binding_size: u64,
@@ -254,7 +255,24 @@ impl VarDctBackend {
         } else {
             None
         };
+        let saliency_pipeline = config
+            .group_order
+            .requires_saliency()
+            .then(|| saliency::Pipeline::new(context.device(), workgroup_variant))
+            .transpose()?;
+        let mut implemented_stages = vec![
+            KernelStage::InputNormalization,
+            KernelStage::ColorTransform,
+            KernelStage::ForwardTransform,
+            KernelStage::Quantization,
+            KernelStage::CoefficientTokenization,
+            KernelStage::HistogramReduction,
+        ];
+        if saliency_pipeline.is_some() {
+            implemented_stages.push(KernelStage::GroupOrderSelection);
+        }
         Ok(Self {
+            saliency_pipeline,
             raw_matrix_pipeline: raw_matrix_plan
                 .as_ref()
                 .map(|_| raw_matrices::Pipeline::new(context.device())),
@@ -274,14 +292,7 @@ impl VarDctBackend {
                 max_progressive_passes: ProgressivePlan::MAX_PASSES as u8,
                 animation: false,
                 determinism: Determinism::SameDevice,
-                implemented_stages: vec![
-                    KernelStage::InputNormalization,
-                    KernelStage::ColorTransform,
-                    KernelStage::ForwardTransform,
-                    KernelStage::Quantization,
-                    KernelStage::CoefficientTokenization,
-                    KernelStage::HistogramReduction,
-                ],
+                implemented_stages,
             },
             max_storage_binding_size: limits.max_storage_buffer_binding_size,
             max_buffer_size: limits.max_buffer_size,
@@ -417,7 +428,7 @@ impl VarDctBackend {
         let hf_correlation = self.config.lf_metadata.hf_correlation();
         let common_strategy = frame.topology.strategy_id();
         let (kernel, mut memory) = {
-            let layout = match frame.topology {
+            let mut layout = match frame.topology {
                 VarDctTopology::StrategyMap => self
                     .transform_plan
                     .as_ref()
@@ -431,7 +442,10 @@ impl VarDctBackend {
                 }
             }
             .with_passes(self.config.progressive.passes().len())?;
-            let required_workgroup_axis = match frame.topology {
+            if self.config.group_order.requires_saliency() {
+                layout = layout.with_saliency(frame.ac_group_count()?)?;
+            }
+            let mut required_workgroup_axis = match frame.topology {
                 VarDctTopology::TiledDct8 => blocks_x.max(blocks_y),
                 VarDctTopology::SingleTransform(_) | VarDctTopology::StrategyMap => {
                     let groups = (frame.blocks_x * frame.blocks_y * 64)
@@ -440,6 +454,11 @@ impl VarDctBackend {
                     columns.max(groups.div_ceil(columns.max(1)))
                 }
             };
+            if self.config.group_order.requires_saliency() {
+                required_workgroup_axis = required_workgroup_axis
+                    .max(frame.ac_groups_x)
+                    .max(frame.ac_groups_y);
+            }
             if required_workgroup_axis > self.max_compute_workgroups_per_dimension {
                 return Err(UnsupportedFeature::DeviceLimit {
                     name: "max_compute_workgroups_per_dimension",
@@ -516,7 +535,9 @@ impl VarDctBackend {
                                         | u32::from(pass.shift) << 8
                                 })
                         }),
-                        padding: [0; 9],
+                        saliency_offset: layout.saliency_offset,
+                        saliency_groups: layout.saliency_groups,
+                        padding: [0; 7],
                     },
                     layout,
                 },
@@ -527,6 +548,10 @@ impl VarDctBackend {
                 ),
             )
         };
+        if kernel.layout.saliency_groups != 0 {
+            memory.saliency_metadata_bytes =
+                u64::from(kernel.layout.artifact_words - kernel.layout.saliency_offset) * 4;
+        }
         if let Some(raw) = &self.raw_matrix_plan {
             memory.raw_matrix_input_bytes = raw.input_bytes();
             memory.raw_matrix_artifact_bytes = raw.artifact_bytes();
@@ -791,7 +816,7 @@ impl GpuEncodeBackend for VarDctBackend {
                                 .transform_plan
                                 .as_ref()
                                 .expect("general transform plan"),
-                            source: source_binding,
+                            source: source_binding.clone(),
                             parameters: &parameters,
                             artifact: &artifact,
                         },
@@ -860,6 +885,16 @@ impl GpuEncodeBackend for VarDctBackend {
                 layout
             }
         };
+        if let Some(pipeline) = &self.saliency_pipeline {
+            pipeline.encode(
+                context.device(),
+                &mut commands,
+                source_binding,
+                &parameters,
+                &artifact,
+                plan.frame,
+            );
+        }
         commands.copy_buffer_to_buffer(
             &artifact,
             0,
@@ -1027,6 +1062,34 @@ pub struct VarDctJob {
 }
 
 impl VarDctJob {
+    #[cfg(test)]
+    pub(super) fn wait_with_saliency_for_test(
+        mut self,
+    ) -> Result<(Vec<saliency::Record>, GpuFrameArtifacts), EncodeError> {
+        self.completion.wait()?;
+        let lifetime = self.lifetime.as_ref().expect("unconsumed test job");
+        let mapped = lifetime
+            .readback
+            .slice(..)
+            .get_mapped_range()
+            .map_err(BackendError::ArtifactRange)?;
+        let artifact = validate_artifact(
+            &mapped[..self.artifact_layout.artifact_bytes() as usize],
+            self.artifact_layout,
+            &self.code,
+            &self.hf_entropy,
+            self.frame_layout,
+            self.transform_plan.as_deref(),
+        )?;
+        let records = artifact
+            .saliency
+            .ok_or(BackendError::Invariant("test requires saliency"))?
+            .to_vec();
+        drop(mapped);
+        let artifacts = self.finish(Ok(()))?;
+        Ok((records, artifacts))
+    }
+
     /// Completes once, retaining all GPU-compressed fragments for independent test oracles.
     #[cfg(test)]
     pub(super) fn wait_with_ac_fragments_for_test(
@@ -1233,14 +1296,11 @@ pub(super) fn validate_artifact<'a>(
         || header.ac_words_per_block != layout.ac_words_per_block
         || header.ac_fragment_words != layout.ac_fragment_words
         || header.ac_pass_count != layout.ac_pass_count
+        || header.saliency_offset != layout.saliency_offset
+        || header.saliency_groups != layout.saliency_groups
     {
         return Err(BackendError::InvalidArtifact(
             "VarDCT status, live counts, orientation, or layout metadata mismatch",
-        ));
-    }
-    if header.padding.iter().any(|&word| word != 0) {
-        return Err(BackendError::InvalidArtifact(
-            "VarDCT header padding is nonzero",
         ));
     }
     if header.dc_fragment_bit_len > layout.fragment_max_bits
@@ -1304,8 +1364,13 @@ pub(super) fn validate_artifact<'a>(
         layout.fragment_offset,
     )?;
     let dc_end = layout.fragment_offset + layout.fragment_word_capacity;
+    let entropy_end = if layout.saliency_groups == 0 {
+        layout.artifact_words
+    } else {
+        layout.saliency_offset
+    };
     let ac = if layout.ac_descriptor_len == 0 {
-        validate_zero_gap(words, dc_end, layout.artifact_words)?;
+        validate_zero_gap(words, dc_end, entropy_end)?;
         AcFragments::Empty
     } else {
         validate_zero_gap(words, dc_end, layout.ac_descriptor_offset)?;
@@ -1317,7 +1382,7 @@ pub(super) fn validate_artifact<'a>(
         validate_zero_gap(
             words,
             layout.ac_fragment_offset + layout.ac_fragment_words,
-            layout.artifact_words,
+            entropy_end,
         )?;
         let bit_lengths = artifact_words(
             words,
@@ -1487,7 +1552,22 @@ pub(super) fn validate_artifact<'a>(
         ));
     }
     validate_fragment_padding(fragment_words, header.dc_fragment_bit_len)?;
+    let saliency = if layout.saliency_groups == 0 {
+        None
+    } else {
+        let records = artifact_words(words, layout.saliency_offset, layout.saliency_groups * 4)?;
+        let records = bytemuck::try_cast_slice::<u32, saliency::Record>(records)
+            .map_err(|_| BackendError::InvalidArtifact("saliency record ABI alignment"))?;
+        saliency::validate(records, frame)?;
+        validate_zero_gap(
+            words,
+            layout.saliency_offset + layout.saliency_groups * 4,
+            layout.artifact_words,
+        )?;
+        Some(records)
+    };
     Ok(VarDctArtifactData {
+        saliency,
         raw_matrices: Default::default(),
         transform_plan,
         strategy: expected_strategy,

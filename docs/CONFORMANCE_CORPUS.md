@@ -1076,10 +1076,11 @@ use i64 cumulative targets rather than the shader's residual loop. Zero/excessiv
 invalid shifts/order/finality, duplicated arena expansion, sixteen-K square arena overflow,
 request/config mismatch and an actual 64-KiB device binding limit have rejection evidence.
 
-Seven tiled images cover 17×1/two passes, 13×21/three spectral passes, 257×17/three quantized
+Nine tiled images cover 17×1/two passes, 13×21/three spectral passes, 257×17/three quantized
 passes, 2057×17/five combined passes, 1×1/eleven passes, 513×257/three center-first passes and
-2057×1/five explicitly ordered passes. The last two carry resolution stopping points and
-nonidentity TOC permutations. They combine raw DCT8 with other
+2057×1/five explicitly ordered passes, plus GPU saliency order at 513×257/three spectral
+passes and 2057×1/eleven passes. The center/explicit cases and three-pass saliency case carry
+resolution stopping points. These cases exercise nonidentity TOC permutations and combine raw DCT8 with other
 parametric families, custom orders and LF metadata. Native scalar libjxl supplies every DC,
 intermediate AC and final linear RGBA-F32 image. Bounds remain `1e-5` for DC, `2e-4` for
 intermediate AC and `1e-4` for the final image. Normal native SIMD is also required for every
@@ -1089,7 +1090,7 @@ at `1e-4`. Whole input and seven-byte transport fragments through 40/256/1024-by
 byte-identical. Held outputs remain immutable, final-only decoding equals the last update,
 and GPU/input reservations return to zero. The reported pass count and TOC match the physical
 inventory; blocking/Future encoding and all five workgroup variants produce identical bytes.
-For the center/explicit cases, native scalar decoding also receives byte prefixes ending
+For the center/explicit/saliency cases, native scalar decoding also receives byte prefixes ending
 exactly after each nonfinal AC pass. Flush output equals that pass's whole-input image byte
 for byte, with the declared intended resolution. This proves those complete-pass prefixes
 are displayable by native libjxl; it does not assert incomplete-main-input GPU readiness.
@@ -1133,7 +1134,37 @@ check first and last slots in every pass at counts 1/3/11. Exact-budget, one-byt
 abandoned-completion and successful-reuse checks cover eleven-pass tiled and five-pass mixed
 jobs, including raw-matrix storage and center/explicit group order. These are spectral/quantized
 AC interoperability, delivery-order and ownership gates. Separate DC progressive frames,
-adaptive saliency selection and full ISO precision remain open.
+broader saliency/perceptual evaluation and full ISO precision remain open.
+
+### GPU saliency group ordering
+
+`vardct_encoder/tests/saliency.rs` independently traverses source pixel edges in u64 and
+compares every GPU edge count and RGB absolute-difference sum. Eight tiled extents cover
+1×1, 17×1, 13×21, 257×17, 513×257, 2057×17, 16384×1 and 1×16384. Three mixed maps include
+all 27 strategies at 512×512, replicated non-DCT8 edges at 13×21 and an LF boundary at
+2057×17. All run under Scalar/32/64/128/256; poisoned row padding is never included. An
+additional 257×257 pixel checkerboard reaches the exact score bound of 765 per edge,
+including every group boundary. An independent f64 mean orders the bounded integer records.
+The progressive cases above also
+require blocking/Future and all five variants to produce identical complete bytes.
+
+A 512×256 source contains a flat left group and a textured right group. GPU saliency produces
+the same codestream as explicit `[1,0]`; every canonical LF/HF/AC payload stays byte-identical
+to raster order. Native scalar full-pass images are unchanged. After receiving one complete
+first-pass AC group, native linear-RGBA squared error against the final image is
+67955.27019047199 for raster order and 103.37899518481355 for saliency order on Apple M5/Metal.
+This compares equal delivered group counts, not equal byte counts, and is one declared local
+contrast example rather than a perceptual or bitrate benchmark. Native/Rust/GPU final RGB8
+retains the one-code bound. A flat image with clipped edge groups retains exact raster bytes.
+
+Typed artifact checks reject missing/forged records, inconsistent edge counts, score overflow,
+nonzero alignment padding and absent/unexpected score data for the chosen policy. Checked
+layout tests cover invalid counts and arithmetic overflow. An actual device binding limit
+admits the raster arena and rejects the extra 256-byte saliency tail before memory admission.
+An actual 32-workgroup axis limit admits linearized codec work for horizontal/vertical 16K
+panoramas and rejects their 64-group saliency dispatch before admission.
+Existing exact-budget, one-byte-pressure, cancellation and reuse matrices add eleven-pass
+tiled and five-pass all-strategy mixed jobs with all raw matrices and automatic ordering.
 
 ## Modular orientation and semantic header admission
 

@@ -370,6 +370,7 @@ fn mixed_jobs_admit_exact_memory_reject_wrong_extents_and_release_after_cancella
         orders::selected(VarDctStrategy::ALL),
         orders::selected(VarDctStrategy::ALL),
         orders::selected(VarDctStrategy::ALL),
+        orders::selected(VarDctStrategy::ALL),
     ]
     .into_iter()
     .enumerate()
@@ -379,10 +380,12 @@ fn mixed_jobs_admit_exact_memory_reject_wrong_extents_and_release_after_cancella
         let custom = VarDctConfig {
             group_order: if case == 4 {
                 crate::VarDctGroupOrder::explicit(vec![2, 3, 1, 0]).unwrap()
+            } else if case == 5 {
+                crate::VarDctGroupOrder::saliency_first()
             } else {
                 Default::default()
             },
-            progressive: if case == 4 {
+            progressive: if case >= 4 {
                 progressive::combined()
             } else {
                 Default::default()
@@ -403,6 +406,10 @@ fn mixed_jobs_admit_exact_memory_reject_wrong_extents_and_release_after_cancella
                 .unwrap();
         let source = padded_rgb_source_sized(&context, 512, 512, &pixels);
         let memory = encoder.memory_plan(&source).unwrap();
+        assert_eq!(
+            memory.saliency_metadata_bytes,
+            if case == 5 { 256 } else { 0 }
+        );
         assert_eq!(memory.kernel_layout, VarDctKernelLayout::StrategyMap);
         let wrong = padded_rgb_source_sized(&context, 8, 8, &[[0; 3]; 64]);
         assert!(matches!(

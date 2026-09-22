@@ -59,6 +59,16 @@ fn progressive_updates_match_native_and_bounded_input_under_all_variants() {
             VarDctGroupOrder::explicit(vec![8, 0, 7, 1, 6, 2, 5, 3, 4]).unwrap(),
             256,
         ),
+        (
+            513,
+            257,
+            plan(&[(2, 0), (4, 0), (8, 0)])
+                .with_downsampling(delivery::endpoints(&[(4, 0), (2, 1)]))
+                .unwrap(),
+            VarDctGroupOrder::saliency_first(),
+            1024,
+        ),
+        (2057, 1, maximum(), VarDctGroupOrder::saliency_first(), 256),
     ] {
         let config = VarDctConfig {
             progressive,
@@ -97,9 +107,20 @@ fn progressive_updates_match_native_and_bounded_input_under_all_variants() {
             native_updates(&bytes, true).expect("native SIMD progressive oracle is required");
         assert_eq!(native.len(), simd.len());
         assert_eq!(native.len(), config.progressive.passes().len() + 1);
+        let delivery_config = if config.group_order.requires_saliency() {
+            VarDctConfig {
+                group_order: VarDctGroupOrder::explicit(saliency::expected_order(
+                    width, height, &pixels,
+                ))
+                .unwrap(),
+                ..config.clone()
+            }
+        } else {
+            config.clone()
+        };
         delivery::check_file_order_and_native_prefixes(
             &bytes,
-            &config,
+            &delivery_config,
             &inventory.frames[0],
             &native,
         );

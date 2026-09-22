@@ -123,8 +123,8 @@ name shown in parentheses.
 | `jxl_wgpu/forward_vardct.wgsl` | `forward_vardct::Params` / `Params` | six transform/LF geometry words, task count, linearized workgroup X count, two vec4 records for strides and constant-basis offsets | 64 | 16 | uniform |
 | `jxl_wgpu/forward_vardct.wgsl` | `ForwardVarDctTask` / `Task` | three scalar source origins, coefficient and LF offsets | 20 | 4 | read-only storage element |
 | `jxl_wgpu_encode/vardct_encoder/transforms.wgsl` | `TransformTask` | block origin, coefficient/LF offsets, transform extent, matrix/order offset, AC slot offset/capacity, strategy ID, HF multiplier | 44 | 4 | read-only storage element |
-| `jxl_wgpu_encode/vardct_encoder/control.wgsl` | `VarDctKernelParams` / `Params` | source/block geometry, LF/control section ranges, topology/LF grid, LF quantization/correlation, separate 33-entry DC/HF prefix tables, HF correlation/quantization, five AC descriptor/fragment fields, linearized workgroup X count, AC pass count/word stride, eleven packed spectral/shift descriptors, 9 pads | 768 | 4 | read-only storage |
-| `jxl_wgpu_encode/vardct_encoder/control.wgsl` | `VarDctArtifactHeader` / header words | status/live counts, AC-presence marker, LF section ranges/total bits, source/block geometry, topology, 33-bin DC histogram, LF descriptors/grid/count, AC descriptor offset/count and fragment offset/stride/word count, AC pass count, 2 pads | 272 | 4 | storage/readback record |
+| `jxl_wgpu_encode/vardct_encoder/control.wgsl` | `VarDctKernelParams` / `Params` | source/block geometry, LF/control section ranges, topology/LF grid, LF quantization/correlation, separate 33-entry DC/HF prefix tables, HF correlation/quantization, five AC descriptor/fragment fields, linearized workgroup X count, AC pass count/word stride, eleven packed spectral/shift descriptors, saliency offset/count, 7 pads | 768 | 4 | read-only storage |
+| `jxl_wgpu_encode/vardct_encoder/control.wgsl` | `VarDctArtifactHeader` / header words | status/live counts, AC-presence marker, LF section ranges/total bits, source/block geometry, topology, 33-bin DC histogram, LF descriptors/grid/count, AC descriptor offset/count and fragment offset/stride/word count, AC pass count, saliency offset/count | 272 | 4 | storage/readback record |
 | `jxl_wgpu_encode/vardct_encoder/control.wgsl` | `DcFragmentDescriptor` / two words | `bit_offset, bit_len` for one row-major LF group | 8 | 4 | storage/readback element |
 | `jxl_wgpu_encode/vardct_encoder/common.wgsl` | six host words / `QuantizationEntry` | three f32 dequantization scales followed by three u32 X/Y/B coefficient-order positions | 24 | 4 | read-only storage element |
 | `jxl_wgpu_encode/vardct_encoder/raw_matrices.wgsl` | five task words | wire width, channel area, input sample offset, output fragment offset, fragment capacity in words | 20 | 4 | read-only storage element after 67 prefix/control words |
@@ -280,6 +280,7 @@ The table below states the default workgroup configuration for each entry point:
 | `vardct_encoder/tiled::quantize_blocks` | source/params RO, artifact RW | 64x1 | Tier C (`KernelVariant` linear) | one 2-D workgroup per 8x8 block; checked block-grid/source/artifact ranges; 2,052 shared bytes including the error flag; tiled DCT8 emits DC plus disjoint word-aligned AC fragments |
 | `vardct_encoder/control::serialize_control` | params RO, artifact RW | 1x1 | Tier B (fixed) | one bounded scalar dispatch serializes LF groups row-major, resets prediction at each 256x256-block boundary, and writes checked contiguous fragment descriptors |
 | `vardct_encoder/raw_matrices::encode` | matrix samples/descriptors/prefix RO, raw artifact RW | 1x1 | Tier B (fixed) | one invocation per raw family (at most 17); each owns one word-aligned fragment and status, with bounded Gradient prediction and two-word prefix/extra writes |
+| `vardct_encoder/saliency::group_saliency` | source/params RO, artifact RW | 64x1 | Tier A (`KernelVariant` linear) | one workgroup per visible AC group; checked RGB source offset/stride, left/up neighbors and disjoint four-word records; 1,024 shared bytes for exact integer reduction |
 | `color_output` (decoder) | X/Y/B, Cb/Y/Cr or R/G/B planes and opacity RO, output RW, 2 U | 256x1 | Tier A (`KernelVariant` 1-D) | shared 304-byte output uniform plus 160-byte codec-source uniform; checked word count is linearized across 2-D workgroups; each invocation writes one packed u32 after full-precision inverse opsin or encoded BT.601 reconstruction, requested color conversion and packing; normative JPEG 2× component interpolation is fused when restoration did not already expand the planes |
 | `vardct_chroma_upsample` (decoder, `chroma_upsample`/`chroma_2d`) | compact component RO, distinct full-resolution component RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | one-axis or fused two-axis quarter/three-quarter interpolation before restoration; checked logical extents, padded strides, storage usage/alignment/binding limits, dispatch counts, and replicated odd borders; the decoder allocates distinct destinations |
 | `vardct_gaborish` (decoder, `gaborish_rgb`) | resident X/Y/B RO, distinct resident X/Y/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked actual image extent, padded per-plane stride/range, storage usage/alignment/binding limits, finite normalized weights and dispatch counts |
@@ -371,6 +372,7 @@ The following shaders declare `var<workgroup>` memory:
 | decoder `vardct_lf` | `array<vec4<f32>, 324>` tile | 5,184 | checked as `ADAPTIVE_LF_WORKGROUP_BYTES` before submission |
 | encoder `vardct_encode_forward` | atomic quantization error flag | 4 | selected variant and bytes checked before pipeline creation |
 | encoder `vardct_encode_quantize` | 64-element XYB `vec3<f32>` and AC `vec3<i32>` arrays plus an atomic quantization error flag | 2,052 | selected variant and bytes checked before pipeline creation; quantized AC never enters a storage/readback array |
+| encoder `vardct_encode_saliency` | `array<u32, 256>` contrast partial sums | 1,024 | selected linear variant and bytes checked before pipeline creation |
 
 Other parameterized image kernels use zero explicit workgroup-local bytes. Default invocation counts are 256
 (`16x16` tiled 2D kernels and `256x1` linear kernels `rgb_to_image` / `color_output`), 64
@@ -819,9 +821,11 @@ All-family exact-budget, cancellation, independent entropy and corruption tests 
 
 `VarDctKernelParams` remains a 768-byte storage record. Word 170 is the AC pass count,
 word 171 is the per-pass AC word stride, and words 172–182 hold eleven descriptors:
-`coefficient_square | (shift << 8)`. Unused descriptors and the nine trailing padding words
-are zero. `VarDctArtifactHeader` remains 272 bytes, with the pass count at word 65 and two
-zero padding words. Rust offset tests and WGSL layout reflection check both records.
+`coefficient_square | (shift << 8)`. Words 183–184 now hold the optional saliency word offset
+and group count; unused descriptors and the seven trailing padding words are zero.
+`VarDctArtifactHeader` remains 272 bytes, with the pass count at word 65 and matching saliency
+offset/count at words 66–67. Both fields are zero when automatic ordering is disabled. Rust
+offset tests and WGSL layout reflection check the unchanged sizes and field positions.
 
 For `T` transforms and `P` passes, all `P*T` length words precede the 256-byte-aligned AC
 arena. Each pass owns the original complete transform-slot arena; its base is
@@ -847,7 +851,7 @@ and readback remain reserved through validation or abandoned completion. Tests c
 first/last slots in every pass, checked arena overflow, actual 64-KiB binding rejection,
 exact/one-byte-deficient budgets, cancellation and successful reuse for tiled and mixed maps.
 
-Resolution stopping points and physical AC-group order are bounded host control metadata.
+Resolution stopping points and raster/center/explicit AC-group order are bounded host control metadata.
 They do not add GPU buffers, change the 768-byte parameters or 272-byte artifact header, or
 add submissions/maps. Group-order centers and exact grid lengths are validated before
 admission. Generic frame assembly accepts at most 65,536 TOC entries; VarDCT's image grid has
@@ -857,6 +861,24 @@ metadata. Packet payloads remain in their validated ownership and are borrowed i
 order during final assembly. Tiled/mixed cancellation and exact-admission cases also exercise
 non-raster order; corrupt late permuted AC packets cannot publish an unvalidated update, and
 retained earlier outputs remain immutable after the failed session is dropped.
+
+Automatic saliency ordering adds one parallel GPU reduction after the codec passes. Each
+workgroup visits one visible 256×256-or-smaller group and reads its source pixels plus existing
+left/up image neighbors through the same checked offset/stride binding. A 256-word workgroup
+array sums integer RGB differences with `Scalar`/32/64/128/256 lanes. At most 131,072 edges
+contribute 765 each, so every reduction fits u32; no floating atomics or padded pixels enter
+the score. The pass uses three storage bindings and 1,024 workgroup bytes, with no new buffer.
+
+The artifact tail stores four u32 words per group: ready marker `0x53414c59`, raster group ID,
+edge count, and contrast sum. The tail starts and ends at 256-byte alignment; its maximum at
+4096 groups is 64 KiB. `saliency_metadata_bytes` reports that padded subtotal inside artifact
+storage and readback, charging twice that many additional owned bytes. Layout arithmetic and
+binding and both dispatch-axis limits are checked before admission. Header fields, group IDs, geometry-derived edge
+counts, score bounds, ready markers and trailing zeros validate before TOC ordering. Exact u64
+cross-products rank mean scores, with raster ties. The existing submission, map and completion
+permit retain all records through cancellation. Tests include missing/forged records, full
+artifact corruption, an actual binding limit equal to the raster arena, exact/one-byte-deficient
+tiled and mixed budgets, abandoned completion, successful reuse and all linear variants.
 
 ## Shader write bounds fixed by this audit
 

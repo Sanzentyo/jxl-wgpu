@@ -13,6 +13,7 @@ mod matrices;
 mod orders;
 mod quantization;
 mod raw_matrices;
+mod saliency;
 mod strategy_map;
 mod transforms;
 mod types;

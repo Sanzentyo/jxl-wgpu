@@ -10,6 +10,7 @@ mod progressive;
 mod quantization;
 mod raw_matrices;
 mod reference;
+mod saliency;
 mod single;
 
 use std::fs;
@@ -59,6 +60,7 @@ struct DcFixture {
 impl DcFixture {
     fn artifact(&self) -> super::types::VarDctArtifactData<'_> {
         super::types::VarDctArtifactData {
+            saliency: None,
             raw_matrices: Default::default(),
             transform_plan: None,
             strategy: 0,
@@ -489,6 +491,8 @@ fn abi_records_are_pod_and_word_aligned() {
     params.ac_pass_count = 0x113;
     params.ac_pass_words = 0x114;
     params.progressive[10] = 0x124;
+    params.saliency_offset = 0x125;
+    params.saliency_groups = 0x126;
     let params = [params];
     let parameter_words = bytemuck::cast_slice::<VarDctKernelParams, u32>(&params);
     assert_eq!(&parameter_words[84..88], &[0x55, 0x56, 0x57, 0x58]);
@@ -498,6 +502,7 @@ fn abi_records_are_pod_and_word_aligned() {
     );
     assert_eq!(&parameter_words[170..172], &[0x113, 0x114]);
     assert_eq!(parameter_words[182], 0x124);
+    assert_eq!(&parameter_words[183..185], &[0x125, 0x126]);
 
     let mut header: VarDctArtifactHeader = bytemuck::Zeroable::zeroed();
     header.fragment_descriptor_offset = 0x41;
@@ -511,11 +516,14 @@ fn abi_records_are_pod_and_word_aligned() {
     header.ac_words_per_block = 0x49;
     header.ac_fragment_words = 0x50;
     header.ac_pass_count = 0x51;
+    header.saliency_offset = 0x52;
+    header.saliency_groups = 0x53;
     let headers = [header];
     let header_words = bytemuck::cast_slice::<VarDctArtifactHeader, u32>(&headers);
     assert_eq!(&header_words[55..60], &[0x41, 0x42, 0x43, 0x44, 0x45]);
     assert_eq!(&header_words[60..65], &[0x46, 0x47, 0x48, 0x49, 0x50]);
     assert_eq!(header_words[65], 0x51);
+    assert_eq!(&header_words[66..68], &[0x52, 0x53]);
 }
 
 #[test]
@@ -523,6 +531,7 @@ fn naga_validates_vardct_shaders() {
     for source in [
         shader_source(TILED_SHADER),
         shader_source(include_str!("transforms.wgsl")),
+        shader_source(include_str!("saliency.wgsl")),
         include_str!("raw_matrices.wgsl").to_owned(),
     ] {
         let module = naga::front::wgsl::parse_str(&source).expect("VarDCT WGSL parses");
@@ -533,6 +542,22 @@ fn naga_validates_vardct_shaders() {
         .validate(&module)
         .expect("VarDCT WGSL validates");
         for (_, ty) in module.types.iter() {
+            if ty.name.as_deref() == Some("Params") {
+                let naga::TypeInner::Struct { members, span } = &ty.inner else {
+                    panic!("parameters must be a structure")
+                };
+                assert_eq!(*span, 768);
+                for (name, offset) in [("saliency_offset", 183 * 4), ("saliency_groups", 184 * 4)] {
+                    assert_eq!(
+                        members
+                            .iter()
+                            .find(|m| m.name.as_deref() == Some(name))
+                            .unwrap()
+                            .offset,
+                        offset
+                    );
+                }
+            }
             if ty.name.as_deref() == Some("QuantizationEntry") {
                 let naga::TypeInner::Struct { members, span } = &ty.inner else {
                     panic!("quantization metadata must be a structure");

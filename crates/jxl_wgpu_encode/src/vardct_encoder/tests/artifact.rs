@@ -9,14 +9,19 @@ use super::ac::write_tokens;
 
 #[test]
 fn artifact_rejects_missing_ac_writes_and_forged_layout() {
-    for passes in [1, 3, 11] {
+    for (passes, saliency) in [(1, false), (3, false), (11, false), (1, true), (11, true)] {
         let frame = VarDctFrameLayout::tiled_dct8(2057, 17).unwrap();
         let dc = fixed_prefix_code().unwrap();
         let hf = HfEntropyPlan::single_cluster_prefix().unwrap();
-        let layout = ArtifactLayout::for_tiled_grid(frame, &dc, &hf)
+        let mut layout = ArtifactLayout::for_tiled_grid(frame, &dc, &hf)
             .unwrap()
             .with_passes(passes)
             .unwrap();
+        if saliency {
+            layout = layout
+                .with_saliency(frame.ac_group_count().unwrap())
+                .unwrap();
+        }
         let mut words = vec![0u32; layout.artifact_words as usize];
         let mut dc_fragment = BitWriter::new();
         for group in 0..frame.lf_group_count().unwrap() {
@@ -81,15 +86,49 @@ fn artifact_rejects_missing_ac_writes_and_forged_layout() {
             ac_words_per_block: layout.ac_words_per_block,
             ac_fragment_words: layout.ac_fragment_words,
             ac_pass_count: layout.ac_pass_count,
-            padding: [0; 2],
+            saliency_offset: layout.saliency_offset,
+            saliency_groups: layout.saliency_groups,
         };
         words[..68].copy_from_slice(bytemuck::cast_slice(std::slice::from_ref(&header)));
+        if saliency {
+            let pixels = vec![[0; 3]; (frame.width * frame.height) as usize];
+            for (group, (edges, contrast)) in
+                super::saliency::oracle(frame.width as usize, frame.height as usize, &pixels)
+                    .into_iter()
+                    .enumerate()
+            {
+                let offset = layout.saliency_offset as usize + group * 4;
+                words[offset..offset + 4].copy_from_slice(&[
+                    super::super::saliency::READY,
+                    group as u32,
+                    edges as u32,
+                    contrast as u32,
+                ]);
+            }
+        }
         let valid = |words: &[u32]| {
             validate_artifact(bytemuck::cast_slice(words), layout, &dc, &hf, frame, None).is_ok()
         };
         assert!(valid(&words));
+        if saliency {
+            for group in [0, layout.saliency_groups - 1] {
+                let offset = (layout.saliency_offset + group * 4) as usize;
+                for field in 0..4 {
+                    let mut corrupt = words.clone();
+                    corrupt[offset + field] = match field {
+                        0 => 0,
+                        1 | 2 => words[offset + field] + 1,
+                        _ => words[offset + 2] * 765 + 1,
+                    };
+                    assert!(!valid(&corrupt), "saliency group {group} field {field}");
+                }
+            }
+            let mut padding = words.clone();
+            *padding.last_mut().unwrap() = 1;
+            assert!(!valid(&padding));
+        }
         // Every new AC header field, its presence marker and final ready status.
-        for index in [0, 4, 60, 61, 62, 63, 64, 65] {
+        for index in [0, 4, 60, 61, 62, 63, 64, 65, 66, 67] {
             let mut invalid = words.clone();
             invalid[index] ^= 1;
             assert!(!valid(&invalid), "header word {index}");

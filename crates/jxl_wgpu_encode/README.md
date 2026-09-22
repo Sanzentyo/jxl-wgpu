@@ -379,13 +379,29 @@ every AC pass repeats the selected group order. A standard entropy-coded TOC per
 records the physical order. Identity order preserves the existing bytes. Caller metadata and
 geometry drive this bounded host assembly; there is no CPU image analysis.
 
+`VarDctGroupOrder::saliency_first()` selects order from GPU-computed local contrast. For each
+visible RGB8 pixel, it sums absolute channel differences to the existing left and upper image
+neighbors. An edge crossing a group boundary belongs to the group containing the right/lower
+pixel. Padding is excluded. Groups sort by mean summed RGB difference per edge, using exact
+integer cross-products and raster-ID ties; the one-pixel image has zero score. This is a local
+contrast heuristic, not a general perceptual-quality or bitrate guarantee.
+
+One GPU reduction pass computes a checked 16-byte record per group, followed by host sorting
+of only those bounded statistics. Pixels and coefficients remain on the device. The records
+share the existing artifact and aggregate readback, with no additional submission/map.
+`VarDctMemoryPlan::saliency_metadata_bytes` includes their 256-byte alignment and is already
+part of both `artifact_storage_bytes` and `readback_bytes`; total owned memory charges both
+copies. Ordinary raster/center/explicit modes add no statistics or GPU work. The selected
+forward/tiled workgroup variant also controls the integer reduction.
+
 `FramePacketSet::with_order` also accepts a complete physical sequence of packet identities
 for generic frame assembly. `packets()` remains canonical, while `packets_in_file_order()`
 follows the requested sequence. Every packet must appear exactly once; malformed orders are
 typed errors. `assemble_frame` writes TOC sizes and payloads in physical order with the inverse
 canonical-to-physical permutation.
 
-Separate DC progressive frames and adaptive saliency selection remain unimplemented. Encoding
+Separate DC progressive frames remain unimplemented. Broader saliency/perceptual evaluation
+and adaptive transform/quantization selection remain required. Encoding
 still completes one whole frame per submission; progressive syntax does not imply an early
 encoder byte-stream API. Native decoders can display byte prefixes ending at a complete AC
 pass; the GPU frontend's whole-input and bounded-window progression are tested separately.
@@ -497,7 +513,7 @@ this is a numerical regression bound, not ISO precision or perceptual-quality ce
 Blocking/Future assembly and all supported linear workgroup variants produce identical bytes.
 The [progressive encoder matrix](../../docs/CONFORMANCE_CORPUS.md#progressive-vardct-encoding)
 adds 81 single-transform streams with exact coefficient accumulation, mixed maps, signed integer
-endpoints, resolution stopping points, center/explicit group order, native partial-input images
+endpoints, resolution stopping points, center/explicit/GPU saliency group order, native partial-input images
 and whole/fragmented convergence. F32 references use the
 pinned scalar libjxl oracle; normal native SIMD retains its independent RGB8 comparisons.
 The suite also rejects malformed or missing GPU AC output in every pass, checks an insufficient device binding,
@@ -545,7 +561,7 @@ let progressive = ProgressivePlan::new(
 let encoder = TiledVarDctEncoder::new_with_config(
     context, VarDctConfig {
         progressive,
-        group_order: VarDctGroupOrder::center_first(),
+        group_order: VarDctGroupOrder::saliency_first(),
         ..Default::default()
     },
 )?;
