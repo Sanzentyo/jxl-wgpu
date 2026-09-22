@@ -2,6 +2,7 @@
 pub mod color;
 pub mod composed;
 pub mod extra_channels;
+pub mod frame_index;
 pub mod gamut_mapping;
 pub mod hdr;
 pub mod icc_profile;

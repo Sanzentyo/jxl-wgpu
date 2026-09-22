@@ -412,8 +412,9 @@ impl DependentSession {
         inventory: &CodestreamInventory,
         request: &GpuOutputRequest,
         plan: &FrameExecutionPlan,
+        needs_surface: bool,
     ) -> Result<Self> {
-        let (source, output) = if needs_surface(inventory, request, plan) {
+        let (source, output) = if needs_surface {
             let (source, compositor) =
                 composed_source(engine, codestream, inventory, request, plan)?;
             (source, Output::Composed(compositor))

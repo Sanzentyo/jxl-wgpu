@@ -64,9 +64,41 @@ pub struct SelectedImageInventory {
     selection: ImageSelection,
     source: ImageSourceInventory,
     reconstruction: Arc<CodestreamInventory>,
+    complete_reconstruction: bool,
 }
 
 impl SelectedImageInventory {
+    /// Internal reconstruction view for one dependency-complete main-image seek interval.
+    /// Original source metadata, physical IDs, noise seeds and byte ranges stay unchanged.
+    pub(crate) fn for_seek(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> Result<Self, ImageSelectionError> {
+        if self.selection != ImageSelection::Main || range.is_empty() {
+            return Err(ImageSelectionError::InvalidInventory(
+                "seek requires a nonempty main interval",
+            ));
+        }
+        let reconstruction = CodestreamInventory {
+            codestream_bytes: self.reconstruction.codestream_bytes,
+            image_header: self.reconstruction.image_header.clone(),
+            frames: self
+                .reconstruction
+                .frames
+                .get(range)
+                .ok_or(ImageSelectionError::InvalidInventory(
+                    "seek interval exceeds main frames",
+                ))?
+                .to_vec(),
+        };
+        Ok(Self {
+            selection: self.selection,
+            source: self.source.clone(),
+            reconstruction: Arc::new(reconstruction),
+            complete_reconstruction: false,
+        })
+    }
+
     pub fn new(
         source: Arc<CodestreamInventory>,
         selection: ImageSelection,
@@ -120,6 +152,7 @@ impl SelectedImageInventory {
             selection,
             source: ImageSourceInventory::Complete(source),
             reconstruction,
+            complete_reconstruction: true,
         })
     }
 
@@ -153,6 +186,7 @@ impl SelectedImageInventory {
                 codestream_bytes,
             },
             reconstruction,
+            complete_reconstruction: true,
         })
     }
 
@@ -169,6 +203,15 @@ impl SelectedImageInventory {
     #[must_use]
     pub fn reconstruction_inventory(&self) -> &CodestreamInventory {
         &self.reconstruction
+    }
+
+    /// Whether reconstruction covers the complete selected image.
+    /// A seek interval may stop at a nonfinal presentation without changing its reference
+    /// saving or color semantics. Use [`crate::FrameExecutionPlan::negotiate_selected`]
+    /// to plan either form.
+    #[must_use]
+    pub const fn reconstruction_is_complete(&self) -> bool {
+        self.complete_reconstruction
     }
 }
 

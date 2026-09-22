@@ -26,7 +26,15 @@ fn open(backend: &WgpuBackend, name: &str) -> (DependentSession, FrameExecutionP
     ))
     .unwrap();
     (
-        DependentSession::new(engine, source, &inventory, &request, &plan).unwrap(),
+        DependentSession::new(
+            engine,
+            source,
+            &inventory,
+            &request,
+            &plan,
+            needs_surface(&inventory, &request, &plan),
+        )
+        .unwrap(),
         plan,
     )
 }

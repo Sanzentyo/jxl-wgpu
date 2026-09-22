@@ -114,9 +114,15 @@ fn queued_and_submitted_lf_composition_stages_cancel_and_drain_without_reference
         let request = GpuOutputRequest::color(crate::vardct_rgb8_format())
             .unwrap()
             .with_progressive_output(true);
-        let mut baseline =
-            DependentSession::new(engine.clone(), source.clone(), &inventory, &request, &plan)
-                .unwrap();
+        let mut baseline = DependentSession::new(
+            engine.clone(),
+            source.clone(),
+            &inventory,
+            &request,
+            &plan,
+            needs_surface(&inventory, &request, &plan),
+        )
+        .unwrap();
         let expected: Vec<_> = (0..4)
             .map(|i| {
                 let frame = baseline.submit(&plan, i).unwrap().wait().unwrap();
@@ -135,6 +141,7 @@ fn queued_and_submitted_lf_composition_stages_cancel_and_drain_without_reference
                     &inventory,
                     &request,
                     &plan,
+                    needs_surface(&inventory, &request, &plan),
                 )
                 .unwrap();
                 for i in 0..2 {
@@ -310,9 +317,15 @@ fn lf_extra_queued_render_blend_and_pack_stages_release_exact_reservations() {
             .with_extra_channel(1)
             .unwrap()
             .with_progressive_output(true);
-            let mut baseline =
-                DependentSession::new(engine.clone(), source.clone(), &inventory, &request, &plan)
-                    .unwrap();
+            let mut baseline = DependentSession::new(
+                engine.clone(),
+                source.clone(),
+                &inventory,
+                &request,
+                &plan,
+                needs_surface(&inventory, &request, &plan),
+            )
+            .unwrap();
             let frame = baseline.submit(&plan, 0).unwrap().wait().unwrap();
             let expected = read(&backend, &frame.output);
             drop(frame);
@@ -328,6 +341,7 @@ fn lf_extra_queued_render_blend_and_pack_stages_release_exact_reservations() {
                         &inventory,
                         &request,
                         &plan,
+                        needs_surface(&inventory, &request, &plan),
                     )
                     .unwrap();
                     let mut pending = session.submit(&plan, 0).unwrap();
@@ -496,7 +510,15 @@ fn lf_previews_wait_for_extra_backgrounds_even_when_the_color_background_is_read
     let request = GpuOutputRequest::color(crate::vardct_rgb8_format())
         .unwrap()
         .with_progressive_output(true);
-    let mut session = DependentSession::new(engine, source, &inventory, &request, &plan).unwrap();
+    let mut session = DependentSession::new(
+        engine,
+        source,
+        &inventory,
+        &request,
+        &plan,
+        needs_surface(&inventory, &request, &plan),
+    )
+    .unwrap();
     let mut pending = session.submit(&plan, 0).unwrap();
     decode(&mut pending);
     assert!(matches!(pending.stage, Some(Stage::Decode(_))));
@@ -535,7 +557,15 @@ fn lf_patch_queued_body_and_each_gpu_stage_preserve_leases_on_cancel_drain_and_a
     .with_alpha_output_policy(crate::AlphaOutputPolicy::Preserve)
     .with_progressive_output(true);
     let new_session = || {
-        DependentSession::new(engine.clone(), source.clone(), &inventory, &request, &plan).unwrap()
+        DependentSession::new(
+            engine.clone(),
+            source.clone(),
+            &inventory,
+            &request,
+            &plan,
+            needs_surface(&inventory, &request, &plan),
+        )
+        .unwrap()
     };
     let mut baseline = new_session();
     let mut pending = baseline.submit(&plan, 0).unwrap();

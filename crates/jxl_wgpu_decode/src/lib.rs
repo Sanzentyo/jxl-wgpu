@@ -34,6 +34,7 @@ mod entropy_window;
 mod error;
 mod frame_plan;
 mod frame_resampling;
+mod frame_seek;
 mod frame_surface;
 pub mod gain_map;
 mod gpu_submission;
@@ -94,6 +95,7 @@ pub use error::{
 pub use frame_plan::{
     FrameExecutionNode, FrameExecutionPlan, FramePlanError, FramePresentation, FrameReference,
 };
+pub use frame_seek::{BoundFrameIndex, FrameSeekError, FrameSeekLimits, FrameSeekPlan};
 pub use frame_surface::FrameSurfaceError;
 pub use image_selection::{
     ImageSelection, ImageSelectionError, ImageSourceInventory, SelectedImageInventory,
@@ -126,6 +128,7 @@ pub use session::{
     NextGpuUpdate, PrefetchBackpressure, PrefetchGpuFrames, PrefetchProgress, PreparedGpuSession,
     SubmittedGpuFrame, SubmittedGpuUpdate,
 };
+pub use session::{GpuSeekSession, NextSeekFrame};
 pub use vardct_engine::{
     GpuJpegCoefficients, GpuJpegFrame, JpegCoefficientError, JpegCoefficientLayout,
     JpegCoefficientLimits, JpegCoefficientPending, JpegCoefficientPlane, JpegCoefficientSession,

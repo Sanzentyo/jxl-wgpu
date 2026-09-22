@@ -82,6 +82,27 @@ impl FrameExecutionPlan {
         inventory: &CodestreamInventory,
         orientation_policy: crate::OrientationPolicy,
     ) -> Result<Self, FramePlanError> {
+        Self::negotiate_interval(inventory, orientation_policy, true)
+    }
+
+    /// Plans a validated image selection, including a dependency-complete seek interval.
+    /// Seek boundaries do not change original frame finality or reference-saving semantics.
+    pub fn negotiate_selected(
+        selection: &crate::SelectedImageInventory,
+        orientation_policy: crate::OrientationPolicy,
+    ) -> Result<Self, FramePlanError> {
+        Self::negotiate_interval(
+            selection.reconstruction_inventory(),
+            orientation_policy,
+            selection.reconstruction_is_complete(),
+        )
+    }
+
+    fn negotiate_interval(
+        inventory: &CodestreamInventory,
+        orientation_policy: crate::OrientationPolicy,
+        complete: bool,
+    ) -> Result<Self, FramePlanError> {
         let image = &inventory.image_header;
         if image.preview_size.is_some() || inventory.frames.iter().any(|frame| frame.is_preview) {
             return Err(FramePlanError::ImageNotSelected);
@@ -147,8 +168,8 @@ impl FrameExecutionPlan {
             {
                 return Err(invalid("noncontiguous physical indices"));
             }
-            if frame.is_last != (index + 1 == inventory.frames.len()) || (frame.is_last && !normal)
-            {
+            let at_end = index + 1 == inventory.frames.len();
+            if (frame.is_last && (!at_end || !normal)) || (complete && at_end && !frame.is_last) {
                 return Err(invalid("missing or misplaced final frame"));
             }
             if frame.width == 0 || frame.height == 0 {

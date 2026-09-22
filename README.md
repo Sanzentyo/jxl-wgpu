@@ -52,7 +52,7 @@ individual kernels, fixtures, or passing tests do not establish full conformance
 |---|---|---|
 | Decode | A common GPU frontend for Modular and VarDCT; stills, animation/composition, embedded previews, and validated progressive output in supported paths. | Both coding modes and their feature combinations remain partially implemented or incompletely covered. Progressive output does not imply incomplete-main-input decoding. |
 | Encode | Lossless Modular Gray/GrayAlpha/RGB/RGBA with 1–31-bit integers or IEEE binary16/binary32 in packed, planar or split buffers, including RGB/BGR order, declared alpha association, enumerated or embedded RGB/Gray ICC source color, selectable 128/256/512/1024 groups, all 42 global/local RCT types, all 14 explicit predictors with custom Weighted coefficients, general GPU LZ77 matching and supported animation; experimental GPU VarDCT with all 27 transform strategies, all 13 caller-selected coefficient-order families, parametric/raw quantization matrices for all 17 matrix families, and 1–11 spectral/quantized AC passes with resolution stopping points and raster/center/explicit or GPU local-contrast group order. | Palette/Squeeze encoding, other floating precisions, CMYK/arbitrary extra channels, YUV and texture inputs remain; VarDCT lacks general perceptual-quality guarantees, adaptive rate control, DC progressive encoding and broad perceptual saliency evidence. |
-| Transport and metadata | Bounded raw/`jxlc`/`jxlp` scanning, fragmented input, opaque metadata retention/writing, bounded `jbrd` metadata parsing/emission, and validated GPU original-JPEG byte reconstruction for a qualified still profile. | Full container policy, frame indexes and broader JPEG reconstruction variants remain incomplete. |
+| Transport and metadata | Bounded raw/`jxlc`/`jxlp` scanning, fragmented input, opaque metadata retention/writing, plain `jxli` indexes with dependency-preserving GPU seeking, bounded `jbrd` metadata parsing/emission, and validated GPU original-JPEG byte reconstruction for a qualified still profile. | Seeking requires complete input; full container policy, incremental/range-based seeking and broader JPEG reconstruction variants remain incomplete. |
 | Color and rendering | GPU restoration, resampling, composition, enumerated SDR/HDR and supported ICC connections; all four original RGB/Gray intents with standard/custom white points; explicit tone/gamut mapping and still gain-map reconstruction with enumerated or ICC output. | Profile, rendering, gain-map, and cross-feature conformance are not complete. |
 | Output and scheduling | GPU-resident pitch-linear buffers, explicit readback, display textures, runtime-neutral async APIs, and budgeted resource leases. | Output support depends on the codec path and format. Host-thread concurrency is not coalesced codec GPU batching. |
 
@@ -88,6 +88,10 @@ only its final update advances animation time, and `next_frame` remains final-on
 Preview/main selection and incremental-input ownership are specified in the
 [decoder guide](crates/jxl_wgpu_decode/README.md#executable-profile); pass and LF
 updates have their own [completion contract](crates/jxl_wgpu_decode/README.md#intermediate-lf-and-pass-images).
+
+[Bounded GPU seeking](docs/FRAME_SEEKING.md) validates index offsets and timing against real headers,
+restores required reference versions, and exposes the target with its original metadata. Skipped
+entropy is not claimed validated. The API does not yet acquire input by byte range.
 
 Output is authoritative only after the applicable codec validation succeeds.
 Explicit unvalidated handoff is separate: completion of downstream display or

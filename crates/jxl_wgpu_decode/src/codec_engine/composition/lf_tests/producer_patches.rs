@@ -31,7 +31,15 @@ fn open(
     .unwrap()
     .with_alpha_output_policy(crate::AlphaOutputPolicy::Preserve)
     .with_progressive_output(progressive);
-    let mut session = DependentSession::new(engine, source, &inventory, &request, &plan).unwrap();
+    let mut session = DependentSession::new(
+        engine,
+        source,
+        &inventory,
+        &request,
+        &plan,
+        needs_surface(&inventory, &request, &plan),
+    )
+    .unwrap();
     let mut pending = session.submit(&plan, 0).unwrap();
     for _ in 0..inventory.frames.len() / 2 {
         decode(&mut pending);

@@ -28,6 +28,13 @@ at its color event without requesting pixel decode. Tests compare every profile 
 the ICC ID, against the production metadata writer and unchanged official inputs. Missing tools,
 version mismatches or native failure fail the test. No production dependency links this oracle.
 
+`oracles::frame_index` compiles [`test-data/frame_index.cpp`](test-data/frame_index.cpp) against
+the public libjxl 0.12.0 encoder, requiring build/runtime identity. Tiny still and dense/sparse
+animated indexes supply independent offsets and frame spans. The native animated zero first
+interval is retained as a rejection witness; it is not silently repaired or used as a valid
+timing oracle. Generated indexes preserve the native input pixels and frame durations.
+[Index/seek evidence](../../docs/CONFORMANCE_CORPUS.md#frame-index-and-seek-checkpoint).
+
 `oracles::color` owns independent f64 transfer, CIE/Bradford and interval calculations shared by
 original-color tests, resident ICC tests and the offline RGB-to-ICC exporter. Its jxl-oxide path
 provides unbounded pre-OETF XYB stills; the codec's Gamma/DCI black floor makes inversion of an

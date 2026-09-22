@@ -19,7 +19,9 @@ use crate::{
     Result, codestream_data::CodestreamSpan,
 };
 
+mod seek;
 mod update;
+pub use seek::{GpuSeekSession, NextSeekFrame};
 pub use update::{FrameProgression, NextGpuUpdate, SubmittedGpuUpdate};
 
 /// GPU-resident frame returned by an engine before bounded lease wrapping.
@@ -387,7 +389,26 @@ fn parse_shared(
     limits: ParseLimits,
     inventory_limits: InventoryLimits,
 ) -> Result<(GpuCodestream, Arc<CodestreamInventory>)> {
+    let (codestream, inventory, _) = parse_shared_indexed(encoded, limits, inventory_limits, None)?;
+    Ok((codestream, inventory))
+}
+
+fn parse_shared_indexed(
+    encoded: Arc<[u8]>,
+    limits: ParseLimits,
+    inventory_limits: InventoryLimits,
+    index_limits: Option<jxl_gpu_bitstream::FrameIndexLimits>,
+) -> Result<(
+    GpuCodestream,
+    Arc<CodestreamInventory>,
+    Option<jxl_gpu_bitstream::FrameIndex>,
+)> {
     let parsed = jxl_gpu_bitstream::parse(&encoded, limits)?;
+    let index = index_limits
+        .map(|limits| jxl_gpu_bitstream::FrameIndex::from_container(&parsed, limits))
+        .transpose()
+        .map_err(crate::FrameSeekError::from)?
+        .flatten();
     let inventory = Arc::new(
         parsed
             .codestream_inventory(inventory_limits)
@@ -420,6 +441,7 @@ fn parse_shared(
     Ok((
         GpuCodestream::from_shared(storage, byte_range, is_container)?,
         inventory,
+        index,
     ))
 }
 

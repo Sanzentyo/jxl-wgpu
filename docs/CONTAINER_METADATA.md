@@ -109,8 +109,10 @@ On Rust 1.98.1 / Apple M5 Metal, the focused tests passed:
 
 See the [native oracle recipe](../crates/jxl_gpu_bitstream/test-data/metadata_oracle/README.md).
 No existing source image or reference asset changes. Full container ordering/compatibility,
-`jxli`, JPEG byte reconstruction, full `jhgm` conformance, encoder quality and the remaining full JPEG XL gates remain
-open. [Gain-map interpretation](GAIN_MAP.md) now has a separate bounded metadata and GPU
+broader frame-index/JPEG reconstruction coverage, full `jhgm` conformance, encoder quality and
+the remaining full JPEG XL gates remain open. [Plain `jxli` and bounded GPU seeking](FRAME_SEEKING.md)
+have a separate typed metadata and reference-restoration API.
+[Gain-map interpretation](GAIN_MAP.md) has a separate bounded metadata and GPU
 alternate-still API; opaque metadata retention alone does not invoke it.
 
 ## JPEG reconstruction metadata

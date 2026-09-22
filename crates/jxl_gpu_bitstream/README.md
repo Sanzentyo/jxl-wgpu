@@ -14,6 +14,11 @@ scratch. Export does not authorize CMS conversion or decode pixels.
 `jxlp` fragment sequences. Raw and single-`jxlc` codestreams remain borrowed; only fragmented
 streams are joined.
 
+`FrameIndex` parses and emits bounded plain `jxli` payloads and rejects duplicate boxes or
+unsupported compressed indexes. It retains logical offsets, rational tick units and displayed
+frame intervals without authorizing a restart. Header/dependency binding and GPU seeking belong
+to `jxl_wgpu_decode`. [Index contract and remaining scope](../../docs/FRAME_SEEKING.md).
+
 The public `metadata` module retains Exif, XMP, JUMBF and unknown auxiliary payloads by explicit
 selection. `MetadataCollector` consumes borrowed transport events without retaining their source
 allocations; `ParsedJxl::metadata` serves contiguous input. Original compressed payloads stay exact

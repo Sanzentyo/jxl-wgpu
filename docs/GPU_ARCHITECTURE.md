@@ -399,6 +399,11 @@ native multi-plane texture object.
 
 ## Animation and concurrency
 
+[Bounded seeking](FRAME_SEEKING.md) uses the same executor over a header-validated dependency
+interval. The planner resolves exact LF/reference versions before GPU work, retains original
+frame attributes and the full animation's output path, and suppresses preroll presentations.
+The seek operation's end is separate from bitstream frame finality.
+
 Physical producers can retain codec components before inverse color conversion for patch
 references. This is an explicit private surface domain, independent of the RGB output layout.
 Patch dictionaries execute in bounded GPU count/validate and command-emission passes; the host

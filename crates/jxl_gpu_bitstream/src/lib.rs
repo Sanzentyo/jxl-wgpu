@@ -14,6 +14,7 @@ use thiserror::Error;
 
 mod acceleration;
 mod colour_encoding;
+mod frame_index;
 pub mod gain_map;
 pub mod icc_profile;
 mod inventory;
@@ -21,6 +22,10 @@ mod inventory_stream;
 pub mod jpeg_reconstruction;
 pub mod metadata;
 mod stream;
+
+pub use frame_index::{
+    FRAME_INDEX_BOX_TYPE, FrameIndex, FrameIndexEntry, FrameIndexError, FrameIndexLimits,
+};
 
 #[cfg(test)]
 mod test_fixtures {

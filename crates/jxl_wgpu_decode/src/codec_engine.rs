@@ -84,11 +84,13 @@ impl WgpuDecodeEngine {
         &self.vardct
     }
 
-    pub(crate) fn open_with_inventory_data(
+    fn open_with_plan_data(
         &self,
         codestream: Arc<GpuCodestream>,
         request: &GpuOutputRequest,
-        inventory: &jxl_gpu_bitstream::CodestreamInventory,
+        inventory: &CodestreamInventory,
+        plan: crate::FrameExecutionPlan,
+        needs_surface: bool,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
         request.numeric_color_channel(inventory.image_header.grayscale)?;
         if let Some(index) = request.extra_channel()
@@ -99,11 +101,7 @@ impl WgpuDecodeEngine {
                 count: inventory.image_header.extra_channel_count,
             });
         }
-        let plan = crate::FrameExecutionPlan::negotiate_with_orientation(
-            inventory,
-            request.orientation_policy(),
-        )?;
-        if composition::needs_surface(inventory, request, &plan)
+        if needs_surface
             || inventory.image_header.animation.is_some()
             || plan.nodes.len() != 1
             || inventory.frames.iter().any(|frame| {
@@ -113,7 +111,7 @@ impl WgpuDecodeEngine {
                 ) || (frame.frame_type == FrameType::Regular && !frame.is_last)
             })
         {
-            return self.open_sequence(codestream, request, inventory, plan);
+            return self.open_sequence(codestream, request, inventory, plan, needs_surface);
         }
         let encoding = inventory
             .frames
@@ -171,7 +169,33 @@ impl GpuSubmissionEngine for WgpuDecodeEngine {
         inventory: crate::SelectedImageInventory,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         let codestream = Arc::new(codestream);
-        self.open_with_inventory_data(codestream, request, inventory.reconstruction_inventory())
+        let plan = crate::FrameExecutionPlan::negotiate_selected(
+            &inventory,
+            request.orientation_policy(),
+        )?;
+        // A later composed frame can select a common surface renderer for the whole animation.
+        // Keep that renderer when a seek stops before it, so output rounding is unchanged.
+        let needs_surface = if !inventory.reconstruction_is_complete() {
+            let crate::ImageSourceInventory::Complete(source) = inventory.source_inventory() else {
+                return Err(Error::EngineContract(
+                    "seek requires complete source metadata",
+                ));
+            };
+            let full =
+                crate::SelectedImageInventory::new(Arc::clone(source), inventory.selection())?;
+            let full_plan =
+                crate::FrameExecutionPlan::negotiate_selected(&full, request.orientation_policy())?;
+            composition::needs_surface(full.reconstruction_inventory(), request, &full_plan)
+        } else {
+            composition::needs_surface(inventory.reconstruction_inventory(), request, &plan)
+        };
+        self.open_with_plan_data(
+            codestream,
+            request,
+            inventory.reconstruction_inventory(),
+            plan,
+            needs_surface,
+        )
     }
 }
 

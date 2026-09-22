@@ -981,6 +981,14 @@ observable in-flight total before the shader is advertised as supported.
 
 ## Decoder crop/blend composition ABI and lifetime
 
+`GpuSeekSession` uses this same accounting for a dependency-complete reconstruction interval.
+Preroll leases are dropped after validation while their exact saved reference versions stay
+resident. Source frame finality and the full animation's surface-renderer choice remain unchanged.
+Completing the requested presentation drops the internal session and reference cache; retained
+target/update leases keep their output reservations independently. Cancellation retains submitted
+work until its ordinary completion callbacks retire it. Seeking adds bounded host index/plan
+metadata and no new shader ABI, image cache, or unvalidated output path.
+
 `jxl_wgpu_decode::codec_engine::composition` retains an explicitly tagged sample domain followed
 by every extra plane in one F32 allocation. Domains are enumerated RGB, original ICC RGB/Gray,
 linear RGB, original numeric samples, and codec components

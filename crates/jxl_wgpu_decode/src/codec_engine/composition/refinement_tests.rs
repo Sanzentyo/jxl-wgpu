@@ -222,8 +222,15 @@ fn exercise_submitted_refinements(backend: &WgpuBackend, hex: &str, numeric: boo
     .with_progressive_output(true);
     let source = Arc::new(GpuCodestream::from_shared(data.clone(), 0..data.len(), false).unwrap());
     let engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-    let mut baseline =
-        DependentSession::new(engine.clone(), source.clone(), &inventory, &request, &plan).unwrap();
+    let mut baseline = DependentSession::new(
+        engine.clone(),
+        source.clone(),
+        &inventory,
+        &request,
+        &plan,
+        needs_surface(&inventory, &request, &plan),
+    )
+    .unwrap();
     let expected: Vec<_> = (0..2)
         .map(|i| {
             let frame = baseline.submit(&plan, i).unwrap().wait().unwrap();
@@ -234,9 +241,15 @@ fn exercise_submitted_refinements(backend: &WgpuBackend, hex: &str, numeric: boo
     for boundary in 0..3 {
         let presentation = usize::from(boundary != 0);
         for action in 0..4 {
-            let mut session =
-                DependentSession::new(engine.clone(), source.clone(), &inventory, &request, &plan)
-                    .unwrap();
+            let mut session = DependentSession::new(
+                engine.clone(),
+                source.clone(),
+                &inventory,
+                &request,
+                &plan,
+                needs_surface(&inventory, &request, &plan),
+            )
+            .unwrap();
             for i in 0..presentation {
                 drop(session.submit(&plan, i).unwrap().wait().unwrap());
             }
@@ -300,8 +313,15 @@ fn encoded_refinements_transform_for_display_without_committing_references() {
     .unwrap()
     .with_progressive_output(true);
     let engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-    let mut baseline =
-        DependentSession::new(engine.clone(), source.clone(), &inventory, &request, &plan).unwrap();
+    let mut baseline = DependentSession::new(
+        engine.clone(),
+        source.clone(),
+        &inventory,
+        &request,
+        &plan,
+        needs_surface(&inventory, &request, &plan),
+    )
+    .unwrap();
     let mut baseline_pending = baseline.submit(&plan, 0).unwrap();
     let (frame, progression) = next_intermediate(&mut baseline_pending);
     baseline_pending.refine(frame, progression).unwrap();
@@ -319,9 +339,15 @@ fn encoded_refinements_transform_for_display_without_committing_references() {
     drop((frame, baseline));
     inventory.frames[0].save_before_color_transform = true;
     for action in 0..3 {
-        let mut session =
-            DependentSession::new(engine.clone(), source.clone(), &inventory, &request, &plan)
-                .unwrap();
+        let mut session = DependentSession::new(
+            engine.clone(),
+            source.clone(),
+            &inventory,
+            &request,
+            &plan,
+            needs_surface(&inventory, &request, &plan),
+        )
+        .unwrap();
         let mut pending = session.submit(&plan, 0).unwrap();
         let (frame, progression) = next_intermediate(&mut pending);
         pending.refine(frame, progression).unwrap();
@@ -444,7 +470,15 @@ fn patch_refinements_preserve_dictionary_and_references_across_cancel_drain_and_
     .unwrap()
     .with_progressive_output(true);
     let session = || {
-        DependentSession::new(engine.clone(), source.clone(), &inventory, &request, &plan).unwrap()
+        DependentSession::new(
+            engine.clone(),
+            source.clone(),
+            &inventory,
+            &request,
+            &plan,
+            needs_surface(&inventory, &request, &plan),
+        )
+        .unwrap()
     };
     let mut baseline = session();
     let mut pending = baseline.submit(&plan, 0).unwrap();

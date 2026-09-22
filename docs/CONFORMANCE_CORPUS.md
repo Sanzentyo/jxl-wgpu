@@ -44,6 +44,50 @@ and 1,357,296 equal F32 words. Timing, progression, alpha, retained bytes and re
 also match. These are exact invariance checks against existing GPU paths, not new codec precision
 or JUMBF-document conformance claims. [Policy and bounds](CONTAINER_METADATA.md).
 
+## Frame-index and seek checkpoint
+
+`jxl_gpu_bitstream::frame_index::tests` uses an independently specified three-entry wire vector,
+all truncated prefixes, nonminimal/overflowing varints, offset/count/time overflow, zero
+denominator, duplicate offsets/boxes, forbidden compressed indexes, exact caps and canonical
+emission. Default and fragmented containers preserve logical offsets.
+
+The decoder's `frame_seek` target compares every presentation of 21 unchanged source streams
+against sequential GPU RGBA8 output exactly and libjxl output within the existing one-code bound.
+Sources include Gray/RGB/high-depth alpha Modular, VarDCT, recursive DC, mixed JPEG/Modular,
+layered stills, composed crops/blends, embedded previews and nonzero physical-frame noise.
+Whole input and indexed seven-fragment `jxlp` with 256-byte GPU entropy windows exercise blocking
+and async seek completion. Original duration, timecode, presentation index and clock agree;
+only the bounded planned presentations are submitted.
+
+Six further progressive sources cover composed recursive DC, associated alpha, Modular pass
+composition, both-mode patch updates and previews. Apply/Keep and available scalar extra output
+preserve every target's physical progression and exact sequential GPU pixels. Held updates remain
+immutable after target completion releases references. Required-source corruption cannot publish
+the target; corrupted preroll cannot publish even a progressive image. An independent restart
+executes one physical frame successfully while normal decoding rejects deliberately damaged
+earlier entropy, documenting the scope of validation rather than claiming the skipped bytes valid.
+Initial admission retry and cancellation before/during/after target updates release caller input
+and all GPU reservations except explicitly held outputs.
+
+Header-only probes cover an old reference surviving a later independent frame, overwritten slot
+versions, patch dependencies, independently sourced blend alpha, forged dependent anchors,
+equivalent rational tick units and work limits. These probes do not create pixel evidence.
+
+`oracles::frame_index` compiles the public libjxl 0.12.0 encoder helper in
+[`frame_index.cpp`](../tools/jxl_test_support/test-data/frame_index.cpp), requiring its build/runtime
+identity. It emits a still, a dense index and a sparse index without using production wire code.
+Actual offsets and frame spans agree with the parsed frame headers. Its animated first time
+interval is zero despite nonzero duration, so those two indexes are explicit temporal-rejection
+evidence, not positive seek interoperability. Generated indexes on the same native codestreams
+preserve all exact source RGB8 words, native pixels and original timing. The native helper is
+development-only and existing fixtures are unchanged.
+
+The target requires an actual GPU; Apple M5/Metal is the recorded adapter, with two libtest threads
+and sequential test processes. Full-input parsing, conservatively bounded GPU restart and index
+generation are the supported slice. Incremental index collection/handoff, byte-range input,
+compressed indexes, non-coalesced layers and broader conformance remain open.
+[API and bounds](FRAME_SEEKING.md).
+
 ## Incremental transport matrix
 
 `jxl_gpu_bitstream::stream` tests raw codestreams and compact `jxlc`/`jxlp` containers at every

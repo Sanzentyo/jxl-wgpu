@@ -30,6 +30,14 @@ continue to select the baseline image.
 mixed Modular/VarDCT presentations and recursive progressive DC. It uses the shared frame executor
 described below.
 
+`GpuDecoder::open_seek` / `open_seek_shared` take a target main-image presentation plus
+`FrameIndexLimits` and `FrameSeekLimits`. They bind an optional `jxli` to complete input headers,
+or generate a conservative index, restore required LF/reference versions on GPU, and expose only
+the target through `GpuSeekSession`. Its blocking/async frame and progressive-update APIs preserve
+original timing, physical IDs and output ownership. Input acquisition remains whole-file;
+incremental seek handoff and non-coalesced layers remain open.
+[Index validation, dependency bounds and evidence](../../docs/FRAME_SEEKING.md).
+
 `GpuOutputRequest::with_image_selection(ImageSelection::Preview)` selects the embedded preview.
 The default is `ImageSelection::Main`. Both use the ordinary GPU session and output APIs:
 

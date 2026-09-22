@@ -28,9 +28,10 @@ impl WgpuDecodeEngine {
         request: &GpuOutputRequest,
         inventory: &CodestreamInventory,
         plan: FrameExecutionPlan,
+        needs_surface: bool,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
         validate_codestream_limit(codestream.logical_bytes(), self.parse_limits())?;
-        let execution = if super::composition::needs_surface(inventory, request, &plan)
+        let execution = if needs_surface
             || inventory
                 .frames
                 .iter()
@@ -42,6 +43,7 @@ impl WgpuDecodeEngine {
                 inventory,
                 request,
                 &plan,
+                needs_surface,
             )?)
         } else {
             let source = Arc::new(SequenceSource {
