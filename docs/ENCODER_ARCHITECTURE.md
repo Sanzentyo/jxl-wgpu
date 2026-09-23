@@ -190,6 +190,44 @@ keeping combined lengths within 15 bits. The LZ77 alphabet still starts at symbo
 1–16-bit prefix policies and the private Gray8 index retain their original 19-entry alphabet;
 the checked 609-byte Gray8 fixture is unchanged.
 
+## Modular transform planning direction
+
+The next structural step for `MOD-E02` is a checked transform plan before dispatch
+lowering. This plan remains to be implemented. Current dispatch geometry and transform
+serialization still interpret the RCT/Palette/Squeeze configuration separately.
+`ModularDispatchPlan` already owns GPU parameters, groups, batches and memory bounds;
+retain that execution plan and its completion-owned reservations.
+
+Use these ownership boundaries when extending transform order or channel topology:
+
+| Layer | Owns |
+|---|---|
+| Selection policy | Requested operations, target ranges, predictor/search choices and caller limits. |
+| Resolved transform plan | Validated operation order, channel roles and mappings before/after each operation, dimensions, meta/image partition, and checked resource capacities. |
+| Validated GPU result | Actual entry/delta counts and entropy artifacts, checked against the plan before they can determine header fields or published output. |
+
+Represent source-component, intermediate-channel, Palette-local component and final
+encoded-channel indices explicitly; a raw channel count cannot describe their mapping.
+For example, applying Palette to components 1 and 2 of a four-component image leaves
+the meta table followed by source component 0, the index image and source component 3.
+Squeeze then targets the image channels while preserving the meta prefix. Both the
+resource bounds and the wire operations must follow that same resolved topology.
+
+Derive memory admission, dispatch parameters and transform-header structure from the
+resolved plan. WGSL executes its lowered operations and addresses. GPU-dependent
+dimensions remain bounded by the pre-execution capacities and become authoritative
+only after artifact validation. Host planning remains metadata work; pixel transforms,
+dictionary search and residual generation stay on GPU. Replacing flags with enums alone
+does not establish these boundaries.
+
+First migrate the existing supported combinations through this representation while
+preserving public behavior, default bytes, typed rejection and resource lifetime.
+Then extend the plan and its lowering for a new combination. Keep independently parsed
+wire headers, exact/native/GPU comparisons and invalid-input/ownership cases: tests that
+reuse the planner's own expected topology cannot replace those independent checks.
+General transform stacks and their global/LF/HF topology remain roadmap work until
+their acceptance gates are met.
+
 ## Public API and state model
 
 `WgpuContext` owns shared device/queue handles. `GpuEncodeBackend` is the capability and submission

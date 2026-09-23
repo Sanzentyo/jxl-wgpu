@@ -30,6 +30,16 @@ These are entry points, not a mandatory reading sequence. Keep current contracts
 their owning documents; remove duplicated status reports rather than archiving them
 inside another always-discoverable README.
 
+## Design changes
+
+Before extending codec behavior, identify the invariants and the representation that
+owns them. When several layers derive the same transform or channel semantics from
+configuration, consolidate that interpretation into a checked plan and migrate its
+consumers together. Keep selection policy, resource bounds, and validated GPU results
+distinct. Scope the design to concrete supported and next-step requirements, preserving
+ownership and independent conformance checks. For Modular transform/topology work, follow
+the [encoder planning direction](docs/ENCODER_ARCHITECTURE.md#modular-transform-planning-direction).
+
 ## Completion
 
 Carry the authorized change through implementation, documentation, and the
