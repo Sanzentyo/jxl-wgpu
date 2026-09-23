@@ -13,7 +13,7 @@ pub struct LosslessModularMemoryPlan {
     pub exponent_bits_per_sample: u8,
     /// Largest storage word containing a component (`1`, `2`, `3`, or `4` bytes).
     pub bytes_per_sample: u8,
-    /// Maximum independently tokenized channels in any group after Palette/Squeeze (1 through 17).
+    /// Maximum independently tokenized channels in any group after all local transforms.
     /// Single-pixel edge axes are skipped, so individual groups may contain fewer channels.
     pub channel_count: u32,
     /// Union of the full source plane binding ranges, excluding gaps between planes.
@@ -33,8 +33,8 @@ pub struct LosslessModularMemoryPlan {
     /// Peak palette dictionary/count/hash, delta residual and delta Weighted row storage,
     /// already included in artifact bytes.
     pub palette_scratch_bytes: u64,
-    /// Peak explicit Squeeze operation tables and live sample arenas, included in artifact bytes.
-    pub squeeze_scratch_bytes: u64,
+    /// Peak explicit transform operation tables and live sample arenas, included in artifact bytes.
+    pub transform_scratch_bytes: u64,
     /// Sum of the worst-case artifact ranges across every batch. This is diagnostic only; the
     /// encoder never allocates the sum as one GPU buffer.
     pub total_artifact_bytes: u64,

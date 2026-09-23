@@ -6,6 +6,7 @@ mod color;
 mod dispatch;
 mod grid;
 mod icc;
+mod local_transforms;
 mod lz77;
 mod memory;
 mod palette;
@@ -24,6 +25,7 @@ mod upload;
 pub use color::LosslessModularColorOptions;
 pub use dispatch::LosslessModularBackend;
 pub use grid::{LosslessModularGroup, LosslessModularGroupGrid};
+pub use local_transforms::{LosslessModularLocalTransforms, LosslessModularTransform};
 pub use lz77::LosslessModularLz77;
 pub use memory::{
     LosslessModularInFlightMemory, LosslessModularMemoryLimits, LosslessModularMemoryPlan,

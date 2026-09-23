@@ -7,7 +7,7 @@ use super::squeeze::SqueezeAxes;
 use super::types::{LosslessModularConfig, LosslessModularFormat};
 use crate::{BackendError, EncodeError};
 pub(super) mod program;
-use program::SqueezeProgram;
+use program::TransformProgram;
 
 #[cfg(test)]
 mod tests;
@@ -177,9 +177,21 @@ pub(super) struct SqueezeStep {
 
 #[derive(Clone, Debug)]
 pub(super) enum TransformOperation {
-    Rct(LosslessModularRctType),
+    Rct(PlannedRct),
     Palette(PlannedPalette),
     Squeeze(Vec<SqueezeStep>),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PlannedRct {
+    pub(super) begin: u32,
+    pub(super) rct_type: LosslessModularRctType,
+}
+
+impl PlannedRct {
+    pub(super) const fn source(rct_type: LosslessModularRctType) -> Self {
+        Self { begin: 0, rct_type }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -188,7 +200,7 @@ pub(super) struct GroupTransformPlan {
     pub(super) channels: Vec<PlannedChannel>,
     pub(super) operations: Vec<TransformOperation>,
     pub(super) palette: Option<PlannedPalette>,
-    pub(super) squeeze_program: Option<SqueezeProgram>,
+    pub(super) transform_program: Option<TransformProgram>,
 }
 
 impl GroupTransformPlan {
@@ -211,7 +223,7 @@ impl GroupTransformPlan {
             .collect();
         let mut operations = Vec::new();
         if let Some(rct) = local_rct {
-            operations.push(TransformOperation::Rct(rct));
+            operations.push(TransformOperation::Rct(PlannedRct::source(rct)));
         }
         let palette = config
             .palette
@@ -240,7 +252,10 @@ impl GroupTransformPlan {
             );
             operations.push(TransformOperation::Palette(palette));
         }
-        let squeeze = config.squeeze.for_extent(extent[0], extent[1]);
+        let squeeze_policy = config.local_transforms.squeeze_policy();
+        let squeeze = squeeze_policy.map_or(SqueezeAxes::None, |policy| {
+            policy.for_extent(extent[0], extent[1])
+        });
         let meta = usize::from(palette.is_some());
         for channel in
             &mut channels[meta + squeeze_range.start as usize..meta + squeeze_range.end as usize]
@@ -284,7 +299,8 @@ impl GroupTransformPlan {
                     channel.extent[axis] = channel.extent[axis].div_ceil(2);
                     channel.shifts[axis] += 1;
                 }
-                if config.squeeze.in_place() == Some(true) {
+                let in_place = squeeze_policy.and_then(|policy| policy.in_place()) == Some(true);
+                if in_place {
                     channels.splice(end..end, residuals);
                     inserted += end - begin;
                 } else {
@@ -292,7 +308,7 @@ impl GroupTransformPlan {
                 }
                 steps.push(SqueezeStep {
                     horizontal,
-                    in_place: config.squeeze.in_place() == Some(true),
+                    in_place,
                     range: ChannelRange {
                         begin: begin as u32,
                         count: (end - begin) as u32,
@@ -300,22 +316,32 @@ impl GroupTransformPlan {
                 });
             }
         }
-        let squeeze_program = if let Some(sequence) = config.squeeze.steps() {
-            let (program, resolved) = SqueezeProgram::new(&mut channels, meta, sequence)?;
-            steps = resolved;
-            Some(program)
-        } else {
-            None
-        };
+        let transform_program =
+            if let Some(sequence) = squeeze_policy.and_then(|policy| policy.steps()) {
+                let (program, resolved) = TransformProgram::squeeze(&mut channels, meta, sequence)?;
+                steps = resolved;
+                Some(program)
+            } else if let Some(sequence) = config.local_transforms.operations() {
+                let (program, resolved) = TransformProgram::new(&mut channels, meta, sequence)?;
+                operations.extend(resolved);
+                Some(program)
+            } else {
+                None
+            };
         if !steps.is_empty() {
             operations.push(TransformOperation::Squeeze(steps));
+        }
+        if operations.len() > 273 {
+            return Err(EncodeError::InvalidModularTransformCount {
+                count: operations.len(),
+            });
         }
         Ok(Self {
             extent,
             channels,
             operations,
             palette,
-            squeeze_program,
+            transform_program,
         })
     }
 }
@@ -346,11 +372,15 @@ impl ModularTransformPlan {
         let image_count = config.palette.map_or(format.channel_count(), |palette| {
             format.channel_count() - palette.components(format) + 1
         });
-        let squeeze_range = config.squeeze.resolve_range(image_count)?;
+        let squeeze_range = if let Some(squeeze) = config.local_transforms.squeeze_policy() {
+            squeeze.resolve_range(image_count)?
+        } else {
+            0..image_count
+        };
         let rct = config.color_transform.resolve(format, exponent_bits)?;
         let mut global_operations = Vec::new();
         if let Some(rct) = rct.filter(|rct| !rct.local && grid.groups > 1) {
-            global_operations.push(TransformOperation::Rct(rct.rct_type));
+            global_operations.push(TransformOperation::Rct(PlannedRct::source(rct.rct_type)));
         }
         let local_rct = rct
             .filter(|rct| rct.local || grid.groups == 1)
@@ -386,12 +416,18 @@ impl ModularTransformPlan {
             .ok_or(BackendError::Invariant("empty Modular topology"))?;
         // Keep the established prefix-table policy even when a group's one-pixel axes elide
         // Squeeze. This is an entropy upper bound, not another physical channel topology.
-        let prefix_channels = if config.squeeze.steps().is_some() {
+        let prefix_channels = if config.local_transforms.uses_program() {
             max_channels.min(4) as usize
         } else {
             (u32::from(config.palette.is_some())
                 + image_count
-                + squeeze_range.len() as u32 * ((1 << config.squeeze.stages()) - 1))
+                + squeeze_range.len() as u32
+                    * ((1
+                        << config
+                            .local_transforms
+                            .squeeze_policy()
+                            .map_or(0, |squeeze| squeeze.stages()))
+                        - 1))
                 .min(4) as usize
         };
         Ok(Self {
@@ -400,7 +436,9 @@ impl ModularTransformPlan {
             max_channels,
             dispatches,
             prefix_channels,
-            extended_prediction_domain: config.palette.is_some() || config.squeeze.enabled(),
+            extended_prediction_domain: config.palette.is_some()
+                || config.local_transforms.uses_program()
+                || config.local_transforms.uses_squeeze(),
             shapes,
         })
     }

@@ -34,7 +34,7 @@ fn config(policy: Palette, begin: u32, count: u32, variant: usize) -> LosslessMo
         } else {
             Lz77::Greedy
         },
-        squeeze: SQUEEZES[variant % 5].clone(),
+        local_transforms: SQUEEZES[variant % 5].clone().into(),
     }
 }
 
@@ -97,7 +97,7 @@ fn selected_and_unselected_components_keep_every_integer_and_ieee_precision() {
             let encoder = LosslessModularEncoder::with_config(
                 rig.context.clone(),
                 LosslessModularConfig {
-                    squeeze: Squeeze::None,
+                    local_transforms: Squeeze::None.into(),
                     ..config(policy, begin, count, bits as usize + index)
                 },
             );
@@ -238,7 +238,7 @@ fn selected_components_keep_animation_words_and_cropped_reference_composition() 
             policy
         };
         let config = LosslessModularConfig {
-            squeeze: Squeeze::None,
+            local_transforms: Squeeze::None.into(),
             ..config(policy, 1, 1, index)
         };
         let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config.clone());
@@ -259,7 +259,7 @@ fn selected_components_keep_animation_words_and_cropped_reference_composition() 
         let composed = LosslessModularEncoder::with_config(
             rig.context.clone(),
             LosslessModularConfig {
-                squeeze: SQUEEZES[index + 1].clone(),
+                local_transforms: SQUEEZES[index + 1].clone().into(),
                 ..config
             },
         );
@@ -275,7 +275,7 @@ fn selected_component_scratch_keeps_exact_admission_cancellation_and_pool_reuse(
         check_lifetime_with_samples(
             &rig,
             LosslessModularConfig {
-                squeeze: SQUEEZES[index + 1].clone(),
+                local_transforms: SQUEEZES[index + 1].clone().into(),
                 predictor: Predictor::Weighted,
                 lz77: Lz77::Greedy,
                 color_transform: Transform::LocalRct(Rct::new(41).unwrap()),
@@ -383,7 +383,7 @@ fn component_admission_and_unselected_squeeze_overflow_remain_typed() {
         let encoder = LosslessModularEncoder::with_config(
             rig.context.clone(),
             LosslessModularConfig {
-                squeeze: Squeeze::Horizontal,
+                local_transforms: Squeeze::Horizontal.into(),
                 ..config(policy, 3, 1, 0)
             },
         );

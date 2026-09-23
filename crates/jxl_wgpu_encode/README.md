@@ -85,10 +85,12 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   preserving NaN payloads, signed zero and independent alpha. The host performs no pixel transform.
   Global RCT is declared once in DC-global; local RCT is declared in each pass group independently
   of MA-tree placement. A fused single-group frame declares either choice in DC-global.
-  The same selected type applies to every group/frame; arbitrary transform stacks and adaptive
+  The same selected type applies to every group/frame; arbitrary Palette placement and adaptive
   per-group selection remain open. Invalid type/channel combinations fail before GPU admission.
-- `LosslessModularConfig::squeeze` uses the immutable `LosslessModularSqueeze` policy with named
-  constants `None`, `Horizontal`, `Vertical`, `HorizontalThenVertical` and `VerticalThenHorizontal`.
+- `LosslessModularConfig::local_transforms` accepts an immutable `LosslessModularSqueeze` policy
+  via `.into()`, or an explicit `LosslessModularLocalTransforms::sequence` described below.
+  Squeeze policies have named constants `None`, `Horizontal`, `Vertical`,
+  `HorizontalThenVertical` and `VerticalThenHorizontal`.
   The default `None` preserves existing bytes. Other named policies transform all image channels
   after RCT and optional Palette, appending residuals in source-channel order.
   `with_channels(begin, count)` selects a nonempty contiguous range in that post-Palette image
@@ -120,8 +122,23 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   Thus explicit Squeeze accepts only representable transforms of the integer/IEEE input domain;
   it does not promise every full-width source is representable. This applies before prediction
   under both entropy policies and both resident/streamed completion paths. Cross-group/global-LF
-  Squeeze, general RCT/Palette/Squeeze composition orders, adaptive transform choices and
+  Squeeze, arbitrary Palette placement, adaptive transform choices and
   progressive Modular remain open.
+- `LosslessModularLocalTransforms::sequence` accepts 1–273 ordered
+  `LosslessModularTransform::{Rct, Squeeze}` operations after the source color transform and
+  optional Palette. Each entry emits one wire transform; each Squeeze entry holds one
+  `LosslessModularSqueezeStep`. Its ranges address the current image channels, excluding the
+  Palette meta table. RCT selects three consecutive channels at `begin_channel`, including
+  alpha, Palette indices or earlier Squeeze residuals. All three dimensions and shifts must
+  match; equal empty residuals are valid and require no GPU job. RCT uses wrapping words,
+  including raw IEEE representations. The checked plan validates every group shape before
+  admission and allocates all outputs before retiring any input span.
+  The complete local header, including preceding local RCT/Palette, must fit 273 entries.
+  In a fused single-group frame the source global RCT also belongs to this header.
+  Invalid counts, ranges or unequal geometry return typed errors before allocation.
+  `operations()` exposes the explicit program; `squeeze_policy()` exposes a converted
+  Squeeze policy. Clones share immutable operation storage. Global/LF/HF programs and
+  Palette interleaving remain unsupported.
 - `LosslessModularConfig::palette` optionally selects `LosslessModularPalette::new(max_colors)`;
   the default is `None`. The checked limit is `1..=70_911`. Each pass group builds an exact
   first-occurrence dictionary of selected component tuples on GPU after RCT, including alpha
@@ -215,7 +232,7 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
 `LosslessModularEncoder::memory_plan` reports the detected valid bits, exponent width (zero for
 integers), largest component storage-word width, full and peak unions of source plane binding
 ranges, the maximum transformed `channel_count` in any group, peak parameter/artifact/readback bytes, `weighted_predictor_scratch_bytes`,
-`lz77_scratch_bytes`, `palette_scratch_bytes`, `squeeze_scratch_bytes`, diagnostic total artifact bytes, batch count, exact GPU submission count,
+`lz77_scratch_bytes`, `palette_scratch_bytes`, `transform_scratch_bytes`, diagnostic total artifact bytes, batch count, exact GPU submission count,
 streaming mode, total encoder-owned live bytes, and the group grid before submission. Streamed jobs
 report exactly twice the batch count:
 one histogram and one serialization submission per batch. Every live batch uses the same shared
@@ -242,9 +259,10 @@ channel's width, height and area. Named policies produce at most 16 image channe
 single-pixel edge axes may produce fewer. Palette adds one meta channel and replaces its selected
 components with one index channel. Explicit sequences add each step's count to the current channel
 list, including empty residual slots; their exact topology determines event and predictor storage.
-Each sequence's `squeeze_scratch_bytes` includes a job-count word, 32 bytes per selected-channel
-operation, and the peak live sample arena. This private region is inside the artifact/readback
-allocation. The job table is also charged in parameter storage and copied to the private region
+Each program's `transform_scratch_bytes` includes a job-count word, 64 bytes per GPU job
+(one selected Squeeze channel or one nonempty RCT triple), and the peak live sample arena.
+This private region is inside the artifact/readback allocation. The job table is also charged
+in parameter storage and copied to the private region
 before execution. Arena reuse never overwrites a job's still-live inputs.
 Its meta channel reserves `k × selected_components` samples, where `k` is the sum of the separately
 pixel-clamped color and delta limits. The implicit policy instead clamps its delta limit to

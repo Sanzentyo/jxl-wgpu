@@ -84,7 +84,7 @@ fn mixed_palette_preserves_every_predictor_rct_precision_and_squeeze_order() {
                 predictor: Predictor::ALL[(value as usize + 7) % 14],
                 weighted_predictor: Weighted::new([31, 0, 17, 3, 11, 31, 1], [0, 15, 7, 12])
                     .unwrap(),
-                squeeze: SQUEEZES[value as usize % 5].clone(),
+                local_transforms: SQUEEZES[value as usize % 5].clone().into(),
                 group_size,
                 tree_mode: TREES[value as usize % 2],
                 color_transform: if value % 2 == 0 {
@@ -120,7 +120,7 @@ fn mixed_palette_preserves_every_predictor_rct_precision_and_squeeze_order() {
                 predictor: Predictor::Weighted,
                 weighted_predictor: Weighted::new([31, 0, 17, 3, 11, 31, 1], [0, 15, 7, 12])
                     .unwrap(),
-                squeeze: SQUEEZES[index % 5].clone(),
+                local_transforms: SQUEEZES[index % 5].clone().into(),
                 tree_mode: TREES[index % 2],
                 ..Default::default()
             },
@@ -170,7 +170,7 @@ fn mixed_palette_separates_identical_color_and_delta_words_and_reuses_absolute_e
             rig.context.clone(),
             LosslessModularConfig {
                 palette: Some(Palette::mixed(1, 3, Predictor::West).unwrap()),
-                squeeze,
+                local_transforms: squeeze.into(),
                 ..Default::default()
             },
         );
@@ -241,7 +241,7 @@ fn mixed_palette_animation_retains_original_words_and_reference_composition() {
             LosslessModularConfig {
                 palette: Some(Palette::mixed(3, 4096, predictor).unwrap()),
                 predictor: Predictor::Weighted,
-                squeeze: SQUEEZES[index + 3].clone(),
+                local_transforms: SQUEEZES[index + 3].clone().into(),
                 group_size,
                 tree_mode: TREES[index],
                 ..Default::default()
@@ -281,7 +281,7 @@ fn mixed_palette_overflow_never_publishes_resident_or_late_streamed_output() {
             rig.context.clone(),
             LosslessModularConfig {
                 palette: Some(Palette::mixed(1, 1, predictor).unwrap()),
-                squeeze,
+                local_transforms: squeeze.into(),
                 lz77: if index % 2 == 0 {
                     Lz77::ZeroRuns
                 } else {
@@ -344,7 +344,7 @@ fn mixed_palette_scratch_obeys_admission_cancellation_and_reuse() {
             &rig,
             LosslessModularConfig {
                 palette: Some(Palette::mixed(3, 4096, Predictor::Weighted).unwrap()),
-                squeeze: SQUEEZES[index + 1].clone(),
+                local_transforms: SQUEEZES[index + 1].clone().into(),
                 group_size,
                 tree_mode: TREES[index % 2],
                 predictor: Predictor::Weighted,

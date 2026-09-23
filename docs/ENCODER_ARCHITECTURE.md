@@ -209,15 +209,22 @@ unselected channels, so a second axis can require two distinct wire steps. Unsel
 their extents and carry no Squeeze axes into the kernel. Both the
 resource bounds and the wire operations must follow that same resolved topology.
 
-Explicit Squeeze sequences use per-step current-channel ranges, axes and residual placement.
-The same shape plan resolves ordered wire parameters, channel shifts and 32-byte GPU jobs, rejecting
-empty inputs, invalid intermediate ranges and cumulative-shift overflow before admission. Explicit
-steps preserve zero-sized residual slots; named separable policies retain their one-pixel-axis
+`local_transforms` selects either a Squeeze policy or an ordered RCT/Squeeze program. The former
+retains optimized separable lowering or up to 296 parameters in one wire transform; the latter
+emits one transform per operation, within the 273-entry complete-header bound. Both use current
+image-channel ranges after the source-RCT/Palette prelude, excluding Palette metadata.
+The same shape plan resolves ordered wire parameters, channel shifts and 64-byte GPU jobs, rejecting
+empty Squeeze inputs, invalid intermediate ranges and cumulative-shift overflow before admission.
+Explicit steps preserve zero-sized residual slots; named separable policies retain their one-pixel-axis
 elision and byte identity. Sequence policy storage is immutable and shared on clone.
 
-Each job reads a post-RCT component, Palette index or an earlier arena view. The planner allocates
-disjoint average/residual outputs before retiring the input span, then coalesces free spans for
-later jobs. Final channel descriptors carry arena offsets. One invocation owns each group's
+RCT requires three channels with equal extents and shifts; it may include alpha or Squeeze
+residuals and retains valid empty triples in the wire topology without a GPU job. The complete
+header bound includes local prelude operations and single-group fusion.
+
+Each job reads post-RCT components, Palette indices or earlier arena views. The planner allocates
+disjoint average/residual outputs or all three RCT outputs before retiring any input span, then
+coalesces free spans for later jobs. Final channel descriptors carry arena offsets. One invocation owns each group's
 ordered program and tokenization, so no cross-invocation synchronization is needed. The existing
 parameter allocation also carries the planned metadata table; a shared resident/streamed uploader
 copies it into private artifact storage after clearing and before dispatch. Metadata and the peak
@@ -240,7 +247,7 @@ default bytes, typed rejection and resource lifetime. Extend the plan and its lo
 for a new combination. Keep independently parsed
 wire headers, exact/native/GPU comparisons and invalid-input/ownership cases: tests that
 reuse the planner's own expected topology cannot replace those independent checks.
-General transform stacks and their global/LF/HF topology remain roadmap work until
+Palette interleaving and global/LF/HF transform topology remain roadmap work until
 their acceptance gates are met.
 
 ## Public API and state model

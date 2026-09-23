@@ -122,6 +122,22 @@ pub enum PacketError {
 
 #[derive(Debug, Error)]
 pub enum EncodeError {
+    #[error("invalid Modular transform count {count} (program: 1..=273; complete header: 0..=273)")]
+    InvalidModularTransformCount { count: usize },
+    #[error("Modular RCT begin {begin} must fit 0..=9287")]
+    InvalidModularRctBegin { begin: u32 },
+    #[error(
+        "RCT operation {operation} range beginning at {begin} needs three of {channels} image channels"
+    )]
+    InvalidModularRctChannels {
+        operation: u32,
+        begin: u32,
+        channels: u32,
+    },
+    #[error(
+        "RCT operation {operation} beginning at {begin} requires equal image-channel extents and shifts"
+    )]
+    UnequalModularRctChannels { operation: u32, begin: u32 },
     #[error("explicit Squeeze sequence requires 1..=296 steps, got {count}")]
     InvalidModularSqueezeStepCount { count: usize },
     #[error("explicit Squeeze begin {begin} must fit 0..=9287 and count {count} must fit 1..=19")]

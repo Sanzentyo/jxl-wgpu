@@ -12,7 +12,7 @@ fn config() -> LosslessModularConfig {
                 .with_components(1, 2)
                 .unwrap(),
         ),
-        squeeze: LosslessModularSqueeze::HorizontalThenVertical,
+        local_transforms: LosslessModularSqueeze::HorizontalThenVertical.into(),
         ..Default::default()
     }
 }
@@ -47,7 +47,9 @@ fn selected_components_keep_explicit_sources_extents_and_band_order() {
     assert_eq!(actual, expected);
     assert_eq!(plan.dispatches, 13);
     assert!(plan.global_operations.is_empty());
-    assert!(matches!(group.operations[0], TransformOperation::Rct(rct) if rct.value() == 41));
+    assert!(
+        matches!(group.operations[0], TransformOperation::Rct(rct) if rct.rct_type.value() == 41)
+    );
     let TransformOperation::Squeeze(steps) = &group.operations[2] else {
         panic!("missing planned Squeeze")
     };
@@ -73,7 +75,7 @@ fn repeated_and_edge_groups_share_plans_with_one_global_rct() {
     assert_eq!(plan.dispatches, 163); // 9*13 + 3*7 + 3*7 + 4
     assert_eq!(plan.max_channels, 13);
     assert!(
-        matches!(&plan.global_operations[..], [TransformOperation::Rct(rct)] if rct.value() == 41)
+        matches!(&plan.global_operations[..], [TransformOperation::Rct(rct)] if rct.rct_type.value() == 41)
     );
     assert!(std::ptr::eq(
         plan.group(grid.group(0).unwrap()).unwrap(),
@@ -112,7 +114,7 @@ fn repeated_and_edge_groups_share_plans_with_one_global_rct() {
         8,
         0,
         LosslessModularConfig {
-            squeeze: LosslessModularSqueeze::Horizontal,
+            local_transforms: LosslessModularSqueeze::Horizontal.into(),
             ..Default::default()
         },
     )
@@ -158,10 +160,11 @@ fn squeeze_selection_preserves_meta_and_unselected_channels_in_both_placements()
             31,
             0,
             LosslessModularConfig {
-                squeeze: LosslessModularSqueeze::HorizontalThenVertical
+                local_transforms: LosslessModularSqueeze::HorizontalThenVertical
                     .with_channels(0, 2)
                     .unwrap()
-                    .with_in_place(in_place),
+                    .with_in_place(in_place)
+                    .into(),
                 ..config()
             },
         )
@@ -227,7 +230,7 @@ fn squeeze_ranges_are_checked_in_the_post_palette_image_domain() {
                             .with_components(0, 5 - channels)
                             .unwrap(),
                     ),
-                    squeeze: squeeze.clone(),
+                    local_transforms: squeeze.clone().into(),
                     ..Default::default()
                 };
                 let result =

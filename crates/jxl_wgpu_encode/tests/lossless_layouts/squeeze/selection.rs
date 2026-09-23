@@ -15,7 +15,7 @@ fn policy(mode: usize, begin: u32, count: u32, in_place: bool) -> Squeeze {
 
 pub(super) fn config(squeeze: Squeeze, variant: usize) -> LosslessModularConfig {
     LosslessModularConfig {
-        squeeze,
+        local_transforms: squeeze.into(),
         color_transform: Transform::None,
         group_size: Size::ALL[variant % 4],
         tree_mode: TREES[variant % 2],
@@ -199,6 +199,28 @@ fn selected_squeeze_keeps_all_rcts_and_group_edge_axis_elision() {
 
 // Read the wire with independent libjxl-style bit fields, not the encoder's transform plan.
 pub(super) fn local_steps(encoded: &[u8]) -> Vec<Vec<(bool, bool, u32, u32)>> {
+    local_operations(encoded)
+        .into_iter()
+        .map(|operations| {
+            operations
+                .into_iter()
+                .flat_map(|operation| match operation {
+                    WireTransform::Squeeze(steps) => steps,
+                    _ => Vec::new(),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum WireTransform {
+    Rct(u32, u32),
+    Palette(u32, u32),
+    Squeeze(Vec<(bool, bool, u32, u32)>),
+}
+
+pub(super) fn local_operations(encoded: &[u8]) -> Vec<Vec<WireTransform>> {
     use jxl_bitstream::U;
     let image = jxl_oxide::JxlImage::read_with_defaults(encoded).unwrap();
     let frame = image.frame(0).unwrap();
@@ -218,26 +240,31 @@ pub(super) fn local_steps(encoded: &[u8]) -> Vec<Vec<(bool, bool, u32, u32)>> {
                 }
             }
             let count = bits.read_u32(0, 1, 2 + U(4), 18 + U(8)).unwrap();
-            let mut steps = Vec::new();
+            let mut operations = Vec::new();
             for _ in 0..count {
                 match bits.read_bits(2).unwrap() {
                     0 => {
-                        bits.read_u32(U(3), 8 + U(6), 72 + U(10), 1096 + U(13))
+                        let begin = bits
+                            .read_u32(U(3), 8 + U(6), 72 + U(10), 1096 + U(13))
                             .unwrap();
-                        bits.read_u32(6, U(2), 2 + U(4), 10 + U(6)).unwrap();
+                        let kind = bits.read_u32(6, U(2), 2 + U(4), 10 + U(6)).unwrap();
+                        operations.push(WireTransform::Rct(begin, kind));
                     }
                     1 => {
-                        bits.read_u32(U(3), 8 + U(6), 72 + U(10), 1096 + U(13))
+                        let begin = bits
+                            .read_u32(U(3), 8 + U(6), 72 + U(10), 1096 + U(13))
                             .unwrap();
-                        bits.read_u32(1, 3, 4, 1 + U(13)).unwrap();
+                        let count = bits.read_u32(1, 3, 4, 1 + U(13)).unwrap();
                         bits.read_u32(U(8), 256 + U(10), 1280 + U(12), 5376 + U(16))
                             .unwrap();
                         bits.read_u32(0, 1 + U(8), 257 + U(10), 1281 + U(16))
                             .unwrap();
                         bits.read_bits(4).unwrap();
+                        operations.push(WireTransform::Palette(begin, count));
                     }
                     2 => {
                         let parameters = bits.read_u32(0, 1 + U(4), 9 + U(6), 41 + U(8)).unwrap();
+                        let mut steps = Vec::new();
                         for _ in 0..parameters {
                             let horizontal = bits.read_bool().unwrap();
                             let in_place = bits.read_bool().unwrap();
@@ -247,11 +274,12 @@ pub(super) fn local_steps(encoded: &[u8]) -> Vec<Vec<(bool, bool, u32, u32)>> {
                             let count = bits.read_u32(1, 2, 3, 4 + U(4)).unwrap();
                             steps.push((horizontal, in_place, begin, count));
                         }
+                        operations.push(WireTransform::Squeeze(steps));
                     }
                     other => panic!("unexpected transform {other}"),
                 }
             }
-            steps
+            operations
         })
         .collect()
 }

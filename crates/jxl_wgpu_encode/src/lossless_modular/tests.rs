@@ -180,7 +180,7 @@ mod native_tests {
         .expect("Modular WGSL validates with portable WebGPU capabilities");
         for (name, size, offsets) in [
             ("Source", 24, vec![0, 4, 8, 12, 16, 20]),
-            ("SqueezeJob", 32, vec![0, 4, 8, 12, 16, 20, 24, 28]),
+            ("TransformJob", 64, vec![0, 4, 8, 12, 16, 28, 40, 52]),
             (
                 "Params",
                 256,
@@ -251,8 +251,8 @@ mod native_tests {
             palette_components: 60,
             sample_source: 61,
             squeeze_band: 62,
-            squeeze_program_word_offset: 63,
-            squeeze_sample_word_offset: 64,
+            transform_program_word_offset: 63,
+            transform_sample_word_offset: 64,
         };
         let words = bytemuck::cast::<ModularParams, [u32; 64]>(params);
         assert_eq!(words.as_slice(), &(1..=64).collect::<Vec<_>>());

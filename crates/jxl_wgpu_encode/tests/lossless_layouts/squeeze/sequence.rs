@@ -199,7 +199,7 @@ fn explicit_squeeze_preserves_bytes_of_equivalent_separable_policies() {
                 let encoded = selection::checked(
                     &rig,
                     LosslessModularConfig {
-                        squeeze: sequence(&steps),
+                        local_transforms: sequence(&steps).into(),
                         ..config
                     },
                     case,
@@ -368,7 +368,7 @@ fn later_squeeze_stage_overflow_never_publishes_resident_or_streamed_output() {
                 let input = upload(&rig.context, &case, extent, &expected, 4099);
                 let plan = encoder.memory_plan(&input).unwrap();
                 assert_eq!(plan.streaming, extent.width > 4);
-                assert!(plan.squeeze_scratch_bytes > 0);
+                assert!(plan.transform_scratch_bytes > 0);
                 let source = Arc::downgrade(&input.buffer);
                 let error =
                     pollster::block_on(encoder.submit_container(input).unwrap()).unwrap_err();

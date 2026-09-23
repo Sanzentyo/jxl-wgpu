@@ -76,10 +76,11 @@ pub use lossless_modular::{
     LosslessModularColorTransform, LosslessModularConfig, LosslessModularEncoder,
     LosslessModularFormat, LosslessModularGroup, LosslessModularGroupGrid,
     LosslessModularGroupSize, LosslessModularInFlightMemory, LosslessModularJob,
-    LosslessModularLz77, LosslessModularMemoryLimits, LosslessModularMemoryPlan,
-    LosslessModularPalette, LosslessModularPredictor, LosslessModularRctType,
-    LosslessModularSqueeze, LosslessModularSqueezeStep, LosslessModularSubmission,
-    LosslessModularTreeMode, LosslessModularWeightedPredictor,
+    LosslessModularLocalTransforms, LosslessModularLz77, LosslessModularMemoryLimits,
+    LosslessModularMemoryPlan, LosslessModularPalette, LosslessModularPredictor,
+    LosslessModularRctType, LosslessModularSqueeze, LosslessModularSqueezeStep,
+    LosslessModularSubmission, LosslessModularTransform, LosslessModularTreeMode,
+    LosslessModularWeightedPredictor,
 };
 pub use packet::{
     BitFragment, EncodedFrame, FrameGroupLayout, FramePacketSet, GroupPacket, GroupPacketKind,

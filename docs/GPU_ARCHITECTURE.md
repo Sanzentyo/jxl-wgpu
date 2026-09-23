@@ -55,8 +55,16 @@ post-Palette image-channel domain and tracks selected descendants through either
 residual insertion. Its per-channel sample source, resolved axes and Squeeze band lower directly
 into GPU parameters; unselected image channels and the meta table have axis mode zero. Complete channel
 sets remain together across streamed histogram/serialization batches. A residual outside signed-32
-storage fails artifact validation before any codestream is returned. General transform stacks and
-cross-group/global-LF Squeeze remain outside this encoder policy.
+storage fails artifact validation before any codestream is returned.
+
+Ordered local RCT/Squeeze programs use the same checked plan for evolving image-channel ranges,
+equal RCT extents/shifts and complete-header limits. Their 64-byte jobs read source components,
+Palette indices or earlier arena views. The planner reserves disjoint outputs before retiring
+inputs and reuses consumed spans; one group-owner invocation executes the program before
+tokenization. Job metadata and the peak arena are budgeted in the existing parameter/artifact
+allocations. Empty RCT triples retain their wire declaration without a GPU job. Named separable
+policies keep their direct computation and byte identity. Arbitrary Palette ordering and
+cross-group/global-LF transform topology remain outside this encoder policy.
 
 Optional exact local Palette runs between RCT and Squeeze. The first invocation of each group
 builds a first-occurrence component-tuple dictionary and an open-addressed lookup table, then

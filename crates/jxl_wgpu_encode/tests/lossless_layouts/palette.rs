@@ -92,7 +92,7 @@ fn local_palette_preserves_every_component_and_composes_with_both_squeeze_orders
                 rig.context.clone(),
                 LosslessModularConfig {
                     palette: Some(Palette::new(32).unwrap()),
-                    squeeze: squeeze.clone(),
+                    local_transforms: squeeze.clone().into(),
                     tree_mode,
                     ..Default::default()
                 },
@@ -136,7 +136,7 @@ fn palette_composes_with_all_rcts_predictors_and_full_precision_words() {
             rig.context.clone(),
             LosslessModularConfig {
                 palette: Some(Palette::new(32).unwrap()),
-                squeeze: SQUEEZES[value as usize % 5].clone(),
+                local_transforms: SQUEEZES[value as usize % 5].clone().into(),
                 group_size,
                 tree_mode: TREES[value as usize % 2],
                 color_transform: if value % 2 == 0 {
@@ -168,7 +168,7 @@ fn palette_composes_with_all_rcts_predictors_and_full_precision_words() {
             rig.context.clone(),
             LosslessModularConfig {
                 palette: Some(Palette::new(32).unwrap()),
-                squeeze,
+                local_transforms: squeeze.into(),
                 color_transform: Transform::None,
                 ..Default::default()
             },
@@ -224,7 +224,7 @@ fn palette_animation_keeps_special_words_crops_and_reference_composition() {
             rig.context.clone(),
             LosslessModularConfig {
                 palette: Some(Palette::new(4096).unwrap()),
-                squeeze,
+                local_transforms: squeeze.into(),
                 group_size,
                 tree_mode: TREES[index],
                 ..Default::default()
@@ -259,7 +259,7 @@ fn palette_overflow_returns_no_stream_and_releases_resident_and_streamed_jobs() 
             rig.context.clone(),
             LosslessModularConfig {
                 palette: Some(Palette::new(1).unwrap()),
-                squeeze,
+                local_transforms: squeeze.into(),
                 lz77: if index % 2 == 0 {
                     Lz77::ZeroRuns
                 } else {
@@ -313,7 +313,7 @@ fn palette_scratch_obeys_exact_admission_cancellation_and_pool_reuse() {
     for (index, group_size) in Size::ALL.into_iter().enumerate() {
         let config = LosslessModularConfig {
             palette: Some(Palette::new(32).unwrap()),
-            squeeze: SQUEEZES[index + 1].clone(),
+            local_transforms: SQUEEZES[index + 1].clone().into(),
             group_size,
             tree_mode: TREES[index % 2],
             predictor: Predictor::Weighted,

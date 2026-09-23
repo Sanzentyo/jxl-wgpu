@@ -76,7 +76,7 @@ fn greedy_lz77_preserves_every_predictor_with_integer_ieee_and_rct_words() {
                     rig.context.clone(),
                     LosslessModularConfig {
                         lz77: Lz77::Greedy,
-                        squeeze: Default::default(),
+                        local_transforms: Default::default(),
                         palette: None,
                         predictor,
                         group_size,
@@ -197,7 +197,7 @@ fn greedy_lz77_keeps_streamed_admission_cancellation_and_reuse() {
             rig.context.clone(),
             LosslessModularConfig {
                 lz77: Lz77::Greedy,
-                squeeze: Default::default(),
+                local_transforms: Default::default(),
                 palette: None,
                 group_size,
                 tree_mode: TREES[index % 2],
@@ -235,7 +235,7 @@ fn greedy_lz77_keeps_animation_words_crops_and_independent_references() {
             rig.context.clone(),
             LosslessModularConfig {
                 lz77: Lz77::Greedy,
-                squeeze: Default::default(),
+                local_transforms: Default::default(),
                 palette: None,
                 group_size,
                 predictor,

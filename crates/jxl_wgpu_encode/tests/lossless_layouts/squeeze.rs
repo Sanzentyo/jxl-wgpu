@@ -1,4 +1,5 @@
 use super::*;
+mod program;
 mod selection;
 mod sequence;
 use jxl_wgpu_encode::{
@@ -43,7 +44,12 @@ fn check_samples(
     let source = upload(&rig.context, case, extent, expected, 4099);
     let plan = encoder.memory_plan(&source).unwrap();
     let factor = match (
-        encoder.config().squeeze,
+        encoder
+            .config()
+            .local_transforms
+            .squeeze_policy()
+            .unwrap()
+            .clone(),
         extent.width > 1,
         extent.height > 1,
     ) {
@@ -74,7 +80,7 @@ fn squeeze_composes_with_all_rcts_predictors_group_sizes_and_entropy_policies() 
         let group_size = Size::ALL[value as usize % 4];
         let config = LosslessModularConfig {
             palette: None,
-            squeeze: MODES[value as usize % 4].clone(),
+            local_transforms: MODES[value as usize % 4].clone().into(),
             group_size,
             tree_mode: TREES[value as usize % 2],
             color_transform: if value % 2 == 0 {
@@ -105,7 +111,7 @@ fn squeeze_keeps_every_integer_precision_and_representable_ieee_words() {
         LosslessModularEncoder::with_config(
             rig.context.clone(),
             LosslessModularConfig {
-                squeeze,
+                local_transforms: squeeze.into(),
                 color_transform: Transform::None,
                 ..Default::default()
             },
@@ -156,7 +162,7 @@ fn squeeze_animation_retains_crops_references_and_ieee_words() {
         let encoder = LosslessModularEncoder::with_config(
             rig.context.clone(),
             LosslessModularConfig {
-                squeeze,
+                local_transforms: squeeze.into(),
                 group_size,
                 tree_mode: TREES[index],
                 ..Default::default()
@@ -182,7 +188,7 @@ fn squeeze_overflow_returns_no_stream_and_releases_the_job() {
         let encoder = LosslessModularEncoder::with_config(
             rig.context.clone(),
             LosslessModularConfig {
-                squeeze,
+                local_transforms: squeeze.into(),
                 lz77: if index % 2 == 0 {
                     Lz77::ZeroRuns
                 } else {
@@ -238,7 +244,7 @@ fn squeeze_streaming_preserves_exact_admission_cancellation_and_pool_reuse() {
     let case = case(LosslessModularFormat::Rgba, 16, SampleKind::Unsigned);
     for (index, group_size) in Size::ALL.into_iter().enumerate() {
         let config = LosslessModularConfig {
-            squeeze: MODES[index].clone(),
+            local_transforms: MODES[index].clone().into(),
             group_size,
             tree_mode: TREES[index % 2],
             predictor: Predictor::Weighted,
@@ -316,7 +322,7 @@ fn separable_squeeze_roundtrips_both_axes_and_single_pixel_edges() {
             let encoder = LosslessModularEncoder::with_config(
                 rig.context.clone(),
                 LosslessModularConfig {
-                    squeeze: squeeze.clone(),
+                    local_transforms: squeeze.clone().into(),
                     tree_mode,
                     ..Default::default()
                 },

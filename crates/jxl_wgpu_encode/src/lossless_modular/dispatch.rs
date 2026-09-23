@@ -40,8 +40,8 @@ pub(super) struct ModularGroupPlan {
     pub(super) output_size: u64,
     pub(super) max_events: usize,
     pub(super) palette: Option<PaletteArtifactPlan>,
-    pub(super) squeeze_metadata_words: u32,
-    pub(super) squeeze_scratch_bytes: u64,
+    pub(super) transform_metadata_words: u32,
+    pub(super) transform_scratch_bytes: u64,
 }
 
 struct ModularChannelLayout {
@@ -175,12 +175,12 @@ impl LosslessModularBackend {
                         compilation_options: wgpu::PipelineCompilationOptions {
                             constants: &[
                                 (
-                                    "squeeze_program_enabled",
-                                    f64::from(u32::from(config.squeeze.steps().is_some())),
+                                    "transform_program_enabled",
+                                    f64::from(u32::from(config.local_transforms.uses_program())),
                                 ),
                                 (
                                     "squeeze_enabled",
-                                    f64::from(u32::from(config.squeeze.enabled())),
+                                    f64::from(u32::from(config.local_transforms.uses_squeeze())),
                                 ),
                                 (
                                     "palette_enabled",
@@ -351,8 +351,8 @@ impl LosslessModularBackend {
             let palette = topology.palette;
             let palette_capacity = palette.map_or(0, |palette| palette.capacity.entries());
             let palette_scratch_bytes = palette.map_or(0, |palette| 4 * palette.scratch_words);
-            let squeeze_scratch_bytes = topology
-                .squeeze_program
+            let transform_scratch_bytes = topology
+                .transform_program
                 .as_ref()
                 .map_or(0, |program| program.scratch_bytes());
             let group_source = source_layout.group(group)?;
@@ -361,7 +361,7 @@ impl LosslessModularBackend {
                 .validate(self.max_storage_binding_size)?;
             let proposed_source_windows = batch_source_windows.merge(group_source.windows);
             let mut palette_counts_byte_offset = None;
-            let mut squeeze_program_byte_offset = None;
+            let mut transform_program_byte_offset = None;
             let layouts = topology
                 .channels
                 .iter()
@@ -376,12 +376,14 @@ impl LosslessModularBackend {
                             .checked_add(palette_scratch_bytes)
                             .ok_or(EncodeError::InvalidSource("palette scratch size overflow"))?;
                     }
-                    if index == 0 && squeeze_scratch_bytes != 0 {
-                        squeeze_program_byte_offset = Some(layout.output_size);
+                    if index == 0 && transform_scratch_bytes != 0 {
+                        transform_program_byte_offset = Some(layout.output_size);
                         layout.output_size = layout
                             .output_size
-                            .checked_add(squeeze_scratch_bytes)
-                            .ok_or(EncodeError::InvalidSource("Squeeze scratch size overflow"))?;
+                            .checked_add(transform_scratch_bytes)
+                            .ok_or(EncodeError::InvalidSource(
+                                "transform scratch size overflow",
+                            ))?;
                     }
                     Ok(layout)
                 })
@@ -454,13 +456,14 @@ impl LosslessModularBackend {
             } else {
                 0
             };
-            let squeeze_program_word_offset = if let Some(offset) = squeeze_program_byte_offset {
+            let transform_program_word_offset = if let Some(offset) = transform_program_byte_offset
+            {
                 align_up(output_size, artifact_alignment)
                     .and_then(|size| size.checked_sub(batch_artifact_offset))
                     .and_then(|size| size.checked_add(offset))
                     .and_then(|size| u32::try_from(size / 4).ok())
                     .ok_or(EncodeError::InvalidSource(
-                        "Squeeze program exceeds WGSL indexing",
+                        "transform program exceeds WGSL indexing",
                     ))?
             } else {
                 0
@@ -523,7 +526,7 @@ impl LosslessModularBackend {
                     palette_capacity,
                     palette_scratch_word_offset,
                     palette_hash_mask: palette.map_or(0, |palette| palette.hash_entries - 1),
-                    group_channels: if palette.is_some() || topology.squeeze_program.is_some() {
+                    group_channels: if palette.is_some() || topology.transform_program.is_some() {
                         channels
                     } else {
                         0
@@ -537,39 +540,39 @@ impl LosslessModularBackend {
                     palette_components: palette.map_or(0, |palette| palette.range.count),
                     sample_source: topology.channels[channel as usize].source.kernel_value(),
                     squeeze_band: topology.channels[channel as usize].band,
-                    squeeze_program_word_offset,
-                    squeeze_sample_word_offset: if let SampleSource::Arena(offset) =
+                    transform_program_word_offset,
+                    transform_sample_word_offset: if let SampleSource::Arena(offset) =
                         topology.channels[channel as usize].source
                     {
                         u32::try_from(
-                            u64::from(squeeze_program_word_offset)
+                            u64::from(transform_program_word_offset)
                                 + topology
-                                    .squeeze_program
+                                    .transform_program
                                     .as_ref()
                                     .ok_or(BackendError::Invariant(
-                                        "arena without Squeeze program",
+                                        "arena without transform program",
                                     ))?
                                     .metadata_words()
                                 + u64::from(offset),
                         )
                         .map_err(|_| {
-                            EncodeError::InvalidSource("Squeeze sample exceeds WGSL indexing")
+                            EncodeError::InvalidSource("transform sample exceeds WGSL indexing")
                         })?
                     } else {
                         0
                     },
                 });
                 groups.push(ModularGroupPlan {
-                    squeeze_metadata_words: if channel == 0 {
+                    transform_metadata_words: if channel == 0 {
                         topology
-                            .squeeze_program
+                            .transform_program
                             .as_ref()
                             .map_or(0, |program| program.metadata_words() as u32)
                     } else {
                         0
                     },
-                    squeeze_scratch_bytes: if channel == 0 {
-                        squeeze_scratch_bytes
+                    transform_scratch_bytes: if channel == 0 {
+                        transform_scratch_bytes
                     } else {
                         0
                     },
@@ -616,9 +619,9 @@ impl LosslessModularBackend {
             {
                 batch.parameter_bytes = batch
                     .parameter_bytes
-                    .checked_add(4 * u64::from(group.squeeze_metadata_words))
+                    .checked_add(4 * u64::from(group.transform_metadata_words))
                     .ok_or(EncodeError::InvalidSource(
-                        "Squeeze parameter size overflow",
+                        "transform parameter size overflow",
                     ))?;
             }
         }
@@ -748,12 +751,12 @@ impl LosslessModularBackend {
             weighted_predictor_scratch_bytes,
             lz77_scratch_bytes,
             palette_scratch_bytes,
-            squeeze_scratch_bytes: batches
+            transform_scratch_bytes: batches
                 .iter()
                 .map(|batch| {
                     groups[batch.first_dispatch..batch.first_dispatch + batch.dispatch_count]
                         .iter()
-                        .map(|group| group.squeeze_scratch_bytes)
+                        .map(|group| group.transform_scratch_bytes)
                         .sum::<u64>()
                 })
                 .max()

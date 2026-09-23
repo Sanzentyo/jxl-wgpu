@@ -734,7 +734,7 @@ bucket, including begin 1,096 in a 1,555-channel topology. Equivalent explicit a
 policies retain identical bytes. Invalid counts/ranges, empty intermediate input channels and
 cumulative shifts reject before allocation. Thirty-one one-pixel stages remain valid; a subsequent
 stage rejects. An 18-stage arena test checks live input/output disjointness, retired-span reuse,
-final channel views and the 32-byte operation ABI.
+final channel views and the shared operation ABI.
 
 Later-stage signed overflow is checked in resident and late-streamed completion under both entropy
 policies and placements, with no output, full retirement and successful subsequent reuse. Exact/
@@ -748,7 +748,35 @@ restoring geometry/shifts; consecutive remaining Squeeze dispatches share one or
 The same boundary matrix passes with these changes. CPU plan checks additionally prove that
 24 identity stages preserve final views, arena size and a later nontrivial inverse schedule for
 both axes and placements. No oracle, tolerance or tested boundary was removed. General transform
-composition orders, global/LF/HF ownership and adaptive policies remain open.
+composition including Palette interleaving, global/LF/HF ownership and adaptive policies remain open.
+
+### Ordered local RCT/Squeeze programs
+
+[`squeeze::program`](../crates/jxl_wgpu_encode/tests/lossless_layouts/squeeze/program.rs)
+adds eight GPU tests for declaration-ordered RCT/Squeeze operations after the source-RCT/Palette
+prelude. All 42 RCT types compose on averages and residuals in both placements, including
+single-pixel axes and empty triples. RCT on current channels includes alpha and channels created
+from Gray/GrayAlpha. All 1–31-bit precisions and binary16/binary32 keep exact original words;
+IEEE RCT-only cases retain full special-word patterns, while Squeeze combinations stay within
+its checked signed-word domain. Whole and 256-byte fragmented numeric GPU output, native libjxl
+original words/component output and applicable jxl-oxide comparisons keep the existing bounds.
+
+All four Palette policies and selected component counts 1–4 exercise post-meta addressing.
+Independent bit parsing checks operation order, source/global versus local RCT placement,
+Palette ranges and translated RCT/Squeeze indices. Header-count buckets 1, 2, 17, 18 and 273
+and RCT begin buckets through 1,096 in a 1,536-channel topology exercise the complete serializer.
+Zero/over-limit programs, invalid triples, unequal dimensions or shifts, a late invalid edge
+group and a 274-entry fused header reject before GPU allocation. A mixed arena test checks
+every live input/output span, all three RCT output reservations, retired-span reuse and final
+views; the shared 64-byte operation ABI has Rust/WGSL layout checks.
+
+RCT followed by later-stage Squeeze overflow publishes no resident or streamed codestream under
+either entropy policy or residual placement, and releases the source, budget and leases before
+subsequent valid reuse. Selected mixed Palette, Weighted prediction and greedy LZ77 compose with
+the program under exact and one-byte-short budgets, cancellation and pool reuse for all four
+group sizes. Integer Replace and finite floating cropped-reference animations preserve original
+words, timing and the existing composition bounds. General Palette ordering, global/LF/HF
+transform ownership and adaptive selection remain open.
 
 ## Lossless Modular Palette encoding
 

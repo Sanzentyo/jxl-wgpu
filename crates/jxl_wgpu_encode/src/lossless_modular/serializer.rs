@@ -16,11 +16,10 @@ use super::icc::{DEFAULT_PROFILE_LIMIT, PreparedImageHeader};
 use super::lz77::LosslessModularLz77;
 use super::memory::{LosslessModularMemoryLimits, LosslessModularMemoryPlan};
 use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
-use super::rct::LosslessModularRctType;
 use super::source::lossless_modular_source_spec;
 use super::streaming::LosslessModularJob;
 use super::transform::{
-    ModularTransformPlan, PlannedPalette, TransformOperation, ValidatedPaletteCounts,
+    ModularTransformPlan, PlannedPalette, PlannedRct, TransformOperation, ValidatedPaletteCounts,
 };
 use super::types::{
     AlphaAssociation, LosslessModularFormat, LosslessModularTreeMode, ModularArtifactHeader,
@@ -1523,7 +1522,12 @@ fn write_transforms(
         ));
     }
     let count = transforms.operations.len();
-    if count >= 2 {
+    if count > 273 {
+        return Err(EncodeError::InvalidModularTransformCount { count });
+    } else if count >= 18 {
+        output.write_bits(3, 2)?;
+        output.write_bits((count - 18) as u64, 8)?;
+    } else if count >= 2 {
         output.write_bits(2, 2)?;
         output.write_bits((count - 2) as u64, 4)?;
     } else {
@@ -1556,18 +1560,7 @@ fn write_transforms(
                 for step in steps {
                     output.write_bits(u64::from(step.horizontal), 1)?;
                     output.write_bits(u64::from(step.in_place), 1)?;
-                    let begin = step.range.begin;
-                    let (selector, base, bits) = if begin < 8 {
-                        (0, 0, 3)
-                    } else if begin < 72 {
-                        (1, 8, 6)
-                    } else if begin < 1096 {
-                        (2, 72, 10)
-                    } else {
-                        (3, 1096, 13)
-                    };
-                    output.write_bits(selector, 2)?;
-                    output.write_bits(u64::from(begin - base), bits)?;
+                    write_transform_begin(output, step.range.begin)?;
                     if step.range.count <= 3 {
                         output.write_bits(u64::from(step.range.count - 1), 2)?;
                     } else {
@@ -1634,13 +1627,10 @@ fn write_palette_parameters(
     Ok(())
 }
 
-fn write_rct_parameters(
-    output: &mut BitWriter,
-    rct: LosslessModularRctType,
-) -> Result<(), EncodeError> {
+fn write_rct_parameters(output: &mut BitWriter, rct: PlannedRct) -> Result<(), EncodeError> {
     output.write_bits(0, 2)?; // reversible color transform
-    output.write_bits(0, 5)?; // begin channel 0
-    let value = rct.value();
+    write_transform_begin(output, rct.begin)?;
+    let value = rct.rct_type.value();
     // U32(Val(6), Bits(2), BitsOffset(4, 2), BitsOffset(6, 10)).
     if value == 6 {
         output.write_bits(0, 2)?;
@@ -1654,6 +1644,23 @@ fn write_rct_parameters(
         output.write_bits(3, 2)?;
         output.write_bits(u64::from(value - 10), 6)?;
     }
+    Ok(())
+}
+
+fn write_transform_begin(output: &mut BitWriter, begin: u32) -> Result<(), EncodeError> {
+    let (selector, base, bits) = match begin {
+        0..8 => (0, 0, 3),
+        8..72 => (1, 8, 6),
+        72..1096 => (2, 72, 10),
+        1096..=9287 => (3, 1096, 13),
+        _ => {
+            return Err(
+                BackendError::Invariant("planned transform begin exceeds wire range").into(),
+            );
+        }
+    };
+    output.write_bits(selector, 2)?;
+    output.write_bits(u64::from(begin - base), bits)?;
     Ok(())
 }
 
@@ -2122,6 +2129,7 @@ fn write_frame_duration(output: &mut BitWriter, duration: u32) -> Result<(), Enc
 #[cfg(test)]
 mod rct_wire_tests {
     use super::*;
+    use crate::LosslessModularRctType;
     use jxl_bitstream::{Bitstream, U};
 
     #[test]
@@ -2129,7 +2137,11 @@ mod rct_wire_tests {
         for value in (0..42).map(Some).chain([None]) {
             let mut writer = BitWriter::new();
             let operations: Vec<_> = value
-                .map(|value| TransformOperation::Rct(LosslessModularRctType::new(value).unwrap()))
+                .map(|value| {
+                    TransformOperation::Rct(PlannedRct::source(
+                        LosslessModularRctType::new(value).unwrap(),
+                    ))
+                })
                 .into_iter()
                 .collect();
             write_transforms(

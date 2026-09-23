@@ -57,8 +57,8 @@ pub(super) struct ModularParams {
     pub(super) squeeze_band: u32,
     // An explicit 256-byte array stride keeps every batch boundary valid for the portable
     // storage-buffer offset alignment without hidden Rust padding.
-    pub(super) squeeze_program_word_offset: u32,
-    pub(super) squeeze_sample_word_offset: u32,
+    pub(super) transform_program_word_offset: u32,
+    pub(super) transform_sample_word_offset: u32,
 }
 
 /// Fixed storage-buffer header written by `lossless_modular.wgsl`.
@@ -202,11 +202,11 @@ pub struct LosslessModularConfig {
     pub weighted_predictor: super::predictor::LosslessModularWeightedPredictor,
     /// Zero-run coding or bounded GPU search for arbitrary residual matches.
     pub lz77: super::lz77::LosslessModularLz77,
-    /// Group-local separable Squeeze of selected image channels after RCT and Palette.
-    /// The policy selects axes, a channel range and residual placement. GPU validation rejects an
-    /// unrepresentable signed residual instead of emitting a lossy result.
-    pub squeeze: super::squeeze::LosslessModularSqueeze,
-    /// Optional exact local palette built on GPU after RCT and before image-channel Squeeze.
+    /// Ordered group-local transforms after source RCT and optional Palette.
+    /// A Squeeze policy converts with `.into()`; explicit programs apply RCT/Squeeze to the
+    /// current image-channel topology. GPU validation rejects unrepresentable signed residuals.
+    pub local_transforms: super::local_transforms::LosslessModularLocalTransforms,
+    /// Optional exact local palette built on GPU after source RCT and before local transforms.
     pub palette: Option<super::palette::LosslessModularPalette>,
 }
 

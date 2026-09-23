@@ -1,6 +1,6 @@
 override squeeze_enabled: bool = false;
 override palette_enabled: bool = false;
-override squeeze_program_enabled: bool = false;
+override transform_program_enabled: bool = false;
 
 struct Source {
     row_stride: u32,
@@ -42,8 +42,8 @@ struct Params {
     palette_components: u32,
     sample_source: u32,
     squeeze_band: u32,
-    squeeze_program_word_offset: u32,
-    squeeze_sample_word_offset: u32,
+    transform_program_word_offset: u32,
+    transform_sample_word_offset: u32,
 }
 
 @group(0) @binding(0)
@@ -137,17 +137,23 @@ fn transformed_component(params: Params, x: u32, y: u32, component: u32) -> i32 
     if params.rct_type == 42u || component >= 3u {
         return source_component(params, x, y, component);
     }
-    let permutation = params.rct_type / 7u;
-    let first = source_component(params, x, y, permutation % 3u);
-    let second = source_component(params, x, y, (permutation + 1u + permutation / 3u) % 3u);
-    let third = source_component(params, x, y, (permutation + 2u - permutation / 3u) % 3u);
-    let operation = params.rct_type % 7u;
+    let input = vec3<i32>(source_component(params, x, y, 0u),
+        source_component(params, x, y, 1u), source_component(params, x, y, 2u));
+    return forward_rct(input, params.rct_type)[component];
+}
+
+fn forward_rct(input: vec3<i32>, rct_type: u32) -> vec3<i32> {
+    let permutation = rct_type / 7u;
+    let first = input[permutation % 3u];
+    let second = input[(permutation + 1u + permutation / 3u) % 3u];
+    let third = input[(permutation + 2u - permutation / 3u) % 3u];
+    let operation = rct_type % 7u;
     if operation == 6u {
         let co = sub_wrap(first, third);
         let temporary = add_wrap(third, co >> 1u);
         let cg = sub_wrap(second, temporary);
         let luma = add_wrap(temporary, cg >> 1u);
-        return vec3<i32>(luma, co, cg)[component];
+        return vec3<i32>(luma, co, cg);
     }
     var transformed = vec3<i32>(first, second, third);
     if operation >= 4u {
@@ -158,7 +164,7 @@ fn transformed_component(params: Params, x: u32, y: u32, component: u32) -> i32 
     if (operation & 1u) != 0u {
         transformed.z = sub_wrap(third, first);
     }
-    return transformed[component];
+    return transformed;
 }
 
 // Divide a signed wide value by twelve with truncation toward zero. Four base-65536
@@ -423,8 +429,8 @@ fn squeeze_first(params: Params, component: u32, band: u32, point: vec2<u32>) ->
 }
 
 fn sample_at(params: Params, x: u32, y: u32) -> i32 {
-    if squeeze_program_enabled && params.sample_source == 6u {
-        return bitcast<i32>(output_words[params.squeeze_sample_word_offset + y * params.width + x]);
+    if transform_program_enabled && params.sample_source == 6u {
+        return bitcast<i32>(output_words[params.transform_sample_word_offset + y * params.width + x]);
     }
     if palette_enabled && params.sample_source == 5u {
         let deltas = output_words[params.palette_scratch_word_offset + 1u];
@@ -737,7 +743,7 @@ fn build_palette_residuals(params: Params) {
 fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if global_id.y != 0u || global_id.z != 0u || global_id.x >= arrayLength(&group_params) { return; }
     let params = group_params[global_id.x];
-    if (palette_enabled && params.palette_capacity != 0u) || squeeze_program_enabled {
+    if (palette_enabled && params.palette_capacity != 0u) || transform_program_enabled {
         if params.channel != 0u { return; }
         if palette_enabled && params.palette_capacity != 0u {
             build_palette_residuals(params);
@@ -746,10 +752,10 @@ fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 return;
             }
         }
-        if squeeze_program_enabled {
+        if transform_program_enabled {
             squeeze_failed = false;
             palette_failed = false;
-            execute_squeeze_program(params);
+            execute_transform_program(params);
             if squeeze_failed { output_words[params.output_word_offset] = SQUEEZE_OVERFLOW; return; }
             if palette_failed { output_words[params.output_word_offset] = PALETTE_INVALID; return; }
         }
@@ -763,35 +769,52 @@ fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 }
 
-struct SqueezeJob {
-    source: u32,
-    source_offset: u32,
+struct TransformJob {
+    operation: u32,
+    mode: u32,
     width: u32,
     height: u32,
-    average_offset: u32,
-    residual_offset: u32,
-    horizontal: u32,
-    padding: u32,
+    sources: array<u32, 3>,
+    source_offsets: array<u32, 3>,
+    output_offsets: array<u32, 3>,
+    padding: array<u32, 3>,
 }
 
-fn squeeze_job_sample(params: Params, job: SqueezeJob, arena: u32, point: vec2<u32>) -> i32 {
-    if job.source == 6u {
-        return bitcast<i32>(output_words[arena + job.source_offset + point.y * job.width + point.x]);
+fn transform_job_sample(params: Params, job: TransformJob, component: u32, arena: u32, point: vec2<u32>) -> i32 {
+    if job.sources[component] == 6u {
+        return bitcast<i32>(output_words[arena + job.source_offsets[component] + point.y * job.width + point.x]);
     }
-    return working_component(params, point.x, point.y, job.source);
+    return working_component(params, point.x, point.y, job.sources[component]);
 }
 
-fn execute_squeeze_program(params: Params) {
-    let base = params.squeeze_program_word_offset;
+fn execute_transform_program(params: Params) {
+    let base = params.transform_program_word_offset;
     let count = output_words[base];
-    let arena = base + 1u + count * 8u;
+    let arena = base + 1u + count * 16u;
     for (var index = 0u; index < count; index += 1u) {
-        let offset = base + 1u + index * 8u;
-        let job = SqueezeJob(output_words[offset], output_words[offset + 1u],
+        let offset = base + 1u + index * 16u;
+        let job = TransformJob(output_words[offset], output_words[offset + 1u],
             output_words[offset + 2u], output_words[offset + 3u],
-            output_words[offset + 4u], output_words[offset + 5u],
-            output_words[offset + 6u], output_words[offset + 7u]);
-        let axis = select(1u, 0u, job.horizontal != 0u);
+            array<u32, 3>(output_words[offset + 4u], output_words[offset + 5u], output_words[offset + 6u]),
+            array<u32, 3>(output_words[offset + 7u], output_words[offset + 8u], output_words[offset + 9u]),
+            array<u32, 3>(output_words[offset + 10u], output_words[offset + 11u], output_words[offset + 12u]),
+            array<u32, 3>(output_words[offset + 13u], output_words[offset + 14u], output_words[offset + 15u]));
+        if job.operation == 1u {
+            for (var y = 0u; y < job.height; y += 1u) {
+                for (var x = 0u; x < job.width; x += 1u) {
+                    let point = vec2<u32>(x, y);
+                    let input = vec3<i32>(transform_job_sample(params, job, 0u, arena, point),
+                        transform_job_sample(params, job, 1u, arena, point),
+                        transform_job_sample(params, job, 2u, arena, point));
+                    let output = forward_rct(input, job.mode);
+                    for (var component = 0u; component < 3u; component += 1u) {
+                        output_words[arena + job.output_offsets[component] + y * job.width + x] = bitcast<u32>(output[component]);
+                    }
+                }
+            }
+            continue;
+        }
+        let axis = select(1u, 0u, job.mode != 0u);
         let extent = vec2<u32>(job.width, job.height);
         var average_extent = extent;
         var residual_extent = extent;
@@ -803,24 +826,24 @@ fn execute_squeeze_program(params: Params) {
             for (var x = 0u; x < average_extent.x; x += 1u) {
                 var source = vec2<u32>(x, y);
                 source[axis] *= 2u;
-                let a = squeeze_job_sample(params, job, arena, source);
+                let a = transform_job_sample(params, job, 0u, arena, source);
                 var average = a;
                 if source[axis] + 1u < extent[axis] {
-                    let b = squeeze_job_sample(params, job, arena, source + step);
+                    let b = transform_job_sample(params, job, 0u, arena, source + step);
                     average = squeeze_average(a, b);
                     var next = average;
                     if source[axis] + 2u < extent[axis] {
-                        next = squeeze_job_sample(params, job, arena, source + 2u * step);
+                        next = transform_job_sample(params, job, 0u, arena, source + 2u * step);
                         if source[axis] + 3u < extent[axis] {
-                            next = squeeze_average(next, squeeze_job_sample(params, job, arena, source + 3u * step));
+                            next = squeeze_average(next, transform_job_sample(params, job, 0u, arena, source + 3u * step));
                         }
                     }
                     var previous = average;
-                    if source[axis] != 0u { previous = squeeze_job_sample(params, job, arena, source - step); }
+                    if source[axis] != 0u { previous = transform_job_sample(params, job, 0u, arena, source - step); }
                     let residual = squeeze_residual(a, b, previous, average, next);
-                    output_words[arena + job.residual_offset + y * residual_extent.x + x] = bitcast<u32>(residual);
+                    output_words[arena + job.output_offsets[1] + y * residual_extent.x + x] = bitcast<u32>(residual);
                 }
-                output_words[arena + job.average_offset + y * average_extent.x + x] = bitcast<u32>(average);
+                output_words[arena + job.output_offsets[0] + y * average_extent.x + x] = bitcast<u32>(average);
             }
         }
         if squeeze_failed || palette_failed { return; }

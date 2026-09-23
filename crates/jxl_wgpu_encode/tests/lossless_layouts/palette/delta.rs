@@ -8,7 +8,7 @@ fn delta_palette_scratch_obeys_exact_admission_cancellation_and_pool_reuse() {
             &rig,
             LosslessModularConfig {
                 palette: Some(Palette::deltas(4096, Predictor::Weighted).unwrap()),
-                squeeze: SQUEEZES[index + 1].clone(),
+                local_transforms: SQUEEZES[index + 1].clone().into(),
                 group_size,
                 tree_mode: TREES[index % 2],
                 predictor: Predictor::Weighted,
@@ -66,7 +66,7 @@ fn delta_palette_composes_every_predictor_rct_precision_and_squeeze_policy() {
                 predictor: Predictor::ALL[(value as usize + 7) % 14],
                 weighted_predictor: Weighted::new([31, 0, 17, 3, 11, 31, 1], [0, 15, 7, 12])
                     .unwrap(),
-                squeeze: SQUEEZES[value as usize % 5].clone(),
+                local_transforms: SQUEEZES[value as usize % 5].clone().into(),
                 group_size,
                 tree_mode: TREES[value as usize % 2],
                 color_transform: if value % 2 == 0 {
@@ -102,7 +102,7 @@ fn delta_palette_composes_every_predictor_rct_precision_and_squeeze_policy() {
                 predictor: Predictor::Weighted,
                 weighted_predictor: Weighted::new([31, 0, 17, 3, 11, 31, 1], [0, 15, 7, 12])
                     .unwrap(),
-                squeeze: SQUEEZES[index % 5].clone(),
+                local_transforms: SQUEEZES[index % 5].clone().into(),
                 tree_mode: TREES[index % 2],
                 ..Default::default()
             },
@@ -204,7 +204,7 @@ fn delta_palette_animation_retains_ieee_words_and_independent_references() {
             LosslessModularConfig {
                 palette: Some(Palette::deltas(4096, predictor).unwrap()),
                 predictor: Predictor::Weighted,
-                squeeze: SQUEEZES[index + 3].clone(),
+                local_transforms: SQUEEZES[index + 3].clone().into(),
                 group_size,
                 tree_mode: TREES[index],
                 ..Default::default()
@@ -248,7 +248,7 @@ fn delta_palette_overflow_releases_resident_and_late_streamed_jobs() {
             rig.context.clone(),
             LosslessModularConfig {
                 palette: Some(Palette::deltas(1, predictor).unwrap()),
-                squeeze,
+                local_transforms: squeeze.into(),
                 lz77: if index % 2 == 0 {
                     Lz77::ZeroRuns
                 } else {
