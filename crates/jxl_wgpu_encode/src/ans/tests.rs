@@ -1,6 +1,40 @@
 use super::*;
 
 #[test]
+fn integer_rate_estimate_covers_all_frequencies_without_float_selection() {
+    let mut previous = u128::MAX;
+    for frequency in 1..=TABLE_SIZE as u32 {
+        let mut frequencies = [0; ALPHABET];
+        frequencies[0] = frequency;
+        frequencies[1] = TABLE_SIZE as u32 - frequency;
+        let code = AnsCode::from_frequencies(frequencies).unwrap();
+        let mut counts = [0; ALPHABET];
+        counts[0] = 1;
+        let estimate = code.estimated_data_bits(&counts).unwrap();
+        assert!(estimate <= previous);
+        previous = estimate;
+        let error = estimate as f64 / 1_048_576.0 - (12.0 - f64::from(frequency).log2());
+        assert!(
+            (-1e-9..=2f64.powi(-19)).contains(&error),
+            "{frequency}: {error}"
+        );
+    }
+    let mut frequencies = [0; ALPHABET];
+    frequencies[255] = TABLE_SIZE as u32;
+    let code = AnsCode::from_frequencies(frequencies).unwrap();
+    let mut counts = [0; ALPHABET];
+    counts[255] = u64::MAX;
+    assert_eq!(code.estimated_data_bits(&counts).unwrap(), 0);
+    counts[0] = 1;
+    assert!(code.estimated_data_bits(&counts).is_err());
+    let uniform = AnsCode::from_frequencies([16; ALPHABET]).unwrap();
+    assert_eq!(
+        uniform.estimated_data_bits(&[u64::MAX; ALPHABET]).unwrap(),
+        u128::from(u64::MAX) * 256 * 8 * (1 << 20)
+    );
+}
+
+#[test]
 fn independent_decoder_checks_every_alias_residue_and_histogram_form() {
     let mut distributions = vec![[0; ALPHABET], [u64::MAX; ALPHABET]];
     for symbol in 0..ALPHABET {

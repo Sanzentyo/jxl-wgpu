@@ -10,12 +10,14 @@ use crate::ans::{ALPHABET, AnsCode, TABLE_WORDS};
 use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS};
 use crate::{BackendError, EncodeError, WgpuContext};
 
+mod clustering;
+
 /// Entropy coding after lossless GPU tokenization. This selection never changes source words.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LosslessModularEntropyCoding {
     #[default]
     Prefix,
-    /// GPU ANS uses one state per complete group and deterministic normalized frame histograms.
+    /// GPU ANS uses one state per complete group and deterministic clustered frame histograms.
     Ans,
 }
 
@@ -47,7 +49,17 @@ impl EntropyCode {
                 distance: super::serializer::build_distance_code(plan.lz77, distance)?,
             }),
             LosslessModularEntropyCoding::Ans => Ok(Self::Ans(Box::new(AnsCodebook::new(
-                plan.lz77, raw, lz77, distance,
+                plan.lz77,
+                raw,
+                lz77,
+                distance,
+                1 + if plan.group_grid.groups > 1
+                    && plan.tree_mode == super::types::LosslessModularTreeMode::LocalPerGroup
+                {
+                    u64::from(plan.group_grid.groups)
+                } else {
+                    0
+                },
             )?))),
         }
     }
@@ -66,6 +78,13 @@ impl EntropyCode {
             Self::Ans(codebook) => Some(codebook),
             _ => None,
         }
+    }
+
+    pub(super) fn write_context_map(&self, writer: &mut BitWriter) -> Result<(), EncodeError> {
+        let map = self
+            .ans()
+            .map_or(&[0, 1, 2, 3, 4], |codebook| &codebook.context_map);
+        clustering::write_context_map(writer, map)
     }
 
     pub(super) fn write_empty_stream(&self, writer: &mut BitWriter) -> Result<(), EncodeError> {
@@ -112,7 +131,9 @@ impl EntropyCode {
 }
 
 pub(super) struct AnsCodebook {
-    tables: [AnsCode; 5],
+    tables: Vec<AnsCode>,
+    /// Distance, then channel 0/1/2/3+. Shared by wire metadata and GPU lowering.
+    context_map: clustering::ContextMap,
     mode: LosslessModularLz77,
 }
 
@@ -122,8 +143,9 @@ impl AnsCodebook {
         raw: &[[u64; RAW_SYMBOLS]; 4],
         lz77: &[[u64; LZ77_SYMBOLS]; 4],
         distance: &[u64; RAW_SYMBOLS],
+        header_copies: u64,
     ) -> Result<Self, EncodeError> {
-        let mut counts = [[0u64; ALPHABET]; 5];
+        let mut counts = [[0u64; ALPHABET]; clustering::CONTEXTS];
         if mode == LosslessModularLz77::ZeroRuns {
             if distance.iter().any(|&count| count != 0) {
                 return Err(BackendError::InvalidArtifact(
@@ -131,7 +153,11 @@ impl AnsCodebook {
                 )
                 .into());
             }
-            counts[0][1] = 1;
+            counts[0][1] = lz77.iter().flatten().try_fold(0u64, |sum, &count| {
+                sum.checked_add(count).ok_or(BackendError::InvalidArtifact(
+                    "ANS distance histogram overflow",
+                ))
+            })?;
         } else {
             counts[0][..RAW_SYMBOLS].copy_from_slice(distance);
         }
@@ -144,20 +170,19 @@ impl AnsCodebook {
             counts[channel + 1][..RAW_SYMBOLS].copy_from_slice(&raw[channel]);
             counts[channel + 1][224..].copy_from_slice(&lz77[channel][..32]);
         }
-        let tables = counts
-            .iter()
-            .map(AnsCode::from_counts)
-            .collect::<Result<Vec<_>, _>>()?
-            .try_into()
-            .map_err(|_| BackendError::Invariant("ANS requires five distributions"))?;
-        Ok(Self { tables, mode })
+        let (tables, context_map) = clustering::cluster(&counts, header_copies)?;
+        Ok(Self {
+            tables,
+            context_map,
+            mode,
+        })
     }
 
     /// Common LZ77/context map has already been written; every hybrid alphabet uses split=0.
     pub(super) fn write_histograms(&self, writer: &mut BitWriter) -> Result<(), EncodeError> {
         writer.write_bits(0, 1)?; // ANS
         writer.write_bits(3, 2)?; // log alphabet size = 8
-        for _ in 0..5 {
+        for _ in &self.tables {
             writer.write_bits(0, 4)?;
         }
         for table in &self.tables {
@@ -206,7 +231,10 @@ pub(super) struct EntropyBatchPlan {
 
 impl EntropyBatchPlan {
     pub(super) fn bytes(self, channels: usize) -> u64 {
-        4 * (4 + 4 * u64::from(self.group_count) + 4 * channels as u64 + 5 * TABLE_WORDS as u64)
+        4 * (4
+            + 4 * u64::from(self.group_count)
+            + 4 * channels as u64
+            + clustering::CONTEXTS as u64 * TABLE_WORDS as u64)
     }
 }
 
@@ -313,7 +341,7 @@ pub(super) fn record(
         entropy.group_count,
         tables_start as u32,
         u32::from(codebook.mode == LosslessModularLz77::Greedy),
-        0,
+        u32::from(codebook.context_map[0]),
     ]);
     let mut job = 0;
     for (index, group) in groups.iter().enumerate() {
@@ -322,7 +350,7 @@ pub(super) fn record(
             base as u32 + super::types::OUTPUT_HEADER_WORDS as u32,
             base as u32,
             group.max_events as u32,
-            group.channel.min(3) + 1,
+            u32::from(codebook.context_map[group.channel.min(3) as usize + 1]),
         ]);
         if let Some(output) = group.entropy {
             let count = groups[index..]
@@ -344,7 +372,8 @@ pub(super) fn record(
     for table in &codebook.tables {
         metadata.extend_from_slice(table.gpu_words());
     }
-    if metadata.len() as u64 * 4 != entropy.bytes(groups.len()) {
+    let metadata_bytes = metadata.len() as u64 * 4;
+    if metadata_bytes > entropy.bytes(groups.len()) {
         return Err(BackendError::Invariant("ANS metadata exceeds admission").into());
     }
     context.queue().write_buffer(
@@ -367,7 +396,7 @@ pub(super) fn record(
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: parameters,
                         offset: entropy.parameter_offset,
-                        size: std::num::NonZeroU64::new(entropy.bytes(groups.len())),
+                        size: std::num::NonZeroU64::new(metadata_bytes),
                     }),
                 },
             ],

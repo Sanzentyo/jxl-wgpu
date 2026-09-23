@@ -207,11 +207,15 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
 - `LosslessModularConfig::entropy` selects `LosslessModularEntropyCoding::Prefix` (default,
   preserving previous bytes) or `Ans`. ANS consumes the GPU events in reverse channel/event
   order with one shared state per complete group, including Palette and Squeeze channels.
-  It uses four channel distributions plus distance, deterministic normalization to 4096,
-  a 256-symbol alphabet, and the existing hybrid-integer configurations. Host work builds
+  Its four channel contexts plus distance share one to five distributions selected from all
+  52 partitions by integer rate estimates plus serialized metadata, including repeated local
+  headers. Normalization to 4096, a 256-symbol alphabet and the existing hybrid-integer
+  configurations remain deterministic. Host work builds
   bounded histogram/alias metadata and copies already compressed fragments; every ANS symbol,
   renormalization and extra bit is emitted on GPU. There is no fallback to Prefix.
-  Histogram/context clustering, adaptive hybrid selection and effort policy remain open.
+  The immutable codebook owns both the wire context map and GPU table selection. This is a
+  size estimate, without an always-smaller-stream guarantee; adaptive hybrid selection,
+  learned contexts and effort policy remain open.
 - One GPU invocation handles each PassGroup/channel pair without Palette. With Palette, the
   group's first invocation builds its dictionary and encodes all its channels sequentially;
   the remaining invocations return. This avoids cross-workgroup synchronization or extra submissions.
@@ -252,8 +256,10 @@ one histogram and one serialization submission per batch. Every live batch uses 
 mapped-range consumer are both finished, including when the returned future is abandoned.
 ANS output is part of the same artifact allocation, lease and budget. For `E` maximum events
 summed across a group's channels, it reserves a 16-byte completion record plus
-`4 * ceil((80 * E + 32) / 32)` compressed bytes. Five tables take 92,160 bytes per batch,
+`4 * ceil((80 * E + 32) / 32)` compressed bytes. The five-table upper bound reserves 92,160 bytes per batch,
 plus a 16-byte batch header and 16-byte group/channel descriptors, in an aligned parameter suffix.
+Only the selected one to five tables are uploaded and bound. Admission retains the upper bound
+before the histogram pass, so selection never needs a late reservation or extra submission.
 The corresponding artifact/readback and parameter allocations are included in admission;
 `ans_output_bytes` is a subtotal, not an additional allocation. One GPU invocation owns each
 whole group's bit writer. This is a correctness baseline with no speed or ratio guarantee.

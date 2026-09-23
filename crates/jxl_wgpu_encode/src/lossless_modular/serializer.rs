@@ -1717,11 +1717,7 @@ pub(super) fn write_ma_config(
     output.write_bits(4, 4)?;
     output.write_bits(0, 3)?;
     output.write_bits(0, 3)?;
-    output.write_bits(1, 1)?;
-    output.write_bits(3, 2)?;
-    for context in [4, 3, 2, 1, 0] {
-        output.write_bits(context, 3)?;
-    }
+    entropy.write_context_map(output)?;
     let EntropyCode::Prefix { codes, distance } = entropy else {
         return entropy
             .ans()

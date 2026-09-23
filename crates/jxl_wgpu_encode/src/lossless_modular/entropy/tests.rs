@@ -84,7 +84,8 @@ fn unvalidated_ans_fragments_cannot_gain_packet_authority() {
                 LosslessModularLz77::ZeroRuns,
                 &[[0; RAW_SYMBOLS]; 4],
                 &[[0; LZ77_SYMBOLS]; 4],
-                &[0; RAW_SYMBOLS]
+                &[0; RAW_SYMBOLS],
+                1
             )
             .unwrap()
         ))
@@ -93,7 +94,7 @@ fn unvalidated_ans_fragments_cannot_gain_packet_authority() {
     );
 }
 
-fn raw(value: u32, kind: u32) -> ModularEvent {
+pub(super) fn raw(value: u32, kind: u32) -> ModularEvent {
     let token = 32 - value.leading_zeros();
     let extra_bit_count = token.saturating_sub(1);
     ModularEvent {
@@ -108,7 +109,7 @@ fn raw(value: u32, kind: u32) -> ModularEvent {
     }
 }
 
-fn length(copied: u32, kind: u32) -> ModularEvent {
+pub(super) fn length(copied: u32, kind: u32) -> ModularEvent {
     let value = copied - 7;
     let extra_bit_count = if value < 16 { 0 } else { value.ilog2() };
     ModularEvent {
@@ -127,7 +128,7 @@ fn length(copied: u32, kind: u32) -> ModularEvent {
     }
 }
 
-fn gpu_fragment(
+pub(super) fn gpu_fragment(
     context: &WgpuContext,
     pipeline: &wgpu::ComputePipeline,
     codebook: &AnsCodebook,
@@ -141,7 +142,7 @@ fn gpu_fragment(
         1,
         table_start as u32,
         u32::from(codebook.mode == LosslessModularLz77::Greedy),
-        0,
+        u32::from(codebook.context_map[0]),
     ];
     metadata.resize(table_start, 0);
     for (channel, events) in channels.iter().enumerate() {
@@ -153,7 +154,7 @@ fn gpu_fragment(
             base as u32 + 100,
             base as u32,
             events.len() as u32,
-            channel.min(3) as u32 + 1,
+            u32::from(codebook.context_map[channel.min(3) + 1]),
         ]);
     }
     let output = words.len();
@@ -236,7 +237,11 @@ fn gpu_fragment(
     (plan, result)
 }
 
-fn independent_decode(code: &EntropyCode, fragment: EncodedGroup<'_>, expected: &[Vec<u32>]) {
+pub(super) fn independent_decode(
+    code: &EntropyCode,
+    fragment: EncodedGroup<'_>,
+    expected: &[Vec<u32>],
+) {
     let mut writer = BitWriter::new();
     super::super::serializer::write_ma_config(
         &mut writer,
@@ -303,7 +308,7 @@ fn gpu_ans_preserves_shared_state_all_extra_widths_long_matches_and_capacity_fai
             [1; RAW_SYMBOLS]
         };
         let code = EntropyCode::Ans(Box::new(
-            AnsCodebook::new(mode, &raw_counts, &lz_counts, &distance).unwrap(),
+            AnsCodebook::new(mode, &raw_counts, &lz_counts, &distance, 1).unwrap(),
         ));
         let mut channels = Vec::new();
         let mut expected = Vec::new();
@@ -380,6 +385,7 @@ fn gpu_ans_preserves_shared_state_all_extra_widths_long_matches_and_capacity_fai
             &[[0; RAW_SYMBOLS]; 4],
             &[[0; LZ77_SYMBOLS]; 4],
             &[0; RAW_SYMBOLS],
+            1,
         )
         .unwrap();
         let (plan, words) = gpu_fragment(&context, &pipeline, &missing, &channels, None);

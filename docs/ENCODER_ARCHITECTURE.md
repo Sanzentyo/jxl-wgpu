@@ -109,11 +109,27 @@ one immutable frame codebook; `EncodedGroup` is granted only after GPU completio
 validation and fragment checks. Native and browser schedulers share those boundaries.
 
 ANS reuses the two-pass batch scheduler even for a single batch: GPU histograms first, then
-retokenization and ANS in the second submission. Four channel distributions (0/1/2/3+) and distance
-are normalized to 4096 using exact integer largest-remainder allocation with symbol-order ties.
+retokenization and ANS in the second submission. Four channel contexts (0/1/2/3+) and distance
+share one to five distributions. Their immutable codebook owns the context map consumed by
+both wire metadata and GPU descriptor lowering; neither consumer reinterprets the choice.
+Distributions are normalized to 4096 using exact integer largest-remainder allocation with symbol-order ties.
 Each observed symbol receives at least one slot. The host serializes small/general histogram
 metadata and builds alias reverse maps; it never codes ANS image symbols. Shared `ans.rs` owns
 these table rules independently of Modular transforms and leaves room for other encoder consumers.
+
+Clustering caches the 31 nonempty histogram unions and examines all 52 partitions of the five
+contexts. Its objective combines Q20 normalized cross-entropy estimates with the actual histogram,
+hybrid-configuration and simple-context-map bit lengths. Header cost is charged once for a shared
+tree or single group, and once plus every PassGroup for multi-group local trees. ZeroRuns contributes
+one distance symbol per run. Checked histogram sums reject overflow; fixed-point binary logarithms
+and u128 cost accumulation avoid host-libm decisions. Equal costs prefer fewer clusters, then the
+lexicographically smaller map. This searches the existing contexts, without learning a new MA tree.
+State-dependent renormalization, fixed extra bits and final packet alignment are not simulated;
+the estimated minimum is not a guarantee that every resulting codestream is smaller.
+
+Before histograms are available, the dispatch plan still admits the five-table maximum. The second
+pass uploads and binds only selected tables, within that reservation, and retains the same batch
+lease. Clustering changes neither output capacity nor the number of submissions.
 
 One serial invocation per group visits all channels/events backwards, expands ZeroRuns into
 literal/length/distance symbols, and prepends renormalization words and hybrid extra bits. It then
@@ -130,8 +146,8 @@ and bit-address limits are checked before admission. See the [ABI](WGSL_MEMORY.m
 and [independent evidence](CONFORMANCE_CORPUS.md#lossless-modular-gpu-ans-encoding).
 The default Prefix path and private Gray8 acceleration index keep their previous byte contract;
 ANS containers omit that Prefix-specific index. This stage establishes correctness, with no
-measured throughput or compression-ratio claim. Clustering, adaptive hybrid choices, effort policy
-and parallelism within a group remain future work.
+measured throughput or compression-ratio claim. Learned contexts, clustering outside this bounded
+Modular ANS codebook, adaptive hybrid choices, effort policy and parallelism within a group remain future work.
 
 ### GPU artifact ABI
 

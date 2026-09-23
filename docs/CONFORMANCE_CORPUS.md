@@ -1100,14 +1100,14 @@ by the existing byte-identical Gray8 fixture and other prior matrices.
 JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --lib --test lossless_layouts --no-fail-fast lz77 -- --test-threads=2
 ```
 
-`ENT-E01` remains **Partial**. Histogram/context clustering, hybrid-uint choice,
+`ENT-E01` remains **Partial**. Broader context modeling, hybrid-uint choice,
 cross-channel matching and broader effort policies are not provided by this fixed greedy search.
 GPU ANS serialization is covered separately below.
 
 ## Lossless Modular GPU ANS encoding
 
 `lossless_layouts::ans` selects GPU ANS explicitly while retaining default Prefix fixture bytes.
-Its eight tests cover Gray/GrayAlpha/RGB/RGBA, all integer depths 1–31 and IEEE16/32 special words,
+Its nine tests cover Gray/GrayAlpha/RGB/RGBA, all integer depths 1–31 and IEEE16/32 special words,
 all 14 predictors with custom Weighted coefficients, all 42 global/local RCT types, all group sizes,
 both MA placements and both LZ77 policies. Packed/planar/split layouts with poisoned padding,
 unaligned pitches, reversed components and big-endian words must emit the same bytes as canonical
@@ -1145,12 +1145,28 @@ codestream and permits subsequent reuse. Tests run with two libtest threads on t
 
 ```console
 cargo test --locked -p jxl_wgpu_encode --lib ans:: -- --test-threads=2
-cargo test --locked -p jxl_wgpu_encode --lib lossless_modular::entropy::tests -- --test-threads=2
+cargo test --locked -p jxl_wgpu_encode --lib lossless_modular::entropy:: -- --test-threads=2
 JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossless_layouts ans:: -- --test-threads=2
 ```
 
-`ENT-E01` remains **Partial** for clustering, adaptive hybrid configurations, cross-channel search
-and effort selection. This evidence makes no throughput or compression-ratio claim.
+The clustered ANS codebook examines every partition of its four channel contexts plus distance.
+An independent Cartesian enumeration checks all 52 context maps with `jxl-coding`; 48 histogram/
+header-multiplicity cases compare the selected partition against an exhaustive F64 rate estimate.
+Every normalized frequency 1–4096 checks the integer Q20 estimate against F64, including monotonicity
+and zero-cost unary data. Empty/equal/disjoint/paired populations, repeated headers, deterministic
+ties and checked count overflow have explicit cases.
+
+Actual GPU tests cover all 52 maps, their reversed cluster labels, both LZ77 policies and six
+channels including an empty channel: 208 dispatches, each independently decoded at width multipliers
+1/17/1024 with exact words, cursor and terminal state. Reversed labels place distance outside table
+zero. Eight public sources independently parse the chosen one/four-cluster map, compare canonical
+and padded/swizzled inputs byte for byte, and check native/original-word plus whole/bounded GPU
+decoding under both tree placements and single/multiple groups. The previous every-depth/transform,
+budget, cancellation and late-failure matrix now uses clustered ANS unchanged.
+
+`ENT-E01` remains **Partial** for learned/wider contexts, clustering outside Modular ANS, adaptive
+hybrid configurations, cross-channel search and effort selection. This evidence makes no throughput
+or compression-ratio claim, and the rate estimate does not guarantee an always-smaller codestream.
 
 
 ## Procedural VarDCT encoder matrix

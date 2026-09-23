@@ -148,7 +148,7 @@ name shown in parentheses.
 | `jxl_wgpu_encode/lossless_modular.wgsl` | `TransformJob` | operation (Squeeze=0/RCT=1), axis or RCT mode, width, height; three source selectors, three source arena offsets, three output arena offsets, three zero padding words | 64 | 4 | private artifact storage after a job-count word, copied from the parameter upload suffix |
 | `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularArtifactHeader` / `output_words[0..100]` | `event_count, raw_counts[33], lz77_counts[33], distance_counts[33]` | 400 | 4 | storage/readback record |
 | `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularEvent` / four-word event | `kind, token, extra_bit_count, extra_bits` | 16 | 4 | storage/readback element |
-| `jxl_wgpu_encode/lossless_modular/entropy.wgsl` | four-word batch/group/channel records | batch: group count/table offset/Greedy flag/reserved; group: channel descriptor offset/count/output offset/capacity words; channel: event offset/count address/max events/distribution | 16 each | 4 | read-only parameter suffix |
+| `jxl_wgpu_encode/lossless_modular/entropy.wgsl` | four-word batch/group/channel records | batch: group count/table offset/Greedy flag/distance distribution; group: channel descriptor offset/count/output offset/capacity words; channel: event offset/count address/max events/distribution | 16 each | 4 | read-only parameter suffix |
 | `jxl_wgpu_encode/lossless_modular/entropy.wgsl` | four completion words | status/bit length/expanded symbol count/reserved | 16 | 4 | artifact storage/readback prefix before each compressed group |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | entropy prefix/window, group geometry, sample/channel counts, channel-layout offset, output kind/transfer/range, channels/order/depth, 4 plane offset/stride pairs, chroma geometry/size/mapping, status/stream/fixed-leaf/weighted-predictor fields; canvas width/height and orientation | 256 | 4 | read-only storage element |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `DecodeStatus` / `status[0..4]` | `code, decoded_samples, cursor, expected_cursor` | 16 | 4 | storage/readback record |
@@ -984,9 +984,13 @@ capacities that exceed WGSL u32 bit addressing. The output range cannot overlap 
 Palette dictionary, prediction state or transform arena.
 
 `EntropyBatchPlan` appends a storage-offset-aligned parameter suffix: four header words, four
-words per group, four words per channel, then five 4608-word tables. Each table contains 256
+words per group, four words per channel, then capacity for five 4608-word tables. Each table contains 256
 frequencies, 256 symbol rank offsets and a 4096-entry reverse alias map. Offsets are relative
-to the parameter suffix or the current artifact binding. Tables consume 92,160 bytes per batch.
+to the parameter suffix or the current artifact binding. Table capacity is 92,160 bytes per batch.
+The clustered codebook uploads one to five tables and binds only the populated suffix. Batch word
+three selects the distance table; each channel descriptor contains its resolved cluster ID. Both
+come from the same immutable context map that writes the entropy header. Unused table capacity is
+not shader-accessible, and the pre-histogram allocation/budget remains the five-table upper bound.
 The parameter and artifact maxima participate in device limits, batching, budget admission and
 pool leasing. `ans_output_bytes` reports only the compressed allocation subtotal already included
 in artifact bytes; separate readback, when needed, copies that region with the rest of the batch.

@@ -13,6 +13,90 @@ fn config(lz77: LosslessModularLz77) -> LosslessModularConfig {
     }
 }
 
+fn read_global_entropy(bits: &mut jxl_bitstream::Bitstream<'_>) -> jxl_coding::Decoder {
+    assert!(bits.read_bool().unwrap()); // default LF dequantization
+    assert!(bits.read_bool().unwrap()); // global Modular tree
+    let mut tree = jxl_coding::Decoder::parse(bits, 6).unwrap();
+    tree.begin(bits).unwrap();
+    let mut nodes = 1;
+    while nodes != 0 {
+        nodes -= 1;
+        if tree.read_varint(bits, 1).unwrap() == 0 {
+            for context in 2..6 {
+                tree.read_varint(bits, context).unwrap();
+            }
+        } else {
+            tree.read_varint(bits, 0).unwrap();
+            nodes += 2;
+        }
+    }
+    tree.finalize().unwrap();
+    jxl_coding::Decoder::parse(bits, 4).unwrap()
+}
+
+#[test]
+fn ans_selects_shared_or_distinct_histograms_from_actual_gpu_populations() {
+    use jxl_wgpu_encode::{LosslessModularColorTransform, LosslessModularPredictor};
+    let rig = Rig::new();
+    let case = case(LosslessModularFormat::Rgba, 16, SampleKind::Unsigned);
+    for tree_mode in TREES {
+        let encoder = LosslessModularEncoder::with_config(
+            rig.context.clone(),
+            LosslessModularConfig {
+                tree_mode,
+                predictor: LosslessModularPredictor::Zero,
+                color_transform: LosslessModularColorTransform::None,
+                ..config(LosslessModularLz77::ZeroRuns)
+            },
+        );
+        for extent in [Extent2d::new(17, 3), Extent2d::new(129, 3)] {
+            for shared in [true, false] {
+                let pixel = if shared { [1; 4] } else { [1, 8, 64, 512] };
+                let expected: Vec<_> = (0..extent.area().unwrap()).flat_map(|_| pixel).collect();
+                let input = upload(&rig.context, &case, extent, &expected, 4099);
+                let encoded = encoder.encode(input).unwrap();
+                assert_eq!(
+                    encoded,
+                    encoder
+                        .encode(upload(
+                            &rig.context,
+                            &case.canonical(),
+                            extent,
+                            &expected,
+                            0
+                        ))
+                        .unwrap()
+                );
+                let parsed = jxl_gpu_bitstream::parse(&encoded, Default::default()).unwrap();
+                let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+                let section = inventory.frames[0]
+                    .sections
+                    .iter()
+                    .find(|section| {
+                        matches!(
+                            section.kind,
+                            jxl_gpu_bitstream::FrameSectionKind::Single
+                                | jxl_gpu_bitstream::FrameSectionKind::LowFrequencyGlobal
+                        )
+                    })
+                    .unwrap();
+                let start = section.bytes.offset as usize;
+                let mut bits = jxl_bitstream::Bitstream::new(
+                    &encoded[start..start + section.bytes.length as usize],
+                );
+                let descriptor = read_global_entropy(&mut bits);
+                let map = descriptor.cluster_map();
+                assert_eq!(map.len(), 5);
+                assert_eq!(*map.iter().max().unwrap() + 1, if shared { 1 } else { 4 });
+                let native = check_oracles(&encoded, &expected, &case);
+                rig.check_gpu(&encoded, &expected, &case, &native);
+            }
+        }
+        assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
+        assert_eq!(encoder.buffer_pool_stats().leased_buffer_sets, 0);
+    }
+}
+
 #[test]
 fn ans_single_and_multiple_groups_preserve_words_and_streaming_decode() {
     let rig = Rig::new();
@@ -306,24 +390,7 @@ fn empty_global_ans_state_and_padding_are_checked_by_native_and_gpu_decoders() {
     let start = section.bytes.offset as usize;
     let end = start + section.bytes.length as usize;
     let mut bits = jxl_bitstream::Bitstream::new(&encoded[start..end]);
-    assert!(bits.read_bool().unwrap());
-    assert!(bits.read_bool().unwrap());
-    let mut tree = jxl_coding::Decoder::parse(&mut bits, 6).unwrap();
-    tree.begin(&mut bits).unwrap();
-    let mut nodes = 1;
-    while nodes != 0 {
-        nodes -= 1;
-        if tree.read_varint(&mut bits, 1).unwrap() == 0 {
-            for context in 2..6 {
-                tree.read_varint(&mut bits, context).unwrap();
-            }
-        } else {
-            tree.read_varint(&mut bits, 0).unwrap();
-            nodes += 2;
-        }
-    }
-    tree.finalize().unwrap();
-    let mut entropy = jxl_coding::Decoder::parse(&mut bits, 4).unwrap();
+    let mut entropy = read_global_entropy(&mut bits);
     assert!(bits.read_bool().unwrap()); // shared tree
     assert!(!bits.read_bool().unwrap()); // explicit WP leaves an unaligned entropy start
     for _ in 0..7 {

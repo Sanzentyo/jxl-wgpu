@@ -114,6 +114,46 @@ impl AnsCode {
         &self.words
     }
 
+    /// Cross entropy of the normalized distribution in Q20 bits. This is a size
+    /// estimate, not a simulation of the order-dependent ANS state or extra bits.
+    pub(crate) fn estimated_data_bits(
+        &self,
+        counts: &[u64; ALPHABET],
+    ) -> Result<u128, EncodeError> {
+        static COSTS: std::sync::OnceLock<[u32; TABLE_SIZE + 1]> = std::sync::OnceLock::new();
+        let costs = COSTS.get_or_init(|| {
+            std::array::from_fn(|frequency| {
+                if frequency == 0 {
+                    return 0;
+                }
+                // Binary logarithm by repeated squaring, with 48 fractional working bits.
+                // Integer arithmetic makes codebook selection independent of host libm.
+                let exponent = frequency.ilog2();
+                let mut value = (frequency as u128) << (48 - exponent);
+                let mut fraction = 0;
+                for bit in (0..20).rev() {
+                    value = (value * value) >> 48;
+                    if value >= 1u128 << 49 {
+                        value >>= 1;
+                        fraction |= 1 << bit;
+                    }
+                }
+                ((12 - exponent) << 20) - fraction
+            })
+        });
+        counts
+            .iter()
+            .zip(self.frequencies)
+            .try_fold(0u128, |sum, (&count, frequency)| {
+                if count != 0 && frequency == 0 {
+                    return Err(
+                        BackendError::Invariant("ANS cost excludes an observed symbol").into(),
+                    );
+                }
+                Ok(sum + u128::from(count) * u128::from(costs[frequency as usize]))
+            })
+    }
+
     pub(crate) fn write_histogram(&self, writer: &mut BitWriter) -> Result<(), EncodeError> {
         let symbols: Vec<_> = self
             .frequencies

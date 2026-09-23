@@ -62,13 +62,13 @@ fn encode(@builtin(global_invocation_id) id: vec3<u32>) {
                 failed = true; break;
             }
             if kind == 1u && metadata[2u] == 0u {
-                put_symbol(0u, 1u);
+                put_symbol(metadata[3u], 1u);
                 prepend(extra, extra_count);
                 put_symbol(histogram, 224u + token);
                 put_symbol(histogram, 0u);
             } else if kind == 0u || (kind == 2u && metadata[2u] == 1u) || (kind == 3u && metadata[2u] == 1u) {
                 prepend(extra, extra_count);
-                put_symbol(select(histogram, 0u, kind == 3u), token + select(0u, 224u, kind == 2u));
+                put_symbol(select(histogram, metadata[3u], kind == 3u), token + select(0u, 224u, kind == 2u));
             } else { failed = true; break; }
         }
         if failed { break; }
