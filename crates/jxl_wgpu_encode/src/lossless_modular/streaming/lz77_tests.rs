@@ -1,4 +1,5 @@
 use super::*;
+use crate::lossless_modular::serializer::parse_group_artifact;
 use crate::{
     AnimationHeader, Determinism, EncodeProfile, FrameOptions, GpuEncodeBackend, GpuFrameSource,
     LosslessModularConfig, LosslessModularFormat, LosslessModularGroupSize, LosslessModularLz77,

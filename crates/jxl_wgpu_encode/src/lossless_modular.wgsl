@@ -1,4 +1,5 @@
 override squeeze_enabled: bool = false;
+override palette_enabled: bool = false;
 
 struct Source {
     row_stride: u32,
@@ -29,7 +30,11 @@ struct Params {
     squeeze: u32,
     source_width: u32,
     source_height: u32,
-    _padding: array<u32, 13>,
+    palette_capacity: u32,
+    palette_scratch_word_offset: u32,
+    palette_hash_mask: u32,
+    palette_channels: u32,
+    _padding: array<u32, 9>,
 }
 
 @group(0) @binding(0)
@@ -59,11 +64,14 @@ const OUTPUT_HEADER_WORDS: u32 = 100u;
 const EVENT_WORDS: u32 = 4u;
 const EVENT_OVERFLOW: u32 = 0xffffffffu;
 const SQUEEZE_OVERFLOW: u32 = 0xfffffffeu;
+const PALETTE_OVERFLOW: u32 = 0xfffffffdu;
+const PALETTE_INVALID: u32 = 0xfffffffcu;
 
 /*__JXL_MODULAR_PREDICT__*/
 
 var<private> active_params: Params;
 var<private> squeeze_failed: bool;
+var<private> palette_failed: bool;
 
 fn wp_current_width() -> u32 { return active_params.width; }
 fn wp_coefficient(index: u32) -> u32 { return active_params.wp_coefficients[index]; }
@@ -196,6 +204,80 @@ fn squeeze_residual(a: i32, b: i32, previous: i32, average: i32, next: i32) -> i
     return result;
 }
 
+fn palette_color(params: Params, x: u32, y: u32) -> vec4<u32> {
+    var color = vec4<u32>(0u);
+    for (var component = 0u; component < params.channels; component += 1u) {
+        color[component] = bitcast<u32>(transformed_component(params, x, y, component));
+    }
+    return color;
+}
+
+fn palette_hash_base(params: Params) -> u32 {
+    return params.palette_scratch_word_offset + 1u + params.channels * params.palette_capacity;
+}
+
+fn palette_slot(params: Params, color: vec4<u32>) -> u32 {
+    var hash = 2166136261u;
+    for (var component = 0u; component < params.channels; component += 1u) {
+        hash = (hash ^ color[component]) * 16777619u;
+        hash ^= hash >> 16u;
+    }
+    let table = params.palette_scratch_word_offset + 1u;
+    let heads = palette_hash_base(params);
+    for (var probe = 0u; probe <= params.palette_hash_mask; probe += 1u) {
+        let slot = (hash + probe) & params.palette_hash_mask;
+        let entry = output_words[heads + slot];
+        if entry == 0u { return slot; }
+        var matches = true;
+        for (var component = 0u; component < params.channels; component += 1u) {
+            if output_words[table + component * params.palette_capacity + entry - 1u] != color[component] {
+                matches = false;
+            }
+        }
+        if matches { return slot; }
+    }
+    return params.palette_hash_mask + 1u;
+}
+
+fn build_palette(params: Params) -> bool {
+    // The whole artifact allocation, including hash heads, was cleared before this dispatch.
+    // Only this group's first invocation owns its dictionary and all token channels.
+    let count_offset = params.palette_scratch_word_offset;
+    let table = count_offset + 1u;
+    let heads = palette_hash_base(params);
+    var count = 0u;
+    for (var y = 0u; y < params.source_height; y += 1u) {
+        for (var x = 0u; x < params.source_width; x += 1u) {
+            let color = palette_color(params, x, y);
+            let slot = palette_slot(params, color);
+            if slot > params.palette_hash_mask { return false; }
+            if output_words[heads + slot] == 0u {
+                if count == params.palette_capacity { return false; }
+                for (var component = 0u; component < params.channels; component += 1u) {
+                    output_words[table + component * params.palette_capacity + count] = color[component];
+                }
+                count += 1u;
+                output_words[heads + slot] = count;
+            }
+        }
+    }
+    output_words[count_offset] = count;
+    return true;
+}
+
+fn working_component(params: Params, x: u32, y: u32, component: u32) -> i32 {
+    if !palette_enabled || params.palette_capacity == 0u {
+        return transformed_component(params, x, y, component);
+    }
+    let slot = palette_slot(params, palette_color(params, x, y));
+    if slot <= params.palette_hash_mask {
+        let entry = output_words[palette_hash_base(params) + slot];
+        if entry != 0u { return i32(entry - 1u); }
+    }
+    palette_failed = true;
+    return 0;
+}
+
 fn squeeze_first(params: Params, component: u32, band: u32, point: vec2<u32>) -> i32 {
     let horizontal = params.squeeze == 1u || params.squeeze == 3u;
     let axis = select(1u, 0u, horizontal);
@@ -204,29 +286,38 @@ fn squeeze_first(params: Params, component: u32, band: u32, point: vec2<u32>) ->
     step[axis] = 1u;
     var source = point;
     source[axis] *= 2u;
-    let a = transformed_component(params, source.x, source.y, component);
+    let a = working_component(params, source.x, source.y, component);
     if source[axis] + 1u == size { return a; } // unpaired average tail
-    let b = transformed_component(params, source.x + step.x, source.y + step.y, component);
+    let b = working_component(params, source.x + step.x, source.y + step.y, component);
     let average = squeeze_average(a, b);
     if band == 0u { return average; }
     var next = average;
     if source[axis] + 2u < size {
-        let c = transformed_component(params, source.x + 2u * step.x, source.y + 2u * step.y, component);
+        let c = working_component(params, source.x + 2u * step.x, source.y + 2u * step.y, component);
         next = c;
         if source[axis] + 3u < size {
-            let d = transformed_component(params, source.x + 3u * step.x, source.y + 3u * step.y, component);
+            let d = working_component(params, source.x + 3u * step.x, source.y + 3u * step.y, component);
             next = squeeze_average(c, d);
         }
     }
     var previous = average;
-    if source[axis] != 0u { previous = transformed_component(params, source.x - step.x, source.y - step.y, component); }
+    if source[axis] != 0u { previous = working_component(params, source.x - step.x, source.y - step.y, component); }
     return squeeze_residual(a, b, previous, average, next);
 }
 
 fn sample_at(params: Params, x: u32, y: u32) -> i32 {
-    if !squeeze_enabled || params.squeeze == 0u { return transformed_component(params, x, y, params.channel); }
-    let component = params.channel % params.channels;
-    let first_band = (params.channel / params.channels) & 1u;
+    var channel = params.channel;
+    var channels = params.channels;
+    if palette_enabled && params.palette_capacity != 0u {
+        if channel == 0u {
+            return bitcast<i32>(output_words[params.palette_scratch_word_offset + 1u + y * params.palette_capacity + x]);
+        }
+        channel -= 1u;
+        channels = 1u;
+    }
+    if !squeeze_enabled || params.squeeze == 0u { return working_component(params, x, y, channel); }
+    let component = channel % channels;
+    let first_band = (channel / channels) & 1u;
     let point = vec2<u32>(x, y);
     if params.squeeze < 3u { return squeeze_first(params, component, first_band, point); }
     // The second axis is perpendicular, so its input axis length is the original group length.
@@ -240,7 +331,7 @@ fn sample_at(params: Params, x: u32, y: u32) -> i32 {
     if source[axis] + 1u == size { return a; }
     let b = squeeze_first(params, component, first_band, source + step);
     let average = squeeze_average(a, b);
-    if params.channel / (2u * params.channels) == 0u { return average; }
+    if channel / (2u * channels) == 0u { return average; }
     var next = average;
     if source[axis] + 2u < size {
         let c = squeeze_first(params, component, first_band, source + 2u * step);
@@ -437,14 +528,10 @@ fn encode_greedy(params: Params) {
     }
 }
 
-@compute @workgroup_size(1)
-fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    if global_id.y != 0u || global_id.z != 0u || global_id.x >= arrayLength(&group_params) {
-        return;
-    }
-    let params = group_params[global_id.x];
+fn encode_tokens(params: Params) {
     active_params = params;
     squeeze_failed = false;
+    palette_failed = false;
     if params.predictor == 6u {
         wp_reset();
         for (var index = 0u; index < params.width * 5u; index += 1u) {
@@ -455,6 +542,7 @@ fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if params.lz77_mode == 1u {
         encode_greedy(params);
         if squeeze_failed { output_words[params.output_word_offset] = SQUEEZE_OVERFLOW; }
+        if palette_failed { output_words[params.output_word_offset] = PALETTE_INVALID; }
         return;
     }
 
@@ -492,4 +580,25 @@ fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
     emit_run(params, run);
     if squeeze_failed { output_words[params.output_word_offset] = SQUEEZE_OVERFLOW; }
+    if palette_failed { output_words[params.output_word_offset] = PALETTE_INVALID; }
+}
+
+@compute @workgroup_size(1)
+fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    if global_id.y != 0u || global_id.z != 0u || global_id.x >= arrayLength(&group_params) { return; }
+    let params = group_params[global_id.x];
+    if palette_enabled && params.palette_capacity != 0u {
+        if params.channel != 0u { return; }
+        if !build_palette(params) {
+            output_words[params.output_word_offset] = PALETTE_OVERFLOW;
+            return;
+        }
+        for (var channel = 0u; channel < params.palette_channels; channel += 1u) {
+            var token_params = group_params[global_id.x + channel];
+            if channel == 0u { token_params.width = output_words[params.palette_scratch_word_offset]; }
+            encode_tokens(token_params);
+        }
+    } else {
+        encode_tokens(params);
+    }
 }

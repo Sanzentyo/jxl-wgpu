@@ -185,7 +185,7 @@ mod native_tests {
                 256,
                 vec![
                     0, 4, 8, 12, 16, 20, 24, 28, 32, 128, 132, 136, 164, 180, 184, 188, 192, 196,
-                    200, 204,
+                    200, 204, 208, 212, 216, 220,
                 ],
             ),
         ] {
@@ -239,11 +239,15 @@ mod native_tests {
             squeeze: 49,
             source_width: 50,
             source_height: 51,
-            _padding: [0; 13],
+            palette_capacity: 52,
+            palette_scratch_word_offset: 53,
+            palette_hash_mask: 54,
+            palette_channels: 55,
+            _padding: [0; 9],
         };
         let words = bytemuck::cast::<ModularParams, [u32; 64]>(params);
-        assert_eq!(&words[..51], &(1..=51).collect::<Vec<_>>());
-        assert!(words[51..].iter().all(|&word| word == 0));
+        assert_eq!(&words[..55], &(1..=55).collect::<Vec<_>>());
+        assert!(words[55..].iter().all(|&word| word == 0));
     }
 
     #[test]
@@ -725,6 +729,7 @@ mod native_tests {
                 31,
                 crate::LosslessModularPredictor::Gradient,
                 crate::LosslessModularSqueeze::None,
+                None,
                 &raw,
                 &runs
             )
@@ -736,6 +741,7 @@ mod native_tests {
                 29,
                 crate::LosslessModularPredictor::Gradient,
                 crate::LosslessModularSqueeze::None,
+                None,
                 &raw,
                 &runs
             ),

@@ -9,12 +9,13 @@ use super::dispatch::{
 };
 use super::grid::LosslessModularGroupGrid;
 use super::lz77::LosslessModularLz77;
+use super::palette::LosslessModularPalette;
 use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
 use super::rct::ResolvedRct;
 use super::serializer::{
     ModularFrameHeader, ModularPacketAssembler, ModularPacketConfig, PacketBuildInput,
     ValidatedModularArtifact, accumulate_artifact_histograms, build_distance_code, build_packets,
-    build_prefix_codes, parse_group_artifact, parse_group_artifact_header,
+    build_prefix_codes, parse_group_artifact_header, parse_planned_artifact,
 };
 use super::squeeze::LosslessModularSqueeze;
 use super::types::{LosslessModularFormat, LosslessModularTreeMode, ModularParams};
@@ -124,6 +125,7 @@ impl StreamingModularWorker {
             self.plan.bits_per_sample,
             self.plan.predictor,
             self.plan.squeeze,
+            self.plan.palette,
             &aggregate_raw,
             &aggregate_lz77,
         )?;
@@ -145,6 +147,7 @@ impl StreamingModularWorker {
                 tree_mode: self.plan.tree_mode,
                 rct: self.plan.rct,
                 squeeze: self.plan.squeeze,
+                palette: self.plan.palette,
                 predictor: self.plan.predictor,
                 weighted_predictor: self.plan.weighted_predictor,
                 lz77: self.plan.lz77,
@@ -411,6 +414,7 @@ fn accumulate_streaming_batch_histograms(
             &ValidatedModularArtifact {
                 header,
                 events: &[],
+                palette_colors: None,
             },
             aggregate_raw,
             aggregate_lz77,
@@ -447,10 +451,8 @@ fn serialize_streaming_batch(
                 )
                 .into());
             }
-            artifacts.push(parse_group_artifact(
-                group_plan.width,
-                group_plan.height,
-                group_plan.max_events,
+            artifacts.push(parse_planned_artifact(
+                group_plan,
                 streaming_artifact_bytes(group_plan, batch, bytes)?,
             )?);
         }
@@ -673,6 +675,7 @@ pub(super) struct ResidentLosslessModularJob {
     pub(super) tree_mode: LosslessModularTreeMode,
     pub(super) rct: Option<ResolvedRct>,
     pub(super) squeeze: LosslessModularSqueeze,
+    pub(super) palette: Option<LosslessModularPalette>,
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
     pub(super) lz77: LosslessModularLz77,
@@ -781,6 +784,7 @@ impl BrowserStreamingLosslessModularJob {
             self.plan.bits_per_sample,
             self.plan.predictor,
             self.plan.squeeze,
+            self.plan.palette,
             &self.aggregate_raw,
             &self.aggregate_lz77,
         )?;
@@ -795,6 +799,7 @@ impl BrowserStreamingLosslessModularJob {
                 tree_mode: self.plan.tree_mode,
                 rct: self.plan.rct,
                 squeeze: self.plan.squeeze,
+                palette: self.plan.palette,
                 predictor: self.plan.predictor,
                 weighted_predictor: self.plan.weighted_predictor,
                 lz77: self.plan.lz77,
@@ -931,6 +936,7 @@ impl ResidentLosslessModularJob {
             tree_mode: self.tree_mode,
             rct: self.rct,
             squeeze: self.squeeze,
+            palette: self.palette,
             predictor: self.predictor,
             weighted_predictor: self.weighted_predictor,
             lz77: self.lz77,

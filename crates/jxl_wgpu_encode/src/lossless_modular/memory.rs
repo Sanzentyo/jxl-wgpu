@@ -30,6 +30,8 @@ pub struct LosslessModularMemoryPlan {
     /// Peak residual words, hash-chain links and bucket heads for greedy LZ77. Already
     /// included in `artifact_storage_bytes`; zero for the default zero-run policy.
     pub lz77_scratch_bytes: u64,
+    /// Peak exact palette dictionary/count/hash storage, already included in artifact bytes.
+    pub palette_scratch_bytes: u64,
     /// Sum of the worst-case artifact ranges across every batch. This is diagnostic only; the
     /// encoder never allocates the sum as one GPU buffer.
     pub total_artifact_bytes: u64,

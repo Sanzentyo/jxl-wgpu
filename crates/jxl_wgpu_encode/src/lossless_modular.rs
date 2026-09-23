@@ -8,6 +8,7 @@ mod grid;
 mod icc;
 mod lz77;
 mod memory;
+mod palette;
 mod predictor;
 mod rct;
 mod serializer;
@@ -25,6 +26,7 @@ pub use lz77::LosslessModularLz77;
 pub use memory::{
     LosslessModularInFlightMemory, LosslessModularMemoryLimits, LosslessModularMemoryPlan,
 };
+pub use palette::LosslessModularPalette;
 pub use predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
 pub use rct::{LosslessModularColorTransform, LosslessModularRctType};
 pub use serializer::{

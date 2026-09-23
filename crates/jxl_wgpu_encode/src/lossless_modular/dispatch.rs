@@ -9,6 +9,7 @@ use super::lz77::LosslessModularLz77;
 use super::memory::{
     LosslessModularMemoryLimits, LosslessModularMemoryPlan, align_up, event_capacity,
 };
+use super::palette::{LosslessModularPalette, encoded_channels};
 use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
 use super::rct::ResolvedRct;
 use super::serializer::{ModularFrameHeader, pack_signed, write_animation_header};
@@ -40,6 +41,7 @@ pub(super) struct ModularGroupPlan {
     pub(super) artifact_byte_offset: u64,
     pub(super) output_size: u64,
     pub(super) max_events: usize,
+    pub(super) palette_colors_byte_offset: Option<u64>,
 }
 
 struct ModularChannelLayout {
@@ -102,6 +104,7 @@ pub(super) struct ModularDispatchPlan {
     pub(super) tree_mode: LosslessModularTreeMode,
     pub(super) rct: Option<ResolvedRct>,
     pub(super) squeeze: LosslessModularSqueeze,
+    pub(super) palette: Option<LosslessModularPalette>,
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
     pub(super) lz77: LosslessModularLz77,
@@ -171,12 +174,18 @@ impl LosslessModularBackend {
                         module: &module,
                         entry_point: Some("encode"),
                         compilation_options: wgpu::PipelineCompilationOptions {
-                            constants: &[(
-                                "squeeze_enabled",
-                                f64::from(u32::from(
-                                    config.squeeze != LosslessModularSqueeze::None,
-                                )),
-                            )],
+                            constants: &[
+                                (
+                                    "squeeze_enabled",
+                                    f64::from(u32::from(
+                                        config.squeeze != LosslessModularSqueeze::None,
+                                    )),
+                                ),
+                                (
+                                    "palette_enabled",
+                                    f64::from(u32::from(config.palette.is_some())),
+                                ),
+                            ],
                             ..Default::default()
                         },
                         cache: None,
@@ -296,22 +305,18 @@ impl LosslessModularBackend {
             .config
             .color_transform
             .resolve(format, source_spec.exponent_bits_per_sample)?;
-        let channels = self
-            .config
-            .squeeze
-            .for_extent(
-                extent.width.min(self.config.group_size.dimension()),
-                extent.height.min(self.config.group_size.dimension()),
-            )
-            .channels(format);
+        let max_squeeze = self.config.squeeze.for_extent(
+            extent.width.min(self.config.group_size.dimension()),
+            extent.height.min(self.config.group_size.dimension()),
+        );
+        let channels = encoded_channels(format, max_squeeze, self.config.palette);
         let dispatches = group_grid.ordered_groups().try_fold(0u32, |count, group| {
             count
-                .checked_add(
-                    self.config
-                        .squeeze
-                        .for_extent(group.width, group.height)
-                        .channels(format),
-                )
+                .checked_add(encoded_channels(
+                    format,
+                    self.config.squeeze.for_extent(group.width, group.height),
+                    self.config.palette,
+                ))
                 .ok_or(EncodeError::InvalidSource(
                     "Modular dispatch count overflow",
                 ))
@@ -352,22 +357,48 @@ impl LosslessModularBackend {
         let mut batch_source_windows = ModularSourceWindows::default();
         for group in group_grid.ordered_groups() {
             let squeeze = self.config.squeeze.for_extent(group.width, group.height);
-            let channels = squeeze.channels(format);
+            let channels = encoded_channels(format, squeeze, self.config.palette);
+            let palette_capacity = self
+                .config
+                .palette
+                .map_or(0, |palette| palette.capacity(group.width, group.height));
+            let palette_scratch_bytes = if palette_capacity == 0 {
+                0
+            } else {
+                4 * LosslessModularPalette::scratch_words(palette_capacity, format.channel_count())
+            };
             let group_source = source_layout.group(group)?;
             group_source
                 .windows
                 .validate(self.max_storage_binding_size)?;
             let proposed_source_windows = batch_source_windows.merge(group_source.windows);
+            let mut palette_colors_byte_offset = None;
             let layouts = (0..channels)
                 .map(|channel| {
-                    let [width, height] = squeeze.extent(
-                        [group.width, group.height],
-                        channel,
-                        format.channel_count(),
-                    );
-                    ModularChannelLayout::new(width, height, self.config)
+                    let [width, height] = if palette_capacity != 0 && channel == 0 {
+                        [palette_capacity, format.channel_count()]
+                    } else {
+                        squeeze.extent(
+                            [group.width, group.height],
+                            channel - u32::from(palette_capacity != 0),
+                            if palette_capacity == 0 {
+                                format.channel_count()
+                            } else {
+                                1
+                            },
+                        )
+                    };
+                    let mut layout = ModularChannelLayout::new(width, height, self.config)?;
+                    if palette_capacity != 0 && channel == 0 {
+                        palette_colors_byte_offset = Some(layout.output_size);
+                        layout.output_size = layout
+                            .output_size
+                            .checked_add(palette_scratch_bytes)
+                            .ok_or(EncodeError::InvalidSource("palette scratch size overflow"))?;
+                    }
+                    Ok(layout)
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, EncodeError>>()?;
             let mut proposed_output_size = output_size;
             for layout in &layouts {
                 proposed_output_size = align_up(proposed_output_size, artifact_alignment)
@@ -425,6 +456,17 @@ impl LosslessModularBackend {
                 .into());
             }
             batch_source_windows = batch_source_windows.merge(group_source.windows);
+            let palette_scratch_word_offset = if let Some(offset) = palette_colors_byte_offset {
+                align_up(output_size, artifact_alignment)
+                    .and_then(|size| size.checked_sub(batch_artifact_offset))
+                    .and_then(|size| size.checked_add(offset))
+                    .and_then(|size| u32::try_from(size / 4).ok())
+                    .ok_or(EncodeError::InvalidSource(
+                        "palette scratch offset exceeds WGSL u32 indexing",
+                    ))?
+            } else {
+                0
+            };
             for (channel, layout) in layouts.into_iter().enumerate() {
                 let ModularChannelLayout {
                     width,
@@ -480,7 +522,15 @@ impl LosslessModularBackend {
                     squeeze: squeeze as u32,
                     source_width: group.width,
                     source_height: group.height,
-                    _padding: [0; 13],
+                    palette_capacity,
+                    palette_scratch_word_offset,
+                    palette_hash_mask: if palette_capacity == 0 {
+                        0
+                    } else {
+                        (palette_capacity * 2).next_power_of_two() - 1
+                    },
+                    palette_channels: if palette_capacity == 0 { 0 } else { channels },
+                    _padding: [0; 9],
                 });
                 groups.push(ModularGroupPlan {
                     group_index: group.index,
@@ -490,6 +540,11 @@ impl LosslessModularBackend {
                     artifact_byte_offset: output_size,
                     output_size: group_output_size,
                     max_events,
+                    palette_colors_byte_offset: if channel == 0 {
+                        palette_colors_byte_offset
+                    } else {
+                        None
+                    },
                 });
                 absolute_source_offsets.push(group_source.offsets);
                 output_size = output_size
@@ -566,6 +621,22 @@ impl LosslessModularBackend {
             })
             .max()
             .unwrap_or(0);
+        let palette_scratch_bytes = batches
+            .iter()
+            .map(|batch| {
+                parameters[batch.first_dispatch..batch.first_dispatch + batch.dispatch_count]
+                    .iter()
+                    .filter(|params| params.palette_capacity != 0 && params.channel == 0)
+                    .map(|params| {
+                        4 * LosslessModularPalette::scratch_words(
+                            params.palette_capacity,
+                            params.channels,
+                        )
+                    })
+                    .sum::<u64>()
+            })
+            .max()
+            .unwrap_or(0);
         if artifact_storage_bytes > self.max_buffer_size {
             return Err(UnsupportedFeature::DeviceLimit {
                 name: "max_buffer_size",
@@ -626,6 +697,7 @@ impl LosslessModularBackend {
             artifact_storage_bytes,
             weighted_predictor_scratch_bytes,
             lz77_scratch_bytes,
+            palette_scratch_bytes,
             total_artifact_bytes,
             readback_bytes,
             direct_readback: self.direct_mapping,
@@ -647,6 +719,7 @@ impl LosslessModularBackend {
             tree_mode: self.config.tree_mode,
             rct,
             squeeze: self.config.squeeze,
+            palette: self.config.palette,
             predictor: self.config.predictor,
             weighted_predictor: self.config.weighted_predictor,
             lz77: self.config.lz77,
@@ -1041,6 +1114,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
                 tree_mode: plan.tree_mode,
                 rct: plan.rct,
                 squeeze: plan.squeeze,
+                palette: plan.palette,
                 predictor: plan.predictor,
                 weighted_predictor: plan.weighted_predictor,
                 lz77: plan.lz77,

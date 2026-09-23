@@ -82,14 +82,14 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   or IEEE input. `LosslessModularRctType::new(0..=41)` selects every normative operation and
   permutation; `IDENTITY` and `YCOCG` are named constants. Explicit RCT requires RGB(A), including
   embedded RGB ICC and IEEE samples. WGSL transforms raw words with wrapping integer arithmetic,
-  preserving NaN payloads, signed zero and independent alpha. No image pixels reach the host.
+  preserving NaN payloads, signed zero and independent alpha. The host performs no pixel transform.
   Global RCT is declared once in DC-global; local RCT is declared in each pass group independently
   of MA-tree placement. A fused single-group frame declares either choice in DC-global.
   The same selected type applies to every group/frame; arbitrary transform stacks and adaptive
   per-group selection remain open. Invalid type/channel combinations fail before GPU admission.
 - `LosslessModularConfig::squeeze` selects `LosslessModularSqueeze::{None, Horizontal, Vertical,
   HorizontalThenVertical, VerticalThenHorizontal}`. The default `None` preserves existing bytes.
-  Each selected axis transforms every current channel after RCT, appending residual channels in
+  Each selected axis transforms every image channel after RCT and optional Palette, appending residual channels in
   source-channel order. Both-axis policies apply the second axis to averages and residuals.
   A group axis of length one is skipped; odd tails remain in the average channel. Each pass group
   declares its own transform, or DC-global declares it for a fused single-group frame.
@@ -99,10 +99,21 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   Thus explicit Squeeze accepts only representable transforms of the integer/IEEE input domain;
   it does not promise every full-width source is representable. This applies before prediction
   under both entropy policies and both resident/streamed completion paths. Cross-group/global-LF
-  Squeeze, arbitrary stacks, Palette, adaptive transform choices and progressive Modular remain open.
+  Squeeze, arbitrary stacks, adaptive transform choices and progressive Modular remain open.
+- `LosslessModularConfig::palette` optionally selects `LosslessModularPalette::new(max_colors)`;
+  the default is `None`. The checked limit is `1..=70_911`. Each pass group builds an exact
+  first-occurrence dictionary of complete component tuples on GPU after RCT, including alpha
+  and raw IEEE words. Signed zero and distinct NaN payloads remain distinct. The same policy
+  applies to every group/frame, with an independent dictionary and actual color count per group.
+  Optional Squeeze transforms only the index channel and its residuals, skipping the palette
+  meta channel. The host validates the GPU color count and token coverage before writing the
+  local transform header; a fused single-group frame defers its DC-global header until then.
+  Exceeding the limit returns `BackendError::ModularPaletteOverflow` without a codestream.
+  Invalid constructor limits return `EncodeError::InvalidModularPaletteLimit`. Delta/implicit
+  entries, component-subset palettes, arbitrary stacks and automatic policy selection remain open.
 - `LosslessModularConfig` selects all four standard PassGroup sizes with
   `LosslessModularGroupSize::{Pixels128, Pixels256, Pixels512, Pixels1024}`, the MA-tree mode,
-  reversible color transform, Squeeze, prediction and LZ77 policy.
+  reversible color transform, Palette, Squeeze, prediction and LZ77 policy.
   `LosslessModularEncoder::with_config` and `LosslessModularBackend::with_config` use the same
   immutable policy; `config()` reports it. The default remains 256×256. LF groups cover eight
   PassGroups per axis. Edge groups may be one pixel wide or high; cropped animation frames use
@@ -125,7 +136,10 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   for every pixel; search history resets at each group/channel. Host code checks canonical
   length/distance events, history bounds, all histograms and exact sample coverage, then writes
   prefix metadata and bits. This is an explicit policy, without automatic effort selection.
-- One GPU invocation handles each PassGroup/channel pair. Dispatch parameters and artifacts use
+- One GPU invocation handles each PassGroup/channel pair without Palette. With Palette, the
+  group's first invocation builds its dictionary and encodes all its channels sequentially;
+  the remaining invocations return. This avoids cross-workgroup synchronization or extra submissions.
+  Dispatch parameters and artifacts use
   group-major, channel-major order. Small jobs use one mapped artifact allocation. Larger jobs use
   complete-channel-group batches bounded by storage-binding and dispatch limits.
 - Multi-batch jobs first run a histogram pass to derive one stream-wide prefix code; a second pass
@@ -150,7 +164,7 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
 `LosslessModularEncoder::memory_plan` reports the detected valid bits, exponent width (zero for
 integers), largest component storage-word width, full and peak unions of source plane binding
 ranges, the maximum transformed `channel_count` in any group, peak parameter/artifact/readback bytes, `weighted_predictor_scratch_bytes`,
-`lz77_scratch_bytes`, diagnostic total artifact bytes, batch count, exact GPU submission count,
+`lz77_scratch_bytes`, `palette_scratch_bytes`, diagnostic total artifact bytes, batch count, exact GPU submission count,
 streaming mode, total encoder-owned live bytes, and the group grid before submission. Streamed jobs
 report exactly twice the batch count:
 one histogram and one serialization submission per batch. Every live batch uses the same shared
@@ -166,7 +180,13 @@ scratch subtotal is already included in owned bytes and any separate readback co
 also inside the artifact allocation and its reported scratch subtotal. A complete group must fit
 the checked source/artifact binding limits. With Squeeze, these formulas use each transformed
 channel's width, height and area, with up to 16 channels per group; single-pixel edge axes may
-produce fewer. Selecting 1024 does not guarantee that every device
+produce fewer. Palette instead has one meta channel plus one, two or four index-image channels.
+Its meta channel reserves `min(max_colors, group_pixels) × source_components` samples; only the
+validated actual color count is encoded. For capacity `k` and `c` source components, Palette adds
+`4 * (1 + k * c + next_power_of_two(2 * k))` scratch bytes per group for the count, dictionary
+and hash table. The peak subtotal is included in the artifact allocation and any readback copy.
+These private scratch bytes are mapped with that allocation; host assembly reads the count and
+encoded events, without inspecting dictionary entries or source pixels. Selecting 1024 does not guarantee that every device
 or memory budget can admit it. Batch splitting, peak reservations and exact submission counts
 are recalculated from that geometry. Long zero runs use the full valid prefix alphabet through
 the 1024²-sample case; histogram, canonical extra-bit and exact sample-count checks remain required.
@@ -233,7 +253,7 @@ let jxl_container = submission.wait()?;
 Single-group Gray8 containers with default color/intent/intensity additionally carry the optional
 private `jwgp` acceleration index. Explicit sRGB matching those defaults retains the same bytes.
 Its current schema represents one contiguous 8-bit single-channel token span, so other depths,
-GrayAlpha, RGB(A), explicit Squeeze, and multi-group containers intentionally omit that private box; all remain ordinary
+GrayAlpha, RGB(A), explicit Palette/Squeeze, and multi-group containers intentionally omit that private box; all remain ordinary
 interoperable JPEG XL containers. Conformance tests cover every depth `1..=31`, the
 1/255/256/257 group boundaries, and extreme aspect ratios. A streamed 16,384×1 RGB8 case is exact
 through both the published Rust `jxl` decoder and reference `djxl`, with identical blocking and
@@ -290,6 +310,11 @@ The [general LZ77 matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-gene
 independent distance/overlap checks through the 2²⁰ history limit, all predictors and group
 sizes, integer/IEEE words, high-depth RCT, animation and streamed resource ownership. A periodic
 source produces fewer bytes with Greedy than ZeroRuns; no universal compression gain is claimed.
+
+The [Palette matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-palette-encoding) checks
+every color-count wire bucket through 70,911, all integer precisions, raw IEEE special words,
+RCT/predictor/Squeeze composition, retained animation output and bounded GPU decoding. Exact
+budgets, cancellation and late streamed capacity failures retain the existing ownership contract.
 
 ## Experimental VarDCT profile
 

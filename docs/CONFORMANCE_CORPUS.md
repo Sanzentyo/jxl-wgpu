@@ -646,7 +646,8 @@ JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossl
 ```
 
 `MOD-E02` stays **Partial**. The selected RCT is uniform across groups/frames; adaptive selection,
-arbitrary transform stacks, Palette/delta palette and global/LF/HF transform topology remain. Explicit local Squeeze is covered below.
+arbitrary transform stacks, delta/implicit Palette and global/LF/HF transform topology remain.
+Explicit local Squeeze and exact Palette are covered below.
 
 ## Lossless Modular Squeeze encoding
 
@@ -689,7 +690,53 @@ JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossl
 ```
 
 `MOD-E02` remains **Partial**. This is a local, caller-selected transform after RCT, without
-content analysis, cross-group Squeeze, general stacks, Palette or progressive Modular encoding.
+content analysis, cross-group Squeeze, general stacks or progressive Modular encoding.
+
+## Lossless Modular Palette encoding
+
+[`lossless_layouts::palette`](../crates/jxl_wgpu_encode/tests/lossless_layouts/palette.rs)
+contains six GPU tests for caller-bounded exact local palettes. Forty geometry cases cover
+Gray/GrayAlpha/RGB/RGBA, shared/local trees, no Squeeze and all four axis policies, fused/separate
+groups, odd tails and one-pixel axes. Forty-two composition cases cover all 42 global/local RCT
+types and every integer precision from 1 through 31 while rotating all predictors, custom Weighted
+parameters, group sizes, entropy policies and packed/planar/split storage. Ten additional cases
+combine binary16/binary32 special words with all five Squeeze choices. Reversed, shifted,
+big-endian split sources and canonical packed sources produce identical codestreams.
+
+Every original component word is compared through independent jxl-oxide working planes; native
+libjxl 0.12.0 retains the integer `2e-7` normalized bound and exact IEEE F32 bits. Whole input and
+43-byte fragments through 256-byte GPU windows compare every numeric output component exactly
+after session drop. Raw-word equality preserves signed zero and NaN payloads in the dictionary.
+Eight additional Gray31 cases use exactly 1/255/256/1279/1280/5375/5376/70,911 distinct colors,
+covering all header bucket boundaries and the maximum explicit palette count. The largest table
+exceeds the image group edge; both independent decoders and both GPU input paths must accept it.
+An independent wire reader also checks all bucket boundaries for each component count and
+Squeeze policy, including RCT-before-Palette ordering and exclusion of the meta channel.
+
+Four three-frame Replace animations cover integer31/raw IEEE32 with changing source storage,
+both Squeeze orders, timing/timecodes, reverse insertion and retained output. Two finite IEEE32
+cropped Add/Multiply sequences retain independent references and the existing native/Rust/GPU
+`3e-6` color / `4e-7` alpha bounds. Eight resident/streamed lifetime cases cover every group size,
+Weighted plus greedy LZ77, exact and one-byte-short admission, abandoned source retirement,
+blocking/Future equality and buffer-pool reuse. The dictionary/hash scratch is included in each
+job's tested reservation.
+
+Ten negative resident/streamed cases set a one-color capacity and introduce both positive and
+negative zero under all five Squeeze policies and both entropy policies. Streamed failures occur
+after a complete valid batch. Every failure returns `BackendError::ModularPaletteOverflow`,
+returns no stream, releases source/reservation/lease and permits reuse for a subsequent valid job.
+Host artifact tests reject zero/oversized counts, truncated/overflowing metadata offsets, counts
+within capacity with mismatched actual sample coverage, and invalid GPU lookup status; status is
+checked before metadata access. Constructors reject zero and values above 70,911. Existing
+fixtures, numerical tolerances and oracle independence remain unchanged.
+
+```console
+JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --lib --test lossless_layouts palette -- --test-threads=2
+```
+
+`MOD-E02` remains **Partial**. This policy encodes complete component tuples with explicit entries
+after RCT and before optional index Squeeze. Delta/implicit entries, component subsets, automatic
+policy selection, arbitrary stacks, cross-group/global-LF transforms and progressive Modular remain.
 
 ## Lossless Modular predictors
 

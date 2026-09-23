@@ -7,6 +7,7 @@ mod groups;
 mod icc;
 mod lifetime;
 mod lz77;
+mod palette;
 mod predictors;
 mod rct;
 mod source;

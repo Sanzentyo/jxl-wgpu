@@ -54,6 +54,16 @@ sets remain together across streamed histogram/serialization batches. A residual
 storage fails artifact validation before any codestream is returned. General transform stacks and
 cross-group/global-LF Squeeze remain outside this encoder policy.
 
+Optional exact local Palette runs between RCT and Squeeze. The first invocation of each group
+builds a first-occurrence component-tuple dictionary and an open-addressed lookup table, then
+encodes its palette meta channel and index-image channels sequentially. Squeeze skips the meta
+channel. Dictionary capacity and hash storage join the existing artifact allocation, cleared
+before dispatch and retained through mapped consumption/cancellation. The host consumes the
+validated count and encoded tokens; mapped private dictionary/hash scratch is not used for
+pixel processing. Actual count controls the meta-channel width and wire header. Capacity overflow
+returns a typed error without a stream. This adds no binding or synchronization dispatch, while
+the expanded artifact geometry can require more batches under the existing limits.
+
 Before codestream inventory, `jxl_gpu_bitstream::ContainerStreamScanner` can now consume arbitrary
 owned chunks without joining the complete transport. Apart from the inline reconstructed two-byte
 signature, raw, `jxlc`, and in-order `jxlp` payloads are emitted as ranges over the caller's

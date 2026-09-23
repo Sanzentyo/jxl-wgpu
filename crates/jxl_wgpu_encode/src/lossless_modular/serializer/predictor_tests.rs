@@ -13,6 +13,7 @@ fn independent_entropy_decoder_reads_every_predictor_and_weighted_header() {
             TransformHeader {
                 rct: None,
                 squeeze: LosslessModularSqueeze::None,
+                palette_colors: None,
                 channels: 4,
             },
             predictor,

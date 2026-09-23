@@ -14,6 +14,7 @@ use super::grid::{LosslessModularGroup, LosslessModularGroupGrid};
 use super::icc::{DEFAULT_PROFILE_LIMIT, PreparedImageHeader};
 use super::lz77::LosslessModularLz77;
 use super::memory::{LosslessModularMemoryLimits, LosslessModularMemoryPlan};
+use super::palette::{LosslessModularPalette, encoded_channels};
 use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
 use super::rct::{LosslessModularRctType, ResolvedRct};
 use super::source::lossless_modular_source_spec;
@@ -709,6 +710,7 @@ pub(super) struct PacketBuildInput<'a> {
     pub(super) tree_mode: LosslessModularTreeMode,
     pub(super) rct: Option<ResolvedRct>,
     pub(super) squeeze: LosslessModularSqueeze,
+    pub(super) palette: Option<LosslessModularPalette>,
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
     pub(super) lz77: LosslessModularLz77,
@@ -787,10 +789,11 @@ pub(super) fn build_prefix_codes(
     bits_per_sample: u8,
     predictor: LosslessModularPredictor,
     squeeze: LosslessModularSqueeze,
+    palette: Option<LosslessModularPalette>,
     aggregate_raw: &RawHistograms,
     aggregate_lz77: &Lz77Histograms,
 ) -> Result<[PrefixCode; 4], EncodeError> {
-    let channels = usize::try_from(squeeze.channels(format).min(4))
+    let channels = usize::try_from(encoded_channels(format, squeeze, palette).min(4))
         .map_err(|_| EncodeError::Backend("Modular channel count overflow".into()))?;
     let unused = PrefixCode::fixed_unused_channel();
     let mut codes = [unused.clone(), unused.clone(), unused.clone(), unused];
@@ -800,9 +803,11 @@ pub(super) fn build_prefix_codes(
         // coefficients. Their wrapping residuals use the full integer alphabet.
         let wide_samples = bits_per_sample > 14
             || predictor != LosslessModularPredictor::Gradient
-            || squeeze != LosslessModularSqueeze::None;
+            || squeeze != LosslessModularSqueeze::None
+            || palette.is_some();
         let max_raw_token = if predictor != LosslessModularPredictor::Gradient
             || squeeze != LosslessModularSqueeze::None
+            || palette.is_some()
         {
             RAW_SYMBOLS - 1
         } else if (15..=16).contains(&bits_per_sample) {
@@ -835,6 +840,7 @@ pub(super) struct ModularPacketAssembler {
     tree_mode: LosslessModularTreeMode,
     rct: Option<ResolvedRct>,
     squeeze: LosslessModularSqueeze,
+    palette: Option<LosslessModularPalette>,
     predictor: LosslessModularPredictor,
     weighted_predictor: LosslessModularWeightedPredictor,
     lz77: LosslessModularLz77,
@@ -857,6 +863,7 @@ pub(super) struct ModularPacketConfig {
     pub(super) tree_mode: LosslessModularTreeMode,
     pub(super) rct: Option<ResolvedRct>,
     pub(super) squeeze: LosslessModularSqueeze,
+    pub(super) palette: Option<LosslessModularPalette>,
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
     pub(super) lz77: LosslessModularLz77,
@@ -879,6 +886,7 @@ impl ModularPacketAssembler {
             tree_mode,
             rct,
             squeeze,
+            palette,
             predictor,
             weighted_predictor,
             lz77,
@@ -890,22 +898,8 @@ impl ModularPacketAssembler {
             ));
         }
         let (packets, single_group, token_bit_offset_in_group) = if group_grid.groups == 1 {
-            let mut group = BitWriter::new();
-            write_dc_global(
-                &mut group,
-                &codes,
-                TransformHeader {
-                    rct: rct.map(|rct| rct.rct_type),
-                    squeeze: squeeze.for_extent(width, height),
-                    channels: format.channel_count(),
-                },
-                predictor,
-                weighted_predictor,
-                distance_code.as_ref(),
-            )?;
-            let token_bit_offset = u64::try_from(group.bit_len())
-                .map_err(|_| EncodeError::Backend("gray8 token offset overflow".into()))?;
-            (Vec::new(), Some(group), token_bit_offset)
+            // The exact palette size is a validated GPU result, available when this group arrives.
+            (Vec::new(), Some(BitWriter::new()), 0)
         } else {
             let layout = FrameGroupLayout::new(group_grid.lf_groups, group_grid.groups, 1)?;
             let mut packets = Vec::with_capacity(layout.toc_entries());
@@ -916,6 +910,7 @@ impl ModularPacketAssembler {
                 TransformHeader {
                     rct: rct.filter(|rct| !rct.local).map(|rct| rct.rct_type),
                     squeeze: LosslessModularSqueeze::None,
+                    palette_colors: None,
                     channels: format.channel_count(),
                 },
                 predictor,
@@ -947,6 +942,7 @@ impl ModularPacketAssembler {
             tree_mode,
             rct,
             squeeze,
+            palette,
             predictor,
             weighted_predictor,
             lz77,
@@ -977,14 +973,35 @@ impl ModularPacketAssembler {
                 "Modular group index exceeds frame grid",
             ))?;
         let squeeze = self.squeeze.for_extent(source.width, source.height);
-        let channels = usize::try_from(squeeze.channels(self.format))
+        let channels = usize::try_from(encoded_channels(self.format, squeeze, self.palette))
             .map_err(|_| EncodeError::Backend("Modular channel count overflow".into()))?;
         if artifacts.len() != channels {
             return Err(EncodeError::Backend(
                 "GPU group does not contain every Modular channel".into(),
             ));
         }
+        let palette_colors = artifacts[0].palette_colors;
+        if palette_colors.is_some() != self.palette.is_some() {
+            return Err(invalid_gpu_artifact(
+                "palette metadata does not match the group policy",
+            ));
+        }
         if let Some(group) = &mut self.single_group {
+            write_dc_global(
+                group,
+                &self.codes,
+                TransformHeader {
+                    rct: self.rct.map(|rct| rct.rct_type),
+                    squeeze,
+                    palette_colors,
+                    channels: self.format.channel_count(),
+                },
+                self.predictor,
+                self.weighted_predictor,
+                self.distance_code.as_ref(),
+            )?;
+            self.token_bit_offset_in_group = u64::try_from(group.bit_len())
+                .map_err(|_| EncodeError::Backend("gray8 token offset overflow".into()))?;
             for (channel, artifact) in artifacts.iter().enumerate() {
                 write_events(
                     group,
@@ -1004,6 +1021,7 @@ impl ModularPacketAssembler {
                 TransformHeader {
                     rct: self.rct.filter(|rct| rct.local).map(|rct| rct.rct_type),
                     squeeze,
+                    palette_colors,
                     channels: self.format.channel_count(),
                 },
             )?;
@@ -1067,6 +1085,7 @@ impl ModularPacketAssembler {
                 && self.exponent_bits_per_sample == 0
                 && self.predictor == LosslessModularPredictor::Gradient
                 && self.squeeze == LosslessModularSqueeze::None
+                && self.palette.is_none()
                 && self.lz77 == LosslessModularLz77::ZeroRuns)
                 .then(|| GpuAccelerationArtifact::Gray8Prefix {
                     width: self.width,
@@ -1103,6 +1122,7 @@ pub(super) fn build_packets(
         tree_mode,
         rct,
         squeeze,
+        palette,
         predictor,
         weighted_predictor,
         lz77,
@@ -1114,11 +1134,11 @@ pub(super) fn build_packets(
         .ordered_groups()
         .try_fold(0usize, |count, group| {
             count
-                .checked_add(
-                    squeeze
-                        .for_extent(group.width, group.height)
-                        .channels(format) as usize,
-                )
+                .checked_add(encoded_channels(
+                    format,
+                    squeeze.for_extent(group.width, group.height),
+                    palette,
+                ) as usize)
                 .ok_or(BackendError::Invariant("GPU group plan count overflow"))
         })?;
     if group_plans.len() != expected_artifacts {
@@ -1141,8 +1161,7 @@ pub(super) fn build_packets(
         let artifact_bytes = bytes
             .get(start..end)
             .ok_or_else(|| EncodeError::Backend("GPU group artifact is truncated".into()))?;
-        let artifact =
-            parse_group_artifact(plan.width, plan.height, plan.max_events, artifact_bytes)?;
+        let artifact = parse_planned_artifact(plan, artifact_bytes)?;
         accumulate_artifact_histograms(
             plan.channel as usize,
             &artifact,
@@ -1158,6 +1177,7 @@ pub(super) fn build_packets(
         bits_per_sample,
         predictor,
         squeeze,
+        palette,
         &aggregate_raw,
         &aggregate_lz77,
     )?;
@@ -1172,6 +1192,7 @@ pub(super) fn build_packets(
             tree_mode,
             rct,
             squeeze,
+            palette,
             predictor,
             weighted_predictor,
             lz77,
@@ -1182,9 +1203,11 @@ pub(super) fn build_packets(
     )?;
     let mut start = 0;
     for group in group_grid.ordered_groups() {
-        let channels = squeeze
-            .for_extent(group.width, group.height)
-            .channels(format) as usize;
+        let channels = encoded_channels(
+            format,
+            squeeze.for_extent(group.width, group.height),
+            palette,
+        ) as usize;
         let end = start + channels;
         for (channel, plan) in group_plans[start..end].iter().enumerate() {
             if plan.group_index != group.index || plan.channel != channel as u32 {
@@ -1204,6 +1227,42 @@ pub(super) fn build_packets(
 pub(super) struct ValidatedModularArtifact<'a> {
     pub(super) header: ModularArtifactHeader,
     pub(super) events: &'a [ModularEvent],
+    pub(super) palette_colors: Option<u32>,
+}
+
+pub(super) fn parse_planned_artifact<'a>(
+    plan: &ModularGroupPlan,
+    bytes: &'a [u8],
+) -> Result<ValidatedModularArtifact<'a>, EncodeError> {
+    // Check status before reading dynamic dimensions or granting token authority.
+    parse_group_artifact_header(plan.max_events, bytes)?;
+    let palette_colors = if let Some(offset) = plan.palette_colors_byte_offset {
+        let offset = usize::try_from(offset)
+            .map_err(|_| invalid_gpu_artifact("palette metadata offset overflow"))?;
+        let end = offset
+            .checked_add(4)
+            .ok_or_else(|| invalid_gpu_artifact("palette metadata offset overflow"))?;
+        let value = bytes
+            .get(offset..end)
+            .ok_or_else(|| invalid_gpu_artifact("palette metadata is truncated"))?;
+        let count = u32::from_le_bytes(value.try_into().expect("four-byte palette count"));
+        if count == 0 || count > plan.width {
+            return Err(invalid_gpu_artifact(
+                "palette count exceeds planned capacity",
+            ));
+        }
+        Some(count)
+    } else {
+        None
+    };
+    let mut artifact = parse_group_artifact(
+        palette_colors.unwrap_or(plan.width),
+        plan.height,
+        plan.max_events,
+        bytes,
+    )?;
+    artifact.palette_colors = palette_colors;
+    Ok(artifact)
 }
 
 pub(super) fn parse_group_artifact_header(
@@ -1222,6 +1281,12 @@ pub(super) fn parse_group_artifact_header(
         .map_err(|_| EncodeError::Backend("GPU event count overflow".into()))?;
     if header.event_count == u32::MAX - 1 {
         return Err(BackendError::ModularSqueezeOverflow.into());
+    }
+    if header.event_count == u32::MAX - 2 {
+        return Err(BackendError::ModularPaletteOverflow.into());
+    }
+    if header.event_count == u32::MAX - 3 {
+        return Err(invalid_gpu_artifact("GPU palette lookup failed"));
     }
     if event_count > max_events {
         return Err(EncodeError::Backend(
@@ -1262,7 +1327,11 @@ pub(super) fn parse_group_artifact<'a>(
         .map_err(|_| EncodeError::Backend("GPU event stream has an invalid ABI layout".into()))?;
 
     validate_gpu_artifacts(width, height, &header, events)?;
-    Ok(ValidatedModularArtifact { header, events })
+    Ok(ValidatedModularArtifact {
+        header,
+        events,
+        palette_colors: None,
+    })
 }
 
 pub(super) fn write_events(
@@ -1440,6 +1509,7 @@ fn invalid_gpu_artifact(reason: &'static str) -> EncodeError {
 struct TransformHeader {
     rct: Option<LosslessModularRctType>,
     squeeze: LosslessModularSqueeze,
+    palette_colors: Option<u32>,
     channels: u32,
 }
 
@@ -1498,17 +1568,52 @@ fn write_transforms(
     let TransformHeader {
         rct,
         squeeze,
+        palette_colors,
         channels,
     } = transforms;
-    if squeeze == LosslessModularSqueeze::None {
+    if squeeze == LosslessModularSqueeze::None && palette_colors.is_none() {
         return write_rct(output, rct);
     }
-    if let Some(rct) = rct {
+    let count = u32::from(rct.is_some())
+        + u32::from(palette_colors.is_some())
+        + u32::from(squeeze != LosslessModularSqueeze::None);
+    if count >= 2 {
         output.write_bits(2, 2)?;
-        output.write_bits(0, 4)?; // two transforms
-        write_rct_parameters(output, rct)?;
+        output.write_bits(u64::from(count - 2), 4)?;
     } else {
         output.write_bits(1, 2)?;
+    }
+    if let Some(rct) = rct {
+        write_rct_parameters(output, rct)?;
+    }
+    if let Some(colors) = palette_colors {
+        output.write_bits(1, 2)?; // Palette
+        output.write_bits(0, 5)?; // begin channel 0
+        match channels {
+            1 => output.write_bits(0, 2)?,
+            3 => output.write_bits(1, 2)?,
+            4 => output.write_bits(2, 2)?,
+            _ => {
+                output.write_bits(3, 2)?;
+                output.write_bits(u64::from(channels - 1), 13)?;
+            }
+        }
+        let (selector, base, bits) = if colors < 256 {
+            (0, 0, 8)
+        } else if colors < 1280 {
+            (1, 256, 10)
+        } else if colors < 5376 {
+            (2, 1280, 12)
+        } else {
+            (3, 5376, 16)
+        };
+        output.write_bits(selector, 2)?;
+        output.write_bits(u64::from(colors - base), bits)?;
+        output.write_bits(0, 2)?; // no delta entries
+        output.write_bits(0, 4)?; // Zero delta predictor
+    }
+    if squeeze == LosslessModularSqueeze::None {
+        return Ok(());
     }
     output.write_bits(2, 2)?; // Squeeze transform
     output.write_bits(1, 2)?; // explicit parameter count: U32(0, 1+u4, 9+u6, 41+u8)
@@ -1516,8 +1621,13 @@ fn write_transforms(
     for stage in 0..squeeze.stages() {
         output.write_bits(u64::from(squeeze.first_horizontal() ^ (stage != 0)), 1)?;
         output.write_bits(0, 1)?; // append residuals after all current channels
-        output.write_bits(0, 5)?; // begin channel 0
-        let count = channels << stage;
+        output.write_bits(0, 2)?; // U32 begin-channel selector
+        output.write_bits(u64::from(palette_colors.is_some()), 3)?; // skip the palette meta channel
+        let count = if palette_colors.is_some() {
+            1
+        } else {
+            channels
+        } << stage;
         if count <= 3 {
             output.write_bits(u64::from(count - 1), 2)?;
         } else {
@@ -2055,3 +2165,6 @@ mod predictor_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod lz77_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod palette_tests;

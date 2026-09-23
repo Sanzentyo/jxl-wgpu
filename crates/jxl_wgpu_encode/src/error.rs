@@ -16,6 +16,8 @@ pub enum BackendError {
     InvalidArtifact(&'static str),
     #[error("Modular Squeeze residual exceeds the lossless signed 32-bit representation")]
     ModularSqueezeOverflow,
+    #[error("Modular palette exceeds the configured distinct-color capacity")]
+    ModularPaletteOverflow,
     #[error(
         "VarDCT quantization exceeds signed 32-bit coefficients (LF: {low_frequency}, HF: {high_frequency})"
     )]
@@ -120,6 +122,8 @@ pub enum PacketError {
 
 #[derive(Debug, Error)]
 pub enum EncodeError {
+    #[error("Modular palette color limit must be in 1..=70911, got {max_colors}")]
+    InvalidModularPaletteLimit { max_colors: u32 },
     #[error(transparent)]
     VarDctMatrix(#[from] jxl_gpu_protocol::VarDctMatrixError),
     #[error("invalid VarDCT coefficient order for family {family}, channel {channel}: {reason}")]

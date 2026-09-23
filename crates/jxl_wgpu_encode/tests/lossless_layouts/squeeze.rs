@@ -71,6 +71,7 @@ fn squeeze_composes_with_all_rcts_predictors_group_sizes_and_entropy_policies() 
     for value in 0..42 {
         let group_size = Size::ALL[value as usize % 4];
         let config = LosslessModularConfig {
+            palette: None,
             squeeze: MODES[value as usize % 4],
             group_size,
             tree_mode: TREES[value as usize % 2],
