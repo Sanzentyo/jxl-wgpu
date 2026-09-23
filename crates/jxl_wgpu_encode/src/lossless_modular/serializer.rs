@@ -1547,7 +1547,7 @@ fn write_transforms(
                 output.write_bits((steps.len() - 1) as u64, 4)?;
                 for step in steps {
                     output.write_bits(u64::from(step.horizontal), 1)?;
-                    output.write_bits(0, 1)?; // residual channels are appended
+                    output.write_bits(u64::from(step.in_place), 1)?;
                     output.write_bits(0, 2)?;
                     output.write_bits(u64::from(step.range.begin), 3)?;
                     if step.range.count <= 3 {

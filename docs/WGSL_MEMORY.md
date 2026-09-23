@@ -439,7 +439,10 @@ against device limits prior to pipeline compilation and dispatch recording.
   group width/height; the 256-byte stride and six bindings remain unchanged. Parameter width/height
   describe the transformed channel, `channels` retains the original component count for source
   binding rebasing, and `channel` identifies the encoded artifact. The resolved transform plan
-  supplies sample source and band separately. One-pixel axes are skipped per group, so batches keep
+  supplies sample source, per-channel axis mode and band separately. Byte 192 is zero for unselected
+  image channels and the Palette table. Selected descendants retain their resolved axes regardless
+  of tail/in-place residual ordering; WGSL needs no selection or placement branch. One-pixel axes
+  are skipped per group, so batches keep
   complete variable-length channel sets in physical group order. Event, Weighted and LZ77 capacities
   use each transformed extent; the public channel count is the maximum over groups (up to 16).
   Source loads compute one or two Squeeze stages after RCT with signed two-word arithmetic, without

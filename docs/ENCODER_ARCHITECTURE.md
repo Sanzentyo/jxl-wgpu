@@ -183,7 +183,7 @@ the checked 609-byte Gray8 fixture is unchanged.
 
 `ModularTransformPlan` resolves the supported RCT/Palette/Squeeze policy before dispatch
 lowering. A frame shares at most four concrete group shapes through one immutable plan.
-Each shape records ordered wire operations, explicit channel sources/extents/bands and
+Each shape records ordered wire operations, explicit channel sources/extents/axes/bands and
 Palette capacities. Global RCT placement and single-group fusion are resolved there as well.
 `ModularDispatchPlan` consumes it for GPU parameters, groups, batches and memory bounds;
 resident, native-streamed and browser-streamed assembly retain that same plan. Buffer
@@ -201,12 +201,17 @@ Represent source-component, intermediate-channel, Palette-local component and fi
 encoded-channel indices explicitly; a raw channel count cannot describe their mapping.
 For example, applying Palette to components 1 and 2 of a four-component image leaves
 the meta table followed by source component 0, the index image and source component 3.
-Squeeze then targets the image channels while preserving the meta prefix. Both the
+Squeeze selection addresses that image-channel list while excluding the meta prefix. Its immutable
+policy keeps axes, target range and residual placement together. The plan validates the range before
+admission and follows the selected channels and their descendants through each axis. In-place
+residuals are inserted after the selected range; tail residuals may be separated from averages by
+unselected channels, so a second axis can require two distinct wire steps. Unselected channels keep
+their extents and carry no Squeeze axes into the kernel. Both the
 resource bounds and the wire operations must follow that same resolved topology.
 
 Memory admission, dispatch parameters and transform-header structure derive from the
 resolved plan. WGSL receives a working-component/index/table source and an explicit
-Squeeze band instead of reconstructing that mapping from an encoded channel number.
+Squeeze axis mode/band instead of reconstructing that mapping from an encoded channel number.
 GPU-dependent
 dimensions remain bounded by the pre-execution capacities and become authoritative
 only after artifact validation. Host planning remains metadata work; pixel transforms,

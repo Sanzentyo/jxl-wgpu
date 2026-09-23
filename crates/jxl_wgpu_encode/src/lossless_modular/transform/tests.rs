@@ -1,5 +1,5 @@
 use super::*;
-use crate::{LosslessModularColorTransform, LosslessModularGroupSize};
+use crate::{LosslessModularColorTransform, LosslessModularGroupSize, LosslessModularSqueeze};
 
 fn config() -> LosslessModularConfig {
     LosslessModularConfig {
@@ -93,7 +93,12 @@ fn repeated_and_edge_groups_share_plans_with_one_global_rct() {
         let group = plan.group(grid.group(index).unwrap()).unwrap();
         assert_eq!(group.extent, extent);
         assert_eq!(group.channels.len(), channels);
-        assert_eq!(group.squeeze, squeeze);
+        assert_eq!(group.channels[0].squeeze, SqueezeAxes::None);
+        assert!(
+            group.channels[1..]
+                .iter()
+                .all(|channel| channel.squeeze == squeeze.for_extent(extent[0], extent[1]))
+        );
         assert!(
             group
                 .operations
@@ -141,4 +146,105 @@ fn invalid_static_topology_is_rejected_before_dispatch_lowering() {
         ),
         Err(EncodeError::ModularRctColorChannels { color_channels: 1 })
     ));
+}
+
+#[test]
+fn squeeze_selection_preserves_meta_and_unselected_channels_in_both_placements() {
+    let grid = LosslessModularGroupGrid::for_extent(5, 3, Default::default()).unwrap();
+    for in_place in [false, true] {
+        let plan = ModularTransformPlan::new(
+            grid,
+            LosslessModularFormat::Rgba,
+            31,
+            0,
+            LosslessModularConfig {
+                squeeze: LosslessModularSqueeze::HorizontalThenVertical
+                    .with_channels(0, 2)
+                    .unwrap()
+                    .with_in_place(in_place),
+                ..config()
+            },
+        )
+        .unwrap();
+        let group = plan.group(grid.group(0).unwrap()).unwrap();
+        let mut expected = vec![(5, 0, [15, 2], SqueezeAxes::None)];
+        for (band, extent) in [(0, [3, 2]), (1, [2, 2]), (2, [3, 1]), (3, [2, 1])] {
+            for source in [0, 4] {
+                expected.push((source, band, extent, SqueezeAxes::HorizontalThenVertical));
+            }
+        }
+        expected.insert(
+            if in_place { 9 } else { 3 },
+            (3, 0, [5, 3], SqueezeAxes::None),
+        );
+        assert_eq!(
+            group
+                .channels
+                .iter()
+                .map(|ch| (ch.source.kernel_value(), ch.band, ch.extent, ch.squeeze))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(plan.max_channels, 10);
+        let TransformOperation::Squeeze(steps) = &group.operations[2] else {
+            panic!("missing Squeeze");
+        };
+        let expected = if in_place {
+            vec![(true, 1, 2), (false, 1, 4)]
+        } else {
+            vec![(true, 1, 2), (false, 1, 2), (false, 4, 2)]
+        };
+        assert!(steps.iter().all(|step| step.in_place == in_place));
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| (step.horizontal, step.range.begin, step.range.count))
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn squeeze_ranges_are_checked_in_the_post_palette_image_domain() {
+    let base = LosslessModularSqueeze::VerticalThenHorizontal;
+    for (begin, count) in [(0, 0), (0, 5), (4, 1), (1, 4), (u32::MAX, 1), (1, u32::MAX)] {
+        assert!(matches!(
+            base.with_channels(begin, count),
+            Err(EncodeError::InvalidModularSqueezeChannels { .. })
+        ));
+    }
+    let grid = LosslessModularGroupGrid::for_extent(1, 1, Default::default()).unwrap();
+    for begin in 0..4 {
+        for count in 1..=4 - begin {
+            let squeeze = base.with_channels(begin, count).unwrap();
+            assert_eq!(squeeze.channel_range(), Some(begin..begin + count));
+            for channels in 1..=4 {
+                let config = LosslessModularConfig {
+                    palette: Some(
+                        LosslessModularPalette::new(4)
+                            .unwrap()
+                            .with_components(0, 5 - channels)
+                            .unwrap(),
+                    ),
+                    squeeze,
+                    ..Default::default()
+                };
+                let result =
+                    ModularTransformPlan::new(grid, LosslessModularFormat::Rgba, 8, 0, config);
+                if begin + count <= channels {
+                    let plan = result.unwrap();
+                    assert_eq!(plan.max_channels, 1 + channels); // both axes elided, including selected ones
+                    assert_eq!(
+                        plan.prefix_channels,
+                        (1 + channels + 3 * count).min(4) as usize
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(EncodeError::InvalidModularSqueezeChannels { channels: actual, .. }) if actual == channels)
+                    );
+                }
+            }
+        }
+    }
 }

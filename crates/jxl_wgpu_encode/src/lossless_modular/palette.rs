@@ -97,7 +97,7 @@ impl LosslessModularPalette {
 
     /// Selects a nonempty contiguous range of post-RCT components. By default all source
     /// components participate. Unselected components remain independent image channels;
-    /// optional Squeeze transforms them along with the index channel, skipping the table.
+    /// optional Squeeze selects from them and the index channel, skipping the table.
     /// The range must fit the four-component input domain and each submitted source format.
     /// Implicit entry components are relative to this range, including when selecting alpha.
     pub fn with_components(mut self, begin: u32, count: u32) -> Result<Self, EncodeError> {

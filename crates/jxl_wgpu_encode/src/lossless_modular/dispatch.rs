@@ -12,7 +12,6 @@ use super::memory::{
 use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
 use super::serializer::{ModularFrameHeader, pack_signed, write_animation_header};
 use super::source::{ModularSourceLayout, ModularSourceWindows};
-use super::squeeze::LosslessModularSqueeze;
 use super::streaming::{
     EncodeJobLifetime, LosslessModularJob, LosslessModularJobState, MapCompletion,
     ResidentLosslessModularJob,
@@ -174,9 +173,7 @@ impl LosslessModularBackend {
                             constants: &[
                                 (
                                     "squeeze_enabled",
-                                    f64::from(u32::from(
-                                        config.squeeze != LosslessModularSqueeze::None,
-                                    )),
+                                    f64::from(u32::from(config.squeeze.stages() != 0)),
                                 ),
                                 (
                                     "palette_enabled",
@@ -489,7 +486,7 @@ impl LosslessModularBackend {
                         .lz77
                         .hash_entries(width * height)
                         .saturating_sub(1),
-                    squeeze: topology.squeeze as u32,
+                    squeeze: topology.channels[channel as usize].squeeze as u32,
                     source_width: group.width,
                     source_height: group.height,
                     palette_capacity,

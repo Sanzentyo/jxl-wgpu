@@ -50,8 +50,10 @@ The lossless Modular encoder can apply caller-selected local Squeeze after RCT, 
 two separable axes directly from source words in the token kernel. Signed-wide averages/tendencies
 require no intermediate image allocation or pixel readback. Each group skips single-pixel axes;
 one `ModularTransformPlan` resolves the resulting channel geometry and ordered wire operations
-for dispatch, memory planning and every packet-assembly path. Its per-channel sample source and
-Squeeze band lower directly into GPU parameters. Complete channel
+for dispatch, memory planning and every packet-assembly path. It validates selection in the
+post-Palette image-channel domain and tracks selected descendants through either tail or in-place
+residual insertion. Its per-channel sample source, resolved axes and Squeeze band lower directly
+into GPU parameters; unselected image channels and the meta table have axis mode zero. Complete channel
 sets remain together across streamed histogram/serialization batches. A residual outside signed-32
 storage fails artifact validation before any codestream is returned. General transform stacks and
 cross-group/global-LF Squeeze remain outside this encoder policy.
@@ -61,7 +63,7 @@ builds a first-occurrence component-tuple dictionary and an open-addressed looku
 encodes its palette meta channel, index image and unselected image channels sequentially.
 A caller-selected contiguous post-RCT range determines dictionary height and component-relative
 implicit entries. Unselected components retain their order; the index replaces the selected range.
-Squeeze applies to all resulting image channels and skips the meta channel.
+Squeeze selects all or a contiguous range of resulting image channels and always skips the meta channel.
 Dictionary capacity and hash storage join the existing artifact allocation, cleared
 before dispatch and retained through mapped consumption/cancellation. The host consumes the
 validated count and encoded tokens; mapped private dictionary/hash scratch is not used for

@@ -692,6 +692,33 @@ JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossl
 `MOD-E02` remains **Partial**. This is a local, caller-selected transform after RCT, without
 content analysis, cross-group Squeeze, general stacks or progressive Modular encoding.
 
+### Squeeze channel selection and residual placement
+
+[`squeeze::selection`](../crates/jxl_wgpu_encode/tests/lossless_layouts/squeeze/selection.rs)
+adds nine GPU tests. A 160-case matrix covers every contiguous range in Gray/GrayAlpha/RGB/RGBA,
+all four axis policies and tail/in-place placement. Another 48 cases select every range from
+`[component 0, Palette index, component 3]` across color/delta/mixed/implicit policies. These retain
+packed/planar/split canonical byte identity, all predictors, custom Weighted state and both entropy
+policies. Sixty-six cases cover every 1–31-bit integer precision and binary16/binary32 under both
+placements, with representable selected words and untouched IEEE extremes outside signed residual
+range. Forty-two RCT cases rotate global/local declarations, group sizes and single-pixel axes.
+
+Native libjxl 0.12.0 exports every original working word; the original-component oracle retains
+the existing `2e-7` integer bound and exact IEEE bits. jxl-oxide additionally checks working words
+where no delta inverse is needed. Whole and fragmented 256-byte-window GPU numeric output remains
+exact. Sixteen multi-group cases independently parse wire axis flags, `in_place`, begin/count and
+one-pixel elision. Hand-worked plan tests check odd geometry and source/band ordering, including the
+separate second-axis steps needed when tail residuals are separated by unselected channels.
+
+Five invalid source/post-Palette ranges fail before reservation or allocation, even when all axes
+would be elided. Sixteen resident/late-streamed overflows publish no stream and release source,
+budget and leases; each encoder subsequently handles valid input. Sixteen resident/streamed cases
+combine selected Squeeze with mixed Palette, local RCT, Weighted and greedy LZ77, proving one-byte-
+short rejection, exact-budget success, cancellation retirement and pool reuse. Four integer Replace
+animations and four cropped/reference compositions retain timing, original words and the existing
+composition bounds. Selection never includes the meta table. These tests extend the local separable
+profile; general transform stacks, global/LF/HF topology and adaptive selection remain open.
+
 ## Lossless Modular Palette encoding
 
 [`lossless_layouts::palette`](../crates/jxl_wgpu_encode/tests/lossless_layouts/palette.rs)

@@ -201,7 +201,8 @@ pub struct LosslessModularConfig {
     pub weighted_predictor: super::predictor::LosslessModularWeightedPredictor,
     /// Zero-run coding or bounded GPU search for arbitrary residual matches.
     pub lz77: super::lz77::LosslessModularLz77,
-    /// Group-local separable Squeeze after color transformation. GPU validation rejects an
+    /// Group-local separable Squeeze of selected image channels after RCT and Palette.
+    /// The policy selects axes, a channel range and residual placement. GPU validation rejects an
     /// unrepresentable signed residual instead of emitting a lossy result.
     pub squeeze: super::squeeze::LosslessModularSqueeze,
     /// Optional exact local palette built on GPU after RCT and before image-channel Squeeze.

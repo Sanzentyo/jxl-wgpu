@@ -1,4 +1,5 @@
 use super::*;
+mod selection;
 use jxl_wgpu_encode::{
     BackendError, LosslessModularColorTransform as Transform, LosslessModularConfig,
     LosslessModularGroupSize as Size, LosslessModularLz77 as Lz77,

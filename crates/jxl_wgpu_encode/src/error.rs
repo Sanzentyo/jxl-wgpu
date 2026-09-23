@@ -122,6 +122,15 @@ pub enum PacketError {
 
 #[derive(Debug, Error)]
 pub enum EncodeError {
+    #[error(
+        "Modular Squeeze range beginning at {begin} with {count} channels must be nonempty and fit {channels} post-Palette image channels"
+    )]
+    InvalidModularSqueezeChannels {
+        begin: u32,
+        count: u32,
+        channels: u32,
+    },
+
     #[error("Modular palette color limit must be in 1..=70911, got {max_colors}")]
     InvalidModularPaletteLimit { max_colors: u32 },
 

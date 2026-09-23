@@ -87,10 +87,20 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   of MA-tree placement. A fused single-group frame declares either choice in DC-global.
   The same selected type applies to every group/frame; arbitrary transform stacks and adaptive
   per-group selection remain open. Invalid type/channel combinations fail before GPU admission.
-- `LosslessModularConfig::squeeze` selects `LosslessModularSqueeze::{None, Horizontal, Vertical,
-  HorizontalThenVertical, VerticalThenHorizontal}`. The default `None` preserves existing bytes.
-  Each selected axis transforms every image channel after RCT and optional Palette, appending residual channels in
-  source-channel order. Both-axis policies apply the second axis to averages and residuals.
+- `LosslessModularConfig::squeeze` uses the immutable `LosslessModularSqueeze` policy with named
+  constants `None`, `Horizontal`, `Vertical`, `HorizontalThenVertical` and `VerticalThenHorizontal`.
+  The default `None` preserves existing bytes. Other named policies transform all image channels
+  after RCT and optional Palette, appending residuals in source-channel order.
+  `with_channels(begin, count)` selects a nonempty contiguous range in that post-Palette image
+  topology, excluding the meta table. For example, Palette on RGBA components 1–2 leaves image
+  channels `[component 0, index, component 3]`; Squeeze range `(1, 1)` selects only the index.
+  Unselected channels retain their dimensions and samples. Invalid ranges return
+  `EncodeError::InvalidModularSqueezeChannels` before GPU admission, including on one-pixel groups.
+  `with_in_place(true)` places residuals immediately after each step's selected range; the default
+  appends them at the end. This selects wire channel order, not GPU buffer aliasing.
+  Both-axis policies apply the second axis to all selected averages and residuals, using separate
+  wire steps when tail placement leaves unselected channels between them. The descriptor retains
+  the previous named values, but is no longer an integer-representable enum.
   A group axis of length one is skipped; odd tails remain in the average channel. Each pass group
   declares its own transform, or DC-global declares it for a fused single-group frame.
   Signed wide GPU arithmetic preserves normative average/tendency rounding without a transformed

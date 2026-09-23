@@ -329,7 +329,7 @@ fn check_lifetime(rig: &Rig, config: LosslessModularConfig, oracle: FrameOracle)
     check_lifetime_with_samples(rig, config, oracle, samples);
 }
 
-fn check_lifetime_with_samples(
+pub(super) fn check_lifetime_with_samples(
     rig: &Rig,
     config: LosslessModularConfig,
     oracle: FrameOracle,
