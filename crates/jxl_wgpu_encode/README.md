@@ -87,9 +87,22 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   of MA-tree placement. A fused single-group frame declares either choice in DC-global.
   The same selected type applies to every group/frame; arbitrary transform stacks and adaptive
   per-group selection remain open. Invalid type/channel combinations fail before GPU admission.
+- `LosslessModularConfig::squeeze` selects `LosslessModularSqueeze::{None, Horizontal, Vertical,
+  HorizontalThenVertical, VerticalThenHorizontal}`. The default `None` preserves existing bytes.
+  Each selected axis transforms every current channel after RCT, appending residual channels in
+  source-channel order. Both-axis policies apply the second axis to averages and residuals.
+  A group axis of length one is skipped; odd tails remain in the average channel. Each pass group
+  declares its own transform, or DC-global declares it for a fused single-group frame.
+  Signed wide GPU arithmetic preserves normative average/tendency rounding without a transformed
+  image allocation or pixel readback. If any intermediate residual cannot fit a signed 32-bit
+  working word, completion returns `BackendError::ModularSqueezeOverflow` and no codestream.
+  Thus explicit Squeeze accepts only representable transforms of the integer/IEEE input domain;
+  it does not promise every full-width source is representable. This applies before prediction
+  under both entropy policies and both resident/streamed completion paths. Cross-group/global-LF
+  Squeeze, arbitrary stacks, Palette, adaptive transform choices and progressive Modular remain open.
 - `LosslessModularConfig` selects all four standard PassGroup sizes with
   `LosslessModularGroupSize::{Pixels128, Pixels256, Pixels512, Pixels1024}`, the MA-tree mode,
-  reversible color transform, prediction and LZ77 policy.
+  reversible color transform, Squeeze, prediction and LZ77 policy.
   `LosslessModularEncoder::with_config` and `LosslessModularBackend::with_config` use the same
   immutable policy; `config()` reports it. The default remains 256×256. LF groups cover eight
   PassGroups per axis. Edge groups may be one pixel wide or high; cropped animation frames use
@@ -123,7 +136,8 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   async runtime. Peak GPU memory is therefore bounded independently of total image area even though
   the final standard codestream remains contiguous.
 - Every group/channel produces independent selected-predictor residuals, LZ77/raw token events, and
-  histograms. The host validates every artifact, combines histograms per channel, creates the four
+  histograms. The host validates every artifact, combines histograms for channels 0/1/2 separately
+  and channels 3 onward together, creates the four
   JPEG XL context prefix codes, and serializes channels inside standard row-major TOC groups.
 - LF global always carries a valid shared Modular tree and entropy code; LF groups and HF global
   are empty. `LosslessModularTreeMode::SharedGlobal` makes each PassGroup select that descriptor.
@@ -135,7 +149,7 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
 
 `LosslessModularEncoder::memory_plan` reports the detected valid bits, exponent width (zero for
 integers), largest component storage-word width, full and peak unions of source plane binding
-ranges, peak parameter/artifact/readback bytes, `weighted_predictor_scratch_bytes`,
+ranges, the maximum transformed `channel_count` in any group, peak parameter/artifact/readback bytes, `weighted_predictor_scratch_bytes`,
 `lz77_scratch_bytes`, diagnostic total artifact bytes, batch count, exact GPU submission count,
 streaming mode, total encoder-owned live bytes, and the group grid before submission. Streamed jobs
 report exactly twice the batch count:
@@ -150,7 +164,9 @@ worst-case event artifact to `400 + 16 * (pixels + ceil(pixels / 8) + 1)` bytes.
 scratch subtotal is already included in owned bytes and any separate readback copy. Greedy adds
 `8 * pixels + 4 * hash_buckets` bytes per channel for residual words, chain links and bucket heads,
 also inside the artifact allocation and its reported scratch subtotal. A complete group must fit
-the checked source/artifact binding limits; selecting 1024 does not guarantee that every device
+the checked source/artifact binding limits. With Squeeze, these formulas use each transformed
+channel's width, height and area, with up to 16 channels per group; single-pixel edge axes may
+produce fewer. Selecting 1024 does not guarantee that every device
 or memory budget can admit it. Batch splitting, peak reservations and exact submission counts
 are recalculated from that geometry. Long zero runs use the full valid prefix alphabet through
 the 1024²-sample case; histogram, canonical extra-bit and exact sample-count checks remain required.
@@ -177,7 +193,7 @@ exact dispatch rectangles and normative PassGroup order before completion.
 # use jxl_wgpu_encode::{
 #     BufferImageSource, LosslessModularConfig, LosslessModularEncoder, LosslessModularFormat,
 #     LosslessModularColorTransform, LosslessModularGroupSize, LosslessModularRctType,
-#     LosslessModularTreeMode, WgpuContext,
+#     LosslessModularSqueeze, LosslessModularTreeMode, WgpuContext,
 # };
 # fn submit(
 #     context: WgpuContext,
@@ -189,6 +205,7 @@ let encoder = LosslessModularEncoder::with_config(
         group_size: LosslessModularGroupSize::Pixels512,
         tree_mode: LosslessModularTreeMode::LocalPerGroup,
         color_transform: LosslessModularColorTransform::LocalRct(LosslessModularRctType::new(41)?),
+        squeeze: LosslessModularSqueeze::HorizontalThenVertical,
         ..Default::default()
     },
 );
@@ -216,7 +233,7 @@ let jxl_container = submission.wait()?;
 Single-group Gray8 containers with default color/intent/intensity additionally carry the optional
 private `jwgp` acceleration index. Explicit sRGB matching those defaults retains the same bytes.
 Its current schema represents one contiguous 8-bit single-channel token span, so other depths,
-GrayAlpha, RGB(A), and multi-group containers intentionally omit that private box; all remain ordinary
+GrayAlpha, RGB(A), explicit Squeeze, and multi-group containers intentionally omit that private box; all remain ordinary
 interoperable JPEG XL containers. Conformance tests cover every depth `1..=31`, the
 1/255/256/257 group boundaries, and extreme aspect ratios. A streamed 16,384×1 RGB8 case is exact
 through both the published Rust `jxl` decoder and reference `djxl`, with identical blocking and

@@ -139,7 +139,7 @@ name shown in parentheses.
 | `jxl_wgpu_encode/vardct_encoder/common.wgsl` | six host words / `QuantizationEntry` | three f32 dequantization scales followed by three u32 X/Y/B coefficient-order positions | 24 | 4 | read-only storage element |
 | `jxl_wgpu_encode/vardct_encoder/raw_matrices.wgsl` | five task words | wire width, channel area, input sample offset, output fragment offset, fragment capacity in words | 20 | 4 | read-only storage element after 67 prefix/control words |
 | `jxl_wgpu_encode/vardct_encoder/raw_matrices.wgsl` | four completion words | ready marker, task index, sample count, fragment bit length | 16 | 4 | storage/readback element before compressed fragments |
-| `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularParams` / `Params` | `width, height, output_word_offset, channel, channels, sample_mask, rct_type, big_endian`; four 24-byte source records (`row_stride, byte_offset, pixel_stride, word_bytes, bit_shift, plane`); predictor and WP scratch offset, seven coefficients, four maximum weights, LZ77 mode/scratch offset/hash mask, 16 pads | 256 | 4 | read-only storage element |
+| `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularParams` / `Params` | `width, height, output_word_offset, channel, channels, sample_mask, rct_type, big_endian`; four 24-byte source records (`row_stride, byte_offset, pixel_stride, word_bytes, bit_shift, plane`); predictor and WP scratch offset, seven coefficients, four maximum weights, LZ77 mode/scratch offset/hash mask; Squeeze mode/source width/source height, 13 pads | 256 | 4 | read-only storage element |
 | `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularArtifactHeader` / `output_words[0..100]` | `event_count, raw_counts[33], lz77_counts[33], distance_counts[33]` | 400 | 4 | storage/readback record |
 | `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularEvent` / four-word event | `kind, token, extra_bit_count, extra_bits` | 16 | 4 | storage/readback element |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | entropy prefix/window, group geometry, sample/channel counts, channel-layout offset, output kind/transfer/range, channels/order/depth, 4 plane offset/stride pairs, chroma geometry/size/mapping, status/stream/fixed-leaf/weighted-predictor fields; canvas width/height and orientation | 256 | 4 | read-only storage element |
@@ -433,6 +433,19 @@ against device limits prior to pipeline compilation and dispatch recording.
   artifact/budget admission, abandoned jobs and pooled reuse cover every size. Full 1024² zero
   runs fit the existing 33-entry histogram allocation but now use legal LZ77 tokens through 31;
   token 32, noncanonical fields and excess sample coverage remain errors.
+  Explicit local Squeeze reuses padding at bytes 192/196/200 for resolved axis policy and original
+  group width/height; the 256-byte stride and six bindings remain unchanged. Parameter width/height
+  describe the transformed channel, `channels` retains the original component count, and `channel`
+  indexes appended average/residual bands. One-pixel axes are skipped per group, so batches keep
+  complete variable-length channel sets in physical group order. Event, Weighted and LZ77 capacities
+  use each transformed extent; the public channel count is the maximum over groups (up to 16).
+  Source loads compute one or two Squeeze stages after RCT with signed two-word arithmetic, without
+  intermediate image storage. The `squeeze_enabled` pipeline constant removes this path for the
+  default policy. An unrepresentable signed-32 residual sets event-count sentinel `0xfffffffe`;
+  host header validation returns `BackendError::ModularSqueezeOverflow` before token parsing or
+  publication. The existing event-overflow sentinel remains `0xffffffff`. Failed/cancelled batches
+  retain and then release the same mapped-buffer lease and budget as successful work; stream assembly
+  does not return partial output. The Gray8 private acceleration index is omitted for explicit Squeeze.
 - Gray8 decoder output allocation is rounded to four bytes while `logical_size` remains explicit.
   RGBA/BGRA pixels and odd-width YUYV/UYVY pairs use aligned whole-word stores; byte and 16-bit
   plane writers bounds-check each addressed byte against `logical_size`.

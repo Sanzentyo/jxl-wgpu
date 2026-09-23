@@ -41,9 +41,12 @@ pub(super) struct ModularParams {
     pub(super) lz77_mode: u32,
     pub(super) lz77_scratch_word_offset: u32,
     pub(super) lz77_hash_mask: u32,
+    pub(super) squeeze: u32,
+    pub(super) source_width: u32,
+    pub(super) source_height: u32,
     // An explicit 256-byte array stride keeps every batch boundary valid for the portable
     // storage-buffer offset alignment without hidden Rust padding.
-    pub(super) _padding: [u32; 16],
+    pub(super) _padding: [u32; 13],
 }
 
 /// Fixed storage-buffer header written by `lossless_modular.wgsl`.
@@ -187,6 +190,9 @@ pub struct LosslessModularConfig {
     pub weighted_predictor: super::predictor::LosslessModularWeightedPredictor,
     /// Zero-run coding or bounded GPU search for arbitrary residual matches.
     pub lz77: super::lz77::LosslessModularLz77,
+    /// Group-local separable Squeeze after color transformation. GPU validation rejects an
+    /// unrepresentable signed residual instead of emitting a lossy result.
+    pub squeeze: super::squeeze::LosslessModularSqueeze,
 }
 
 impl LosslessModularFormat {

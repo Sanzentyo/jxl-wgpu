@@ -12,6 +12,7 @@ mod predictor;
 mod rct;
 mod serializer;
 mod source;
+mod squeeze;
 mod streaming;
 #[cfg(test)]
 mod tests;
@@ -30,6 +31,7 @@ pub use serializer::{
     LosslessModularAnimationDescriptor, LosslessModularAnimationSession, LosslessModularEncoder,
     LosslessModularSubmission,
 };
+pub use squeeze::LosslessModularSqueeze;
 pub use streaming::LosslessModularJob;
 pub use types::{
     AlphaAssociation, LOSSLESS_MODULAR_GROUP_DIMENSION, LosslessModularConfig,

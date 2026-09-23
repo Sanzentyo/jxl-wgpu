@@ -14,6 +14,8 @@ pub enum BackendError {
     Invariant(&'static str),
     #[error("invalid GPU artifact: {0}")]
     InvalidArtifact(&'static str),
+    #[error("Modular Squeeze residual exceeds the lossless signed 32-bit representation")]
+    ModularSqueezeOverflow,
     #[error(
         "VarDCT quantization exceeds signed 32-bit coefficients (LF: {low_frequency}, HF: {high_frequency})"
     )]

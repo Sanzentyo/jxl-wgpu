@@ -13,6 +13,7 @@ use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredicto
 use super::rct::ResolvedRct;
 use super::serializer::{ModularFrameHeader, pack_signed, write_animation_header};
 use super::source::{ModularSourceLayout, ModularSourceWindows};
+use super::squeeze::LosslessModularSqueeze;
 use super::streaming::{
     EncodeJobLifetime, LosslessModularJob, LosslessModularJobState, MapCompletion,
     ResidentLosslessModularJob,
@@ -32,12 +33,53 @@ use crate::{
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ModularGroupPlan {
+    pub(super) group_index: u32,
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) channel: u32,
     pub(super) artifact_byte_offset: u64,
     pub(super) output_size: u64,
     pub(super) max_events: usize,
+}
+
+struct ModularChannelLayout {
+    width: u32,
+    height: u32,
+    max_events: usize,
+    output_words: usize,
+    weighted_words: u64,
+    output_size: u64,
+}
+
+impl ModularChannelLayout {
+    fn new(width: u32, height: u32, config: LosslessModularConfig) -> Result<Self, EncodeError> {
+        let pixels = usize::try_from(u64::from(width) * u64::from(height))
+            .map_err(|_| EncodeError::InvalidSource("group dimensions overflow"))?;
+        let max_events = event_capacity(pixels)?;
+        let output_words = max_events
+            .checked_mul(EVENT_WORDS)
+            .and_then(|words| words.checked_add(OUTPUT_HEADER_WORDS))
+            .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
+        let weighted_words = if config.predictor == LosslessModularPredictor::Weighted {
+            5 * u64::from(width)
+        } else {
+            0
+        };
+        let output_size = u64::try_from(output_words)
+            .ok()
+            .and_then(|words| words.checked_add(weighted_words))
+            .and_then(|words| words.checked_add(config.lz77.scratch_words(width * height)))
+            .and_then(|words| words.checked_mul(4))
+            .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
+        Ok(Self {
+            width,
+            height,
+            max_events,
+            output_words,
+            weighted_words,
+            output_size,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -59,6 +101,7 @@ pub(super) struct ModularDispatchPlan {
     pub(super) exponent_bits_per_sample: u8,
     pub(super) tree_mode: LosslessModularTreeMode,
     pub(super) rct: Option<ResolvedRct>,
+    pub(super) squeeze: LosslessModularSqueeze,
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
     pub(super) lz77: LosslessModularLz77,
@@ -127,7 +170,15 @@ impl LosslessModularBackend {
                         layout: None,
                         module: &module,
                         entry_point: Some("encode"),
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        compilation_options: wgpu::PipelineCompilationOptions {
+                            constants: &[(
+                                "squeeze_enabled",
+                                f64::from(u32::from(
+                                    config.squeeze != LosslessModularSqueeze::None,
+                                )),
+                            )],
+                            ..Default::default()
+                        },
                         cache: None,
                     },
                 ))
@@ -245,14 +296,26 @@ impl LosslessModularBackend {
             .config
             .color_transform
             .resolve(format, source_spec.exponent_bits_per_sample)?;
-        let channels = format.channel_count();
-        let dispatches =
-            group_grid
-                .groups
-                .checked_mul(channels)
+        let channels = self
+            .config
+            .squeeze
+            .for_extent(
+                extent.width.min(self.config.group_size.dimension()),
+                extent.height.min(self.config.group_size.dimension()),
+            )
+            .channels(format);
+        let dispatches = group_grid.ordered_groups().try_fold(0u32, |count, group| {
+            count
+                .checked_add(
+                    self.config
+                        .squeeze
+                        .for_extent(group.width, group.height)
+                        .channels(format),
+                )
                 .ok_or(EncodeError::InvalidSource(
                     "Modular dispatch count overflow",
-                ))?;
+                ))
+        })?;
         if dispatches > self.max_compute_workgroups_per_dimension {
             return Err(UnsupportedFeature::DeviceLimit {
                 name: "max_compute_workgroups_per_dimension",
@@ -288,39 +351,27 @@ impl LosslessModularBackend {
         let mut batch_artifact_offset = 0u64;
         let mut batch_source_windows = ModularSourceWindows::default();
         for group in group_grid.ordered_groups() {
+            let squeeze = self.config.squeeze.for_extent(group.width, group.height);
+            let channels = squeeze.channels(format);
             let group_source = source_layout.group(group)?;
             group_source
                 .windows
                 .validate(self.max_storage_binding_size)?;
             let proposed_source_windows = batch_source_windows.merge(group_source.windows);
-            let width = group.width;
-            let height = group.height;
-            let pixel_count = usize::try_from(u64::from(width) * u64::from(height))
-                .map_err(|_| EncodeError::InvalidSource("group dimensions overflow"))?;
-            let max_events = event_capacity(pixel_count)?;
-            let output_words = OUTPUT_HEADER_WORDS
-                .checked_add(
-                    max_events
-                        .checked_mul(EVENT_WORDS)
-                        .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?,
-                )
-                .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
-            let weighted_words = if self.config.predictor == LosslessModularPredictor::Weighted {
-                5 * u64::from(width)
-            } else {
-                0
-            };
-            let lz77_words = self.config.lz77.scratch_words(width * height);
-            let group_output_size = u64::try_from(output_words)
-                .ok()
-                .and_then(|words| words.checked_add(weighted_words))
-                .and_then(|words| words.checked_add(lz77_words))
-                .and_then(|words| words.checked_mul(4))
-                .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
+            let layouts = (0..channels)
+                .map(|channel| {
+                    let [width, height] = squeeze.extent(
+                        [group.width, group.height],
+                        channel,
+                        format.channel_count(),
+                    );
+                    ModularChannelLayout::new(width, height, self.config)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let mut proposed_output_size = output_size;
-            for _ in 0..channels {
+            for layout in &layouts {
                 proposed_output_size = align_up(proposed_output_size, artifact_alignment)
-                    .and_then(|value| value.checked_add(group_output_size))
+                    .and_then(|value| value.checked_add(layout.output_size))
                     .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
             }
             let batch_dispatches = parameters.len() - batch_first_dispatch;
@@ -356,9 +407,9 @@ impl LosslessModularBackend {
                 )?;
                 batch_artifact_offset = output_size;
                 proposed_output_size = output_size;
-                for _ in 0..channels {
+                for layout in &layouts {
                     proposed_output_size = align_up(proposed_output_size, artifact_alignment)
-                        .and_then(|value| value.checked_add(group_output_size))
+                        .and_then(|value| value.checked_add(layout.output_size))
                         .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
                 }
             }
@@ -374,7 +425,16 @@ impl LosslessModularBackend {
                 .into());
             }
             batch_source_windows = batch_source_windows.merge(group_source.windows);
-            for channel in 0..channels {
+            for (channel, layout) in layouts.into_iter().enumerate() {
+                let ModularChannelLayout {
+                    width,
+                    height,
+                    max_events,
+                    output_words,
+                    weighted_words,
+                    output_size: group_output_size,
+                } = layout;
+                let channel = channel as u32;
                 output_size = align_up(output_size, artifact_alignment).ok_or(
                     EncodeError::InvalidSource("artifact group alignment overflow"),
                 )?;
@@ -389,7 +449,7 @@ impl LosslessModularBackend {
                     height,
                     output_word_offset,
                     channel,
-                    channels,
+                    channels: format.channel_count(),
                     sample_mask: u32::MAX >> (32 - source_spec.bits_per_sample),
                     rct_type: rct.map_or(42, |rct| rct.rct_type.value()),
                     big_endian: u32::from(source_spec.big_endian),
@@ -417,9 +477,13 @@ impl LosslessModularBackend {
                         .lz77
                         .hash_entries(width * height)
                         .saturating_sub(1),
-                    _padding: [0; 16],
+                    squeeze: squeeze as u32,
+                    source_width: group.width,
+                    source_height: group.height,
+                    _padding: [0; 13],
                 });
                 groups.push(ModularGroupPlan {
+                    group_index: group.index,
                     width,
                     height,
                     channel,
@@ -582,6 +646,7 @@ impl LosslessModularBackend {
             exponent_bits_per_sample: source_spec.exponent_bits_per_sample,
             tree_mode: self.config.tree_mode,
             rct,
+            squeeze: self.config.squeeze,
             predictor: self.config.predictor,
             weighted_predictor: self.config.weighted_predictor,
             lz77: self.config.lz77,
@@ -975,6 +1040,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
                 exponent_bits_per_sample: plan.exponent_bits_per_sample,
                 tree_mode: plan.tree_mode,
                 rct: plan.rct,
+                squeeze: plan.squeeze,
                 predictor: plan.predictor,
                 weighted_predictor: plan.weighted_predictor,
                 lz77: plan.lz77,

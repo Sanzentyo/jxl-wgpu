@@ -1,3 +1,5 @@
+override squeeze_enabled: bool = false;
+
 struct Source {
     row_stride: u32,
     byte_offset: u32,
@@ -24,7 +26,10 @@ struct Params {
     lz77_mode: u32,
     lz77_scratch_word_offset: u32,
     lz77_hash_mask: u32,
-    _padding: array<u32, 16>,
+    squeeze: u32,
+    source_width: u32,
+    source_height: u32,
+    _padding: array<u32, 13>,
 }
 
 @group(0) @binding(0)
@@ -53,10 +58,12 @@ var<storage, read> group_params: array<Params>;
 const OUTPUT_HEADER_WORDS: u32 = 100u;
 const EVENT_WORDS: u32 = 4u;
 const EVENT_OVERFLOW: u32 = 0xffffffffu;
+const SQUEEZE_OVERFLOW: u32 = 0xfffffffeu;
 
 /*__JXL_MODULAR_PREDICT__*/
 
 var<private> active_params: Params;
+var<private> squeeze_failed: bool;
 
 fn wp_current_width() -> u32 { return active_params.width; }
 fn wp_coefficient(index: u32) -> u32 { return active_params.wp_coefficients[index]; }
@@ -108,9 +115,9 @@ fn sub_wrap(a: i32, b: i32) -> i32 {
 
 // The forward RCT uses wrapping integer words even for raw IEEE input. Computing it
 // in the token kernel avoids both an intermediate image and a CPU color path.
-fn sample_at(params: Params, x: u32, y: u32) -> i32 {
-    if params.rct_type == 42u || params.channel >= 3u {
-        return source_component(params, x, y, params.channel);
+fn transformed_component(params: Params, x: u32, y: u32, component: u32) -> i32 {
+    if params.rct_type == 42u || component >= 3u {
+        return source_component(params, x, y, component);
     }
     let permutation = params.rct_type / 7u;
     let first = source_component(params, x, y, permutation % 3u);
@@ -122,7 +129,7 @@ fn sample_at(params: Params, x: u32, y: u32) -> i32 {
         let temporary = add_wrap(third, co >> 1u);
         let cg = sub_wrap(second, temporary);
         let luma = add_wrap(temporary, cg >> 1u);
-        return vec3<i32>(luma, co, cg)[params.channel];
+        return vec3<i32>(luma, co, cg)[component];
     }
     var transformed = vec3<i32>(first, second, third);
     if operation >= 4u {
@@ -133,7 +140,118 @@ fn sample_at(params: Params, x: u32, y: u32) -> i32 {
     if (operation & 1u) != 0u {
         transformed.z = sub_wrap(third, first);
     }
-    return transformed[params.channel];
+    return transformed[component];
+}
+
+// Divide a signed wide value by twelve with truncation toward zero. Four base-65536
+// digits keep each division operand in u32; Squeeze's largest numerator is below 2^35.
+fn squeeze_div12(value: ModularI64) -> ModularI64 {
+    let magnitude = mi_abs(value);
+    var result = vec2<u32>(0u);
+    var remainder = 0u;
+    for (var digit = 4u; digit != 0u; digit -= 1u) {
+        let shift = (digit - 1u) * 16u;
+        let part = mi_shr(magnitude, shift).x & 65535u;
+        let input = remainder * 65536u + part;
+        result |= mi_shl(vec2<u32>(input / 12u, 0u), shift);
+        remainder = input % 12u;
+    }
+    return select(result, mi_neg(result), mi_negative(value));
+}
+
+fn squeeze_average(a: i32, b: i32) -> i32 {
+    let sum = mi_add(mi_add(mi_from_i32(a), mi_from_i32(b)), vec2<u32>(u32(a > b), 0u));
+    return bitcast<i32>(mi_sar(sum, 1u).x);
+}
+
+fn squeeze_tendency(previous: i32, average: i32, next: i32) -> ModularI64 {
+    let p = mi_from_i32(previous);
+    let a = mi_from_i32(average);
+    let n = mi_from_i32(next);
+    let numerator = mi_sub(mi_sub(mi_mul_u32(p, 4u), mi_mul_u32(n, 3u)), a);
+    let left_limit = mi_mul_u32(mi_sub(p, a), 2u);
+    let right_limit = mi_mul_u32(mi_sub(a, n), 2u);
+    var diff = vec2<u32>(0u);
+    if previous >= average && average >= next {
+        diff = squeeze_div12(mi_add(numerator, vec2<u32>(6u, 0u)));
+        if mi_less(left_limit, mi_sub(diff, vec2<u32>(diff.x & 1u, 0u))) {
+            diff = mi_add(left_limit, vec2<u32>(1u, 0u));
+        }
+        if mi_less(right_limit, mi_add(diff, vec2<u32>(diff.x & 1u, 0u))) { diff = right_limit; }
+    } else if previous <= average && average <= next {
+        diff = squeeze_div12(mi_sub(numerator, vec2<u32>(6u, 0u)));
+        if mi_less(mi_add(diff, vec2<u32>(diff.x & 1u, 0u)), left_limit) {
+            diff = mi_sub(left_limit, vec2<u32>(1u, 0u));
+        }
+        if mi_less(mi_sub(diff, vec2<u32>(diff.x & 1u, 0u)), right_limit) { diff = right_limit; }
+    }
+    return diff;
+}
+
+fn squeeze_residual(a: i32, b: i32, previous: i32, average: i32, next: i32) -> i32 {
+    let residual = mi_sub(mi_sub(mi_from_i32(a), mi_from_i32(b)), squeeze_tendency(previous, average, next));
+    let result = bitcast<i32>(residual.x);
+    // Narrowing an unrepresentable residual would destroy reversibility. Publish only status.
+    if any(residual != mi_from_i32(result)) { squeeze_failed = true; }
+    return result;
+}
+
+fn squeeze_first(params: Params, component: u32, band: u32, point: vec2<u32>) -> i32 {
+    let horizontal = params.squeeze == 1u || params.squeeze == 3u;
+    let axis = select(1u, 0u, horizontal);
+    let size = vec2<u32>(params.source_width, params.source_height)[axis];
+    var step = vec2<u32>(0u);
+    step[axis] = 1u;
+    var source = point;
+    source[axis] *= 2u;
+    let a = transformed_component(params, source.x, source.y, component);
+    if source[axis] + 1u == size { return a; } // unpaired average tail
+    let b = transformed_component(params, source.x + step.x, source.y + step.y, component);
+    let average = squeeze_average(a, b);
+    if band == 0u { return average; }
+    var next = average;
+    if source[axis] + 2u < size {
+        let c = transformed_component(params, source.x + 2u * step.x, source.y + 2u * step.y, component);
+        next = c;
+        if source[axis] + 3u < size {
+            let d = transformed_component(params, source.x + 3u * step.x, source.y + 3u * step.y, component);
+            next = squeeze_average(c, d);
+        }
+    }
+    var previous = average;
+    if source[axis] != 0u { previous = transformed_component(params, source.x - step.x, source.y - step.y, component); }
+    return squeeze_residual(a, b, previous, average, next);
+}
+
+fn sample_at(params: Params, x: u32, y: u32) -> i32 {
+    if !squeeze_enabled || params.squeeze == 0u { return transformed_component(params, x, y, params.channel); }
+    let component = params.channel % params.channels;
+    let first_band = (params.channel / params.channels) & 1u;
+    let point = vec2<u32>(x, y);
+    if params.squeeze < 3u { return squeeze_first(params, component, first_band, point); }
+    // The second axis is perpendicular, so its input axis length is the original group length.
+    let axis = select(1u, 0u, params.squeeze == 4u);
+    let size = vec2<u32>(params.source_width, params.source_height)[axis];
+    var step = vec2<u32>(0u);
+    step[axis] = 1u;
+    var source = point;
+    source[axis] *= 2u;
+    let a = squeeze_first(params, component, first_band, source);
+    if source[axis] + 1u == size { return a; }
+    let b = squeeze_first(params, component, first_band, source + step);
+    let average = squeeze_average(a, b);
+    if params.channel / (2u * params.channels) == 0u { return average; }
+    var next = average;
+    if source[axis] + 2u < size {
+        let c = squeeze_first(params, component, first_band, source + 2u * step);
+        next = c;
+        if source[axis] + 3u < size {
+            next = squeeze_average(c, squeeze_first(params, component, first_band, source + 3u * step));
+        }
+    }
+    var previous = average;
+    if source[axis] != 0u { previous = squeeze_first(params, component, first_band, source - step); }
+    return squeeze_residual(a, b, previous, average, next);
 }
 
 fn append_event(params: Params, kind: u32, token: u32, nbits: u32, bits: u32) {
@@ -326,6 +444,7 @@ fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
     let params = group_params[global_id.x];
     active_params = params;
+    squeeze_failed = false;
     if params.predictor == 6u {
         wp_reset();
         for (var index = 0u; index < params.width * 5u; index += 1u) {
@@ -335,6 +454,7 @@ fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     if params.lz77_mode == 1u {
         encode_greedy(params);
+        if squeeze_failed { output_words[params.output_word_offset] = SQUEEZE_OVERFLOW; }
         return;
     }
 
@@ -371,4 +491,5 @@ fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
     }
     emit_run(params, run);
+    if squeeze_failed { output_words[params.output_word_offset] = SQUEEZE_OVERFLOW; }
 }

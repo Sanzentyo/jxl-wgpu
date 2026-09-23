@@ -46,6 +46,14 @@ GPU image source -> GPU prediction/transform/quantization/tokenization
                  -> deterministic group packet assembly -> JPEG XL codestream/container
 ```
 
+The lossless Modular encoder can apply caller-selected local Squeeze after RCT, computing one or
+two separable axes directly from source words in the token kernel. Signed-wide averages/tendencies
+require no intermediate image allocation or pixel readback. Each group skips single-pixel axes;
+dispatch, memory planning and wire headers share the resulting channel geometry. Complete channel
+sets remain together across streamed histogram/serialization batches. A residual outside signed-32
+storage fails artifact validation before any codestream is returned. General transform stacks and
+cross-group/global-LF Squeeze remain outside this encoder policy.
+
 Before codestream inventory, `jxl_gpu_bitstream::ContainerStreamScanner` can now consume arbitrary
 owned chunks without joining the complete transport. Apart from the inline reconstructed two-byte
 signature, raw, `jxlc`, and in-order `jxlp` payloads are emitted as ranges over the caller's

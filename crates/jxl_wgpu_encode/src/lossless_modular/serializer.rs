@@ -17,6 +17,7 @@ use super::memory::{LosslessModularMemoryLimits, LosslessModularMemoryPlan};
 use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
 use super::rct::{LosslessModularRctType, ResolvedRct};
 use super::source::lossless_modular_source_spec;
+use super::squeeze::LosslessModularSqueeze;
 use super::streaming::LosslessModularJob;
 use super::types::{
     AlphaAssociation, LosslessModularFormat, LosslessModularTreeMode, ModularArtifactHeader,
@@ -707,6 +708,7 @@ pub(super) struct PacketBuildInput<'a> {
     pub(super) exponent_bits_per_sample: u8,
     pub(super) tree_mode: LosslessModularTreeMode,
     pub(super) rct: Option<ResolvedRct>,
+    pub(super) squeeze: LosslessModularSqueeze,
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
     pub(super) lz77: LosslessModularLz77,
@@ -726,6 +728,9 @@ pub(super) fn accumulate_artifact_histograms(
     aggregate_lz77: &mut Lz77Histograms,
     aggregate_distance: &mut [u64; RAW_SYMBOLS],
 ) -> Result<(), EncodeError> {
+    // The fixed four-leaf MA tree selects channels 0/1/2 separately and all later channels
+    // together. Squeeze's additional residual planes therefore share the final distribution.
+    let channel = channel.min(3);
     for (total, count) in aggregate_raw[channel]
         .iter_mut()
         .zip(artifact.header.raw_counts)
@@ -781,10 +786,11 @@ pub(super) fn build_prefix_codes(
     format: LosslessModularFormat,
     bits_per_sample: u8,
     predictor: LosslessModularPredictor,
+    squeeze: LosslessModularSqueeze,
     aggregate_raw: &RawHistograms,
     aggregate_lz77: &Lz77Histograms,
 ) -> Result<[PrefixCode; 4], EncodeError> {
-    let channels = usize::try_from(format.channel_count())
+    let channels = usize::try_from(squeeze.channels(format).min(4))
         .map_err(|_| EncodeError::Backend("Modular channel count overflow".into()))?;
     let unused = PrefixCode::fixed_unused_channel();
     let mut codes = [unused.clone(), unused.clone(), unused.clone(), unused];
@@ -792,8 +798,12 @@ pub(super) fn build_prefix_codes(
         let transformed_extra_token = u8::from(format.color_channel_count() == 3);
         // Other predictors may overshoot the sample range, including with custom WP
         // coefficients. Their wrapping residuals use the full integer alphabet.
-        let wide_samples = bits_per_sample > 14 || predictor != LosslessModularPredictor::Gradient;
-        let max_raw_token = if predictor != LosslessModularPredictor::Gradient {
+        let wide_samples = bits_per_sample > 14
+            || predictor != LosslessModularPredictor::Gradient
+            || squeeze != LosslessModularSqueeze::None;
+        let max_raw_token = if predictor != LosslessModularPredictor::Gradient
+            || squeeze != LosslessModularSqueeze::None
+        {
             RAW_SYMBOLS - 1
         } else if (15..=16).contains(&bits_per_sample) {
             18
@@ -824,6 +834,7 @@ pub(super) struct ModularPacketAssembler {
     exponent_bits_per_sample: u8,
     tree_mode: LosslessModularTreeMode,
     rct: Option<ResolvedRct>,
+    squeeze: LosslessModularSqueeze,
     predictor: LosslessModularPredictor,
     weighted_predictor: LosslessModularWeightedPredictor,
     lz77: LosslessModularLz77,
@@ -845,6 +856,7 @@ pub(super) struct ModularPacketConfig {
     pub(super) exponent_bits_per_sample: u8,
     pub(super) tree_mode: LosslessModularTreeMode,
     pub(super) rct: Option<ResolvedRct>,
+    pub(super) squeeze: LosslessModularSqueeze,
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
     pub(super) lz77: LosslessModularLz77,
@@ -866,6 +878,7 @@ impl ModularPacketAssembler {
             exponent_bits_per_sample,
             tree_mode,
             rct,
+            squeeze,
             predictor,
             weighted_predictor,
             lz77,
@@ -881,7 +894,11 @@ impl ModularPacketAssembler {
             write_dc_global(
                 &mut group,
                 &codes,
-                rct.map(|rct| rct.rct_type),
+                TransformHeader {
+                    rct: rct.map(|rct| rct.rct_type),
+                    squeeze: squeeze.for_extent(width, height),
+                    channels: format.channel_count(),
+                },
                 predictor,
                 weighted_predictor,
                 distance_code.as_ref(),
@@ -896,7 +913,11 @@ impl ModularPacketAssembler {
             write_dc_global(
                 &mut dc_global,
                 &codes,
-                rct.filter(|rct| !rct.local).map(|rct| rct.rct_type),
+                TransformHeader {
+                    rct: rct.filter(|rct| !rct.local).map(|rct| rct.rct_type),
+                    squeeze: LosslessModularSqueeze::None,
+                    channels: format.channel_count(),
+                },
                 predictor,
                 weighted_predictor,
                 distance_code.as_ref(),
@@ -925,6 +946,7 @@ impl ModularPacketAssembler {
             exponent_bits_per_sample,
             tree_mode,
             rct,
+            squeeze,
             predictor,
             weighted_predictor,
             lz77,
@@ -948,7 +970,14 @@ impl ModularPacketAssembler {
                 "GPU artifact groups are not in canonical order".into(),
             ));
         }
-        let channels = usize::try_from(self.format.channel_count())
+        let source = self
+            .group_grid
+            .group(group_index)
+            .ok_or(BackendError::Invariant(
+                "Modular group index exceeds frame grid",
+            ))?;
+        let squeeze = self.squeeze.for_extent(source.width, source.height);
+        let channels = usize::try_from(squeeze.channels(self.format))
             .map_err(|_| EncodeError::Backend("Modular channel count overflow".into()))?;
         if artifacts.len() != channels {
             return Err(EncodeError::Backend(
@@ -959,7 +988,7 @@ impl ModularPacketAssembler {
             for (channel, artifact) in artifacts.iter().enumerate() {
                 write_events(
                     group,
-                    &self.codes[channel],
+                    &self.codes[channel.min(3)],
                     self.distance_code.as_ref(),
                     artifact.events,
                 )?;
@@ -970,9 +999,13 @@ impl ModularPacketAssembler {
             // Each local Modular stream declares its own WP coefficients and transform list.
             pass_group.write_bits(u64::from(use_global_tree), 1)?;
             write_weighted_predictor(&mut pass_group, self.weighted_predictor)?;
-            write_rct(
+            write_transforms(
                 &mut pass_group,
-                self.rct.filter(|rct| rct.local).map(|rct| rct.rct_type),
+                TransformHeader {
+                    rct: self.rct.filter(|rct| rct.local).map(|rct| rct.rct_type),
+                    squeeze,
+                    channels: self.format.channel_count(),
+                },
             )?;
             if !use_global_tree {
                 write_ma_config(
@@ -985,7 +1018,7 @@ impl ModularPacketAssembler {
             for (channel, artifact) in artifacts.iter().enumerate() {
                 write_events(
                     &mut pass_group,
-                    &self.codes[channel],
+                    &self.codes[channel.min(3)],
                     self.distance_code.as_ref(),
                     artifact.events,
                 )?;
@@ -1033,6 +1066,7 @@ impl ModularPacketAssembler {
                 && self.bits_per_sample == 8
                 && self.exponent_bits_per_sample == 0
                 && self.predictor == LosslessModularPredictor::Gradient
+                && self.squeeze == LosslessModularSqueeze::None
                 && self.lz77 == LosslessModularLz77::ZeroRuns)
                 .then(|| GpuAccelerationArtifact::Gray8Prefix {
                     width: self.width,
@@ -1068,6 +1102,7 @@ pub(super) fn build_packets(
         exponent_bits_per_sample,
         tree_mode,
         rct,
+        squeeze,
         predictor,
         weighted_predictor,
         lz77,
@@ -1075,12 +1110,17 @@ pub(super) fn build_packets(
         group_plans,
         bytes,
     } = input;
-    let channels = usize::try_from(format.channel_count())
-        .map_err(|_| EncodeError::Backend("Modular channel count overflow".into()))?;
-    let expected_artifacts = usize::try_from(group_grid.groups)
-        .ok()
-        .and_then(|groups| groups.checked_mul(channels))
-        .ok_or_else(|| EncodeError::Backend("GPU group plan count overflow".into()))?;
+    let expected_artifacts = group_grid
+        .ordered_groups()
+        .try_fold(0usize, |count, group| {
+            count
+                .checked_add(
+                    squeeze
+                        .for_extent(group.width, group.height)
+                        .channels(format) as usize,
+                )
+                .ok_or(BackendError::Invariant("GPU group plan count overflow"))
+        })?;
     if group_plans.len() != expected_artifacts {
         return Err(EncodeError::Backend(
             "GPU group plan does not match the frame grid".into(),
@@ -1090,13 +1130,7 @@ pub(super) fn build_packets(
     let mut aggregate_raw = [[0u64; RAW_SYMBOLS]; 4];
     let mut aggregate_lz77 = [[0u64; LZ77_SYMBOLS]; 4];
     let mut aggregate_distance = [0u64; RAW_SYMBOLS];
-    for (artifact_index, plan) in group_plans.iter().enumerate() {
-        let channel = artifact_index % channels;
-        if plan.channel != channel as u32 {
-            return Err(EncodeError::Backend(
-                "GPU group plan channel order is not canonical".into(),
-            ));
-        }
+    for plan in group_plans {
         let start = usize::try_from(plan.artifact_byte_offset)
             .map_err(|_| EncodeError::Backend("GPU artifact offset overflow".into()))?;
         let end = plan
@@ -1110,7 +1144,7 @@ pub(super) fn build_packets(
         let artifact =
             parse_group_artifact(plan.width, plan.height, plan.max_events, artifact_bytes)?;
         accumulate_artifact_histograms(
-            channel,
+            plan.channel as usize,
             &artifact,
             &mut aggregate_raw,
             &mut aggregate_lz77,
@@ -1123,6 +1157,7 @@ pub(super) fn build_packets(
         format,
         bits_per_sample,
         predictor,
+        squeeze,
         &aggregate_raw,
         &aggregate_lz77,
     )?;
@@ -1136,6 +1171,7 @@ pub(super) fn build_packets(
             exponent_bits_per_sample,
             tree_mode,
             rct,
+            squeeze,
             predictor,
             weighted_predictor,
             lz77,
@@ -1144,15 +1180,22 @@ pub(super) fn build_packets(
         codes,
         build_distance_code(lz77, &aggregate_distance)?,
     )?;
-    for group in 0..group_grid.groups {
-        let start = usize::try_from(group)
-            .ok()
-            .and_then(|group| group.checked_mul(channels))
-            .ok_or_else(|| EncodeError::Backend("Modular group index overflow".into()))?;
-        let end = start
-            .checked_add(channels)
-            .ok_or_else(|| EncodeError::Backend("Modular group index overflow".into()))?;
-        assembler.push_group(group, &artifacts[start..end])?;
+    let mut start = 0;
+    for group in group_grid.ordered_groups() {
+        let channels = squeeze
+            .for_extent(group.width, group.height)
+            .channels(format) as usize;
+        let end = start + channels;
+        for (channel, plan) in group_plans[start..end].iter().enumerate() {
+            if plan.group_index != group.index || plan.channel != channel as u32 {
+                return Err(BackendError::Invariant(
+                    "GPU group plan channel order is not canonical",
+                )
+                .into());
+            }
+        }
+        assembler.push_group(group.index, &artifacts[start..end])?;
+        start = end;
     }
     assembler.finish()
 }
@@ -1177,6 +1220,9 @@ pub(super) fn parse_group_artifact_header(
         .ok_or_else(|| EncodeError::Backend("GPU artifact header is truncated".into()))?;
     let event_count = usize::try_from(header.event_count)
         .map_err(|_| EncodeError::Backend("GPU event count overflow".into()))?;
+    if header.event_count == u32::MAX - 1 {
+        return Err(BackendError::ModularSqueezeOverflow.into());
+    }
     if event_count > max_events {
         return Err(EncodeError::Backend(
             "GPU emitted more token events than the output allocation".into(),
@@ -1391,10 +1437,16 @@ fn invalid_gpu_artifact(reason: &'static str) -> EncodeError {
     BackendError::InvalidArtifact(reason).into()
 }
 
+struct TransformHeader {
+    rct: Option<LosslessModularRctType>,
+    squeeze: LosslessModularSqueeze,
+    channels: u32,
+}
+
 fn write_dc_global(
     output: &mut BitWriter,
     codes: &[PrefixCode; 4],
-    rct: Option<LosslessModularRctType>,
+    transforms: TransformHeader,
     predictor: LosslessModularPredictor,
     weighted_predictor: LosslessModularWeightedPredictor,
     distance_code: Option<&DistanceCode>,
@@ -1406,7 +1458,7 @@ fn write_dc_global(
     write_ma_config(output, codes, predictor, distance_code)?;
     output.write_bits(1, 1)?;
     write_weighted_predictor(output, weighted_predictor)?;
-    write_rct(output, rct)
+    write_transforms(output, transforms)
 }
 
 fn write_weighted_predictor(
@@ -1432,24 +1484,69 @@ fn write_rct(
 ) -> Result<(), EncodeError> {
     if let Some(rct) = rct {
         output.write_bits(1, 2)?; // one transform
-        output.write_bits(0, 2)?; // reversible color transform
-        output.write_bits(0, 5)?; // begin channel 0
-        let value = rct.value();
-        // U32(Val(6), Bits(2), BitsOffset(4, 2), BitsOffset(6, 10)).
-        if value == 6 {
-            output.write_bits(0, 2)?;
-        } else if value < 4 {
-            output.write_bits(1, 2)?;
-            output.write_bits(u64::from(value), 2)?;
-        } else if value < 18 {
-            output.write_bits(2, 2)?;
-            output.write_bits(u64::from(value - 2), 4)?;
-        } else {
-            output.write_bits(3, 2)?;
-            output.write_bits(u64::from(value - 10), 6)?;
-        }
+        write_rct_parameters(output, rct)?;
     } else {
         output.write_bits(0, 2)?; // no transforms
+    }
+    Ok(())
+}
+
+fn write_transforms(
+    output: &mut BitWriter,
+    transforms: TransformHeader,
+) -> Result<(), EncodeError> {
+    let TransformHeader {
+        rct,
+        squeeze,
+        channels,
+    } = transforms;
+    if squeeze == LosslessModularSqueeze::None {
+        return write_rct(output, rct);
+    }
+    if let Some(rct) = rct {
+        output.write_bits(2, 2)?;
+        output.write_bits(0, 4)?; // two transforms
+        write_rct_parameters(output, rct)?;
+    } else {
+        output.write_bits(1, 2)?;
+    }
+    output.write_bits(2, 2)?; // Squeeze transform
+    output.write_bits(1, 2)?; // explicit parameter count: U32(0, 1+u4, 9+u6, 41+u8)
+    output.write_bits(u64::from(squeeze.stages() - 1), 4)?;
+    for stage in 0..squeeze.stages() {
+        output.write_bits(u64::from(squeeze.first_horizontal() ^ (stage != 0)), 1)?;
+        output.write_bits(0, 1)?; // append residuals after all current channels
+        output.write_bits(0, 5)?; // begin channel 0
+        let count = channels << stage;
+        if count <= 3 {
+            output.write_bits(u64::from(count - 1), 2)?;
+        } else {
+            output.write_bits(3, 2)?;
+            output.write_bits(u64::from(count - 4), 4)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_rct_parameters(
+    output: &mut BitWriter,
+    rct: LosslessModularRctType,
+) -> Result<(), EncodeError> {
+    output.write_bits(0, 2)?; // reversible color transform
+    output.write_bits(0, 5)?; // begin channel 0
+    let value = rct.value();
+    // U32(Val(6), Bits(2), BitsOffset(4, 2), BitsOffset(6, 10)).
+    if value == 6 {
+        output.write_bits(0, 2)?;
+    } else if value < 4 {
+        output.write_bits(1, 2)?;
+        output.write_bits(u64::from(value), 2)?;
+    } else if value < 18 {
+        output.write_bits(2, 2)?;
+        output.write_bits(u64::from(value - 2), 4)?;
+    } else {
+        output.write_bits(3, 2)?;
+        output.write_bits(u64::from(value - 10), 6)?;
     }
     Ok(())
 }

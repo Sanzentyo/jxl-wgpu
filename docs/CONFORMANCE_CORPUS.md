@@ -598,7 +598,7 @@ JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossl
 ```
 
 This advances `MOD-E02` to **Partial** for complete group-size selection. RCT selection is covered
-below; Palette/Squeeze, global/LF/HF transform topology, parallel token production, adaptive prediction,
+below; Palette/general Squeeze stacks, global/LF/HF transform topology, parallel token production, adaptive prediction,
 progressive encoding and remaining encoder quality/input gates are still open.
 
 ## Lossless Modular RCT selection
@@ -646,7 +646,50 @@ JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossl
 ```
 
 `MOD-E02` stays **Partial**. The selected RCT is uniform across groups/frames; adaptive selection,
-arbitrary transform stacks, Palette/delta palette, Squeeze and their global/LF/HF topology remain.
+arbitrary transform stacks, Palette/delta palette and global/LF/HF transform topology remain. Explicit local Squeeze is covered below.
+
+## Lossless Modular Squeeze encoding
+
+[`lossless_layouts::squeeze`](../crates/jxl_wgpu_encode/tests/lossless_layouts/squeeze.rs)
+contains six GPU tests for explicit local horizontal, vertical and separable two-axis Squeeze in
+both orders. Thirty-two geometry cases cross both MA-tree modes and Gray/GrayAlpha/RGB/RGBA,
+with fused and separate groups, odd tails and single-pixel edge axes. Four 1×1 cases and two
+257×257 cases additionally cover both axes elided and variable channel counts at each corner.
+Such axes are skipped before
+dispatch and header serialization, including when the second axis would otherwise transform an
+empty residual. Forty-two composition cases cover every RCT type while rotating global/local RCT,
+all 14 predictors, custom Weighted parameters, all four group sizes and both LZ77 policies.
+Packed/planar/split, reversed, shifted big-endian input retains canonical packed bytes.
+
+Another 31 cases exercise every integer precision with bounded differences at the full-depth
+maximum, so wide sums and exact words beyond F32 precision are retained. Four binary16 cases use
+mixed IEEE special words, and eight binary32 cases hold each selected special word in its component
+plane, exercising signed-wide averages without requiring an unrepresentable difference between
+opposite i32 extremes. jxl-oxide compares every original working word, libjxl 0.12.0 checks original
+components at the unchanged integer `2e-7` bound or exact IEEE F32 bits, and whole/256-byte-window
+fragmented GPU numeric output compares every component after session drop. These cases establish
+the checked representable domain, not unrestricted Squeeze of every 32-bit word sequence.
+
+Two three-frame integer16 Replace animations and two finite binary32 cropped Add/Multiply
+sequences cover both axis orders, independent references, timing/timecodes, reverse insertion and
+retained output. Native/Rust composition retains the existing `3e-6` color and `4e-7` alpha bounds.
+Eight resident/streamed cases cover all group sizes, Weighted plus greedy LZ77, exact/one-byte-short
+budgets, unique source retirement after cancellation, deterministic blocking/Future output and
+buffer-pool reuse, including variable channel counts in the final edge group.
+
+Eight resident/streamed negative cases create an unrepresentable signed-32 residual under all four
+axis policies and both entropy policies. Streamed errors occur after earlier valid batches.
+Completion returns `BackendError::ModularSqueezeOverflow`, publishes no codestream, releases source,
+reservation and pool lease, and allows a valid encode to reuse the same encoder afterward. No
+existing fixture, tolerance or independent oracle is changed. Default `None` retains the existing
+byte-identity tests; explicit Squeeze omits the private Gray8 acceleration index.
+
+```console
+JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossless_layouts squeeze:: -- --test-threads=2
+```
+
+`MOD-E02` remains **Partial**. This is a local, caller-selected transform after RCT, without
+content analysis, cross-group Squeeze, general stacks, Palette or progressive Modular encoding.
 
 ## Lossless Modular predictors
 

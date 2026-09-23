@@ -75,6 +75,7 @@ fn independent_decoder_reads_general_lz77_distances_and_overlaps() {
             LosslessModularFormat::Gray,
             31,
             LosslessModularPredictor::Zero,
+            LosslessModularSqueeze::None,
             &raw_counts,
             &lz77_counts,
         )

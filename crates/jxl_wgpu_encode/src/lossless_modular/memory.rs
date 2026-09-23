@@ -13,7 +13,8 @@ pub struct LosslessModularMemoryPlan {
     pub exponent_bits_per_sample: u8,
     /// Largest storage word containing a component (`1`, `2`, `3`, or `4` bytes).
     pub bytes_per_sample: u8,
-    /// Number of independently tokenized Modular channels (1 through 4).
+    /// Maximum independently tokenized channels in any group after Squeeze (1 through 16).
+    /// Single-pixel edge axes are skipped, so individual groups may contain fewer channels.
     pub channel_count: u32,
     /// Union of the full source plane binding ranges, excluding gaps between planes.
     pub source_binding_bytes: u64,

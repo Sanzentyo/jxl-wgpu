@@ -10,6 +10,7 @@ mod lz77;
 mod predictors;
 mod rct;
 mod source;
+mod squeeze;
 
 use std::num::NonZeroU64;
 use std::sync::Arc;

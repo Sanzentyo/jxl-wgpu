@@ -16,6 +16,7 @@ use super::serializer::{
     ValidatedModularArtifact, accumulate_artifact_histograms, build_distance_code, build_packets,
     build_prefix_codes, parse_group_artifact, parse_group_artifact_header,
 };
+use super::squeeze::LosslessModularSqueeze;
 use super::types::{LosslessModularFormat, LosslessModularTreeMode, ModularParams};
 use crate::buffer_pool::EncoderBufferPool;
 use crate::prefix::{LZ77_SYMBOLS, RAW_SYMBOLS};
@@ -122,6 +123,7 @@ impl StreamingModularWorker {
             self.plan.format,
             self.plan.bits_per_sample,
             self.plan.predictor,
+            self.plan.squeeze,
             &aggregate_raw,
             &aggregate_lz77,
         )?;
@@ -142,6 +144,7 @@ impl StreamingModularWorker {
                 exponent_bits_per_sample: self.plan.exponent_bits_per_sample,
                 tree_mode: self.plan.tree_mode,
                 rct: self.plan.rct,
+                squeeze: self.plan.squeeze,
                 predictor: self.plan.predictor,
                 weighted_predictor: self.plan.weighted_predictor,
                 lz77: self.plan.lz77,
@@ -391,8 +394,6 @@ fn accumulate_streaming_batch_histograms(
     aggregate_lz77: &mut [[u64; LZ77_SYMBOLS]; 4],
     aggregate_distance: &mut [u64; RAW_SYMBOLS],
 ) -> Result<(), EncodeError> {
-    let channels = usize::try_from(plan.format.channel_count())
-        .map_err(|_| EncodeError::Backend("Modular channel count overflow".into()))?;
     let end_dispatch = batch
         .first_dispatch
         .checked_add(batch.dispatch_count)
@@ -406,7 +407,7 @@ fn accumulate_streaming_batch_histograms(
         let artifact_bytes = streaming_artifact_bytes(group_plan, batch, bytes)?;
         let header = parse_group_artifact_header(group_plan.max_events, artifact_bytes)?;
         accumulate_artifact_histograms(
-            dispatch % channels,
+            group_plan.channel as usize,
             &ValidatedModularArtifact {
                 header,
                 events: &[],
@@ -425,27 +426,27 @@ fn serialize_streaming_batch(
     bytes: &[u8],
     assembler: &mut ModularPacketAssembler,
 ) -> Result<(), EncodeError> {
-    let channels = usize::try_from(plan.format.channel_count())
-        .map_err(|_| EncodeError::Backend("Modular channel count overflow".into()))?;
-    if !batch.first_dispatch.is_multiple_of(channels)
-        || !batch.dispatch_count.is_multiple_of(channels)
-    {
-        return Err(EncodeError::Backend(
-            "streaming batch splits a Modular channel group".into(),
-        ));
-    }
     let end_dispatch = batch
         .first_dispatch
         .checked_add(batch.dispatch_count)
         .ok_or(EncodeError::InvalidSource(
             "artifact batch dispatch range overflow",
         ))?;
-    for first_channel in (batch.first_dispatch..end_dispatch).step_by(channels) {
-        let mut artifacts = Vec::with_capacity(channels);
-        for dispatch in first_channel..first_channel + channels {
-            let group_plan = plan.groups.get(dispatch).ok_or(EncodeError::InvalidSource(
+    let group_plans =
+        plan.groups
+            .get(batch.first_dispatch..end_dispatch)
+            .ok_or(BackendError::Invariant(
                 "artifact batch dispatch range is invalid",
             ))?;
+    for channels in group_plans.chunk_by(|a, b| a.group_index == b.group_index) {
+        let mut artifacts = Vec::with_capacity(channels.len());
+        for (channel, group_plan) in channels.iter().enumerate() {
+            if group_plan.channel != channel as u32 {
+                return Err(BackendError::Invariant(
+                    "streaming batch splits a Modular channel group",
+                )
+                .into());
+            }
             artifacts.push(parse_group_artifact(
                 group_plan.width,
                 group_plan.height,
@@ -453,9 +454,7 @@ fn serialize_streaming_batch(
                 streaming_artifact_bytes(group_plan, batch, bytes)?,
             )?);
         }
-        let group_index = u32::try_from(first_channel / channels)
-            .map_err(|_| EncodeError::Backend("Modular group index overflow".into()))?;
-        assembler.push_group(group_index, &artifacts)?;
+        assembler.push_group(channels[0].group_index, &artifacts)?;
     }
     Ok(())
 }
@@ -673,6 +672,7 @@ pub(super) struct ResidentLosslessModularJob {
     pub(super) exponent_bits_per_sample: u8,
     pub(super) tree_mode: LosslessModularTreeMode,
     pub(super) rct: Option<ResolvedRct>,
+    pub(super) squeeze: LosslessModularSqueeze,
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
     pub(super) lz77: LosslessModularLz77,
@@ -780,6 +780,7 @@ impl BrowserStreamingLosslessModularJob {
             self.plan.format,
             self.plan.bits_per_sample,
             self.plan.predictor,
+            self.plan.squeeze,
             &self.aggregate_raw,
             &self.aggregate_lz77,
         )?;
@@ -793,6 +794,7 @@ impl BrowserStreamingLosslessModularJob {
                 exponent_bits_per_sample: self.plan.exponent_bits_per_sample,
                 tree_mode: self.plan.tree_mode,
                 rct: self.plan.rct,
+                squeeze: self.plan.squeeze,
                 predictor: self.plan.predictor,
                 weighted_predictor: self.plan.weighted_predictor,
                 lz77: self.plan.lz77,
@@ -928,6 +930,7 @@ impl ResidentLosslessModularJob {
             exponent_bits_per_sample: self.exponent_bits_per_sample,
             tree_mode: self.tree_mode,
             rct: self.rct,
+            squeeze: self.squeeze,
             predictor: self.predictor,
             weighted_predictor: self.weighted_predictor,
             lz77: self.lz77,
