@@ -35,6 +35,9 @@ pub struct LosslessModularMemoryPlan {
     pub palette_scratch_bytes: u64,
     /// Peak explicit transform operation tables and live sample arenas, included in artifact bytes.
     pub transform_scratch_bytes: u64,
+    /// Peak GPU ANS output capacity, already included in artifact bytes; zero for Prefix.
+    /// Immutable ANS tables and descriptors are included in `parameter_storage_bytes`.
+    pub ans_output_bytes: u64,
     /// Sum of the worst-case artifact ranges across every batch. This is diagnostic only; the
     /// encoder never allocates the sum as one GPU buffer.
     pub total_artifact_bytes: u64,
@@ -47,6 +50,7 @@ pub struct LosslessModularMemoryPlan {
     /// Actual `wgpu::Queue::submit` calls made by this job. Resident jobs submit once; streamed
     /// jobs submit every batch once for histogram aggregation and once for serialization.
     pub gpu_submission_count: u32,
+    /// Two-pass scheduling, selected for multiple batches or GPU ANS even with one batch.
     pub streaming: bool,
     /// Caller-owned ICC bytes retained by the source/descriptor; zero for enumerated color.
     pub icc_profile_bytes: u64,

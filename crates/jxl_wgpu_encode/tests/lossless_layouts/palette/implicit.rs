@@ -23,6 +23,7 @@ fn implicit_cubes_cover_every_interoperable_depth_and_component_count() {
             let encoder = LosslessModularEncoder::with_config(
                 rig.context.clone(),
                 LosslessModularConfig {
+                    entropy: Default::default(),
                     palette: Some(Palette::implicit(1, delta_predictor).unwrap()),
                     predictor: Predictor::ALL[(variant + 7) % 14],
                     weighted_predictor: Weighted::new([31, 0, 17, 3, 11, 31, 1], [0, 15, 7, 12])
@@ -162,6 +163,7 @@ fn implicit_policy_composes_rct_all_predictors_squeeze_and_ieee_special_words() 
         let encoder = LosslessModularEncoder::with_config(
             rig.context.clone(),
             LosslessModularConfig {
+                entropy: Default::default(),
                 palette: Some(
                     Palette::implicit(4096, Predictor::ALL[value as usize % 14]).unwrap(),
                 ),
@@ -331,6 +333,7 @@ fn implicit_palette_hash_obeys_exact_admission_cancellation_and_pool_reuse() {
         check_lifetime(
             &rig,
             LosslessModularConfig {
+                entropy: Default::default(),
                 palette: Some(Palette::implicit(4096, Predictor::Weighted).unwrap()),
                 local_transforms: SQUEEZES[index + 1].clone().into(),
                 group_size,

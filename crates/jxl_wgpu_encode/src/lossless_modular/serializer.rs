@@ -11,6 +11,7 @@ use jxl_gpu_bitstream::{
 use super::color::{LosslessModularColorOptions, ModularColorEncoding, ModularImageMetadata};
 use super::dispatch::frame_covers_canvas;
 use super::dispatch::{LosslessModularBackend, ModularGroupPlan};
+use super::entropy::{EncodedGroup, EntropyCode};
 use super::grid::{LosslessModularGroup, LosslessModularGroupGrid};
 use super::icc::{DEFAULT_PROFILE_LIMIT, PreparedImageHeader};
 use super::lz77::LosslessModularLz77;
@@ -838,8 +839,7 @@ pub(super) struct ModularPacketAssembler {
     weighted_predictor: LosslessModularWeightedPredictor,
     lz77: LosslessModularLz77,
     frame: ModularFrameHeader,
-    codes: [PrefixCode; 4],
-    distance_code: Option<DistanceCode>,
+    entropy: Arc<EntropyCode>,
     packets: Vec<GroupPacket>,
     single_group: Option<BitWriter>,
     token_bit_offset_in_group: u64,
@@ -864,8 +864,7 @@ pub(super) struct ModularPacketConfig {
 impl ModularPacketAssembler {
     pub(super) fn new(
         config: ModularPacketConfig,
-        codes: [PrefixCode; 4],
-        distance_code: Option<DistanceCode>,
+        entropy: Arc<EntropyCode>,
     ) -> Result<Self, EncodeError> {
         let ModularPacketConfig {
             width,
@@ -881,7 +880,7 @@ impl ModularPacketAssembler {
             lz77,
             frame,
         } = config;
-        if distance_code.is_some() != (lz77 == LosslessModularLz77::Greedy) {
+        if !entropy.matches_lz77(lz77) {
             return Err(invalid_gpu_artifact(
                 "distance code does not match LZ77 policy",
             ));
@@ -895,15 +894,15 @@ impl ModularPacketAssembler {
             let mut dc_global = BitWriter::new();
             write_dc_global(
                 &mut dc_global,
-                &codes,
+                &entropy,
                 TransformHeader {
                     operations: &transforms.global_operations,
                     palette_counts: None,
                 },
                 predictor,
                 weighted_predictor,
-                distance_code.as_ref(),
             )?;
+            entropy.write_empty_stream(&mut dc_global)?;
             dc_global.align_to_byte()?;
             packets.push(GroupPacket::new(
                 GroupPacketKind::DcGlobal,
@@ -932,8 +931,7 @@ impl ModularPacketAssembler {
             weighted_predictor,
             lz77,
             frame,
-            codes,
-            distance_code,
+            entropy,
             packets,
             single_group,
             token_bit_offset_in_group,
@@ -941,10 +939,16 @@ impl ModularPacketAssembler {
         })
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub(super) fn entropy(&self) -> &EntropyCode {
+        &self.entropy
+    }
+
     pub(super) fn push_group(
         &mut self,
         group_index: u32,
         artifacts: &[ValidatedModularArtifact<'_>],
+        encoded: Option<EncodedGroup<'_>>,
     ) -> Result<(), EncodeError> {
         if group_index != self.next_group {
             return Err(EncodeError::Backend(
@@ -973,25 +977,17 @@ impl ModularPacketAssembler {
         if let Some(group) = &mut self.single_group {
             write_dc_global(
                 group,
-                &self.codes,
+                &self.entropy,
                 TransformHeader {
                     operations: &topology.operations,
                     palette_counts,
                 },
                 self.predictor,
                 self.weighted_predictor,
-                self.distance_code.as_ref(),
             )?;
             self.token_bit_offset_in_group = u64::try_from(group.bit_len())
                 .map_err(|_| EncodeError::Backend("gray8 token offset overflow".into()))?;
-            for (channel, artifact) in artifacts.iter().enumerate() {
-                write_events(
-                    group,
-                    &self.codes[channel.min(3)],
-                    self.distance_code.as_ref(),
-                    artifact.events,
-                )?;
-            }
+            self.entropy.write_stream(group, artifacts, encoded)?;
         } else {
             let mut pass_group = BitWriter::new();
             let use_global_tree = self.tree_mode == LosslessModularTreeMode::SharedGlobal;
@@ -1006,21 +1002,10 @@ impl ModularPacketAssembler {
                 },
             )?;
             if !use_global_tree {
-                write_ma_config(
-                    &mut pass_group,
-                    &self.codes,
-                    self.predictor,
-                    self.distance_code.as_ref(),
-                )?;
+                write_ma_config(&mut pass_group, &self.entropy, self.predictor)?;
             }
-            for (channel, artifact) in artifacts.iter().enumerate() {
-                write_events(
-                    &mut pass_group,
-                    &self.codes[channel.min(3)],
-                    self.distance_code.as_ref(),
-                    artifact.events,
-                )?;
-            }
+            self.entropy
+                .write_stream(&mut pass_group, artifacts, encoded)?;
             pass_group.align_to_byte()?;
             self.packets.push(GroupPacket::new(
                 GroupPacketKind::AcGroup {
@@ -1060,20 +1045,24 @@ impl ModularPacketAssembler {
                     group.into_bytes(),
                 )],
             )?;
-            let acceleration = (self.format == LosslessModularFormat::Gray
-                && self.bits_per_sample == 8
-                && self.exponent_bits_per_sample == 0
-                && self.predictor == LosslessModularPredictor::Gradient
-                && !self.transforms.extended_prediction_domain
-                && self.lz77 == LosslessModularLz77::ZeroRuns)
-                .then(|| GpuAccelerationArtifact::Gray8Prefix {
-                    width: self.width,
-                    height: self.height,
-                    token_bit_offset_in_group: self.token_bit_offset_in_group,
-                    token_bit_len,
-                    raw_prefix: std::array::from_fn(|index| self.codes[0].raw_entries()[index]),
-                    lz77_prefix: self.codes[0].lz77_entries(),
-                });
+            let acceleration = if let EntropyCode::Prefix { codes, .. } = &*self.entropy {
+                (self.format == LosslessModularFormat::Gray
+                    && self.bits_per_sample == 8
+                    && self.exponent_bits_per_sample == 0
+                    && self.predictor == LosslessModularPredictor::Gradient
+                    && !self.transforms.extended_prediction_domain
+                    && self.lz77 == LosslessModularLz77::ZeroRuns)
+                    .then(|| GpuAccelerationArtifact::Gray8Prefix {
+                        width: self.width,
+                        height: self.height,
+                        token_bit_offset_in_group: self.token_bit_offset_in_group,
+                        token_bit_len,
+                        raw_prefix: std::array::from_fn(|index| codes[0].raw_entries()[index]),
+                        lz77_prefix: codes[0].lz77_entries(),
+                    })
+            } else {
+                None
+            };
             return Ok((packets, acceleration));
         }
         let layout = FrameGroupLayout::new(self.group_grid.lf_groups, self.group_grid.groups, 1)?;
@@ -1162,8 +1151,10 @@ pub(super) fn build_packets(
             lz77,
             frame: frame.clone(),
         },
-        codes,
-        build_distance_code(lz77, &aggregate_distance)?,
+        Arc::new(EntropyCode::Prefix {
+            codes: Box::new(codes),
+            distance: build_distance_code(lz77, &aggregate_distance)?,
+        }),
     )?;
     let mut start = 0;
     for group in group_grid.ordered_groups() {
@@ -1177,7 +1168,7 @@ pub(super) fn build_packets(
                 .into());
             }
         }
-        assembler.push_group(group.index, &artifacts[start..end])?;
+        assembler.push_group(group.index, &artifacts[start..end], None)?;
         start = end;
     }
     assembler.finish()
@@ -1475,17 +1466,16 @@ struct TransformHeader<'a> {
 
 fn write_dc_global(
     output: &mut BitWriter,
-    codes: &[PrefixCode; 4],
+    entropy: &EntropyCode,
     transforms: TransformHeader<'_>,
     predictor: LosslessModularPredictor,
     weighted_predictor: LosslessModularWeightedPredictor,
-    distance_code: Option<&DistanceCode>,
 ) -> Result<(), EncodeError> {
     // Handcrafted Modular metadata adapted from zune-jpegxl 0.5.2. See this crate's
     // `THIRD_PARTY.md` and `LICENSES/zune-jpegxl-MIT.txt`.
     output.write_bits(1, 1)?; // default LF-channel dequantization
     output.write_bits(1, 1)?; // GlobalModular is present
-    write_ma_config(output, codes, predictor, distance_code)?;
+    write_ma_config(output, entropy, predictor)?;
     output.write_bits(1, 1)?;
     write_weighted_predictor(output, weighted_predictor)?;
     write_transforms(output, transforms)
@@ -1664,11 +1654,10 @@ fn write_transform_begin(output: &mut BitWriter, begin: u32) -> Result<(), Encod
     Ok(())
 }
 
-fn write_ma_config(
+pub(super) fn write_ma_config(
     output: &mut BitWriter,
-    codes: &[PrefixCode; 4],
+    entropy: &EntropyCode,
     predictor: LosslessModularPredictor,
-    distance_code: Option<&DistanceCode>,
 ) -> Result<(), EncodeError> {
     let gradient = predictor == LosslessModularPredictor::Gradient;
     output.write_bits(0, 1)?;
@@ -1733,6 +1722,13 @@ fn write_ma_config(
     for context in [4, 3, 2, 1, 0] {
         output.write_bits(context, 3)?;
     }
+    let EntropyCode::Prefix { codes, distance } = entropy else {
+        return entropy
+            .ans()
+            .expect("ANS entropy variant")
+            .write_histograms(output);
+    };
+    let distance_code = distance.as_ref();
     output.write_bits(1, 1)?;
     output.write_bits(0, 4)?;
     for _ in 0..4 {
@@ -1758,7 +1754,7 @@ fn write_ma_config(
         output.write_bits(0, 2)?;
         output.write_bits(1, 1)?;
     }
-    for code in codes {
+    for code in codes.iter() {
         code.write_tree(output)?;
     }
     Ok(())

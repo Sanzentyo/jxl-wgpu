@@ -23,6 +23,7 @@ fn ranges(channels: u32) -> impl Iterator<Item = (u32, u32)> {
 
 fn config(policy: Palette, begin: u32, count: u32, variant: usize) -> LosslessModularConfig {
     LosslessModularConfig {
+        entropy: Default::default(),
         palette: Some(policy.with_components(begin, count).unwrap()),
         group_size: Size::ALL[variant % 4],
         tree_mode: TREES[variant % 2],

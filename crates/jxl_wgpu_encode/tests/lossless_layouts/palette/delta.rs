@@ -7,6 +7,7 @@ fn delta_palette_scratch_obeys_exact_admission_cancellation_and_pool_reuse() {
         check_lifetime(
             &rig,
             LosslessModularConfig {
+                entropy: Default::default(),
                 palette: Some(Palette::deltas(4096, Predictor::Weighted).unwrap()),
                 local_transforms: SQUEEZES[index + 1].clone().into(),
                 group_size,
@@ -62,6 +63,7 @@ fn delta_palette_composes_every_predictor_rct_precision_and_squeeze_policy() {
         let encoder = LosslessModularEncoder::with_config(
             rig.context.clone(),
             LosslessModularConfig {
+                entropy: Default::default(),
                 palette: Some(Palette::deltas(4096, Predictor::ALL[value as usize % 14]).unwrap()),
                 predictor: Predictor::ALL[(value as usize + 7) % 14],
                 weighted_predictor: Weighted::new([31, 0, 17, 3, 11, 31, 1], [0, 15, 7, 12])

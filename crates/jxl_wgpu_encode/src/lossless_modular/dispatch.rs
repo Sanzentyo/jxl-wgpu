@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use jxl_gpu_bitstream::BitWriter;
 
+use super::entropy::{EntropyArtifactPlan, EntropyBatchPlan, LosslessModularEntropyCoding};
 use super::grid::LosslessModularGroupGrid;
 use super::lz77::LosslessModularLz77;
 use super::memory::{
@@ -42,6 +43,7 @@ pub(super) struct ModularGroupPlan {
     pub(super) palette: Option<PaletteArtifactPlan>,
     pub(super) transform_metadata_words: u32,
     pub(super) transform_scratch_bytes: u64,
+    pub(super) entropy: Option<EntropyArtifactPlan>,
 }
 
 struct ModularChannelLayout {
@@ -92,6 +94,7 @@ pub(super) struct ModularDispatchBatch {
     pub(super) artifact_binding_size: NonZeroU64,
     pub(super) source_windows: ModularSourceWindows,
     pub(super) parameter_bytes: u64,
+    pub(super) entropy: Option<EntropyBatchPlan>,
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +110,7 @@ pub(super) struct ModularDispatchPlan {
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
     pub(super) lz77: LosslessModularLz77,
+    pub(super) entropy: LosslessModularEntropyCoding,
     pub(super) parameters: Vec<ModularParams>,
     pub(super) groups: Vec<ModularGroupPlan>,
     pub(super) batches: Vec<ModularDispatchBatch>,
@@ -120,9 +124,11 @@ pub(super) struct ModularDispatchPlan {
 /// planar or split storage with explicit swizzles, bit positions and word byte order. Samples
 /// have one common 1-31-bit integer or binary16/binary32 precision.
 /// The selected reversible color transform operates on source words. The GPU
-/// emits predictor residual tokens and histograms; the host only serializes those artifacts.
+/// emits predictor residual tokens and histograms, then optionally serializes ANS on GPU.
+/// The host validates artifacts and assembles the selected entropy stream.
 pub struct LosslessModularBackend {
     pipeline: Option<Arc<wgpu::ComputePipeline>>,
+    pub(super) ans_pipeline: Option<Arc<wgpu::ComputePipeline>>,
     pub(super) buffer_pool: Arc<EncoderBufferPool>,
     capabilities: EncoderCapabilities,
     max_storage_binding_size: u64,
@@ -194,6 +200,9 @@ impl LosslessModularBackend {
                 ))
             });
         Self {
+            ans_pipeline: (pipeline.is_some()
+                && config.entropy == LosslessModularEntropyCoding::Ans)
+                .then(|| super::entropy::pipeline(context)),
             pipeline,
             buffer_pool: EncoderBufferPool::new(DEFAULT_ENCODER_BUFFER_POOL_BYTES),
             capabilities: EncoderCapabilities {
@@ -211,13 +220,19 @@ impl LosslessModularBackend {
                 max_progressive_passes: 1,
                 animation: true,
                 determinism: Determinism::CrossDevice,
-                implemented_stages: vec![
+                implemented_stages: [
                     KernelStage::ColorTransform,
                     KernelStage::ModularTransform,
                     KernelStage::ModularPrediction,
                     KernelStage::ModularResidualTokenization,
                     KernelStage::HistogramReduction,
-                ],
+                ]
+                .into_iter()
+                .chain(
+                    (config.entropy == LosslessModularEntropyCoding::Ans)
+                        .then_some(KernelStage::AnsSerialization),
+                )
+                .collect(),
             },
             max_storage_binding_size: limits.max_storage_buffer_binding_size,
             max_storage_buffers_per_shader_stage: limits.max_storage_buffers_per_shader_stage,
@@ -362,7 +377,7 @@ impl LosslessModularBackend {
             let proposed_source_windows = batch_source_windows.merge(group_source.windows);
             let mut palette_counts_byte_offset = None;
             let mut transform_program_byte_offset = None;
-            let layouts = topology
+            let mut layouts = topology
                 .channels
                 .iter()
                 .enumerate()
@@ -388,6 +403,20 @@ impl LosslessModularBackend {
                     Ok(layout)
                 })
                 .collect::<Result<Vec<_>, EncodeError>>()?;
+            let entropy = if self.config.entropy == LosslessModularEntropyCoding::Ans {
+                let events = layouts.iter().try_fold(0u64, |sum, layout| {
+                    sum.checked_add(layout.max_events as u64)
+                        .ok_or(EncodeError::InvalidSource("ANS event capacity overflow"))
+                })?;
+                let entropy = EntropyArtifactPlan::for_events(layouts[0].output_size, events)?;
+                layouts[0].output_size =
+                    layouts[0].output_size.checked_add(entropy.bytes()).ok_or(
+                        EncodeError::InvalidSource("ANS artifact allocation overflow"),
+                    )?;
+                Some(entropy)
+            } else {
+                None
+            };
             let mut proposed_output_size = output_size;
             for layout in &layouts {
                 proposed_output_size = align_up(proposed_output_size, artifact_alignment)
@@ -563,6 +592,7 @@ impl LosslessModularBackend {
                     },
                 });
                 groups.push(ModularGroupPlan {
+                    entropy: if channel == 0 { entropy } else { None },
                     transform_metadata_words: if channel == 0 {
                         topology
                             .transform_program
@@ -623,6 +653,27 @@ impl LosslessModularBackend {
                     .ok_or(EncodeError::InvalidSource(
                         "transform parameter size overflow",
                     ))?;
+            }
+            if self.config.entropy == LosslessModularEntropyCoding::Ans {
+                let parameter_offset =
+                    align_up(batch.parameter_bytes, self.storage_offset_alignment).ok_or(
+                        EncodeError::InvalidSource("ANS parameter alignment overflow"),
+                    )?;
+                let group_count = groups
+                    [batch.first_dispatch..batch.first_dispatch + batch.dispatch_count]
+                    .iter()
+                    .filter(|group| group.entropy.is_some())
+                    .count() as u32;
+                let entropy = EntropyBatchPlan {
+                    parameter_offset,
+                    group_count,
+                };
+                batch.parameter_bytes = parameter_offset
+                    .checked_add(entropy.bytes(batch.dispatch_count))
+                    .ok_or(EncodeError::InvalidSource(
+                        "ANS parameter allocation overflow",
+                    ))?;
+                batch.entropy = Some(entropy);
             }
         }
         let parameter_storage_bytes = batches
@@ -729,7 +780,7 @@ impl LosslessModularBackend {
             .ok_or(EncodeError::InvalidSource("per-job memory size overflow"))?;
         let batch_count = u32::try_from(batches.len())
             .map_err(|_| EncodeError::InvalidSource("artifact batch count overflow"))?;
-        let streaming = batch_count > 1;
+        let streaming = batch_count > 1 || self.config.entropy == LosslessModularEntropyCoding::Ans;
         let gpu_submission_count = if streaming {
             batch_count
                 .checked_mul(2)
@@ -751,6 +802,17 @@ impl LosslessModularBackend {
             weighted_predictor_scratch_bytes,
             lz77_scratch_bytes,
             palette_scratch_bytes,
+            ans_output_bytes: batches
+                .iter()
+                .map(|batch| {
+                    groups[batch.first_dispatch..batch.first_dispatch + batch.dispatch_count]
+                        .iter()
+                        .filter_map(|group| group.entropy)
+                        .map(EntropyArtifactPlan::bytes)
+                        .sum()
+                })
+                .max()
+                .unwrap_or(0),
             transform_scratch_bytes: batches
                 .iter()
                 .map(|batch| {
@@ -773,6 +835,7 @@ impl LosslessModularBackend {
             addressed_bytes_per_job,
         };
         Ok(ModularDispatchPlan {
+            entropy: self.config.entropy,
             width: extent.width,
             height: extent.height,
             group_grid,
@@ -846,6 +909,7 @@ fn modular_dispatch_batch(
         )?;
     }
     Ok(ModularDispatchBatch {
+        entropy: None,
         parameter_bytes: dispatch_count as u64 * std::mem::size_of::<ModularParams>() as u64,
         first_dispatch,
         dispatch_count,

@@ -1100,8 +1100,58 @@ by the existing byte-identical Gray8 fixture and other prior matrices.
 JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --lib --test lossless_layouts --no-fail-fast lz77 -- --test-threads=2
 ```
 
-`ENT-E01` remains **Partial**. GPU ANS writing, histogram/context clustering, hybrid-uint choice,
+`ENT-E01` remains **Partial**. Histogram/context clustering, hybrid-uint choice,
 cross-channel matching and broader effort policies are not provided by this fixed greedy search.
+GPU ANS serialization is covered separately below.
+
+## Lossless Modular GPU ANS encoding
+
+`lossless_layouts::ans` selects GPU ANS explicitly while retaining default Prefix fixture bytes.
+Its eight tests cover Gray/GrayAlpha/RGB/RGBA, all integer depths 1–31 and IEEE16/32 special words,
+all 14 predictors with custom Weighted coefficients, all 42 global/local RCT types, all group sizes,
+both MA placements and both LZ77 policies. Packed/planar/split layouts with poisoned padding,
+unaligned pitches, reversed components and big-endian words must emit the same bytes as canonical
+input. Single/multiple groups, one-pixel axes, empty residual planes, selected-component
+color/delta/mixed/implicit Palette and ordered RCT/Squeeze programs share complete group states.
+
+jxl-oxide checks original integer/IEEE words and libjxl 0.12.0 checks original F32 output under the
+unchanged `2e-7` integer and exact IEEE bounds. Delta/mixed/implicit Palette additionally requires
+the pinned scalar native word oracle. Whole and 256-byte-window fragmented GPU output retain their
+existing exact component/bit comparisons. Replace animations preserve physical words and timing;
+cropped Add/Multiply composition keeps the existing native/Rust comparison bounds.
+
+The generic ANS table test checks every one of 4096 alias residues with the independent
+`jxl-coding` decoder for empty, every unary symbol, sparse binary, uniform and skewed distributions,
+including `u64::MAX` counts and every active alphabet size. It also checks exact histogram cursor
+consumption and deterministic normalization. A real GPU serialization test uses five channel
+contexts including an empty channel, all raw token/extra-bit widths through token 32, LZ77 length
+31, overlap, a `2^20 - 7` distance, and context changes under width multipliers 1/17/1024. Independent
+entropy decoding must consume exactly the fragment bits and finish at the normative ANS state.
+A sentinel catches writes past output capacity; one-word output and absent symbols must fail.
+Malformed completion records, missing events, truncation and nonzero tail bits cannot become packets.
+
+The native word helper now handles the retained zero-symbol DC-global ANS state produced by
+libjxl's `EncodeStream`/`WriteTokens`: its generic Modular decoder returns before reading that state
+when no global samples exist. The helper invokes the unchanged native `ANSSymbolReader` and final
+state check before its strict section-end check. It does not decode any image values itself or
+ignore extra bytes. A regression corrupts both ends of the 32-bit state and unaligned padding;
+both this oracle and whole/fragmented GPU decoding must reject every mutation without publishing
+an image. No native entropy, inverse-transform or reference arithmetic is replaced.
+
+One/multiple-batch ANS jobs check exactly two submissions per batch, compressed-storage accounting,
+one-byte-short rejection before allocation, exact-budget completion, cancellation/source retirement
+and buffer reuse. Late Palette/Squeeze overflow after valid batches returns typed errors with no
+codestream and permits subsequent reuse. Tests run with two libtest threads on the actual adapter.
+
+```console
+cargo test --locked -p jxl_wgpu_encode --lib ans:: -- --test-threads=2
+cargo test --locked -p jxl_wgpu_encode --lib lossless_modular::entropy::tests -- --test-threads=2
+JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossless_layouts ans:: -- --test-threads=2
+```
+
+`ENT-E01` remains **Partial** for clustering, adaptive hybrid configurations, cross-channel search
+and effort selection. This evidence makes no throughput or compression-ratio claim.
+
 
 ## Procedural VarDCT encoder matrix
 

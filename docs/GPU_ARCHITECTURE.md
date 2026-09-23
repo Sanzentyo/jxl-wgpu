@@ -46,6 +46,14 @@ GPU image source -> GPU prediction/transform/quantization/tokenization
                  -> deterministic group packet assembly -> JPEG XL codestream/container
 ```
 
+The lossless Modular encoder's explicit ANS policy adds a frame histogram/codebook barrier and a
+GPU serialization pass per batch. A checked plan reserves compressed output and immutable tables
+inside the existing parameter/artifact/readback lease. One invocation owns a complete group's ANS
+state across its transformed channels; validated fragments alone reach packet assembly. Native and
+browser scheduling retain the same cancellation and byte-budget boundary. Prefix remains the
+default. The [encoder architecture](ENCODER_ARCHITECTURE.md#entropy-planning-and-ans-serialization)
+owns the coding and planning contract.
+
 The lossless Modular encoder can apply caller-selected local Squeeze after RCT, computing one or
 two separable axes directly from source words in the token kernel. Signed-wide averages/tendencies
 require no intermediate image allocation or pixel readback. Each group skips single-pixel axes;

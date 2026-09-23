@@ -75,6 +75,7 @@ fn greedy_lz77_preserves_every_predictor_with_integer_ieee_and_rct_words() {
                 let encoder = LosslessModularEncoder::with_config(
                     rig.context.clone(),
                     LosslessModularConfig {
+                        entropy: Default::default(),
                         lz77: Lz77::Greedy,
                         local_transforms: Default::default(),
                         palette: None,
@@ -196,6 +197,7 @@ fn greedy_lz77_keeps_streamed_admission_cancellation_and_reuse() {
         let encoder = LosslessModularEncoder::with_config(
             rig.context.clone(),
             LosslessModularConfig {
+                entropy: Default::default(),
                 lz77: Lz77::Greedy,
                 local_transforms: Default::default(),
                 palette: None,
@@ -234,6 +236,7 @@ fn greedy_lz77_keeps_animation_words_crops_and_independent_references() {
         let encoder = LosslessModularEncoder::with_config(
             rig.context.clone(),
             LosslessModularConfig {
+                entropy: Default::default(),
                 lz77: Lz77::Greedy,
                 local_transforms: Default::default(),
                 palette: None,

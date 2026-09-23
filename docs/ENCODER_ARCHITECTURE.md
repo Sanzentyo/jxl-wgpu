@@ -16,9 +16,10 @@ samples, form residuals, transform or quantize coefficients, tokenize image data
 histograms, or silently replace a failed GPU job.
 
 For the executable profile, `lossless_modular.wgsl` reads the caller's `wgpu::Buffer` and performs
-reversible color transform, the Gradient predictor, packed-signed residual mapping, zero-run
-formation, hybrid-uint tokenization, and histogram accumulation. Rust reads only the resulting
-entropy artifacts and serializes standard JPEG XL metadata, prefix trees, TOC, and group bytes. A
+reversible transforms, the selected predictor, packed-signed residual mapping, ZeroRuns or Greedy
+LZ77, hybrid-uint tokenization, and histogram accumulation. Rust builds bounded entropy metadata
+and validates artifacts. Prefix assembles validated events on the host; ANS serializes complete
+groups on GPU before host fragment/TOC/container assembly. A
 GPU mapping or shader failure is an encode failure.
 
 The repository does not vendor or retain `libjxl` as an upstream source tree. The production crates
@@ -41,12 +42,12 @@ implementation audits.
 | Animation | `true` (5 blend modes, signed crop, 4 reference slots, timecodes) |
 | Determinism | `CrossDevice` integer GPU artifacts and deterministic host assembly |
 | Progressive passes | `max_progressive_passes = 1` |
-| Implemented stages | `ColorTransform`, `ModularTransform`, `ModularPrediction`, `ModularResidualTokenization`, `HistogramReduction` |
-| Predictor | JPEG XL Gradient predictor |
+| Implemented stages | `ColorTransform`, `ModularTransform`, `ModularPrediction`, `ModularResidualTokenization`, `HistogramReduction`, plus `AnsSerialization` when selected |
+| Predictor | All 14 explicit standard predictors and caller-selected Weighted coefficients; default Gradient |
 | Modular transforms | caller-selected none or any of 42 RCT types in DC-global or each pass group; default YCoCg for integer RGB(A), none for Gray/GrayAlpha or IEEE samples |
-| Entropy | JPEG XL prefix code with LZ77 distance 1, not ANS; fixed MA tree |
+| Entropy | Default Prefix or GPU ANS; ZeroRuns or bounded Greedy LZ77; fixed four-leaf channel MA tree |
 | Filters | Gaborish off, EPF zero iterations |
-| Output | raw codestream or standard `jxlc` container; private `jwgp` index emitted only for single-group Gray8 containers with default color/intent/intensity |
+| Output | raw codestream or standard `jxlc` container; private `jwgp` index emitted only for single-group Gray8 Prefix containers with default color/intent/intensity |
 
 The backend rejects textures, chroma subsampling, YUV/NV12, signed samples, unsupported color
 metadata, non-bijective/missing channels, mismatched component precision and progressive passes > 1.
@@ -100,11 +101,43 @@ or internal sentinel `42` for no transform. Wire type 42 is rejected by the publ
 [RCT conformance](CONFORMANCE_CORPUS.md#lossless-modular-rct-selection) covers both placements,
 both trees, every operation/permutation, source-word preservation and ownership.
 
+### Entropy planning and ANS serialization
+
+`LosslessModularEntropyCoding` is the caller's policy. The checked dispatch plan owns group
+output capacities and aligned per-batch metadata storage before admission. `EntropyCode` owns
+one immutable frame codebook; `EncodedGroup` is granted only after GPU completion, event/histogram
+validation and fragment checks. Native and browser schedulers share those boundaries.
+
+ANS reuses the two-pass batch scheduler even for a single batch: GPU histograms first, then
+retokenization and ANS in the second submission. Four channel distributions (0/1/2/3+) and distance
+are normalized to 4096 using exact integer largest-remainder allocation with symbol-order ties.
+Each observed symbol receives at least one slot. The host serializes small/general histogram
+metadata and builds alias reverse maps; it never codes ANS image symbols. Shared `ans.rs` owns
+these table rules independently of Modular transforms and leaves room for other encoder consumers.
+
+One serial invocation per group visits all channels/events backwards, expands ZeroRuns into
+literal/length/distance symbols, and prepends renormalization words and hybrid extra bits. It then
+prepends the 32-bit state and rebases the resulting fragment in place. Groups have disjoint output
+ranges; per-channel streams cannot be independently concatenated. Empty multi-group DC-global
+retains the zero-symbol ANS state emitted by libjxl's `WriteTokens`. The same codebook feeds global
+or independently local headers. A completed fragment must match its admitted capacity, expanded
+symbol count and zero tail padding before packet assembly. A failed stage never selects Prefix.
+
+The existing exclusive parameter/artifact/readback lease includes tables, group/channel descriptors
+and worst-case compressed storage through mapping, consumption and cancellation. The public memory
+plan reports `ans_output_bytes` as an artifact subtotal and two submissions per batch. GPU binding
+and bit-address limits are checked before admission. See the [ABI](WGSL_MEMORY.md#modular-ans-serialization)
+and [independent evidence](CONFORMANCE_CORPUS.md#lossless-modular-gpu-ans-encoding).
+The default Prefix path and private Gray8 acceleration index keep their previous byte contract;
+ANS containers omit that Prefix-specific index. This stage establishes correctness, with no
+measured throughput or compression-ratio claim. Clustering, adaptive hybrid choices, effort policy
+and parallelism within a group remain future work.
+
 ### GPU artifact ABI
 
 The token kernel is still `@compute @workgroup_size(1)` in `lossless_modular.wgsl`.
 Parallelism comes only from the number of (PassGroup, channel) pairs in the dispatch; one
-invocation scans its whole group serially. Streamed multi-batch jobs use two submissions per batch
+invocation scans its whole group serially. Multi-batch jobs and every ANS job use two submissions per batch
 (one histogram pass, one serialization pass). This remains a correctness milestone, not the
 eventual performance topology. Its readback buffer consists of little-endian `u32` words:
 
@@ -112,11 +145,13 @@ eventual performance topology. Its readback buffer consists of little-endian `u3
 word 0       event_count
 word 1..33   raw hybrid-token counts (33 entries)
 word 34..66  LZ77 hybrid-token counts (33 entries)
-word 67..    event_count records of:
+word 67..99  distance hybrid-token counts (33 entries)
+word 100..   event_count records of:
               kind, token, extra_bit_count, extra_bits
 ```
 
-`kind == 0` is a raw residual token and `kind == 1` is a zero-run token. No source sample or residual
+`kind == 0` is a raw residual token, `kind == 1` is a zero-run token, and Greedy uses
+`kind == 2/3` for a length/distance pair. No source sample or residual
 plane is copied into a private container box. The ABI is bounded before allocation: at most
 `pixels + ceil(pixels / 8) + 1` events per group channel.
 
@@ -303,7 +338,7 @@ normative buckets `(10, 14, 22, 30 bits)` with offsets `(0, 1024, 17408, 4211712
 raw/container validation, `jxlc` construction, and auxiliary-box framing come from
 `jxl_gpu_bitstream`; the encoder does not duplicate container assembly.
 
-LF global carries the shared Modular tree and entropy code (four prefix codes derived from combined
+LF global carries the shared Modular tree and selected entropy code (four distributions derived from combined
 channel histograms); LF groups and HF global are empty; each PassGroup carries its own group header
 and channel token streams inside standard row-major TOC groups. Group payload and TOC are byte
 aligned.
@@ -311,7 +346,7 @@ aligned.
 ### `jwgp` acceleration index
 
 The standard `jxlc` remains the source of truth and must decode without private metadata.
-For single-group Gray8 containers, `encode_container` adds an optional private `jwgp` box containing
+For single-group Gray8 Prefix containers, `encode_container` adds an optional private `jwgp` box containing
 only a bounded, hash-bound index into those codestream bits so the project's GPU decoder need not
 first implement a fully generic JPEG XL entropy parser. Multi-group, RGB(A), and other bit depths
 omit this box and remain standard interoperable containers. Unknown-box-aware decoders, including

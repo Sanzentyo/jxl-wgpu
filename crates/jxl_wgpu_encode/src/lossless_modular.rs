@@ -4,6 +4,7 @@
 
 mod color;
 mod dispatch;
+mod entropy;
 mod grid;
 mod icc;
 mod local_transforms;
@@ -24,6 +25,7 @@ mod upload;
 
 pub use color::LosslessModularColorOptions;
 pub use dispatch::LosslessModularBackend;
+pub use entropy::LosslessModularEntropyCoding;
 pub use grid::{LosslessModularGroup, LosslessModularGroupGrid};
 pub use local_transforms::{LosslessModularLocalTransforms, LosslessModularTransform};
 pub use lz77::LosslessModularLz77;

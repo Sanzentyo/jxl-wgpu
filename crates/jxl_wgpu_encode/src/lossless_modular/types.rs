@@ -202,6 +202,8 @@ pub struct LosslessModularConfig {
     pub weighted_predictor: super::predictor::LosslessModularWeightedPredictor,
     /// Zero-run coding or bounded GPU search for arbitrary residual matches.
     pub lz77: super::lz77::LosslessModularLz77,
+    /// Prefix (default) or GPU ANS with deterministic frame-wide histogram normalization.
+    pub entropy: super::entropy::LosslessModularEntropyCoding,
     /// Ordered group-local transforms after source RCT and optional Palette.
     /// A Squeeze policy converts with `.into()`; explicit programs apply RCT/Squeeze to the
     /// current image-channel topology. GPU validation rejects unrepresentable signed residuals.

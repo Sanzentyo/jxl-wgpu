@@ -46,6 +46,7 @@ compile_error!(
     "jxl_wgpu_encode requires a little-endian target because WGSL host-shareable buffer values are little-endian"
 );
 
+mod ans;
 mod buffer_pool;
 mod capability;
 mod error;
@@ -74,13 +75,13 @@ pub use lossless_modular::{
     AlphaAssociation, LOSSLESS_MODULAR_GROUP_DIMENSION, LosslessModularAnimationDescriptor,
     LosslessModularAnimationSession, LosslessModularBackend, LosslessModularColorOptions,
     LosslessModularColorTransform, LosslessModularConfig, LosslessModularEncoder,
-    LosslessModularFormat, LosslessModularGroup, LosslessModularGroupGrid,
-    LosslessModularGroupSize, LosslessModularInFlightMemory, LosslessModularJob,
-    LosslessModularLocalTransforms, LosslessModularLz77, LosslessModularMemoryLimits,
-    LosslessModularMemoryPlan, LosslessModularPalette, LosslessModularPredictor,
-    LosslessModularRctType, LosslessModularSqueeze, LosslessModularSqueezeStep,
-    LosslessModularSubmission, LosslessModularTransform, LosslessModularTreeMode,
-    LosslessModularWeightedPredictor,
+    LosslessModularEntropyCoding, LosslessModularFormat, LosslessModularGroup,
+    LosslessModularGroupGrid, LosslessModularGroupSize, LosslessModularInFlightMemory,
+    LosslessModularJob, LosslessModularLocalTransforms, LosslessModularLz77,
+    LosslessModularMemoryLimits, LosslessModularMemoryPlan, LosslessModularPalette,
+    LosslessModularPredictor, LosslessModularRctType, LosslessModularSqueeze,
+    LosslessModularSqueezeStep, LosslessModularSubmission, LosslessModularTransform,
+    LosslessModularTreeMode, LosslessModularWeightedPredictor,
 };
 pub use packet::{
     BitFragment, EncodedFrame, FrameGroupLayout, FramePacketSet, GroupPacket, GroupPacketKind,

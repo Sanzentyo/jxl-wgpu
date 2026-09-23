@@ -73,7 +73,14 @@ impl ModularDispatchPlan {
             });
             source_offset += bytes;
         }
-        if source_offset != batch.parameter_bytes {
+        let complete = if let Some(entropy) = batch.entropy {
+            source_offset <= entropy.parameter_offset
+                && entropy.parameter_offset + entropy.bytes(batch.dispatch_count)
+                    == batch.parameter_bytes
+        } else {
+            source_offset == batch.parameter_bytes
+        };
+        if !complete {
             return Err(BackendError::Invariant("incomplete transform parameter upload").into());
         }
         Ok(uploads)

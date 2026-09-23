@@ -181,7 +181,7 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   implicit policies and automatic policy selection remain open.
 - `LosslessModularConfig` selects all four standard PassGroup sizes with
   `LosslessModularGroupSize::{Pixels128, Pixels256, Pixels512, Pixels1024}`, the MA-tree mode,
-  reversible color transform, Palette, Squeeze, prediction and LZ77 policy.
+  reversible color transform, Palette, Squeeze, prediction, LZ77 and entropy coding.
   `LosslessModularEncoder::with_config` and `LosslessModularBackend::with_config` use the same
   immutable policy; `config()` reports it. The default remains 256×256. LF groups cover eight
   PassGroups per axis. Edge groups may be one pixel wide or high; cropped animation frames use
@@ -203,15 +203,25 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   next power of two of the group pixel count, capped at 65,536. Prediction state still advances
   for every pixel; search history resets at each group/channel. Host code checks canonical
   length/distance events, history bounds, all histograms and exact sample coverage, then writes
-  prefix metadata and bits. This is an explicit policy, without automatic effort selection.
+  the selected entropy metadata. This is an explicit policy, without automatic effort selection.
+- `LosslessModularConfig::entropy` selects `LosslessModularEntropyCoding::Prefix` (default,
+  preserving previous bytes) or `Ans`. ANS consumes the GPU events in reverse channel/event
+  order with one shared state per complete group, including Palette and Squeeze channels.
+  It uses four channel distributions plus distance, deterministic normalization to 4096,
+  a 256-symbol alphabet, and the existing hybrid-integer configurations. Host work builds
+  bounded histogram/alias metadata and copies already compressed fragments; every ANS symbol,
+  renormalization and extra bit is emitted on GPU. There is no fallback to Prefix.
+  Histogram/context clustering, adaptive hybrid selection and effort policy remain open.
 - One GPU invocation handles each PassGroup/channel pair without Palette. With Palette, the
   group's first invocation builds its dictionary and encodes all its channels sequentially;
   the remaining invocations return. This avoids cross-workgroup synchronization or extra submissions.
   Dispatch parameters and artifacts use
   group-major, channel-major order. Small jobs use one mapped artifact allocation. Larger jobs use
   complete-channel-group batches bounded by storage-binding and dispatch limits.
-- Multi-batch jobs first run a histogram pass to derive one stream-wide prefix code; a second pass
-  validates and serializes each batch immediately, then releases its mapped artifact storage.
+- Multi-batch jobs and every ANS job use a histogram pass to derive one frame-wide codebook.
+  A second pass regenerates tokens, runs GPU ANS when selected, validates and assembles each batch,
+  then releases its mapped artifact storage. ANS therefore uses two submissions even for one batch;
+  the Prefix single-batch path retains one submission.
   Native builds drive the sequence with one runtime-neutral worker. Browser WebGPU drives the same
   two-pass sequence from map callbacks and the returned `Future`: each callback wakes the caller,
   and the next poll records exactly one next batch without requiring a Web Worker or a particular
@@ -220,7 +230,9 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
 - Every group/channel produces independent selected-predictor residuals, LZ77/raw token events, and
   histograms. The host validates every artifact, combines histograms for channels 0/1/2 separately
   and channels 3 onward together, creates the four
-  JPEG XL context prefix codes, and serializes channels inside standard row-major TOC groups.
+  JPEG XL channel distributions plus distance, and assembles channels inside standard row-major
+  TOC groups. Prefix writes validated events on the host; ANS requires a completed GPU fragment
+  with a bounded bit length, matching expanded symbol count and zero tail padding.
 - LF global always carries a valid shared Modular tree and entropy code; LF groups and HF global
   are empty. `LosslessModularTreeMode::SharedGlobal` makes each PassGroup select that descriptor.
   `LocalPerGroup` instead writes a complete standards-compliant MA/entropy configuration after
@@ -232,13 +244,21 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
 `LosslessModularEncoder::memory_plan` reports the detected valid bits, exponent width (zero for
 integers), largest component storage-word width, full and peak unions of source plane binding
 ranges, the maximum transformed `channel_count` in any group, peak parameter/artifact/readback bytes, `weighted_predictor_scratch_bytes`,
-`lz77_scratch_bytes`, `palette_scratch_bytes`, `transform_scratch_bytes`, diagnostic total artifact bytes, batch count, exact GPU submission count,
-streaming mode, total encoder-owned live bytes, and the group grid before submission. Streamed jobs
+`lz77_scratch_bytes`, `palette_scratch_bytes`, `transform_scratch_bytes`, `ans_output_bytes`, diagnostic total artifact bytes, batch count, exact GPU submission count,
+two-pass `streaming` mode, total encoder-owned live bytes, and the group grid before submission. Streamed jobs
 report exactly twice the batch count:
 one histogram and one serialization submission per batch. Every live batch uses the same shared
 `MemoryBudget`. Its exclusive buffer-pool lease and reservation survive until the map callback and
 mapped-range consumer are both finished, including when the returned future is abandoned.
+ANS output is part of the same artifact allocation, lease and budget. For `E` maximum events
+summed across a group's channels, it reserves a 16-byte completion record plus
+`4 * ceil((80 * E + 32) / 32)` compressed bytes. Five tables take 92,160 bytes per batch,
+plus a 16-byte batch header and 16-byte group/channel descriptors, in an aligned parameter suffix.
+The corresponding artifact/readback and parameter allocations are included in admission;
+`ans_output_bytes` is a subtotal, not an additional allocation. One GPU invocation owns each
+whole group's bit writer. This is a correctness baseline with no speed or ratio guarantee.
 Source range accounting excludes gaps between planes and counts shared alignment prefixes once.
+
 One checked transform plan resolves group-channel geometry, Palette capacity and ordered wire
 operations before allocation. Dispatch and all three resident/native-streamed/browser-streamed
 assembly paths share it; GPU parameters carry the resolved sample source, Squeeze band or arena
@@ -339,7 +359,7 @@ let jxl_container = submission.wait()?;
 # }
 ```
 
-Single-group Gray8 containers with default color/intent/intensity additionally carry the optional
+Single-group Gray8 Prefix containers with default color/intent/intensity additionally carry the optional
 private `jwgp` acceleration index. Explicit sRGB matching those defaults retains the same bytes.
 Its current schema represents one contiguous 8-bit single-channel token span, so other depths,
 GrayAlpha, RGB(A), explicit Palette/Squeeze, and multi-group containers intentionally omit that private box; all remain ordinary
@@ -393,7 +413,7 @@ retains the existing checked-in Gray8 codestream bytes.
 The [predictor matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-predictors) checks all
 14 predictors, custom Weighted parameters, exact integer/IEEE words, streamed ownership and
 comparison against Gradient on a shifted-row source. Gray8 containers attach the private `jwgp`
-shortcut only for Gradient with ZeroRuns; other policies use the standard Modular path.
+shortcut only for Prefix with Gradient and ZeroRuns; other policies use the standard Modular path.
 
 The [general LZ77 matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-general-lz77) adds
 independent distance/overlap checks through the 2²⁰ history limit, all predictors and group

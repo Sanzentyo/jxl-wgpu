@@ -7,13 +7,14 @@ use jxl_wgpu::MemoryPermit;
 use super::dispatch::{
     LosslessModularBackend, ModularDispatchBatch, ModularDispatchPlan, ModularGroupPlan,
 };
+use super::entropy::{AnsCodebook, EntropyCode, validate_encoded_group};
 use super::grid::LosslessModularGroupGrid;
 use super::lz77::LosslessModularLz77;
 use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
 use super::serializer::{
     ModularFrameHeader, ModularPacketAssembler, ModularPacketConfig, PacketBuildInput,
-    ValidatedModularArtifact, accumulate_artifact_histograms, build_distance_code, build_packets,
-    build_prefix_codes, parse_group_artifact_header, parse_planned_artifact,
+    ValidatedModularArtifact, accumulate_artifact_histograms, build_packets,
+    parse_group_artifact_header, parse_planned_artifact,
 };
 use super::transform::ModularTransformPlan;
 use super::types::{LosslessModularFormat, LosslessModularTreeMode, ModularParams};
@@ -39,6 +40,7 @@ impl LosslessModularBackend {
         let worker = StreamingModularWorker {
             context: context.clone(),
             pipeline: Arc::clone(self.pipeline()?),
+            ans_pipeline: self.ans_pipeline.clone(),
             buffer_pool: Arc::clone(&self.buffer_pool),
             direct_mapping: self.direct_mapping,
             source,
@@ -74,9 +76,7 @@ impl LosslessModularBackend {
             state: LosslessModularJobState::Streaming(Box::new(
                 BrowserStreamingLosslessModularJob::new(
                     context.clone(),
-                    Arc::clone(self.pipeline()?),
-                    Arc::clone(&self.buffer_pool),
-                    self.direct_mapping,
+                    self,
                     source,
                     plan,
                     request,
@@ -90,6 +90,7 @@ impl LosslessModularBackend {
 struct StreamingModularWorker {
     context: WgpuContext,
     pipeline: Arc<wgpu::ComputePipeline>,
+    ans_pipeline: Option<Arc<wgpu::ComputePipeline>>,
     buffer_pool: Arc<EncoderBufferPool>,
     direct_mapping: bool,
     source: crate::BufferImageSource,
@@ -106,7 +107,7 @@ impl StreamingModularWorker {
         let mut aggregate_distance = [0u64; RAW_SYMBOLS];
         for batch in &self.plan.batches {
             ensure_streaming_job_active(&self.cancelled)?;
-            self.with_batch(batch, |bytes| {
+            self.with_batch(batch, None, |bytes| {
                 accumulate_streaming_batch_histograms(
                     &self.plan,
                     batch,
@@ -118,14 +119,12 @@ impl StreamingModularWorker {
             })?;
         }
 
-        let codes = build_prefix_codes(
-            self.plan.format,
-            self.plan.bits_per_sample,
-            self.plan.predictor,
-            &self.plan.transforms,
+        let entropy = Arc::new(EntropyCode::from_histograms(
+            &self.plan,
             &aggregate_raw,
             &aggregate_lz77,
-        )?;
+            &aggregate_distance,
+        )?);
         let frame = ModularFrameHeader {
             animation: self.request.animation,
             canvas_width: self.request.canvas_width,
@@ -148,12 +147,11 @@ impl StreamingModularWorker {
                 lz77: self.plan.lz77,
                 frame,
             },
-            codes,
-            build_distance_code(self.plan.lz77, &aggregate_distance)?,
+            Arc::clone(&entropy),
         )?;
         for batch in &self.plan.batches {
             ensure_streaming_job_active(&self.cancelled)?;
-            self.with_batch(batch, |bytes| {
+            self.with_batch(batch, entropy.ans(), |bytes| {
                 serialize_streaming_batch(&self.plan, batch, bytes, &mut assembler)
             })?;
         }
@@ -169,11 +167,13 @@ impl StreamingModularWorker {
     fn with_batch<T>(
         &self,
         batch: &ModularDispatchBatch,
+        codebook: Option<&AnsCodebook>,
         inspect: impl FnOnce(&[u8]) -> Result<T, EncodeError>,
     ) -> Result<T, EncodeError> {
         let pending = submit_streaming_batch(StreamingBatchContext {
             context: &self.context,
             pipeline: &self.pipeline,
+            entropy: entropy_stage(self.ans_pipeline.as_deref(), codebook)?,
             buffer_pool: &self.buffer_pool,
             direct_mapping: self.direct_mapping,
             source: &self.source,
@@ -185,9 +185,25 @@ impl StreamingModularWorker {
     }
 }
 
+fn entropy_stage<'a>(
+    pipeline: Option<&'a wgpu::ComputePipeline>,
+    codebook: Option<&'a AnsCodebook>,
+) -> Result<Option<(&'a wgpu::ComputePipeline, &'a AnsCodebook)>, EncodeError> {
+    codebook
+        .map(|codebook| {
+            pipeline
+                .map(|pipeline| (pipeline, codebook))
+                .ok_or_else(|| {
+                    BackendError::Invariant("ANS serialization pipeline is absent").into()
+                })
+        })
+        .transpose()
+}
+
 struct StreamingBatchContext<'a> {
     context: &'a WgpuContext,
     pipeline: &'a wgpu::ComputePipeline,
+    entropy: Option<(&'a wgpu::ComputePipeline, &'a AnsCodebook)>,
     buffer_pool: &'a Arc<EncoderBufferPool>,
     direct_mapping: bool,
     source: &'a crate::BufferImageSource,
@@ -233,6 +249,7 @@ fn submit_streaming_batch(
     let StreamingBatchContext {
         context,
         pipeline,
+        entropy,
         buffer_pool,
         direct_mapping,
         source,
@@ -306,6 +323,20 @@ fn submit_streaming_batch(
             1,
             1,
         );
+    }
+    if let Some((pipeline, codebook)) = entropy {
+        super::entropy::record(
+            super::entropy::AnsSubmission {
+                plan,
+                batch,
+                codebook,
+                context,
+                pipeline,
+                parameters: &buffers.parameters,
+                artifact: &buffers.artifact,
+            },
+            &mut commands,
+        )?;
     }
     if !direct_mapping {
         commands.copy_buffer_to_buffer(&buffers.artifact, 0, &buffers.readback, 0, artifact_bytes);
@@ -442,7 +473,17 @@ fn serialize_streaming_batch(
                 streaming_artifact_bytes(group_plan, batch, bytes)?,
             )?);
         }
-        assembler.push_group(channels[0].group_index, &artifacts)?;
+        let encoded = channels[0]
+            .entropy
+            .map(|entropy| {
+                validate_encoded_group(
+                    entropy,
+                    streaming_artifact_bytes(&channels[0], batch, bytes)?,
+                    &artifacts,
+                )
+            })
+            .transpose()?;
+        assembler.push_group(channels[0].group_index, &artifacts, encoded)?;
     }
     Ok(())
 }
@@ -692,6 +733,7 @@ impl Drop for EncodeJobLifetime {
 pub(super) struct BrowserStreamingLosslessModularJob {
     context: WgpuContext,
     pipeline: Arc<wgpu::ComputePipeline>,
+    ans_pipeline: Option<Arc<wgpu::ComputePipeline>>,
     buffer_pool: Arc<EncoderBufferPool>,
     direct_mapping: bool,
     source: crate::BufferImageSource,
@@ -709,9 +751,7 @@ pub(super) struct BrowserStreamingLosslessModularJob {
 impl BrowserStreamingLosslessModularJob {
     pub(super) fn new(
         context: WgpuContext,
-        pipeline: Arc<wgpu::ComputePipeline>,
-        buffer_pool: Arc<EncoderBufferPool>,
-        direct_mapping: bool,
+        backend: &LosslessModularBackend,
         source: crate::BufferImageSource,
         plan: ModularDispatchPlan,
         request: FrameEncodeRequest,
@@ -719,9 +759,10 @@ impl BrowserStreamingLosslessModularJob {
         let cursor = StreamingCursor::new(plan.batches.len())?;
         let mut job = Self {
             context,
-            pipeline,
-            buffer_pool,
-            direct_mapping,
+            pipeline: Arc::clone(backend.pipeline()?),
+            ans_pipeline: backend.ans_pipeline.clone(),
+            buffer_pool: Arc::clone(&backend.buffer_pool),
+            direct_mapping: backend.direct_mapping,
             source,
             plan,
             request,
@@ -753,6 +794,12 @@ impl BrowserStreamingLosslessModularJob {
         self.pending = Some(submit_streaming_batch(StreamingBatchContext {
             context: &self.context,
             pipeline: &self.pipeline,
+            entropy: entropy_stage(
+                self.ans_pipeline.as_deref(),
+                self.assembler
+                    .as_ref()
+                    .and_then(|assembler| assembler.entropy().ans()),
+            )?,
             buffer_pool: &self.buffer_pool,
             direct_mapping: self.direct_mapping,
             source: &self.source,
@@ -763,14 +810,12 @@ impl BrowserStreamingLosslessModularJob {
     }
 
     fn begin_serialization(&mut self) -> Result<(), EncodeError> {
-        let codes = build_prefix_codes(
-            self.plan.format,
-            self.plan.bits_per_sample,
-            self.plan.predictor,
-            &self.plan.transforms,
+        let entropy = Arc::new(EntropyCode::from_histograms(
+            &self.plan,
             &self.aggregate_raw,
             &self.aggregate_lz77,
-        )?;
+            &self.aggregate_distance,
+        )?);
         self.assembler = Some(ModularPacketAssembler::new(
             ModularPacketConfig {
                 width: self.plan.width,
@@ -792,8 +837,7 @@ impl BrowserStreamingLosslessModularJob {
                     is_last: self.request.is_last,
                 },
             },
-            codes,
-            build_distance_code(self.plan.lz77, &self.aggregate_distance)?,
+            entropy,
         )?);
         Ok(())
     }

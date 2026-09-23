@@ -9,14 +9,16 @@ fn independent_entropy_decoder_reads_every_predictor_and_weighted_header() {
         let mut output = BitWriter::new();
         write_dc_global(
             &mut output,
-            &codes,
+            &EntropyCode::Prefix {
+                codes: Box::new(codes),
+                distance: None,
+            },
             TransformHeader {
                 operations: &[],
                 palette_counts: None,
             },
             predictor,
             weighted,
-            None,
         )
         .unwrap();
         let bit_len = output.bit_len();

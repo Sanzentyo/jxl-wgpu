@@ -29,6 +29,7 @@ pub enum KernelStage {
     ModularResidualTokenization,
     CoefficientTokenization,
     HistogramReduction,
+    AnsSerialization,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

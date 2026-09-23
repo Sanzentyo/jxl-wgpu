@@ -78,6 +78,7 @@ fn mixed_palette_preserves_every_predictor_rct_precision_and_squeeze_order() {
         let encoder = LosslessModularEncoder::with_config(
             rig.context.clone(),
             LosslessModularConfig {
+                entropy: Default::default(),
                 palette: Some(
                     Palette::mixed(3, 4096, Predictor::ALL[value as usize % 14]).unwrap(),
                 ),
@@ -343,6 +344,7 @@ fn mixed_palette_scratch_obeys_admission_cancellation_and_reuse() {
         check_lifetime(
             &rig,
             LosslessModularConfig {
+                entropy: Default::default(),
                 palette: Some(Palette::mixed(3, 4096, Predictor::Weighted).unwrap()),
                 local_transforms: SQUEEZES[index + 1].clone().into(),
                 group_size,

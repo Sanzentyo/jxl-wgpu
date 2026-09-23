@@ -147,6 +147,21 @@ jxl::Status Decode(const std::vector<uint8_t>& raw, std::vector<Frame>* frames,
       jxl::ModularOptions options;
       options.max_chan_size = options.group_dim = dim.group_dim;
       JXL_RETURN_IF_ERROR(jxl::ModularGenericDecompress(&reader, image, &global, 0, &options, false, &tree, &code, &contexts));
+      // ModularDecode returns before constructing its symbol reader when every channel
+      // belongs to later groups. EncodeStream/WriteTokens can nevertheless retain a
+      // zero-symbol ANS state. Validate it with libjxl, rather than ignoring trailing bytes.
+      bool has_global_samples = false;
+      for (size_t c = 0; c < image.channel.size(); ++c) {
+        const auto& channel = image.channel[c];
+        if (c >= image.nb_meta_channels &&
+            (channel.w > options.max_chan_size || channel.h > options.max_chan_size)) break;
+        has_global_samples |= channel.w != 0 && channel.h != 0;
+      }
+      if (!has_global_samples && global.use_global_tree && !code.use_prefix_code &&
+          reader.TotalBitsConsumed() + 7 < reader.TotalBytes() * 8) {
+        JXL_ASSIGN_OR_RETURN(jxl::ANSSymbolReader empty, jxl::ANSSymbolReader::Create(&code, &reader, 0));
+        JXL_ENSURE(reader.AllReadsWithinBounds() && empty.CheckANSFinalState());
+      }
       JXL_RETURN_IF_ERROR(FinishSection(reader));
     }
     if (dim.num_groups > 1) {

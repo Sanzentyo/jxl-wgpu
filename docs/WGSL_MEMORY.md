@@ -148,6 +148,8 @@ name shown in parentheses.
 | `jxl_wgpu_encode/lossless_modular.wgsl` | `TransformJob` | operation (Squeeze=0/RCT=1), axis or RCT mode, width, height; three source selectors, three source arena offsets, three output arena offsets, three zero padding words | 64 | 4 | private artifact storage after a job-count word, copied from the parameter upload suffix |
 | `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularArtifactHeader` / `output_words[0..100]` | `event_count, raw_counts[33], lz77_counts[33], distance_counts[33]` | 400 | 4 | storage/readback record |
 | `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularEvent` / four-word event | `kind, token, extra_bit_count, extra_bits` | 16 | 4 | storage/readback element |
+| `jxl_wgpu_encode/lossless_modular/entropy.wgsl` | four-word batch/group/channel records | batch: group count/table offset/Greedy flag/reserved; group: channel descriptor offset/count/output offset/capacity words; channel: event offset/count address/max events/distribution | 16 each | 4 | read-only parameter suffix |
+| `jxl_wgpu_encode/lossless_modular/entropy.wgsl` | four completion words | status/bit length/expanded symbol count/reserved | 16 | 4 | artifact storage/readback prefix before each compressed group |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | entropy prefix/window, group geometry, sample/channel counts, channel-layout offset, output kind/transfer/range, channels/order/depth, 4 plane offset/stride pairs, chroma geometry/size/mapping, status/stream/fixed-leaf/weighted-predictor fields; canvas width/height and orientation | 256 | 4 | read-only storage element |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `DecodeStatus` / `status[0..4]` | `code, decoded_samples, cursor, expected_cursor` | 16 | 4 | storage/readback record |
 | `jxl_wgpu_decode/vardct_raw_matrix.wgsl` | `RawMatrixParams` / `RawMatrixParams` | denominator, raster width/height, target count, then padded four-lane source offsets, source strides, and resident resource target offsets | 64 | 16 | uniform |
@@ -307,6 +309,7 @@ The table below states the default workgroup configuration for each entry point:
 | decoder `vardct_pass_group` | bounded stream/entropy bundle RO, quantized-LF plus disjoint LZ/state slices/status RW, 160-byte pass params RO; artifact/order RO, coefficients RW, sink U | 1x1 | Tier B (fixed) | one serial invocation per pass-group window; eight storage bindings meet the portable stage limit; a 464-byte aligned state retains common entropy, nested coefficient progress, sink failure and the 96-word nonzero grid; the 48-byte block-context table ABI addresses QF and signed X/Y/B LF thresholds |
 | `vardct_dct8` | coefficients/tasks/resources RO, X/Y/B RW, U | 8x8 | Tier B (fixed) | exactly one workgroup per validated task; task count and all upload bindings are device-bounded |
 | encoder `lossless_modular` | four source-plane bindings RO (0/3/4/5), artifact RW (1), 256-byte parameter records RO (2) | 1x1 | Tier B (fixed) | one invocation per selected 128/256/512/1024-square PassGroup/channel; each plane window/alignment/u32 address and artifact capacity are prevalidated; per-component 1–4-byte words, bit positions and Native/Little/Big endian loads preserve 1–31-bit integer or IEEE binary16/binary32 fields; six storage bindings are required |
+| encoder `lossless_modular/entropy` | artifact/events/compressed output RW (0), tables/group/channel descriptors RO (1) | 1x1 | Tier B (fixed) | one serial invocation owns each complete group's ANS state and reverse bit writer; ranges are disjoint and checked before admission; token generation precedes serialization in the same submission |
 
 The decoder entropy shaders share a nested host/WGSL ABI rather than duplicating an untyped word
 prefix. `EntropyStreamParams` is a 12-byte, four-byte-aligned `repr(C)`/`Pod` record of three `u32`
@@ -969,6 +972,37 @@ cross-products rank mean scores, with raster ties. The existing submission, map 
 permit retain all records through cancellation. Tests include missing/forged records, full
 artifact corruption, an actual binding limit equal to the raster arena, exact/one-byte-deficient
 tiled and mixed budgets, abandoned completion, successful reuse and all linear variants.
+
+## Modular ANS serialization
+
+`EntropyArtifactPlan` reserves output after the first channel's event/scratch arena in each
+complete group. With `E` maximum events summed across its channels, capacity is
+`ceil((80 * E + 32) / 32)` words, plus four completion words. One ZeroRuns event expands to
+three ANS symbols, each requiring at most 16 renormalization bits, plus at most 31 extra bits;
+80 bits per event and the 32-bit state therefore bound the fragment. Checked arithmetic rejects
+capacities that exceed WGSL u32 bit addressing. The output range cannot overlap any event,
+Palette dictionary, prediction state or transform arena.
+
+`EntropyBatchPlan` appends a storage-offset-aligned parameter suffix: four header words, four
+words per group, four words per channel, then five 4608-word tables. Each table contains 256
+frequencies, 256 symbol rank offsets and a 4096-entry reverse alias map. Offsets are relative
+to the parameter suffix or the current artifact binding. Tables consume 92,160 bytes per batch.
+The parameter and artifact maxima participate in device limits, batching, budget admission and
+pool leasing. `ans_output_bytes` reports only the compressed allocation subtotal already included
+in artifact bytes; separate readback, when needed, copies that region with the rest of the batch.
+
+The second pass clears the artifact allocation, regenerates tokens, then dispatches the ANS
+kernel before mapping/copying. One invocation visits channels/events backwards, checks symbol
+availability and bit capacity, prepends the state and rebases bits forwards in place. Completion
+is four words: status (`1` complete, `2` invalid or insufficient capacity), bit count, expanded
+symbol count and zero reserved word. Host validation first checks every token/histogram/channel,
+then these fields, exact capacity and zero tail padding; only its private validated fragment type
+can reach ANS packet assembly. Mapping errors and cancellation retain the same callback-owned
+lease and permit. Prefix allocations and its single-batch submission remain unchanged.
+
+Naga portability validation, independent exhaustive alias lookups, GPU shared-state/hybrid/LZ77
+cursor tests, output sentinel checks, malformed completion tests and public admission/cancellation
+cases cover this contract. See [ANS conformance](CONFORMANCE_CORPUS.md#lossless-modular-gpu-ans-encoding).
 
 ## Shader write bounds fixed by this audit
 

@@ -1,0 +1,171 @@
+//! JPEG XL ANS tables built from GPU histogram metadata. Token coding stays on GPU.
+// The alias-table construction and histogram grammar follow libjxl's BSD-licensed
+// ans_common.cc / enc_ans.cc. See THIRD_PARTY.md and LICENSES/libjxl-BSD.txt.
+use jxl_gpu_bitstream::BitWriter;
+
+use crate::{BackendError, EncodeError};
+
+pub(crate) const ALPHABET: usize = 256;
+pub(crate) const TABLE_SIZE: usize = 4096;
+pub(crate) const TABLE_WORDS: usize = 2 * ALPHABET + TABLE_SIZE;
+
+#[derive(Clone, Debug)]
+pub(crate) struct AnsCode {
+    frequencies: [u32; ALPHABET],
+    words: Vec<u32>,
+}
+
+impl AnsCode {
+    pub(crate) fn from_counts(counts: &[u64; ALPHABET]) -> Result<Self, EncodeError> {
+        let total: u128 = counts.iter().map(|&count| u128::from(count)).sum();
+        let active = counts.iter().filter(|&&count| count != 0).count();
+        let mut frequencies = [0; ALPHABET];
+        if active == 0 {
+            frequencies[0] = TABLE_SIZE as u32;
+        } else {
+            let remaining = (TABLE_SIZE - active) as u128;
+            let mut remainders = Vec::with_capacity(active);
+            for (symbol, &count) in counts.iter().enumerate().filter(|(_, count)| **count != 0) {
+                let scaled = u128::from(count) * remaining;
+                frequencies[symbol] = 1 + (scaled / total) as u32;
+                remainders.push((scaled % total, symbol));
+            }
+            remainders.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            let missing = TABLE_SIZE
+                - frequencies
+                    .iter()
+                    .map(|&count| count as usize)
+                    .sum::<usize>();
+            for &(_, symbol) in &remainders[..missing] {
+                frequencies[symbol] += 1;
+            }
+        }
+        Self::from_frequencies(frequencies)
+    }
+
+    fn from_frequencies(frequencies: [u32; ALPHABET]) -> Result<Self, EncodeError> {
+        if frequencies
+            .iter()
+            .map(|&value| u64::from(value))
+            .sum::<u64>()
+            != TABLE_SIZE as u64
+        {
+            return Err(BackendError::Invariant("ANS frequencies must sum to 4096").into());
+        }
+        let mut words = vec![0; TABLE_WORDS];
+        words[..ALPHABET].copy_from_slice(&frequencies);
+        let mut offset = 0;
+        for (symbol, &frequency) in frequencies.iter().enumerate() {
+            words[ALPHABET + symbol] = offset;
+            offset += frequency;
+        }
+        if frequencies.contains(&(TABLE_SIZE as u32)) {
+            for state in 0..TABLE_SIZE {
+                words[2 * ALPHABET + state] = state as u32;
+            }
+        } else {
+            const BUCKET: u32 = (TABLE_SIZE / ALPHABET) as u32;
+            let mut cutoffs = frequencies;
+            let mut alias = [0usize; ALPHABET];
+            let mut offsets = [0u32; ALPHABET];
+            let mut under = Vec::new();
+            let mut over = Vec::new();
+            for (index, &frequency) in frequencies.iter().enumerate() {
+                match frequency.cmp(&BUCKET) {
+                    std::cmp::Ordering::Less => under.push(index),
+                    std::cmp::Ordering::Greater => over.push(index),
+                    std::cmp::Ordering::Equal => {}
+                }
+            }
+            while let Some(large) = over.pop() {
+                let small = under
+                    .pop()
+                    .ok_or(BackendError::Invariant("unbalanced ANS aliases"))?;
+                cutoffs[large] -= BUCKET - cutoffs[small];
+                alias[small] = large;
+                offsets[small] = cutoffs[large];
+                match cutoffs[large].cmp(&BUCKET) {
+                    std::cmp::Ordering::Less => under.push(large),
+                    std::cmp::Ordering::Greater => over.push(large),
+                    std::cmp::Ordering::Equal => {}
+                }
+            }
+            for bucket in 0..ALPHABET {
+                for position in 0..BUCKET {
+                    let (symbol, rank) = if position < cutoffs[bucket] {
+                        (bucket, position)
+                    } else {
+                        (alias[bucket], offsets[bucket] + position - cutoffs[bucket])
+                    };
+                    if rank >= frequencies[symbol] {
+                        return Err(
+                            BackendError::Invariant("ANS alias rank exceeds frequency").into()
+                        );
+                    }
+                    let destination = (words[ALPHABET + symbol] + rank) as usize;
+                    words[2 * ALPHABET + destination] = bucket as u32 * BUCKET + position;
+                }
+            }
+        }
+        Ok(Self { frequencies, words })
+    }
+
+    pub(crate) fn gpu_words(&self) -> &[u32] {
+        &self.words
+    }
+
+    pub(crate) fn write_histogram(&self, writer: &mut BitWriter) -> Result<(), EncodeError> {
+        let symbols: Vec<_> = self
+            .frequencies
+            .iter()
+            .enumerate()
+            .filter_map(|(symbol, &frequency)| (frequency != 0).then_some(symbol))
+            .collect();
+        if symbols.len() <= 2 {
+            writer.write_bits(1, 1)?;
+            writer.write_bits((symbols.len() - 1) as u64, 1)?;
+            for &symbol in &symbols {
+                write_u8(writer, symbol as u32)?;
+            }
+            if symbols.len() == 2 {
+                writer.write_bits(u64::from(self.frequencies[symbols[0]]), 12)?;
+            }
+            return Ok(());
+        }
+        writer.write_bits(0, 2)?; // general, non-flat histogram
+        writer.write_bits(7, 3)?;
+        writer.write_bits(5, 3)?; // exact population precision: shift=12
+        let alphabet = symbols.last().copied().unwrap() + 1;
+        write_u8(writer, (alphabet - 3) as u32)?;
+        let widths = self.frequencies.map(|count| 32 - count.leading_zeros());
+        let maximum = widths.iter().copied().max().unwrap();
+        let omitted = widths.iter().position(|&width| width == maximum).unwrap();
+        const LENGTHS: [u8; 13] = [5, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 6, 7];
+        const BITS: [u64; 13] = [17, 11, 15, 3, 9, 7, 4, 2, 5, 6, 0, 33, 1];
+        for &width in &widths[..alphabet] {
+            writer.write_bits(BITS[width as usize], LENGTHS[width as usize])?;
+        }
+        for (symbol, &width) in widths[..alphabet].iter().enumerate() {
+            if symbol != omitted && width > 1 {
+                writer.write_bits(
+                    u64::from(self.frequencies[symbol] - (1 << (width - 1))),
+                    (width - 1) as u8,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn write_u8(writer: &mut BitWriter, value: u32) -> Result<(), EncodeError> {
+    writer.write_bits(u64::from(value != 0), 1)?;
+    if value != 0 {
+        let bits = value.ilog2();
+        writer.write_bits(u64::from(bits), 3)?;
+        writer.write_bits(u64::from(value - (1 << bits)), bits as u8)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

@@ -79,6 +79,10 @@ unmodified native header, entropy, prediction and inverse-transform code; it onl
 original-color one-pass encoder groups and exports their integer planes. Unsupported transports,
 ICC/resampling, global non-RCT transforms in multi-group frames and nonempty LF/HF groups fail.
 Fused single-group transforms and global-RCT/local-transform combinations are supported.
+For an empty global image, the generic native decoder can return before consuming the zero-symbol
+ANS state retained by native `EncodeStream`/`WriteTokens`. The helper then uses native
+`ANSSymbolReader::Create` and `CheckANSFinalState` before checking the exact section end. It still
+rejects corrupt states, nonzero padding and extra bytes; it never replaces native image decoding.
 This supplies the delta/mixed Palette exact-word oracle because jxl-oxide's `jxl-modular` 0.11.3 sizes
 its table from the color count alone and can omit delta prediction through its simple path.
 Existing color-only Palette tests retain their jxl-oxide comparisons. Native F32 output and

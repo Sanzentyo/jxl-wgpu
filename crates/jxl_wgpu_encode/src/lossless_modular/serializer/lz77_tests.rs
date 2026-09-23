@@ -89,9 +89,11 @@ fn independent_decoder_reads_general_lz77_distances_and_overlaps() {
         let mut output = BitWriter::new();
         write_ma_config(
             &mut output,
-            &codes,
+            &EntropyCode::Prefix {
+                codes: Box::new(codes.clone()),
+                distance: distance_code.clone(),
+            },
             LosslessModularPredictor::Zero,
-            distance_code.as_ref(),
         )
         .unwrap();
         write_events(&mut output, &codes[0], distance_code.as_ref(), &events).unwrap();

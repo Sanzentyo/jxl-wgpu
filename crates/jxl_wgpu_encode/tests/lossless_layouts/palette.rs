@@ -49,7 +49,7 @@ fn samples(case: Case, extent: Extent2d, colors: u32) -> Vec<u32> {
         .collect()
 }
 
-fn checked_stream(
+pub(super) fn checked_stream(
     rig: &Rig,
     encoder: &LosslessModularEncoder,
     case: Case,
@@ -135,6 +135,7 @@ fn palette_composes_with_all_rcts_predictors_and_full_precision_words() {
         let encoder = LosslessModularEncoder::with_config(
             rig.context.clone(),
             LosslessModularConfig {
+                entropy: Default::default(),
                 palette: Some(Palette::new(32).unwrap()),
                 local_transforms: SQUEEZES[value as usize % 5].clone().into(),
                 group_size,
