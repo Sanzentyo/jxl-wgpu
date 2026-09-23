@@ -10,6 +10,8 @@
 #endif
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -21,6 +23,7 @@
 #include "lib/jxl/fields.h"
 #include "lib/jxl/image_metadata.h"
 #include "lib/jxl/modular/encoding/encoding.h"
+#include "lib/jxl/modular/transform/palette.h"
 #include "lib/jxl/toc.h"
 
 namespace {
@@ -65,7 +68,22 @@ jxl::Status FinishSection(Reader& reader) {
   return true;
 }
 
-jxl::Status Decode(const std::vector<uint8_t>& raw, std::vector<Frame>* frames) {
+jxl::Status AuditPalette(const jxl::Image& image, const jxl::GroupHeader& header,
+                         std::array<uint32_t, 3>* counts) {
+  JXL_ENSURE(!header.transforms.empty());
+  const auto& transform = header.transforms.back();
+  JXL_ENSURE(transform.id == jxl::TransformId::kPalette && transform.begin_c == 0);
+  JXL_ENSURE(image.nb_meta_channels == 1 && image.channel.size() == 2);
+  const auto& indices = image.channel[1];
+  for (size_t y = 0; y < indices.h; ++y) for (size_t x = 0; x < indices.w; ++x) {
+    const int32_t index = indices.Row(y)[x];
+    ++(*counts)[index < 0 ? 0 : uint32_t(index) >= transform.nb_colors + transform.nb_deltas ? 1 : 2];
+  }
+  return true;
+}
+
+jxl::Status Decode(const std::vector<uint8_t>& raw, std::vector<Frame>* frames,
+                   std::array<uint32_t, 3>* audit = nullptr) {
   JxlMemoryManager memory{nullptr, [](void*, size_t size) -> void* { return std::malloc(size); }, [](void*, void* p) { std::free(p); }};
   jxl::CodecMetadata metadata;
   size_t pos;
@@ -142,9 +160,14 @@ jxl::Status Decode(const std::vector<uint8_t>& raw, std::vector<Frame>* frames) 
         Reader reader(jxl::Bytes(raw.data() + offsets[begin + group], sizes[begin + group]));
         jxl::ModularOptions options;
         options.group_dim = dim.group_dim;
-        JXL_RETURN_IF_ERROR(jxl::ModularGenericDecompress(&reader, part, nullptr,
-          jxl::ModularStreamId::ModularAC(group, 0).ID(dim), &options, true, &tree, &code, &contexts));
+        jxl::GroupHeader local;
+        JXL_RETURN_IF_ERROR(jxl::ModularGenericDecompress(&reader, part, audit ? &local : nullptr,
+          jxl::ModularStreamId::ModularAC(group, 0).ID(dim), &options, audit == nullptr, &tree, &code, &contexts));
         JXL_RETURN_IF_ERROR(FinishSection(reader));
+        if (audit) {
+          JXL_RETURN_IF_ERROR(AuditPalette(part, local, audit));
+          part.undo_transforms(local.wp_header);
+        }
         JXL_ENSURE(!part.error && part.channel.size() == channels && part.nb_meta_channels == 0);
         for (size_t c = 0; c < channels; ++c) {
           JXL_ENSURE(part.channel[c].w == rect.xsize() && part.channel[c].h == rect.ysize());
@@ -152,6 +175,7 @@ jxl::Status Decode(const std::vector<uint8_t>& raw, std::vector<Frame>* frames) 
         }
       }
     }
+    if (audit && dim.num_groups == 1) JXL_RETURN_IF_ERROR(AuditPalette(image, global, audit));
     image.undo_transforms(global.wp_header);
     JXL_ENSURE(!image.error && image.nb_meta_channels == 0 && image.channel.size() == channels);
     Frame frame{uint32_t(dim.xsize), uint32_t(dim.ysize), uint32_t(channels), uint32_t(bits), metadata.m.bit_depth.floating_point_sample ? metadata.m.bit_depth.exponent_bits_per_sample : 0, {}};
@@ -174,14 +198,33 @@ void Word(uint32_t value) {
 
 int main(int argc, char** argv) {
   if (JPEGXL_MAJOR_VERSION != 0 || JPEGXL_MINOR_VERSION != 12 || JPEGXL_PATCH_VERSION != 0 || JxlDecoderVersion() != 12000) return 2;
-  if (argc != 2) return 2;
-  std::ifstream input(argv[1], std::ios::binary);
+  if (argc == 3 && std::strcmp(argv[1], "--implicit-entries") == 0) {
+    char* end = nullptr;
+    const long bits = std::strtol(argv[2], &end, 10);
+    if (!end || *end || bits < 1 || bits > 32) return 2;
+    if (fwrite("JXLIMP12", 1, 8, stdout) != 8) return 2;
+    Word(JxlDecoderVersion());
+    for (int index = -143; index < 189; ++index) for (size_t c = 0; c < 4; ++c) {
+      Word(uint32_t(jxl::palette_internal::GetPaletteValue(nullptr, index, c, 0, 0, std::min<long>(bits, 24))));
+    }
+    return 0;
+  }
+  const bool audit = argc == 3 && std::strcmp(argv[1], "--palette-audit") == 0;
+  if (argc != 2 && !audit) return 2;
+  std::ifstream input(argv[audit ? 2 : 1], std::ios::binary);
   if (!input) return 2;
   std::vector<uint8_t> file{std::istreambuf_iterator<char>(input), {}};
   if (file.size() > (1u << 26)) return 2;
   std::vector<uint8_t> raw;
   std::vector<Frame> frames;
-  if (!Codestream(file, &raw) || !Decode(raw, &frames)) return 1;
+  std::array<uint32_t, 3> counts{};
+  if (!Codestream(file, &raw) || !Decode(raw, &frames, audit ? &counts : nullptr)) return 1;
+  if (audit) {
+    if (fwrite("JXLPAL12", 1, 8, stdout) != 8) return 2;
+    Word(JxlDecoderVersion());
+    for (uint32_t count : counts) Word(count);
+    return 0;
+  }
   if (fwrite("JXLRAW12", 1, 8, stdout) != 8) return 2;
   Word(JxlDecoderVersion());
   Word(frames.size());

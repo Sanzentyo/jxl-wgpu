@@ -646,7 +646,7 @@ JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossl
 ```
 
 `MOD-E02` stays **Partial**. The selected RCT is uniform across groups/frames; adaptive selection,
-arbitrary transform stacks, implicit Palette and global/LF/HF transform topology remain.
+arbitrary transform stacks and global/LF/HF transform topology remain.
 Explicit local Squeeze and exact Palette are covered below.
 
 ## Lossless Modular Squeeze encoding
@@ -735,8 +735,8 @@ JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --lib --test
 ```
 
 `MOD-E02` remains **Partial**. This policy encodes complete component tuples with explicit entries
-after RCT and before optional index Squeeze. Delta and mixed entries are covered below. Implicit entries,
-component subsets, automatic policy selection, arbitrary stacks, cross-group/global-LF transforms
+after RCT and before optional index Squeeze. Delta, mixed and implicit entries are covered below.
+Component subsets, automatic policy selection, arbitrary stacks, cross-group/global-LF transforms
 and progressive Modular remain.
 
 ## Lossless Modular Delta Palette encoding
@@ -783,7 +783,7 @@ With `JXL_MODULAR_WORD_ORACLE` configured by the test-support instructions:
 JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossless_layouts palette::delta:: -- --test-threads=2
 ```
 
-`MOD-E02` remains **Partial**: implicit entries, component subsets,
+`MOD-E02` remains **Partial**: component subsets,
 arbitrary transform ordering, adaptive selection and global/LF transform topology remain open.
 
 ## Lossless Modular mixed Palette encoding
@@ -827,8 +827,60 @@ With `JXL_MODULAR_WORD_ORACLE` configured by the test-support instructions:
 JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --lib --test lossless_layouts palette -- --test-threads=2
 ```
 
-`MOD-E02` remains **Partial**: implicit entries, component subsets, arbitrary transform ordering,
+`MOD-E02` remains **Partial**: component subsets, arbitrary transform ordering,
 adaptive choices and global/LF transform topology remain open, as do the other encoder gates.
+
+## Lossless Modular implicit Palette encoding
+
+[`lossless_layouts::palette::implicit`](../crates/jxl_wgpu_encode/tests/lossless_layouts/palette/implicit.rs)
+adds seven GPU tests. The opt-in policy selects exact whole-component cube colors, then exact
+canonical signed residual entries, then explicit residual tuples. It never quantizes input words.
+The bounded explicit table declares one zero delta even if unused, avoiding libjxl's single-channel
+zero-delta/Zero-predictor index clamp. Cube matching uses depths 1–24; the native inverse caps its
+cube scale at 24 while the project's normative decoder preserves wider scaling. Wider source
+words therefore use signed implicit or explicit residuals with unchanged exact comparisons.
+
+The existing pinned scalar libjxl helper now exports its unmodified implicit-entry function and
+can audit decoded index classes before the native Palette inverse. The audit requires a final
+Palette with no following Squeeze; ordinary exact-word decoding retains all native transforms.
+These development modes retain build/runtime identity and strict output shape checks. Expected
+input tuples come from the native entries, not from the shared production WGSL fragment.
+
+- 100 cube cases cover all 64/125 entries, depths 1–24 plus binary16, and Gray/GrayAlpha/RGB/RGBA.
+  All 14 delta and entropy predictors, custom Weighted parameters, four group sizes, both trees,
+  both entropy policies and every Squeeze choice appear across the matrix. A one-entry explicit
+  limit succeeds for every cube image. Independent local headers retain exactly one zero delta;
+  native audits in the cases without Squeeze require every pixel to use a cube index.
+- 24 signed-entry cases derive two-pixel West-predicted pairs from every canonical index -143
+  through -1 at integer depths 8/16/24/31 and IEEE16/32, in all four component layouts. Native
+  auditing requires at least 143 negative indices per image, including exact high and special words.
+- 32 wide-source cases place native depth-24 cube words in 25–31-bit integer or binary32 sources.
+  Both native and GPU output retain every original word, while independent native audits require
+  zero cube indices and nonempty explicit residual use. This checks the interoperability boundary.
+- 42 integer RCT cases and 28 IEEE special-word cases cover every RCT/predictor, both Squeeze axis
+  orders, all source depths/layouts and independent token prediction. Four three-frame Replace
+  animations plus two cropped Add/Multiply sequences retain words, timing and reference semantics.
+- Eight resident/streamed lifetime cases check the enlarged hash, Weighted state, all group sizes,
+  exact/one-byte-short budgets, cancellation, source retirement and buffer reuse. Ten capacity
+  failures, including failures after a valid streamed batch, return no stream and release memory
+  before a later successful encode. Invalid constructor limits remain typed errors.
+
+The still-image matrices retain native exact-word and F32 checks, whole/fragmented GPU numeric
+output, canonical source-layout equality and retained-output ownership. Animation and lifetime
+cases reuse the existing word/composition and resource checks. Existing bounds and
+color/delta/mixed matrices are unchanged. General binary16 reference conversion is shared from
+the existing exhaustive floating test; layout tests keep their literal special-word references.
+The moved decoder entry function retains its independent actual-GPU 1–32-bit primitive checks.
+
+With the rebuilt `JXL_MODULAR_WORD_ORACLE` from the test-support instructions:
+
+```console
+JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --lib --test lossless_layouts palette -- --test-threads=2
+cargo test --locked -p jxl_wgpu_decode --lib modular_palette -- --test-threads=2
+```
+
+`MOD-E02` remains **Partial** for component subsets, table-free implicit policies, general transform
+stacks and global/LF topology, adaptive choices and the remaining encoder acceptance gates.
 
 ## Lossless Modular predictors
 

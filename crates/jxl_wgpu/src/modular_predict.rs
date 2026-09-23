@@ -1,4 +1,4 @@
-/// Expands shared integer and predictor WGSL fragments for codec consumers.
+/// Expands shared integer, predictor and implicit Palette WGSL fragments for codec consumers.
 ///
 /// The caller supplies `wp_current_width`, `wp_coefficient`, `wp_max_weight`, `wp_true_error`,
 /// `wp_subpred_error`, `wp_store_row`, and `predictor_error`. All sample-dependent arithmetic
@@ -6,6 +6,10 @@
 #[must_use]
 pub fn modular_prediction_shader(source: &str) -> String {
     source
+        .replace(
+            "/*__JXL_MODULAR_PALETTE__*/",
+            include_str!("../shaders/modular_palette.wgsl"),
+        )
         .replace(
             "/*__JXL_MODULAR_PREDICT__*/",
             include_str!("../shaders/modular_predict.wgsl"),

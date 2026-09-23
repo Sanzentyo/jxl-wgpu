@@ -14,6 +14,8 @@ fragment includes this helper automatically.
 entropy reconstruction and Palette. All 14 predictors use portable two-word signed-wide
 intermediates with 32-bit committed error state. Consumers provide coefficients and row-storage
 callbacks; the shared fragments introduce no bindings or host pixel arithmetic.
+The same expansion includes the pure implicit Palette entry fragment for encoder matching and
+decoder inversion, retaining wide cube arithmetic and the 24-bit signed-delta scale cap.
 
 Host code validates plans and packets, records command buffers, and resolves completion. Supported
 pixel, coefficient, restoration, color, packing, and display work executes in WGSL. Unsupported

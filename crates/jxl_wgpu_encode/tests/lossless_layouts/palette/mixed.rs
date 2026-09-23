@@ -3,7 +3,7 @@ use jxl_bitstream::U;
 
 // Only reads local transform declarations with independent frame/TOC and bit readers.
 // Sample validation uses native original words, not jxl-oxide's delta inverse.
-fn local_counts(encoded: &[u8]) -> Vec<(u32, u32, u32)> {
+pub(super) fn local_counts(encoded: &[u8]) -> Vec<(u32, u32, u32)> {
     let image = jxl_oxide::JxlImage::read_with_defaults(encoded).unwrap();
     let frame = image.frame(0).unwrap();
     assert!(!frame.toc().is_single_entry());

@@ -50,9 +50,10 @@ pub(super) struct ModularParams {
     pub(super) palette_channels: u32,
     pub(super) palette_delta_predictor: u32,
     pub(super) palette_delta_capacity: u32,
+    pub(super) palette_implicit_depth: u32,
     // An explicit 256-byte array stride keeps every batch boundary valid for the portable
     // storage-buffer offset alignment without hidden Rust padding.
-    pub(super) _padding: [u32; 7],
+    pub(super) _padding: [u32; 6],
 }
 
 /// Fixed storage-buffer header written by `lossless_modular.wgsl`.

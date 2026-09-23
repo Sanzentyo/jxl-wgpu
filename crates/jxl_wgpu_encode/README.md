@@ -124,8 +124,16 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   `max_colors()` reports total dictionary capacity, including deltas; `max_deltas()` reports the
   delta limit, and `delta_predictor()` is absent only for the color-only policy. Invalid delta
   limits return `EncodeError::InvalidModularPaletteDeltaLimit`; capacity overflow uses the same
-  completion error and returns no stream. Implicit entries, component subsets, arbitrary stacks
-  and automatic policy selection remain open.
+  completion error and returns no stream.
+  `LosslessModularPalette::implicit(max_deltas, predictor)` also selects exact implicit entries.
+  It first matches the complete post-RCT tuple against the 64/125-entry cubes, then looks for an
+  exact predictor residual among the 143 canonical signed entries, and finally stores an explicit
+  residual. No component is rounded, including alpha or raw IEEE words. The explicit delta limit
+  includes one declared zero entry, which avoids native libjxl's single-channel zero-delta index
+  clamp. Cube selection is limited to working depths 1–24, where native and normative scaling
+  agree; wider integers and binary32 retain implicit signed deltas and exact explicit residuals.
+  `uses_implicit_entries()` identifies this policy. Component subsets, arbitrary stacks, table-free
+  implicit policies and automatic policy selection remain open.
 - `LosslessModularConfig` selects all four standard PassGroup sizes with
   `LosslessModularGroupSize::{Pixels128, Pixels256, Pixels512, Pixels1024}`, the MA-tree mode,
   reversible color transform, Palette, Squeeze, prediction and LZ77 policy.
@@ -197,11 +205,13 @@ the checked source/artifact binding limits. With Squeeze, these formulas use eac
 channel's width, height and area, with up to 16 channels per group; single-pixel edge axes may
 produce fewer. Palette instead has one meta channel plus one, two or four index-image channels.
 Its meta channel reserves `k × source_components` samples, where `k` is the sum of the separately
-pixel-clamped color and delta limits. Only actual used entries are encoded. For capacity `k` and
-`c` source components, Palette adds `4 * (2 + k * c + next_power_of_two(2 * k))` scratch bytes per
-group for total/delta counts, the partitioned dictionary and hash table. The peak subtotal is
+pixel-clamped color and delta limits. The implicit policy instead clamps its delta limit to
+`group_pixels + 1`, including its declared zero entry. Only declared entries are encoded.
+For capacity `k` and `c` source components, Palette adds
+`4 * (2 + k * c + next_power_of_two(2 * (k + i)))` scratch bytes per group, where `i` is 143 for
+implicit lookup and zero otherwise. This covers total/delta counts, the dictionary and hash table. The peak subtotal is
 included in the artifact allocation and any readback copy.
-Delta and mixed modes additionally retain `4 * group_pixels * source_components` residual bytes and,
+Delta, mixed and implicit modes additionally retain `4 * group_pixels * source_components` residual bytes and,
 for Weighted delta prediction, `20 * group_width` row-state bytes reused between components.
 These are included in `palette_scratch_bytes`, separately from token-predictor scratch.
 These private scratch bytes are mapped with that allocation; host assembly reads the counts and
@@ -343,6 +353,10 @@ The [mixed Palette matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-mix
 checks the simultaneous 70,911-color/66,816-delta maximum, equal words in different partitions,
 all predictors, integer/IEEE/RCT/Squeeze composition, animations and resident/streamed ownership.
 It uses the same independent native exact-word and F32 oracles without changing their bounds.
+The [implicit Palette matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-implicit-palette-encoding)
+uses native implicit entries as inputs and audits native-decoded indices before inversion.
+Both cubes, signed entries, wider exact residuals, RCT/Squeeze, animation and lifetime checks keep
+the original-word and F32 bounds. The declared zero entry and depth policy preserve interoperability.
 
 ## Experimental VarDCT profile
 

@@ -1,5 +1,6 @@
 use super::*;
 pub(crate) mod delta;
+mod implicit;
 mod mixed;
 use jxl_wgpu_encode::{
     BackendError, LosslessModularColorTransform as Transform, LosslessModularConfig,
@@ -47,13 +48,13 @@ fn samples(case: Case, extent: Extent2d, colors: u32) -> Vec<u32> {
         .collect()
 }
 
-fn check(
+fn checked_stream(
     rig: &Rig,
     encoder: &LosslessModularEncoder,
     case: Case,
     extent: Extent2d,
     expected: &[u32],
-) -> usize {
+) -> Vec<u8> {
     eprintln!("{:?}, {case:?}, {extent:?}", encoder.config());
     let input = upload(&rig.context, &case, extent, expected, 4099);
     let plan = encoder.memory_plan(&input).unwrap();
@@ -78,7 +79,7 @@ fn check(
     }
     color::check_numeric(rig, &encoded, &[expected.to_vec()], &case);
     assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
-    encoded.len()
+    encoded
 }
 
 #[test]
@@ -386,4 +387,14 @@ fn check_lifetime(rig: &Rig, config: LosslessModularConfig, oracle: FrameOracle)
         oracle(&encoded, &[&expected], &case);
         color::check_numeric(rig, &encoded, &[expected], &case);
     }
+}
+
+fn check(
+    rig: &Rig,
+    encoder: &LosslessModularEncoder,
+    case: Case,
+    extent: Extent2d,
+    expected: &[u32],
+) -> usize {
+    checked_stream(rig, encoder, case, extent, expected).len()
 }

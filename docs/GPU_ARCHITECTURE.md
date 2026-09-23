@@ -77,6 +77,12 @@ equal word tuple cannot alias its prediction delta. Weighted residual generation
 original sample before this choice. GPU table/index reads remap reserved partition offsets to the
 compact wire order of used deltas followed by used colors. The host validates total and delta
 counts against both planned limits and exact token coverage before publishing a transform header.
+The implicit policy starts with one declared zero residual and seeds the hash with the 143
+canonical negative entries. Tagged hash values refer to shared WGSL constants rather than extra
+dictionary words. Exact whole-tuple cube matching precedes residual lookup. Cube selection stops
+at depth 24 for native interoperability; wider source words still use exact signed/explicit
+residuals. Index tokens refer to canonical negative entries or to cubes after the actual explicit
+table. The extra hash capacity shares the same reservation, completion and cancellation lifetime.
 
 Before codestream inventory, `jxl_gpu_bitstream::ContainerStreamScanner` can now consume arbitrary
 owned chunks without joining the complete transport. Apart from the inline reconstructed two-byte

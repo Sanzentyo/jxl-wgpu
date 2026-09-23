@@ -66,6 +66,8 @@ or drop releases copied metadata without extending the lifetime of caller chunks
   narrowing and wrapping sums. The five-word-per-column weighted row state and existing resume
   tails are unchanged. Implicit Palette scaling also uses the shared wide product through a
   32-bit working depth, while negative delta scaling still caps at 24 bits.
+  Encoder matching and decoder inversion share `jxl_wgpu/shaders/modular_palette.wgsl`;
+  its pure entry function and 72-vector constant table add no bindings or allocations.
 - `ModularRctParams` is another 64-byte, 16-byte-aligned `Pod` uniform with three
   `width,height,row_stride,word_offset` records and an RCT type plus three reserved words. The three
   footprints are pairwise non-overlapping views of one read-write arena binding. Every invocation
@@ -139,7 +141,7 @@ name shown in parentheses.
 | `jxl_wgpu_encode/vardct_encoder/common.wgsl` | six host words / `QuantizationEntry` | three f32 dequantization scales followed by three u32 X/Y/B coefficient-order positions | 24 | 4 | read-only storage element |
 | `jxl_wgpu_encode/vardct_encoder/raw_matrices.wgsl` | five task words | wire width, channel area, input sample offset, output fragment offset, fragment capacity in words | 20 | 4 | read-only storage element after 67 prefix/control words |
 | `jxl_wgpu_encode/vardct_encoder/raw_matrices.wgsl` | four completion words | ready marker, task index, sample count, fragment bit length | 16 | 4 | storage/readback element before compressed fragments |
-| `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularParams` / `Params` | `width, height, output_word_offset, channel, channels, sample_mask, rct_type, big_endian`; four 24-byte source records (`row_stride, byte_offset, pixel_stride, word_bytes, bit_shift, plane`); predictor and WP scratch offset, seven coefficients, four maximum weights, LZ77 mode/scratch offset/hash mask; Squeeze mode/source width/source height; Palette capacity/scratch offset/hash mask/channel count/delta predictor/delta capacity, seven pads | 256 | 4 | read-only storage element |
+| `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularParams` / `Params` | `width, height, output_word_offset, channel, channels, sample_mask, rct_type, big_endian`; four 24-byte source records (`row_stride, byte_offset, pixel_stride, word_bytes, bit_shift, plane`); predictor and WP scratch offset, seven coefficients, four maximum weights, LZ77 mode/scratch offset/hash mask; Squeeze mode/source width/source height; Palette capacity/scratch offset/hash mask/channel count/delta predictor/delta capacity/implicit depth, six pads | 256 | 4 | read-only storage element |
 | `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularArtifactHeader` / `output_words[0..100]` | `event_count, raw_counts[33], lz77_counts[33], distance_counts[33]` | 400 | 4 | storage/readback record |
 | `jxl_wgpu_encode/lossless_modular.wgsl` | `ModularEvent` / four-word event | `kind, token, extra_bit_count, extra_bits` | 16 | 4 | storage/readback element |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | entropy prefix/window, group geometry, sample/channel counts, channel-layout offset, output kind/transfer/range, channels/order/depth, 4 plane offset/stride pairs, chroma geometry/size/mapping, status/stream/fixed-leaf/weighted-predictor fields; canvas width/height and orientation | 256 | 4 | read-only storage element |
@@ -448,8 +450,9 @@ against device limits prior to pipeline compilation and dispatch recording.
   does not return partial output. The Gray8 private acceleration index is omitted for explicit Squeeze.
   Optional Palette uses bytes 204/208/212/216 for dictionary capacity, binding-relative scratch
   word offset, hash mask and encoded channel count. Delta predictor at byte 220 is `0..=13`,
-  or sentinel 14 for an exact color table. Delta partition capacity occupies byte 224; seven
-  padding words begin at byte 228. Six bindings and the 256-byte stride remain unchanged.
+  or sentinel 14 for an exact color table. Delta partition capacity occupies byte 224.
+  Byte 228 carries the implicit working depth (zero disables selection); six padding words begin
+  at byte 232. Six bindings and the 256-byte stride remain unchanged.
   Capacity `k` sums the separately pixel-clamped color and delta limits, at most 137,727;
   each group's first artifact adds `4 * (2 + k * source_components + next_power_of_two(2*k))`
   bytes for total/delta counts, a channel-major dictionary and at-most-half-full hash table. The whole
@@ -481,6 +484,14 @@ against device limits prior to pipeline compilation and dispatch recording.
   only after the full dictionary succeeds. The wire declares their validated counts and selected
   predictor, including zero used deltas in a mixed group. Squeeze geometry, failure sentinels and
   ownership are unchanged.
+  Implicit mode reserves one explicit zero delta and clamps its table capacity to at most
+  `group_pixels + 1`. Hash capacity becomes `next_power_of_two(2 * (k + 143))` words. The high bit
+  of an occupied hash entry tags a canonical negative index; low bits hold its magnitude 1–143.
+  Equality regenerates the constant tuple on GPU. The seed zero counts against the caller's limit
+  and prevents the native single-channel zero-delta inverse from clamping cube indices. Whole-tuple
+  matching selects cube indices 0–188 only at depths 1–24; signed implicit deltas and explicit
+  residuals preserve wider words. No new sample array, binding or dispatch is introduced. All hash
+  words are included in `palette_scratch_bytes`, artifact/readback bytes and exact admission.
 - Gray8 decoder output allocation is rounded to four bytes while `logical_size` remains explicit.
   RGBA/BGRA pixels and odd-width YUYV/UYVY pairs use aligned whole-word stores; byte and 16-bit
   plane writers bounds-check each addressed byte against `logical_size`.

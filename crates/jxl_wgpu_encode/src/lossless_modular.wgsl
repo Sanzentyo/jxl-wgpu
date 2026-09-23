@@ -36,7 +36,8 @@ struct Params {
     palette_channels: u32,
     palette_delta_predictor: u32,
     palette_delta_capacity: u32,
-    _padding: array<u32, 7>,
+    palette_implicit_depth: u32,
+    _padding: array<u32, 6>,
 }
 
 @group(0) @binding(0)
@@ -70,6 +71,7 @@ const PALETTE_OVERFLOW: u32 = 0xfffffffdu;
 const PALETTE_INVALID: u32 = 0xfffffffcu;
 
 /*__JXL_MODULAR_PREDICT__*/
+/*__JXL_MODULAR_PALETTE__*/
 
 var<private> active_params: Params;
 var<private> squeeze_failed: bool;
@@ -226,6 +228,45 @@ fn palette_residual_base(params: Params) -> u32 {
     return palette_hash_base(params) + params.palette_hash_mask + 1u;
 }
 
+fn implicit_delta_color(params: Params, index: i32) -> vec4<u32> {
+    var color = vec4<u32>(0u);
+    for (var component = 0u; component < params.channels; component += 1u) {
+        color[component] = bitcast<u32>(mp_implicit_palette_value(index, component, params.palette_implicit_depth));
+    }
+    return color;
+}
+
+fn implicit_cube_index(params: Params, color: vec4<u32>) -> i32 {
+    // Native and normative cube scaling agree through depth 24. Preserve wider words via
+    // signed implicit deltas or the explicit residual dictionary, without rounding them.
+    if params.palette_implicit_depth == 0u || params.palette_implicit_depth > 24u { return -1; }
+    for (var cube = 0u; cube < 2u; cube += 1u) {
+        let levels = 4u + cube;
+        var index = select(0u, 64u, cube == 1u);
+        var stride = 1u;
+        var matches = true;
+        for (var component = 0u; component < params.channels; component += 1u) {
+            if component >= 3u {
+                matches = matches && color[component] == 0u;
+                continue;
+            }
+            var found = false;
+            for (var digit = 0u; digit < levels; digit += 1u) {
+                let candidate = select(0u, 64u, cube == 1u) + digit * stride;
+                if color[component] == bitcast<u32>(mp_implicit_palette_value(i32(candidate), component, params.palette_implicit_depth)) {
+                    index += digit * stride;
+                    found = true;
+                    break;
+                }
+            }
+            matches = matches && found;
+            stride *= levels;
+        }
+        if matches { return i32(index); }
+    }
+    return -1;
+}
+
 fn palette_slot(params: Params, color: vec4<u32>, delta: bool) -> u32 {
     var hash = 2166136261u ^ select(0u, 0x80000000u, delta);
     for (var component = 0u; component < params.channels; component += 1u) {
@@ -238,6 +279,10 @@ fn palette_slot(params: Params, color: vec4<u32>, delta: bool) -> u32 {
         let slot = (hash + probe) & params.palette_hash_mask;
         let entry = output_words[heads + slot];
         if entry == 0u { return slot; }
+        if (entry & 0x80000000u) != 0u {
+            if delta && all(implicit_delta_color(params, -i32(entry & 0x7fffffffu)) == color) { return slot; }
+            continue;
+        }
         if (entry - 1u < params.palette_delta_capacity) != delta { continue; }
         var matches = true;
         for (var component = 0u; component < params.channels; component += 1u) {
@@ -258,9 +303,24 @@ fn build_palette(params: Params) -> bool {
     let heads = palette_hash_base(params);
     var colors = 0u;
     var deltas = 0u;
+    if params.palette_implicit_depth != 0u {
+        // A declared zero delta keeps native single-channel inverse code from clamping
+        // implicit indices. It counts against the requested explicit delta capacity.
+        deltas = 1u;
+        for (var component = 0u; component < params.channels; component += 1u) {
+            output_words[table + component * params.palette_capacity] = 0u;
+        }
+        for (var index = 1u; index <= 143u; index += 1u) {
+            let color = implicit_delta_color(params, -i32(index));
+            let slot = palette_slot(params, color, true);
+            if slot > params.palette_hash_mask { return false; }
+            if output_words[heads + slot] == 0u { output_words[heads + slot] = 0x80000000u | index; }
+        }
+    }
     let color_capacity = params.palette_capacity - params.palette_delta_capacity;
     for (var y = 0u; y < params.source_height; y += 1u) {
         for (var x = 0u; x < params.source_width; x += 1u) {
+            if params.palette_implicit_depth != 0u && implicit_cube_index(params, palette_color(params, x, y, false)) >= 0i { continue; }
             // Absolute matches take priority. The first distinct tuples fill the color
             // partition; subsequent new colors use the independent residual partition.
             var delta = color_capacity == 0u;
@@ -296,6 +356,10 @@ fn build_palette(params: Params) -> bool {
 }
 
 fn palette_index(params: Params, x: u32, y: u32) -> i32 {
+    if params.palette_implicit_depth != 0u {
+        let index = implicit_cube_index(params, palette_color(params, x, y, false));
+        if index >= 0i { return index + i32(output_words[params.palette_scratch_word_offset]); }
+    }
     let heads = palette_hash_base(params);
     if params.palette_capacity != params.palette_delta_capacity {
         let slot = palette_slot(params, palette_color(params, x, y, false), false);
@@ -311,6 +375,7 @@ fn palette_index(params: Params, x: u32, y: u32) -> i32 {
         let slot = palette_slot(params, palette_color(params, x, y, true), true);
         if slot <= params.palette_hash_mask {
             let entry = output_words[heads + slot];
+            if (entry & 0x80000000u) != 0u { return -i32(entry & 0x7fffffffu); }
             if entry != 0u { return i32(entry - 1u); }
         }
     }

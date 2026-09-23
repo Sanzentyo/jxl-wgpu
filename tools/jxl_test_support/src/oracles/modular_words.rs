@@ -12,7 +12,7 @@ pub struct FrameWords {
     pub planes: Vec<Vec<i32>>,
 }
 
-pub fn original_frames(encoded: &[u8]) -> Vec<FrameWords> {
+fn run_input(encoded: &[u8], option: Option<&str>) -> Vec<u8> {
     static INPUT: AtomicUsize = AtomicUsize::new(0);
     let binary = std::env::var_os("JXL_MODULAR_WORD_ORACLE")
         .expect("required pinned scalar libjxl oracle: set JXL_MODULAR_WORD_ORACLE (see tools/jxl_test_support/README.md)");
@@ -22,7 +22,7 @@ pub fn original_frames(encoded: &[u8]) -> Vec<FrameWords> {
         INPUT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::write(&path, encoded).unwrap();
-    let result = Command::new(binary).arg(&path).output();
+    let result = Command::new(binary).args(option).arg(&path).output();
     std::fs::remove_file(path).unwrap();
     let result = result.expect("run required native Modular word oracle");
     assert!(
@@ -30,15 +30,56 @@ pub fn original_frames(encoded: &[u8]) -> Vec<FrameWords> {
         "native Modular word oracle: {}",
         String::from_utf8_lossy(&result.stderr)
     );
-    let (magic, bytes) = result
-        .stdout
-        .split_at_checked(8)
-        .expect("native word header");
-    assert_eq!(magic, b"JXLRAW12");
+    result.stdout
+}
+
+fn words<'a>(bytes: &'a [u8], signature: &[u8; 8]) -> impl Iterator<Item = u32> + 'a {
+    let (magic, bytes) = bytes.split_at_checked(8).expect("native word header");
+    assert_eq!(magic, signature);
     let (words, tail) = bytes.as_chunks::<4>();
     assert!(tail.is_empty());
     let mut words = words.iter().map(|word| u32::from_le_bytes(*word));
     assert_eq!(words.next(), Some(12000), "libjxl runtime identity");
+    words
+}
+
+/// Native implicit entries for indices -143 through 188, with the native inverse's depth cap.
+pub fn implicit_entries(bits: u8) -> Vec<[i32; 4]> {
+    assert!((1..=32).contains(&bits));
+    let binary = std::env::var_os("JXL_MODULAR_WORD_ORACLE").expect("native Modular word oracle");
+    let result = Command::new(binary)
+        .arg("--implicit-entries")
+        .arg(bits.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let words: Vec<_> = words(&result.stdout, b"JXLIMP12").collect();
+    assert_eq!(words.len(), 332 * 4);
+    words
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|values| std::array::from_fn(|c| values[c] as i32))
+        .collect()
+}
+
+/// Counts negative implicit, cube implicit and explicit indices before the native inverse.
+/// Requires a final Palette transform, without following Squeeze, in each group.
+pub fn palette_index_counts(encoded: &[u8]) -> [u32; 3] {
+    let output = run_input(encoded, Some("--palette-audit"));
+    let mut words = words(&output, b"JXLPAL12");
+    let counts = std::array::from_fn(|_| words.next().expect("palette index count"));
+    assert!(words.next().is_none(), "trailing palette index counts");
+    counts
+}
+
+pub fn original_frames(encoded: &[u8]) -> Vec<FrameWords> {
+    let output = run_input(encoded, None);
+    let mut words = words(&output, b"JXLRAW12");
     let count = words.next().expect("frame count");
     assert!((1..=64).contains(&count));
     let frames = (0..count)

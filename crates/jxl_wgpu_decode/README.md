@@ -560,7 +560,7 @@ Entropy reconstruction, inverse Palette and Modular encoding share all 14 predic
 Their averaging, self-correcting predictions, and weighted sums use portable signed 64-bit
 intermediates represented by two GPU words. Persistent predictor errors retain the specified
 `i32`/`u32` storage, so bounded-input and Palette continuation layouts remain unchanged. Implicit
-Palette entries use a wide product for every 1–32-bit working depth; negative delta entries retain
+Palette entries share a pure WGSL fragment with encoder matching and use a wide product for every 1–32-bit working depth; negative delta entries retain
 the normative 24-bit scaling cap. Direct GPU tests cover signed extremes, binary32 bit patterns,
 all implicit color components, and every predictor against a native-`i64` scalar oracle. This
 working-word support also underpins the separate floating representation conversion described above.

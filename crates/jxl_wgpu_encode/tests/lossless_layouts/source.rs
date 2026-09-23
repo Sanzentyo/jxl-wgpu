@@ -100,7 +100,10 @@ impl Case {
         } else if self.bits == 32 {
             f32::from_bits(word)
         } else {
-            f32::from_bits(HALF.iter().find(|&&(half, _)| half == word).unwrap().1)
+            f32::from_bits(HALF.iter().find(|&&(half, _)| half == word).map_or_else(
+                || jxl_test_support::oracles::sample_bits::binary32(word, 16),
+                |&(_, expected)| expected,
+            ))
         }
     }
 }

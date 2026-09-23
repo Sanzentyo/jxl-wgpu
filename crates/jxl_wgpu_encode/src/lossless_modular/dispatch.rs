@@ -531,11 +531,10 @@ impl LosslessModularBackend {
                     source_height: group.height,
                     palette_capacity,
                     palette_scratch_word_offset,
-                    palette_hash_mask: if palette_capacity == 0 {
-                        0
-                    } else {
-                        (palette_capacity * 2).next_power_of_two() - 1
-                    },
+                    palette_hash_mask: self
+                        .config
+                        .palette
+                        .map_or(0, |palette| palette.hash_entries(palette_capacity) - 1),
                     palette_channels: if palette_capacity == 0 { 0 } else { channels },
                     palette_delta_predictor: self
                         .config
@@ -543,7 +542,12 @@ impl LosslessModularBackend {
                         .and_then(LosslessModularPalette::delta_predictor)
                         .map_or(14, LosslessModularPredictor::value),
                     palette_delta_capacity,
-                    _padding: [0; 7],
+                    palette_implicit_depth: self
+                        .config
+                        .palette
+                        .filter(|palette| palette.uses_implicit_entries())
+                        .map_or(0, |_| u32::from(source_spec.bits_per_sample)),
+                    _padding: [0; 6],
                 });
                 groups.push(ModularGroupPlan {
                     group_index: group.index,
