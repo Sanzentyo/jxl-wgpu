@@ -122,6 +122,21 @@ pub enum PacketError {
 
 #[derive(Debug, Error)]
 pub enum EncodeError {
+    #[error("explicit Squeeze sequence requires 1..=296 steps, got {count}")]
+    InvalidModularSqueezeStepCount { count: usize },
+    #[error("explicit Squeeze begin {begin} must fit 0..=9287 and count {count} must fit 1..=19")]
+    InvalidModularSqueezeStep { begin: u32, count: u32 },
+    #[error("Squeeze step {step} targets empty image channel {channel}")]
+    EmptyModularSqueezeChannel { step: u32, channel: u32 },
+    #[error(
+        "Squeeze step {step} targets image channel {channel} with shifts {horizontal}/{vertical} exceeding 30"
+    )]
+    ModularSqueezeShiftLimit {
+        step: u32,
+        channel: u32,
+        horizontal: u8,
+        vertical: u8,
+    },
     #[error(
         "Modular Squeeze range beginning at {begin} with {count} channels must be nonempty and fit {channels} post-Palette image channels"
     )]

@@ -27,7 +27,7 @@ fn implicit_cubes_cover_every_interoperable_depth_and_component_count() {
                     predictor: Predictor::ALL[(variant + 7) % 14],
                     weighted_predictor: Weighted::new([31, 0, 17, 3, 11, 31, 1], [0, 15, 7, 12])
                         .unwrap(),
-                    squeeze: SQUEEZES[variant % 5],
+                    squeeze: SQUEEZES[variant % 5].clone(),
                     group_size,
                     tree_mode: TREES[variant % 2],
                     color_transform: Transform::None,
@@ -168,7 +168,7 @@ fn implicit_policy_composes_rct_all_predictors_squeeze_and_ieee_special_words() 
                 predictor: Predictor::ALL[(value as usize + 7) % 14],
                 weighted_predictor: Weighted::new([31, 0, 17, 3, 11, 31, 1], [0, 15, 7, 12])
                     .unwrap(),
-                squeeze: SQUEEZES[value as usize % 5],
+                squeeze: SQUEEZES[value as usize % 5].clone(),
                 group_size,
                 tree_mode: TREES[value as usize % 2],
                 color_transform: if value % 2 == 0 {
@@ -198,7 +198,7 @@ fn implicit_policy_composes_rct_all_predictors_squeeze_and_ieee_special_words() 
             LosslessModularConfig {
                 palette: Some(Palette::implicit(1024, predictor).unwrap()),
                 predictor: Predictor::Weighted,
-                squeeze: SQUEEZES[index % 5],
+                squeeze: SQUEEZES[index % 5].clone(),
                 tree_mode: TREES[index % 2],
                 ..Default::default()
             },
@@ -224,7 +224,7 @@ fn implicit_palette_animation_preserves_exact_words_crops_and_reference_composit
             LosslessModularConfig {
                 palette: Some(Palette::implicit(4096, predictor).unwrap()),
                 predictor: Predictor::Weighted,
-                squeeze: SQUEEZES[index + 3],
+                squeeze: SQUEEZES[index + 3].clone(),
                 group_size,
                 tree_mode: TREES[index],
                 ..Default::default()
@@ -332,7 +332,7 @@ fn implicit_palette_hash_obeys_exact_admission_cancellation_and_pool_reuse() {
             &rig,
             LosslessModularConfig {
                 palette: Some(Palette::implicit(4096, Predictor::Weighted).unwrap()),
-                squeeze: SQUEEZES[index + 1],
+                squeeze: SQUEEZES[index + 1].clone(),
                 group_size,
                 tree_mode: TREES[index % 2],
                 predictor: Predictor::Weighted,

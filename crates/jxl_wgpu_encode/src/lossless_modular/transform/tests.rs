@@ -210,14 +210,14 @@ fn squeeze_ranges_are_checked_in_the_post_palette_image_domain() {
     let base = LosslessModularSqueeze::VerticalThenHorizontal;
     for (begin, count) in [(0, 0), (0, 5), (4, 1), (1, 4), (u32::MAX, 1), (1, u32::MAX)] {
         assert!(matches!(
-            base.with_channels(begin, count),
+            base.clone().with_channels(begin, count),
             Err(EncodeError::InvalidModularSqueezeChannels { .. })
         ));
     }
     let grid = LosslessModularGroupGrid::for_extent(1, 1, Default::default()).unwrap();
     for begin in 0..4 {
         for count in 1..=4 - begin {
-            let squeeze = base.with_channels(begin, count).unwrap();
+            let squeeze = base.clone().with_channels(begin, count).unwrap();
             assert_eq!(squeeze.channel_range(), Some(begin..begin + count));
             for channels in 1..=4 {
                 let config = LosslessModularConfig {
@@ -227,7 +227,7 @@ fn squeeze_ranges_are_checked_in_the_post_palette_image_domain() {
                             .with_components(0, 5 - channels)
                             .unwrap(),
                     ),
-                    squeeze,
+                    squeeze: squeeze.clone(),
                     ..Default::default()
                 };
                 let result =

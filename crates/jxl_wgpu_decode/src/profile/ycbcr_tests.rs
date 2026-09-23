@@ -8,8 +8,8 @@ use super::{parse_dc_global_ir, parse_lf_channel_dequantization, parse_standard_
 use crate::GpuCodestream;
 use crate::modular_inverse::{ModularInverseJob, plan_modular_inverse};
 use crate::modular_transform::{
-    ModularChannelGeometry, ModularChannelTopology, ModularTransformIr, ModularTransformLimits,
-    ModularTransformPlan, parse_modular_transforms,
+    ModularChannelGeometry, ModularChannelTopology, ModularInverseTransform, ModularTransformIr,
+    ModularTransformLimits, ModularTransformPlan, parse_modular_transforms,
 };
 use crate::modular_tree::{MaTreeLimits, WpHeaderIr, parse_ma_config};
 
@@ -65,6 +65,39 @@ fn require_topology(
         native.transform_count,
         "{name}: transforms"
     );
+    assert_eq!(
+        plan.transforms
+            .iter()
+            .map(|transform| match transform {
+                ModularTransformIr::Squeeze { parameters, .. } => parameters
+                    .iter()
+                    .map(|parameter| parameter.channel_count as usize)
+                    .sum::<usize>(),
+                _ => 0,
+            })
+            .sum::<usize>(),
+        native.squeeze_channels,
+        "{name}: declared Squeeze channels"
+    );
+    let mut identity_channels = 0;
+    plan.visit_inverse(|operation, _, destination| {
+        if let ModularInverseTransform::Squeeze(parameter) = operation {
+            let begin = parameter.begin_channel as usize;
+            for channel in &destination.channels()[begin..begin + parameter.channel_count as usize]
+            {
+                if (if parameter.horizontal {
+                    channel.width
+                } else {
+                    channel.height
+                }) == 1
+                {
+                    identity_channels += 1;
+                }
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
     let inverse = plan_modular_inverse(plan).unwrap();
     assert_eq!(
         inverse
@@ -72,8 +105,8 @@ fn require_topology(
             .iter()
             .filter(|job| matches!(job, ModularInverseJob::Squeeze { .. }))
             .count(),
-        native.squeeze_channels,
-        "{name}: Squeeze channels"
+        native.squeeze_channels - identity_channels,
+        "{name}: nonidentity GPU Squeeze channels"
     );
 }
 

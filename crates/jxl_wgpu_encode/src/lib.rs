@@ -78,8 +78,8 @@ pub use lossless_modular::{
     LosslessModularGroupSize, LosslessModularInFlightMemory, LosslessModularJob,
     LosslessModularLz77, LosslessModularMemoryLimits, LosslessModularMemoryPlan,
     LosslessModularPalette, LosslessModularPredictor, LosslessModularRctType,
-    LosslessModularSqueeze, LosslessModularSubmission, LosslessModularTreeMode,
-    LosslessModularWeightedPredictor,
+    LosslessModularSqueeze, LosslessModularSqueezeStep, LosslessModularSubmission,
+    LosslessModularTreeMode, LosslessModularWeightedPredictor,
 };
 pub use packet::{
     BitFragment, EncodedFrame, FrameGroupLayout, FramePacketSet, GroupPacket, GroupPacketKind,

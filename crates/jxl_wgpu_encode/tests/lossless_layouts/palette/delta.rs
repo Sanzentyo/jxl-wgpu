@@ -8,7 +8,7 @@ fn delta_palette_scratch_obeys_exact_admission_cancellation_and_pool_reuse() {
             &rig,
             LosslessModularConfig {
                 palette: Some(Palette::deltas(4096, Predictor::Weighted).unwrap()),
-                squeeze: SQUEEZES[index + 1],
+                squeeze: SQUEEZES[index + 1].clone(),
                 group_size,
                 tree_mode: TREES[index % 2],
                 predictor: Predictor::Weighted,
@@ -66,7 +66,7 @@ fn delta_palette_composes_every_predictor_rct_precision_and_squeeze_policy() {
                 predictor: Predictor::ALL[(value as usize + 7) % 14],
                 weighted_predictor: Weighted::new([31, 0, 17, 3, 11, 31, 1], [0, 15, 7, 12])
                     .unwrap(),
-                squeeze: SQUEEZES[value as usize % 5],
+                squeeze: SQUEEZES[value as usize % 5].clone(),
                 group_size,
                 tree_mode: TREES[value as usize % 2],
                 color_transform: if value % 2 == 0 {
@@ -102,7 +102,7 @@ fn delta_palette_composes_every_predictor_rct_precision_and_squeeze_policy() {
                 predictor: Predictor::Weighted,
                 weighted_predictor: Weighted::new([31, 0, 17, 3, 11, 31, 1], [0, 15, 7, 12])
                     .unwrap(),
-                squeeze: SQUEEZES[index % 5],
+                squeeze: SQUEEZES[index % 5].clone(),
                 tree_mode: TREES[index % 2],
                 ..Default::default()
             },
@@ -204,7 +204,7 @@ fn delta_palette_animation_retains_ieee_words_and_independent_references() {
             LosslessModularConfig {
                 palette: Some(Palette::deltas(4096, predictor).unwrap()),
                 predictor: Predictor::Weighted,
-                squeeze: SQUEEZES[index + 3],
+                squeeze: SQUEEZES[index + 3].clone(),
                 group_size,
                 tree_mode: TREES[index],
                 ..Default::default()

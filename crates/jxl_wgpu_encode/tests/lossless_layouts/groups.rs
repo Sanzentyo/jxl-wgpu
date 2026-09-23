@@ -14,7 +14,7 @@ fn encoder(
         tree_mode,
         ..Default::default()
     };
-    let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config);
+    let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config.clone());
     assert_eq!(encoder.config(), config);
     encoder
 }

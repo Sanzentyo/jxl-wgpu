@@ -604,32 +604,57 @@ impl ModularSqueezePipeline {
         arena: ModularSqueezeArena<'_>,
         params: ModularSqueezeParams,
     ) -> Result<wgpu::Buffer, ModularSqueezeError> {
-        let plan = plan_for_device(device, arena, params, self.variant)?;
-        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("jxl-wgpu decode Modular inverse Squeeze params"),
-            contents: bytemuck::bytes_of(&plan.params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("jxl-wgpu decode Modular inverse Squeeze bindings"),
-            layout: &self.pipeline.get_bind_group_layout(0),
-            entries: &[
-                binding_entry(0, arena.storage),
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: uniform.as_entire_binding(),
-                },
-            ],
-        });
+        Ok(self
+            .encode_batch(device, encoder, arena, [params])?
+            .remove(0))
+    }
+
+    /// Keeps ordered, dependent Squeeze dispatches in one compute pass. Each dispatch
+    /// retains its own validated views and uniform; storage ordering preserves arena reuse.
+    pub(crate) fn encode_batch(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        arena: ModularSqueezeArena<'_>,
+        parameters: impl IntoIterator<Item = ModularSqueezeParams>,
+    ) -> Result<Vec<wgpu::Buffer>, ModularSqueezeError> {
+        let mut uniforms = Vec::new();
+        let mut dispatches = Vec::new();
+        for params in parameters {
+            let plan = plan_for_device(device, arena, params, self.variant)?;
+            let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("jxl-wgpu decode Modular inverse Squeeze params"),
+                contents: bytemuck::bytes_of(&plan.params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("jxl-wgpu decode Modular inverse Squeeze bindings"),
+                layout: &self.pipeline.get_bind_group_layout(0),
+                entries: &[
+                    binding_entry(0, arena.storage),
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: uniform.as_entire_binding(),
+                    },
+                ],
+            });
+            uniforms.push(uniform);
+            dispatches.push((bind_group, plan.workgroups));
+        }
+        if dispatches.is_empty() {
+            return Ok(uniforms);
+        }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("jxl-wgpu decode Modular inverse Squeeze"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(plan.workgroups, 1, 1);
+        for (bind_group, workgroups) in &dispatches {
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.dispatch_workgroups(*workgroups, 1, 1);
+        }
         drop(pass);
-        Ok(uniform)
+        Ok(uniforms)
     }
 
     /// Returns the selected workgroup variant.

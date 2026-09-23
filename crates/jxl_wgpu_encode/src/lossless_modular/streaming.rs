@@ -239,12 +239,7 @@ fn submit_streaming_batch(
         plan,
         batch,
     } = submission;
-    let parameter_bytes = u64::try_from(batch.dispatch_count)
-        .ok()
-        .and_then(|count| count.checked_mul(std::mem::size_of::<ModularParams>() as u64))
-        .ok_or(EncodeError::InvalidSource(
-            "streaming parameter buffer size overflow",
-        ))?;
+    let parameter_bytes = batch.parameter_bytes;
     let artifact_bytes = batch.artifact_binding_size.get();
     let owned_bytes = artifact_bytes
         .checked_add(if direct_mapping { 0 } else { artifact_bytes })
@@ -260,21 +255,7 @@ fn submit_streaming_batch(
         direct_mapping,
     );
     let buffers = buffer_lease.buffers();
-    let end_dispatch = batch
-        .first_dispatch
-        .checked_add(batch.dispatch_count)
-        .ok_or(EncodeError::InvalidSource(
-            "streaming parameter range overflow",
-        ))?;
-    let parameters = plan
-        .parameters
-        .get(batch.first_dispatch..end_dispatch)
-        .ok_or(EncodeError::InvalidSource(
-            "streaming parameter range is invalid",
-        ))?;
-    context
-        .queue()
-        .write_buffer(&buffers.parameters, 0, bytemuck::cast_slice(parameters));
+    let uploads = plan.upload_parameters(context.queue(), &buffers.parameters, *batch)?;
     let [source0, source1, source2, source3] = batch.source_windows.entries(&source.buffer);
     let bind_group = context
         .device()
@@ -292,7 +273,14 @@ fn submit_streaming_batch(
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: buffers.parameters.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &buffers.parameters,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(
+                            batch.dispatch_count as u64
+                                * std::mem::size_of::<ModularParams>() as u64,
+                        ),
+                    }),
                 },
             ],
         });
@@ -302,6 +290,9 @@ fn submit_streaming_batch(
             label: Some("jxl-wgpu streamed lossless modular encode"),
         });
     commands.clear_buffer(&buffers.artifact, 0, None);
+    for upload in uploads {
+        upload.record(&mut commands, &buffers.parameters, &buffers.artifact);
+    }
     {
         let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("jxl-wgpu streamed lossless modular tokenization"),

@@ -8,7 +8,7 @@ fn local_and_global_rct_keep_admission_cancellation_and_streamed_reuse() {
     for local in [false, true] {
         for value in [4, 5, 6, 41] {
             let config = config(value, local, value as usize % 2);
-            let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config);
+            let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config.clone());
             groups::lifetime::check_admission(
                 &rig,
                 &encoder,

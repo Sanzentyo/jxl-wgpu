@@ -7,7 +7,7 @@ fn rct_animations_keep_original_words_and_reference_composition() {
         for operation in 0..7 {
             let value = operation + 7 * ((operation + u32::from(local)) % 6);
             let config = config(value, local, operation as usize % 2);
-            let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config);
+            let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config.clone());
             let kind = if operation % 2 == 0 {
                 SampleKind::Float
             } else {

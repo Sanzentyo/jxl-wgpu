@@ -255,6 +255,8 @@ fn palette_artifacts_validate_status_count_bounds_and_exact_dynamic_coverage() {
     bytes.extend_from_slice(&1u32.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
     let mut plan = ModularGroupPlan {
+        squeeze_metadata_words: 0,
+        squeeze_scratch_bytes: 0,
         group_index: 0,
         width: 4,
         height: 2,
@@ -319,6 +321,8 @@ fn mixed_palette_metadata_rejects_partition_overflow_and_truncation_before_token
     let offset = bytes.len();
     bytes.resize(offset + 8, 0);
     let mut plan = ModularGroupPlan {
+        squeeze_metadata_words: 0,
+        squeeze_scratch_bytes: 0,
         group_index: 0,
         width: 3,
         height: 2,

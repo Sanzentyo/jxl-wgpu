@@ -19,6 +19,7 @@ mod streaming;
 mod tests;
 mod transform;
 mod types;
+mod upload;
 
 pub use color::LosslessModularColorOptions;
 pub use dispatch::LosslessModularBackend;
@@ -34,7 +35,7 @@ pub use serializer::{
     LosslessModularAnimationDescriptor, LosslessModularAnimationSession, LosslessModularEncoder,
     LosslessModularSubmission,
 };
-pub use squeeze::LosslessModularSqueeze;
+pub use squeeze::{LosslessModularSqueeze, LosslessModularSqueezeStep};
 pub use streaming::LosslessModularJob;
 pub use types::{
     AlphaAssociation, LOSSLESS_MODULAR_GROUP_DIMENSION, LosslessModularConfig,

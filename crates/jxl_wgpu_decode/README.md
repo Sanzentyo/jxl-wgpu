@@ -297,6 +297,13 @@ The low-level `WgpuSubmissionEngine` implements a standards-only Modular still p
   nonempty DC-global sample channels and group-edge geometry; straight and associated alpha are accepted,
   and restoration filters and references remain outside this low-level still engine.
 
+The inverse plan preserves empty-residual channel positions and restores their geometry/shifts
+without copying unchanged samples or retiring the live average view. Consecutive Squeeze jobs
+record ordered dispatches in one compute pass, retaining each job's checked arena views and uniform
+budget. This handles the encoder's 296-parameter and 1,555-channel boundary streams on Metal without
+creating one command encoder per channel. RCT/Palette ordering and validation-before-output remain
+unchanged.
+
 Presentation normalizes all eight image orientations in the GPU writer. The source canvas and
 group origins remain in codestream coordinates; output layout and changed regions use the oriented
 extent. The same forward/inverse WGSL coordinate helpers serve Modular and VarDCT. Fixed-Gradient

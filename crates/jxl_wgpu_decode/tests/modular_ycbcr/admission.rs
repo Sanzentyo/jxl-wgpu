@@ -72,8 +72,13 @@ fn component_expansion_is_fully_admitted_and_survives_retry_and_cancellation() {
             assert_eq!(stats.low_frequency_group_stream_count, 3);
         }
         if name.starts_with("rct_empty_") {
-            assert_eq!(stats.inverse_transform_count, 3);
-            assert_eq!(stats.inverse_transform_uniform_bytes, 3 * 64);
+            // Empty RCT and the identity Squeeze that created its residuals retain
+            // topology and live average views without GPU jobs or uniform bytes.
+            assert_eq!(stats.inverse_transform_count, 0, "{name}: inverse jobs");
+            assert_eq!(
+                stats.inverse_transform_uniform_bytes, 0,
+                "{name}: inverse uniforms"
+            );
         }
         if name == "sampling_000" {
             equal_grid_render_bytes = Some(stats.modular_render_bytes);

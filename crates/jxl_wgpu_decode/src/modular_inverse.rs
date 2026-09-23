@@ -358,6 +358,13 @@ fn lower_squeeze(
         let average = live[average_index];
         let residual = live[residual_index];
         let geometry = destination.channels()[average_index];
+        // A checked one-sample axis has no residual: its inverse changes only
+        // topology (including shifts), not samples. Keep the average allocation
+        // live instead of recording a copy and retiring its still-owned span.
+        if geometry_words(residual.geometry)? == 0 {
+            live[average_index].geometry = geometry;
+            continue;
+        }
         let output_span = allocator.allocate(geometry_words(geometry)?)?;
         let output = ModularArenaPlane {
             geometry,
@@ -682,7 +689,8 @@ mod tests {
             let base = ModularTransformPlan::from_ir(source.clone(), vec![squeeze.clone()], limits)
                 .unwrap();
             let expected = plan_modular_inverse(&base).unwrap();
-            assert_eq!(expected.jobs().len(), 3);
+            assert!(expected.jobs().is_empty());
+            assert_eq!(expected.arena_words(), expected.entropy_words());
             for rct_type in 0..42 {
                 let plan = ModularTransformPlan::from_ir(
                     source.clone(),
@@ -702,6 +710,56 @@ mod tests {
                     plan_modular_inverse(&plan).unwrap(),
                     expected,
                     "{width}x{height}, horizontal {horizontal}, RCT {rct_type}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_empty_residuals_keep_live_views_for_later_inverse_jobs() {
+        let limits = ModularTransformLimits::default();
+        for (width, height, horizontal) in [(1, 19, true), (37, 1, false)] {
+            for in_place in [false, true] {
+                let source =
+                    ModularChannelTopology::full_resolution(width, height, 16, 4, limits).unwrap();
+                let identity = ModularSqueezeParameter {
+                    horizontal,
+                    in_place,
+                    begin_channel: 1,
+                    channel_count: 2,
+                };
+                let mut parameters = vec![identity; 24];
+                let transform = ModularTransformPlan::squeeze_only_for_test(
+                    source.clone(),
+                    parameters.clone(),
+                    limits,
+                )
+                .unwrap();
+                let inverse = plan_modular_inverse(&transform).unwrap();
+                assert!(inverse.jobs().is_empty());
+                assert_eq!(inverse.arena_words(), width * height * 4);
+                assert_eq!(inverse.uniform_bytes().unwrap(), 0);
+                assert_eq!(inverse.final_gpu_layouts(), source.gpu_layout().unwrap());
+
+                // A later nontrivial transform consumes a still-live source view.
+                // Its inverse schedule must equal the same operation without the
+                // identity topology steps, including arena reuse and final shifts.
+                let later = ModularSqueezeParameter {
+                    horizontal: !horizontal,
+                    in_place: false,
+                    begin_channel: 0,
+                    channel_count: 1,
+                };
+                parameters.push(later);
+                let transform =
+                    ModularTransformPlan::squeeze_only_for_test(source.clone(), parameters, limits)
+                        .unwrap();
+                let baseline =
+                    ModularTransformPlan::squeeze_only_for_test(source, vec![later], limits)
+                        .unwrap();
+                assert_eq!(
+                    plan_modular_inverse(&transform).unwrap(),
+                    plan_modular_inverse(&baseline).unwrap()
                 );
             }
         }
@@ -810,11 +868,10 @@ mod tests {
             },
         );
         assert_eq!(single_column.entropy_words(), 7);
-        assert_eq!(single_column.arena_words(), 14);
-        let ModularInverseJob::Squeeze { params } = single_column.jobs()[0] else {
-            panic!("single Squeeze plan contains RCT");
-        };
-        assert_eq!(params.residual_plane().width, 0);
+        assert_eq!(single_column.arena_words(), 7);
+        assert!(single_column.jobs().is_empty());
+        assert_eq!(single_column.uniform_bytes().unwrap(), 0);
+        assert_eq!(single_column.final_planes[0].offset_words, 0);
         assert_eq!(single_column.final_planes[0].geometry.width, 1);
         assert_eq!(single_column.final_planes[0].geometry.height, 7);
     }

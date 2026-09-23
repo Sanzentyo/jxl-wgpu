@@ -310,7 +310,12 @@ Entropy-visible planes begin as tightly packed ranges in one storage arena. RCT 
 three views without allocation; before each Squeeze channel dispatch a best-fit allocator reserves a
 non-overlapping restored range, then releases its average/residual ranges and coalesces adjacent
 holes. In-place and tail-appended residual orders use the same logical-plane table. A five-job
-RCT/Squeeze/RCT case executes in one encoder and maps all three noncontiguous final planes once; the
+RCT/Squeeze/RCT case executes in one encoder and maps all three noncontiguous final planes once.
+When the checked residual is empty, inverse Squeeze restores geometry/shifts while retaining the
+average span, with no copy, uniform or arena allocation. Consecutive nonempty Squeeze jobs record
+ordered dispatches in one compute pass, avoiding one Metal command encoder per channel while
+preserving the plan's dependencies and per-job uniforms. RCT and Palette boundaries retain their
+place in the schedule. The
 13-parameter progressive-DC root remains 37 jobs. Its final `[Y, X, B-Y]` i32 planes feed a
 resident-only conversion and later LF-pack pass, without a canonical Modular output write or
 readback between physical frames. The planner returns a typed address-space,

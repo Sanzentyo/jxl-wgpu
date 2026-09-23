@@ -47,7 +47,7 @@ pub(super) struct ModularParams {
     pub(super) palette_capacity: u32,
     pub(super) palette_scratch_word_offset: u32,
     pub(super) palette_hash_mask: u32,
-    pub(super) palette_channels: u32,
+    pub(super) group_channels: u32,
     pub(super) palette_delta_predictor: u32,
     pub(super) palette_delta_capacity: u32,
     pub(super) palette_implicit_depth: u32,
@@ -57,7 +57,8 @@ pub(super) struct ModularParams {
     pub(super) squeeze_band: u32,
     // An explicit 256-byte array stride keeps every batch boundary valid for the portable
     // storage-buffer offset alignment without hidden Rust padding.
-    pub(super) _padding: [u32; 2],
+    pub(super) squeeze_program_word_offset: u32,
+    pub(super) squeeze_sample_word_offset: u32,
 }
 
 /// Fixed storage-buffer header written by `lossless_modular.wgsl`.
@@ -189,7 +190,7 @@ impl LosslessModularGroupSize {
 /// assert_eq!(encoder.config().group_size.dimension(), 512);
 /// # }
 /// ```
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LosslessModularConfig {
     pub group_size: LosslessModularGroupSize,
     pub tree_mode: LosslessModularTreeMode,

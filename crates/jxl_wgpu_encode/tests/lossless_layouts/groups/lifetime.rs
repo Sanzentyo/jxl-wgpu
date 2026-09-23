@@ -49,7 +49,7 @@ pub(crate) fn check_admission(
                     NonZeroU64::new(bytes).unwrap(),
                 )
                 .unwrap(),
-                config,
+                config.clone(),
             )
         };
         let short = limited(plan.owned_bytes_per_job - 1);

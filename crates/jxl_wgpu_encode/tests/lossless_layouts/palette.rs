@@ -92,7 +92,7 @@ fn local_palette_preserves_every_component_and_composes_with_both_squeeze_orders
                 rig.context.clone(),
                 LosslessModularConfig {
                     palette: Some(Palette::new(32).unwrap()),
-                    squeeze,
+                    squeeze: squeeze.clone(),
                     tree_mode,
                     ..Default::default()
                 },
@@ -136,7 +136,7 @@ fn palette_composes_with_all_rcts_predictors_and_full_precision_words() {
             rig.context.clone(),
             LosslessModularConfig {
                 palette: Some(Palette::new(32).unwrap()),
-                squeeze: SQUEEZES[value as usize % 5],
+                squeeze: SQUEEZES[value as usize % 5].clone(),
                 group_size,
                 tree_mode: TREES[value as usize % 2],
                 color_transform: if value % 2 == 0 {
@@ -313,7 +313,7 @@ fn palette_scratch_obeys_exact_admission_cancellation_and_pool_reuse() {
     for (index, group_size) in Size::ALL.into_iter().enumerate() {
         let config = LosslessModularConfig {
             palette: Some(Palette::new(32).unwrap()),
-            squeeze: SQUEEZES[index + 1],
+            squeeze: SQUEEZES[index + 1].clone(),
             group_size,
             tree_mode: TREES[index % 2],
             predictor: Predictor::Weighted,
@@ -337,7 +337,7 @@ pub(super) fn check_lifetime_with_samples(
 ) {
     let group_size = config.group_size;
     let case = case(LosslessModularFormat::Rgba, 31, SampleKind::Unsigned);
-    let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config);
+    let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config.clone());
     for extent in [
         Extent2d::new(group_size.dimension() + 1, 3),
         Extent2d::new(group_size.dimension() * 33 + 1, 3),
@@ -355,7 +355,7 @@ pub(super) fn check_lifetime_with_samples(
                     NonZeroU64::new(bytes).unwrap(),
                 )
                 .unwrap(),
-                config,
+                config.clone(),
             )
         };
         let short = limited(plan.owned_bytes_per_job - 1);

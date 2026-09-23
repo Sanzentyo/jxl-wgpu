@@ -180,12 +180,13 @@ mod native_tests {
         .expect("Modular WGSL validates with portable WebGPU capabilities");
         for (name, size, offsets) in [
             ("Source", 24, vec![0, 4, 8, 12, 16, 20]),
+            ("SqueezeJob", 32, vec![0, 4, 8, 12, 16, 20, 24, 28]),
             (
                 "Params",
                 256,
                 vec![
                     0, 4, 8, 12, 16, 20, 24, 28, 32, 128, 132, 136, 164, 180, 184, 188, 192, 196,
-                    200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 240, 244, 248,
+                    200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 240, 244, 248, 252,
                 ],
             ),
         ] {
@@ -242,7 +243,7 @@ mod native_tests {
             palette_capacity: 52,
             palette_scratch_word_offset: 53,
             palette_hash_mask: 54,
-            palette_channels: 55,
+            group_channels: 55,
             palette_delta_predictor: 56,
             palette_delta_capacity: 57,
             palette_implicit_depth: 58,
@@ -250,11 +251,11 @@ mod native_tests {
             palette_components: 60,
             sample_source: 61,
             squeeze_band: 62,
-            _padding: [0; 2],
+            squeeze_program_word_offset: 63,
+            squeeze_sample_word_offset: 64,
         };
         let words = bytemuck::cast::<ModularParams, [u32; 64]>(params);
-        assert_eq!(&words[..62], &(1..=62).collect::<Vec<_>>());
-        assert!(words[62..].iter().all(|&word| word == 0));
+        assert_eq!(words.as_slice(), &(1..=64).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1135,6 +1136,16 @@ mod native_tests {
         assert!(encoder.in_flight_memory_stats().reserved_bytes > 0);
         drop(dropped);
 
+        // Cancellation retains buffers until the submitted GPU work and mapping complete.
+        // A concurrent long-running kernel can delay that work; the release deadline starts
+        // at the fence, not while resources are still required by the GPU.
+        context
+            .device()
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(30)),
+            })
+            .expect("abandoned GPU submission must complete before checking retirement");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let pool = encoder.buffer_pool_stats();

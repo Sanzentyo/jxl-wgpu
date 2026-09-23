@@ -101,15 +101,27 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   Both-axis policies apply the second axis to all selected averages and residuals, using separate
   wire steps when tail placement leaves unselected channels between them. The descriptor retains
   the previous named values, but is no longer an integer-representable enum.
-  A group axis of length one is skipped; odd tails remain in the average channel. Each pass group
-  declares its own transform, or DC-global declares it for a fused single-group frame.
-  Signed wide GPU arithmetic preserves normative average/tendency rounding without a transformed
-  image allocation or pixel readback. If any intermediate residual cannot fit a signed 32-bit
+  Named policies skip group axes of length one; odd tails remain in the average channel.
+  `LosslessModularSqueeze::sequence` accepts 1–296 ordered `LosslessModularSqueezeStep` values.
+  Each step selects an axis, current image-channel range and residual placement, allowing repeated
+  axes and selection of earlier residuals. `LosslessModularSqueezeStep::new` checks the wire bounds
+  (begin at most 9,287 and count 1–19); the shared plan checks actual ranges, nonempty input channels
+  and both cumulative shifts at most 30 before each step. Explicit steps retain zero-sized residual
+  slots on one-pixel axes. Their ranges exclude the Palette meta prefix throughout.
+  `steps()` exposes sequence descriptors; `channel_range()` and `in_place()` describe named
+  policies and return `None` for sequences. `with_channels` rejects sequences, while
+  `with_in_place` updates all their steps. Policies and `LosslessModularConfig` are `Clone`, not
+  `Copy`; cloning a sequence shares immutable step storage.
+  Each pass group declares its own transform, or DC-global declares it for a fused single-group
+  frame. Named policies compute samples directly; explicit sequences materialize GPU intermediates
+  in a planned reusable arena. Signed wide GPU arithmetic preserves normative average/tendency
+  rounding without pixel readback. If any intermediate residual cannot fit a signed 32-bit
   working word, completion returns `BackendError::ModularSqueezeOverflow` and no codestream.
   Thus explicit Squeeze accepts only representable transforms of the integer/IEEE input domain;
   it does not promise every full-width source is representable. This applies before prediction
   under both entropy policies and both resident/streamed completion paths. Cross-group/global-LF
-  Squeeze, arbitrary stacks, adaptive transform choices and progressive Modular remain open.
+  Squeeze, general RCT/Palette/Squeeze composition orders, adaptive transform choices and
+  progressive Modular remain open.
 - `LosslessModularConfig::palette` optionally selects `LosslessModularPalette::new(max_colors)`;
   the default is `None`. The checked limit is `1..=70_911`. Each pass group builds an exact
   first-occurrence dictionary of selected component tuples on GPU after RCT, including alpha
@@ -203,7 +215,7 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
 `LosslessModularEncoder::memory_plan` reports the detected valid bits, exponent width (zero for
 integers), largest component storage-word width, full and peak unions of source plane binding
 ranges, the maximum transformed `channel_count` in any group, peak parameter/artifact/readback bytes, `weighted_predictor_scratch_bytes`,
-`lz77_scratch_bytes`, `palette_scratch_bytes`, diagnostic total artifact bytes, batch count, exact GPU submission count,
+`lz77_scratch_bytes`, `palette_scratch_bytes`, `squeeze_scratch_bytes`, diagnostic total artifact bytes, batch count, exact GPU submission count,
 streaming mode, total encoder-owned live bytes, and the group grid before submission. Streamed jobs
 report exactly twice the batch count:
 one histogram and one serialization submission per batch. Every live batch uses the same shared
@@ -212,7 +224,8 @@ mapped-range consumer are both finished, including when the returned future is a
 Source range accounting excludes gaps between planes and counts shared alignment prefixes once.
 One checked transform plan resolves group-channel geometry, Palette capacity and ordered wire
 operations before allocation. Dispatch and all three resident/native-streamed/browser-streamed
-assembly paths share it; GPU parameters carry the resolved sample source and Squeeze band.
+assembly paths share it; GPU parameters carry the resolved sample source, Squeeze band or arena
+offset. Ordered sequence jobs and their metadata/sample capacity belong to that same plan.
 Actual Palette counts must validate against that plan before they can determine a header.
 Streamed submission checks the reported peak against available budget before allocating its first
 batch, even when a later batch is larger. Each batch still acquires and retains its own reservation;
@@ -225,9 +238,14 @@ scratch subtotal is already included in owned bytes and any separate readback co
 `8 * pixels + 4 * hash_buckets` bytes per channel for residual words, chain links and bucket heads,
 also inside the artifact allocation and its reported scratch subtotal. A complete group must fit
 the checked source/artifact binding limits. With Squeeze, these formulas use each transformed
-channel's width, height and area, with up to 16 channels per group; single-pixel edge axes may
-produce fewer. Palette has one meta channel plus `(source_components - selected_components + 1)`
-image channels multiplied by one, two or four Squeeze bands, for at most 17 encoded channels.
+channel's width, height and area. Named policies produce at most 16 image channels per group;
+single-pixel edge axes may produce fewer. Palette adds one meta channel and replaces its selected
+components with one index channel. Explicit sequences add each step's count to the current channel
+list, including empty residual slots; their exact topology determines event and predictor storage.
+Each sequence's `squeeze_scratch_bytes` includes a job-count word, 32 bytes per selected-channel
+operation, and the peak live sample arena. This private region is inside the artifact/readback
+allocation. The job table is also charged in parameter storage and copied to the private region
+before execution. Arena reuse never overwrites a job's still-live inputs.
 Its meta channel reserves `k × selected_components` samples, where `k` is the sum of the separately
 pixel-clamped color and delta limits. The implicit policy instead clamps its delta limit to
 `group_pixels + 1`, including its declared zero entry. Only declared entries are encoded.

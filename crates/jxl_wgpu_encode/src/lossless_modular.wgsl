@@ -1,5 +1,6 @@
 override squeeze_enabled: bool = false;
 override palette_enabled: bool = false;
+override squeeze_program_enabled: bool = false;
 
 struct Source {
     row_stride: u32,
@@ -33,7 +34,7 @@ struct Params {
     palette_capacity: u32,
     palette_scratch_word_offset: u32,
     palette_hash_mask: u32,
-    palette_channels: u32,
+    group_channels: u32,
     palette_delta_predictor: u32,
     palette_delta_capacity: u32,
     palette_implicit_depth: u32,
@@ -41,7 +42,8 @@ struct Params {
     palette_components: u32,
     sample_source: u32,
     squeeze_band: u32,
-    _padding: array<u32, 2>,
+    squeeze_program_word_offset: u32,
+    squeeze_sample_word_offset: u32,
 }
 
 @group(0) @binding(0)
@@ -421,6 +423,9 @@ fn squeeze_first(params: Params, component: u32, band: u32, point: vec2<u32>) ->
 }
 
 fn sample_at(params: Params, x: u32, y: u32) -> i32 {
+    if squeeze_program_enabled && params.sample_source == 6u {
+        return bitcast<i32>(output_words[params.squeeze_sample_word_offset + y * params.width + x]);
+    }
     if palette_enabled && params.sample_source == 5u {
         let deltas = output_words[params.palette_scratch_word_offset + 1u];
         let entry = select(params.palette_delta_capacity + x - deltas, x, x < deltas);
@@ -732,19 +737,92 @@ fn build_palette_residuals(params: Params) {
 fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if global_id.y != 0u || global_id.z != 0u || global_id.x >= arrayLength(&group_params) { return; }
     let params = group_params[global_id.x];
-    if palette_enabled && params.palette_capacity != 0u {
+    if (palette_enabled && params.palette_capacity != 0u) || squeeze_program_enabled {
         if params.channel != 0u { return; }
-        build_palette_residuals(params);
-        if !build_palette(params) {
-            output_words[params.output_word_offset] = PALETTE_OVERFLOW;
-            return;
+        if palette_enabled && params.palette_capacity != 0u {
+            build_palette_residuals(params);
+            if !build_palette(params) {
+                output_words[params.output_word_offset] = PALETTE_OVERFLOW;
+                return;
+            }
         }
-        for (var channel = 0u; channel < params.palette_channels; channel += 1u) {
+        if squeeze_program_enabled {
+            squeeze_failed = false;
+            palette_failed = false;
+            execute_squeeze_program(params);
+            if squeeze_failed { output_words[params.output_word_offset] = SQUEEZE_OVERFLOW; return; }
+            if palette_failed { output_words[params.output_word_offset] = PALETTE_INVALID; return; }
+        }
+        for (var channel = 0u; channel < params.group_channels; channel += 1u) {
             var token_params = group_params[global_id.x + channel];
-            if channel == 0u { token_params.width = output_words[params.palette_scratch_word_offset]; }
+            if params.palette_capacity != 0u && channel == 0u { token_params.width = output_words[params.palette_scratch_word_offset]; }
             encode_tokens(token_params);
         }
     } else {
         encode_tokens(params);
+    }
+}
+
+struct SqueezeJob {
+    source: u32,
+    source_offset: u32,
+    width: u32,
+    height: u32,
+    average_offset: u32,
+    residual_offset: u32,
+    horizontal: u32,
+    padding: u32,
+}
+
+fn squeeze_job_sample(params: Params, job: SqueezeJob, arena: u32, point: vec2<u32>) -> i32 {
+    if job.source == 6u {
+        return bitcast<i32>(output_words[arena + job.source_offset + point.y * job.width + point.x]);
+    }
+    return working_component(params, point.x, point.y, job.source);
+}
+
+fn execute_squeeze_program(params: Params) {
+    let base = params.squeeze_program_word_offset;
+    let count = output_words[base];
+    let arena = base + 1u + count * 8u;
+    for (var index = 0u; index < count; index += 1u) {
+        let offset = base + 1u + index * 8u;
+        let job = SqueezeJob(output_words[offset], output_words[offset + 1u],
+            output_words[offset + 2u], output_words[offset + 3u],
+            output_words[offset + 4u], output_words[offset + 5u],
+            output_words[offset + 6u], output_words[offset + 7u]);
+        let axis = select(1u, 0u, job.horizontal != 0u);
+        let extent = vec2<u32>(job.width, job.height);
+        var average_extent = extent;
+        var residual_extent = extent;
+        average_extent[axis] = (extent[axis] + 1u) / 2u;
+        residual_extent[axis] = extent[axis] / 2u;
+        var step = vec2<u32>(0u);
+        step[axis] = 1u;
+        for (var y = 0u; y < average_extent.y; y += 1u) {
+            for (var x = 0u; x < average_extent.x; x += 1u) {
+                var source = vec2<u32>(x, y);
+                source[axis] *= 2u;
+                let a = squeeze_job_sample(params, job, arena, source);
+                var average = a;
+                if source[axis] + 1u < extent[axis] {
+                    let b = squeeze_job_sample(params, job, arena, source + step);
+                    average = squeeze_average(a, b);
+                    var next = average;
+                    if source[axis] + 2u < extent[axis] {
+                        next = squeeze_job_sample(params, job, arena, source + 2u * step);
+                        if source[axis] + 3u < extent[axis] {
+                            next = squeeze_average(next, squeeze_job_sample(params, job, arena, source + 3u * step));
+                        }
+                    }
+                    var previous = average;
+                    if source[axis] != 0u { previous = squeeze_job_sample(params, job, arena, source - step); }
+                    let residual = squeeze_residual(a, b, previous, average, next);
+                    output_words[arena + job.residual_offset + y * residual_extent.x + x] = bitcast<u32>(residual);
+                }
+                output_words[arena + job.average_offset + y * average_extent.x + x] = bitcast<u32>(average);
+            }
+        }
+        if squeeze_failed || palette_failed { return; }
     }
 }

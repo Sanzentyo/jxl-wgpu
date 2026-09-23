@@ -2417,19 +2417,26 @@ pub(super) fn encode_modular_inverse_jobs(
     pipelines: &ModularInversePipelines,
 ) -> Result<Vec<wgpu::Buffer>> {
     let mut uniforms = Vec::new();
-    for job in plan.jobs() {
+    let mut remaining = plan.jobs();
+    while let Some((job, rest)) = remaining.split_first() {
+        remaining = rest;
         match *job {
             ModularInverseJob::Squeeze { params } => {
                 let pipeline = pipelines.squeeze.as_ref().ok_or(Error::EngineContract(
                     "resident Modular Squeeze job is missing its pipeline",
                 ))?;
-                uniforms.push(
+                let mut parameters = vec![params];
+                while let Some(ModularInverseJob::Squeeze { params }) = remaining.first() {
+                    parameters.push(*params);
+                    remaining = &remaining[1..];
+                }
+                uniforms.extend(
                     pipeline
-                        .encode(
+                        .encode_batch(
                             device,
                             encoder,
                             ModularSqueezeArena::from_storage(storage),
-                            params,
+                            parameters,
                         )
                         .map_err(crate::ModularInversePlanError::from)
                         .map_err(Error::from)?,

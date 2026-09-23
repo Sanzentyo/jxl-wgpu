@@ -719,6 +719,37 @@ animations and four cropped/reference compositions retain timing, original words
 composition bounds. Selection never includes the meta table. These tests extend the local separable
 profile; general transform stacks, global/LF/HF topology and adaptive selection remain open.
 
+### Ordered Squeeze sequences
+
+[`squeeze::sequence`](../crates/jxl_wgpu_encode/tests/lossless_layouts/squeeze/sequence.rs)
+adds nine GPU tests for explicit current-channel programs. Repeated axes and unequal channel
+extents cover all four source formats, both residual placements, one-pixel axes and retained empty
+residual slots. Every integer precision and binary16/binary32, all 42 RCT types, all four Palette
+policies, both entropy policies and all group sizes compose through the same checked plan. Native
+libjxl original words and component output, jxl-oxide working words where applicable, and whole/
+256-byte fragmented GPU numeric output retain the existing exact/precision contracts.
+
+Independent bit parsing checks 1, 16, 17, 72, 73 and 296 wire parameters and every begin-channel
+bucket, including begin 1,096 in a 1,555-channel topology. Equivalent explicit and named separable
+policies retain identical bytes. Invalid counts/ranges, empty intermediate input channels and
+cumulative shifts reject before allocation. Thirty-one one-pixel stages remain valid; a subsequent
+stage rejects. An 18-stage arena test checks live input/output disjointness, retired-span reuse,
+final channel views and the 32-byte operation ABI.
+
+Later-stage signed overflow is checked in resident and late-streamed completion under both entropy
+policies and placements, with no output, full retirement and successful subsequent reuse. Exact/
+one-byte-short budgets, cancellation and pool reuse combine sequences with selected mixed Palette,
+local RCT and Weighted/greedy policies. Integer Replace and finite floating cropped-reference
+animations keep original words, timing and existing composition bounds.
+
+The wide topology cases reproduced Metal device loss when inverse lowering emitted a separate
+compute pass for each channel. Empty-residual inverses now retain the average allocation while
+restoring geometry/shifts; consecutive remaining Squeeze dispatches share one ordered pass.
+The same boundary matrix passes with these changes. CPU plan checks additionally prove that
+24 identity stages preserve final views, arena size and a later nontrivial inverse schedule for
+both axes and placements. No oracle, tolerance or tested boundary was removed. General transform
+composition orders, global/LF/HF ownership and adaptive policies remain open.
+
 ## Lossless Modular Palette encoding
 
 [`lossless_layouts::palette`](../crates/jxl_wgpu_encode/tests/lossless_layouts/palette.rs)
@@ -4810,7 +4841,8 @@ and entropy APIs even when native forward selection would omit them.
 
 Twenty-nine admission cases request exactly one frame slot, verify identical per-frame cost at
 the exact budget, reject a one-byte shortfall and check retry, held output and cancellation.
-Empty RCT adds neither a fourth job nor another 64-byte uniform to a three-channel Squeeze plan.
+Empty RCT adds no job or uniform; Squeeze with empty residuals likewise preserves its average
+views without recording GPU work.
 Nine two-pass cases compare 27 native prefix snapshots, immutable GPU updates and exact final-only
 convergence. Color and numeric output compare whole input with 40-byte GPU windows and 43-byte
 transport fragments. Broader mixed MA/transform combinations, frame features and mixed-frame

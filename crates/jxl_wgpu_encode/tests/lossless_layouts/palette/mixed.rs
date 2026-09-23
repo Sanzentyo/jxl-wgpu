@@ -84,7 +84,7 @@ fn mixed_palette_preserves_every_predictor_rct_precision_and_squeeze_order() {
                 predictor: Predictor::ALL[(value as usize + 7) % 14],
                 weighted_predictor: Weighted::new([31, 0, 17, 3, 11, 31, 1], [0, 15, 7, 12])
                     .unwrap(),
-                squeeze: SQUEEZES[value as usize % 5],
+                squeeze: SQUEEZES[value as usize % 5].clone(),
                 group_size,
                 tree_mode: TREES[value as usize % 2],
                 color_transform: if value % 2 == 0 {
@@ -120,7 +120,7 @@ fn mixed_palette_preserves_every_predictor_rct_precision_and_squeeze_order() {
                 predictor: Predictor::Weighted,
                 weighted_predictor: Weighted::new([31, 0, 17, 3, 11, 31, 1], [0, 15, 7, 12])
                     .unwrap(),
-                squeeze: SQUEEZES[index % 5],
+                squeeze: SQUEEZES[index % 5].clone(),
                 tree_mode: TREES[index % 2],
                 ..Default::default()
             },
@@ -241,7 +241,7 @@ fn mixed_palette_animation_retains_original_words_and_reference_composition() {
             LosslessModularConfig {
                 palette: Some(Palette::mixed(3, 4096, predictor).unwrap()),
                 predictor: Predictor::Weighted,
-                squeeze: SQUEEZES[index + 3],
+                squeeze: SQUEEZES[index + 3].clone(),
                 group_size,
                 tree_mode: TREES[index],
                 ..Default::default()
@@ -344,7 +344,7 @@ fn mixed_palette_scratch_obeys_admission_cancellation_and_reuse() {
             &rig,
             LosslessModularConfig {
                 palette: Some(Palette::mixed(3, 4096, Predictor::Weighted).unwrap()),
-                squeeze: SQUEEZES[index + 1],
+                squeeze: SQUEEZES[index + 1].clone(),
                 group_size,
                 tree_mode: TREES[index % 2],
                 predictor: Predictor::Weighted,

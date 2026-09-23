@@ -1,5 +1,6 @@
 use super::*;
 mod selection;
+mod sequence;
 use jxl_wgpu_encode::{
     BackendError, LosslessModularColorTransform as Transform, LosslessModularConfig,
     LosslessModularGroupSize as Size, LosslessModularLz77 as Lz77,
@@ -73,7 +74,7 @@ fn squeeze_composes_with_all_rcts_predictors_group_sizes_and_entropy_policies() 
         let group_size = Size::ALL[value as usize % 4];
         let config = LosslessModularConfig {
             palette: None,
-            squeeze: MODES[value as usize % 4],
+            squeeze: MODES[value as usize % 4].clone(),
             group_size,
             tree_mode: TREES[value as usize % 2],
             color_transform: if value % 2 == 0 {
@@ -237,7 +238,7 @@ fn squeeze_streaming_preserves_exact_admission_cancellation_and_pool_reuse() {
     let case = case(LosslessModularFormat::Rgba, 16, SampleKind::Unsigned);
     for (index, group_size) in Size::ALL.into_iter().enumerate() {
         let config = LosslessModularConfig {
-            squeeze: MODES[index],
+            squeeze: MODES[index].clone(),
             group_size,
             tree_mode: TREES[index % 2],
             predictor: Predictor::Weighted,
@@ -245,7 +246,7 @@ fn squeeze_streaming_preserves_exact_admission_cancellation_and_pool_reuse() {
             color_transform: Transform::LocalRct(Rct::new(41).unwrap()),
             ..Default::default()
         };
-        let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config);
+        let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config.clone());
         for extent in [
             Extent2d::new(group_size.dimension() + 1, 3),
             Extent2d::new(group_size.dimension() * 17 + 1, 3),
@@ -262,7 +263,7 @@ fn squeeze_streaming_preserves_exact_admission_cancellation_and_pool_reuse() {
                         NonZeroU64::new(bytes).unwrap(),
                     )
                     .unwrap(),
-                    config,
+                    config.clone(),
                 )
             };
             let short = limited(plan.owned_bytes_per_job - 1);
@@ -315,7 +316,7 @@ fn separable_squeeze_roundtrips_both_axes_and_single_pixel_edges() {
             let encoder = LosslessModularEncoder::with_config(
                 rig.context.clone(),
                 LosslessModularConfig {
-                    squeeze,
+                    squeeze: squeeze.clone(),
                     tree_mode,
                     ..Default::default()
                 },

@@ -89,7 +89,9 @@ impl EncoderBufferSet {
             parameters: Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("jxl-wgpu lossless modular pooled group parameters"),
                 size: parameter_bytes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             })),
             artifact,

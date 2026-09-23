@@ -1543,13 +1543,31 @@ fn write_transforms(
             }
             TransformOperation::Squeeze(steps) => {
                 output.write_bits(2, 2)?;
-                output.write_bits(1, 2)?;
-                output.write_bits((steps.len() - 1) as u64, 4)?;
+                let count = steps.len();
+                let (selector, base, bits) = if count <= 16 {
+                    (1, 1, 4)
+                } else if count <= 72 {
+                    (2, 9, 6)
+                } else {
+                    (3, 41, 8)
+                };
+                output.write_bits(selector, 2)?;
+                output.write_bits((count - base) as u64, bits)?;
                 for step in steps {
                     output.write_bits(u64::from(step.horizontal), 1)?;
                     output.write_bits(u64::from(step.in_place), 1)?;
-                    output.write_bits(0, 2)?;
-                    output.write_bits(u64::from(step.range.begin), 3)?;
+                    let begin = step.range.begin;
+                    let (selector, base, bits) = if begin < 8 {
+                        (0, 0, 3)
+                    } else if begin < 72 {
+                        (1, 8, 6)
+                    } else if begin < 1096 {
+                        (2, 72, 10)
+                    } else {
+                        (3, 1096, 13)
+                    };
+                    output.write_bits(selector, 2)?;
+                    output.write_bits(u64::from(begin - base), bits)?;
                     if step.range.count <= 3 {
                         output.write_bits(u64::from(step.range.count - 1), 2)?;
                     } else {

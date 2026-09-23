@@ -34,7 +34,7 @@ fn config(policy: Palette, begin: u32, count: u32, variant: usize) -> LosslessMo
         } else {
             Lz77::Greedy
         },
-        squeeze: SQUEEZES[variant % 5],
+        squeeze: SQUEEZES[variant % 5].clone(),
     }
 }
 
@@ -46,7 +46,8 @@ fn every_component_range_keeps_unselected_channels_with_all_palette_policies() {
         for (begin, count) in ranges(format.channel_count()) {
             for policy in policies(Predictor::ALL[variant % 14]) {
                 let config = config(policy, begin, count, variant);
-                let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config);
+                let encoder =
+                    LosslessModularEncoder::with_config(rig.context.clone(), config.clone());
                 let mut case = case(format, 8, SampleKind::Unsigned);
                 case.storage = [Storage::Packed, Storage::Planar, Storage::Split][variant % 3];
                 let extent = Extent2d::new(config.group_size.dimension() + 1, 3);
@@ -240,7 +241,7 @@ fn selected_components_keep_animation_words_and_cropped_reference_composition() 
             squeeze: Squeeze::None,
             ..config(policy, 1, 1, index)
         };
-        let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config);
+        let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config.clone());
         for (format, kind, bits) in [
             (LosslessModularFormat::Rgba, SampleKind::Unsigned, 31),
             (LosslessModularFormat::GrayAlpha, SampleKind::Float, 32),
@@ -258,7 +259,7 @@ fn selected_components_keep_animation_words_and_cropped_reference_composition() 
         let composed = LosslessModularEncoder::with_config(
             rig.context.clone(),
             LosslessModularConfig {
-                squeeze: SQUEEZES[index + 1],
+                squeeze: SQUEEZES[index + 1].clone(),
                 ..config
             },
         );
@@ -274,7 +275,7 @@ fn selected_component_scratch_keeps_exact_admission_cancellation_and_pool_reuse(
         check_lifetime_with_samples(
             &rig,
             LosslessModularConfig {
-                squeeze: SQUEEZES[index + 1],
+                squeeze: SQUEEZES[index + 1].clone(),
                 predictor: Predictor::Weighted,
                 lz77: Lz77::Greedy,
                 color_transform: Transform::LocalRct(Rct::new(41).unwrap()),

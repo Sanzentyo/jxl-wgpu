@@ -209,9 +209,24 @@ unselected channels, so a second axis can require two distinct wire steps. Unsel
 their extents and carry no Squeeze axes into the kernel. Both the
 resource bounds and the wire operations must follow that same resolved topology.
 
+Explicit Squeeze sequences use per-step current-channel ranges, axes and residual placement.
+The same shape plan resolves ordered wire parameters, channel shifts and 32-byte GPU jobs, rejecting
+empty inputs, invalid intermediate ranges and cumulative-shift overflow before admission. Explicit
+steps preserve zero-sized residual slots; named separable policies retain their one-pixel-axis
+elision and byte identity. Sequence policy storage is immutable and shared on clone.
+
+Each job reads a post-RCT component, Palette index or an earlier arena view. The planner allocates
+disjoint average/residual outputs before retiring the input span, then coalesces free spans for
+later jobs. Final channel descriptors carry arena offsets. One invocation owns each group's
+ordered program and tokenization, so no cross-invocation synchronization is needed. The existing
+parameter allocation also carries the planned metadata table; a shared resident/streamed uploader
+copies it into private artifact storage after clearing and before dispatch. Metadata and the peak
+live arena are charged before execution, with no additional binding or buffer-pool ownership path.
+
 Memory admission, dispatch parameters and transform-header structure derive from the
 resolved plan. WGSL receives a working-component/index/table source and an explicit
-Squeeze axis mode/band instead of reconstructing that mapping from an encoded channel number.
+Squeeze axis mode/band or arena offset instead of reconstructing that mapping from an encoded
+channel number.
 GPU-dependent
 dimensions remain bounded by the pre-execution capacities and become authoritative
 only after artifact validation. Host planning remains metadata work; pixel transforms,

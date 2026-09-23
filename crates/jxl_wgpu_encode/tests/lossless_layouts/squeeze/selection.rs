@@ -7,12 +7,13 @@ fn ranges(channels: u32) -> impl Iterator<Item = (u32, u32)> {
 
 fn policy(mode: usize, begin: u32, count: u32, in_place: bool) -> Squeeze {
     MODES[mode]
+        .clone()
         .with_channels(begin, count)
         .unwrap()
         .with_in_place(in_place)
 }
 
-fn config(squeeze: Squeeze, variant: usize) -> LosslessModularConfig {
+pub(super) fn config(squeeze: Squeeze, variant: usize) -> LosslessModularConfig {
     LosslessModularConfig {
         squeeze,
         color_transform: Transform::None,
@@ -29,7 +30,7 @@ fn config(squeeze: Squeeze, variant: usize) -> LosslessModularConfig {
     }
 }
 
-fn checked(
+pub(super) fn checked(
     rig: &Rig,
     config: LosslessModularConfig,
     case: Case,
@@ -38,7 +39,7 @@ fn checked(
     channels: u32,
 ) -> Vec<u8> {
     eprintln!("{config:?}, {case:?}, {extent:?}");
-    let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config);
+    let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config.clone());
     let input = upload(&rig.context, &case, extent, expected, 4099);
     assert_eq!(encoder.memory_plan(&input).unwrap().channel_count, channels);
     let encoded = pollster::block_on(encoder.submit_container(input).unwrap()).unwrap();
@@ -197,7 +198,7 @@ fn selected_squeeze_keeps_all_rcts_and_group_edge_axis_elision() {
 }
 
 // Read the wire with independent libjxl-style bit fields, not the encoder's transform plan.
-fn local_steps(encoded: &[u8]) -> Vec<Vec<(bool, bool, u32, u32)>> {
+pub(super) fn local_steps(encoded: &[u8]) -> Vec<Vec<(bool, bool, u32, u32)>> {
     use jxl_bitstream::U;
     let image = jxl_oxide::JxlImage::read_with_defaults(encoded).unwrap();
     let frame = image.frame(0).unwrap();
@@ -426,7 +427,7 @@ fn selected_squeeze_retains_cropped_animation_references() {
     for mode in [2, 3] {
         for in_place in [false, true] {
             let config = config(policy(mode, 1, 2, in_place), mode - 2);
-            let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config);
+            let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config.clone());
             groups::animation::check_animation_words_with_oracle(
                 &rig,
                 &encoder,

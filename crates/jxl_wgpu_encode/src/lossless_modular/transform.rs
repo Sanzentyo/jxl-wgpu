@@ -6,6 +6,8 @@ use super::rct::LosslessModularRctType;
 use super::squeeze::SqueezeAxes;
 use super::types::{LosslessModularConfig, LosslessModularFormat};
 use crate::{BackendError, EncodeError};
+pub(super) mod program;
+use program::SqueezeProgram;
 
 #[cfg(test)]
 mod tests;
@@ -19,6 +21,7 @@ pub(super) enum SampleSource {
     Component(WorkingComponent),
     PaletteIndex,
     PaletteTable,
+    Arena(u32),
 }
 
 impl SampleSource {
@@ -27,6 +30,7 @@ impl SampleSource {
             Self::Component(WorkingComponent(value)) => value,
             Self::PaletteIndex => 4,
             Self::PaletteTable => 5,
+            Self::Arena(_) => 6,
         }
     }
 }
@@ -41,6 +45,7 @@ pub(super) struct ChannelRange {
 pub(super) struct PlannedChannel {
     pub(super) extent: [u32; 2],
     pub(super) source: SampleSource,
+    pub(super) shifts: [u8; 2],
     pub(super) squeeze: SqueezeAxes,
     /// Bit n selects the residual from Squeeze stage n; zero selects its average.
     pub(super) band: u32,
@@ -183,6 +188,7 @@ pub(super) struct GroupTransformPlan {
     pub(super) channels: Vec<PlannedChannel>,
     pub(super) operations: Vec<TransformOperation>,
     pub(super) palette: Option<PlannedPalette>,
+    pub(super) squeeze_program: Option<SqueezeProgram>,
 }
 
 impl GroupTransformPlan {
@@ -190,14 +196,15 @@ impl GroupTransformPlan {
         extent: [u32; 2],
         format: LosslessModularFormat,
         depth: u8,
-        config: LosslessModularConfig,
+        config: &LosslessModularConfig,
         local_rct: Option<LosslessModularRctType>,
         squeeze_range: &std::ops::Range<u32>,
-    ) -> Self {
+    ) -> Result<Self, EncodeError> {
         let mut channels: Vec<_> = (0..format.channel_count())
             .map(|component| PlannedChannel {
                 extent,
                 source: SampleSource::Component(WorkingComponent(component)),
+                shifts: [0; 2],
                 squeeze: SqueezeAxes::None,
                 band: 0,
             })
@@ -216,6 +223,7 @@ impl GroupTransformPlan {
                 [PlannedChannel {
                     extent,
                     source: SampleSource::PaletteIndex,
+                    shifts: [0; 2],
                     squeeze: SqueezeAxes::None,
                     band: 0,
                 }],
@@ -225,6 +233,7 @@ impl GroupTransformPlan {
                 PlannedChannel {
                     extent: [palette.capacity.entries(), range.count],
                     source: SampleSource::PaletteTable,
+                    shifts: [0; 2],
                     squeeze: SqueezeAxes::None,
                     band: 0,
                 },
@@ -266,14 +275,16 @@ impl GroupTransformPlan {
                     .map(|channel| {
                         let mut residual = *channel;
                         residual.extent[axis] /= 2;
+                        residual.shifts[axis] += 1;
                         residual.band |= 1 << stage;
                         residual
                     })
                     .collect();
                 for channel in &mut channels[begin..end] {
                     channel.extent[axis] = channel.extent[axis].div_ceil(2);
+                    channel.shifts[axis] += 1;
                 }
-                if config.squeeze.in_place() {
+                if config.squeeze.in_place() == Some(true) {
                     channels.splice(end..end, residuals);
                     inserted += end - begin;
                 } else {
@@ -281,7 +292,7 @@ impl GroupTransformPlan {
                 }
                 steps.push(SqueezeStep {
                     horizontal,
-                    in_place: config.squeeze.in_place(),
+                    in_place: config.squeeze.in_place() == Some(true),
                     range: ChannelRange {
                         begin: begin as u32,
                         count: (end - begin) as u32,
@@ -289,15 +300,23 @@ impl GroupTransformPlan {
                 });
             }
         }
+        let squeeze_program = if let Some(sequence) = config.squeeze.steps() {
+            let (program, resolved) = SqueezeProgram::new(&mut channels, meta, sequence)?;
+            steps = resolved;
+            Some(program)
+        } else {
+            None
+        };
         if !steps.is_empty() {
             operations.push(TransformOperation::Squeeze(steps));
         }
-        Self {
+        Ok(Self {
             extent,
             channels,
             operations,
             palette,
-        }
+            squeeze_program,
+        })
     }
 }
 
@@ -348,10 +367,10 @@ impl ModularTransformPlan {
                     extent,
                     format,
                     depth,
-                    config,
+                    &config,
                     local_rct,
                     &squeeze_range,
-                ));
+                )?);
                 shapes.len() - 1
             };
             dispatches = dispatches
@@ -367,17 +386,21 @@ impl ModularTransformPlan {
             .ok_or(BackendError::Invariant("empty Modular topology"))?;
         // Keep the established prefix-table policy even when a group's one-pixel axes elide
         // Squeeze. This is an entropy upper bound, not another physical channel topology.
-        let prefix_channels = (u32::from(config.palette.is_some())
-            + image_count
-            + squeeze_range.len() as u32 * ((1 << config.squeeze.stages()) - 1))
-            .min(4) as usize;
+        let prefix_channels = if config.squeeze.steps().is_some() {
+            max_channels.min(4) as usize
+        } else {
+            (u32::from(config.palette.is_some())
+                + image_count
+                + squeeze_range.len() as u32 * ((1 << config.squeeze.stages()) - 1))
+                .min(4) as usize
+        };
         Ok(Self {
             global_operations,
             rct_type: rct.map_or(42, |rct| rct.rct_type.value()),
             max_channels,
             dispatches,
             prefix_channels,
-            extended_prediction_domain: config.palette.is_some() || config.squeeze.stages() != 0,
+            extended_prediction_domain: config.palette.is_some() || config.squeeze.enabled(),
             shapes,
         })
     }
