@@ -39,7 +39,9 @@ struct Params {
     palette_implicit_depth: u32,
     palette_begin: u32,
     palette_components: u32,
-    _padding: array<u32, 4>,
+    sample_source: u32,
+    squeeze_band: u32,
+    _padding: array<u32, 2>,
 }
 
 @group(0) @binding(0)
@@ -386,12 +388,9 @@ fn palette_index(params: Params, x: u32, y: u32) -> i32 {
 }
 
 fn working_component(params: Params, x: u32, y: u32, component: u32) -> i32 {
-    if !palette_enabled || params.palette_capacity == 0u {
-        return transformed_component(params, x, y, component);
-    }
-    if component == params.palette_begin { return palette_index(params, x, y); }
-    let source_component = select(component, component + params.palette_components - 1u, component > params.palette_begin);
-    return transformed_component(params, x, y, source_component);
+    // The host's resolved topology supplies a working component or the index-image tag.
+    if palette_enabled && component == 4u { return palette_index(params, x, y); }
+    return transformed_component(params, x, y, component);
 }
 
 fn squeeze_first(params: Params, component: u32, band: u32, point: vec2<u32>) -> i32 {
@@ -422,20 +421,14 @@ fn squeeze_first(params: Params, component: u32, band: u32, point: vec2<u32>) ->
 }
 
 fn sample_at(params: Params, x: u32, y: u32) -> i32 {
-    var channel = params.channel;
-    var channels = params.channels;
-    if palette_enabled && params.palette_capacity != 0u {
-        if channel == 0u {
-            let deltas = output_words[params.palette_scratch_word_offset + 1u];
-            let entry = select(params.palette_delta_capacity + x - deltas, x, x < deltas);
-            return bitcast<i32>(output_words[params.palette_scratch_word_offset + 2u + y * params.palette_capacity + entry]);
-        }
-        channel -= 1u;
-        channels = params.channels - params.palette_components + 1u;
+    if palette_enabled && params.sample_source == 5u {
+        let deltas = output_words[params.palette_scratch_word_offset + 1u];
+        let entry = select(params.palette_delta_capacity + x - deltas, x, x < deltas);
+        return bitcast<i32>(output_words[params.palette_scratch_word_offset + 2u + y * params.palette_capacity + entry]);
     }
-    if !squeeze_enabled || params.squeeze == 0u { return working_component(params, x, y, channel); }
-    let component = channel % channels;
-    let first_band = (channel / channels) & 1u;
+    let component = params.sample_source;
+    if !squeeze_enabled || params.squeeze == 0u { return working_component(params, x, y, component); }
+    let first_band = params.squeeze_band & 1u;
     let point = vec2<u32>(x, y);
     if params.squeeze < 3u { return squeeze_first(params, component, first_band, point); }
     // The second axis is perpendicular, so its input axis length is the original group length.
@@ -449,7 +442,7 @@ fn sample_at(params: Params, x: u32, y: u32) -> i32 {
     if source[axis] + 1u == size { return a; }
     let b = squeeze_first(params, component, first_band, source + step);
     let average = squeeze_average(a, b);
-    if channel / (2u * channels) == 0u { return average; }
+    if params.squeeze_band < 2u { return average; }
     var next = average;
     if source[axis] + 2u < size {
         let c = squeeze_first(params, component, first_band, source + 2u * step);
@@ -722,6 +715,8 @@ fn build_palette_residuals(params: Params) {
     source_params.wp_scratch_word_offset = residual_base + pixels * params.palette_components;
     for (var component = 0u; component < params.palette_components; component += 1u) {
         source_params.channel = params.palette_begin + component;
+        source_params.sample_source = params.palette_begin + component;
+        source_params.squeeze_band = 0u;
         reset_prediction(source_params);
         for (var y = 0u; y < params.source_height; y += 1u) {
             for (var x = 0u; x < params.source_width; x += 1u) {

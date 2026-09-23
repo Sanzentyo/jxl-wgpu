@@ -71,12 +71,15 @@ fn independent_decoder_reads_general_lz77_distances_and_overlaps() {
         lz77_counts[0][16] = 1;
         let mut distance_counts = [0; RAW_SYMBOLS];
         distance_counts[distance_event.token as usize] = 1;
+        let grid = LosslessModularGroupGrid::for_extent(1, 1, Default::default()).unwrap();
+        let transforms =
+            ModularTransformPlan::new(grid, LosslessModularFormat::Gray, 31, 0, Default::default())
+                .unwrap();
         let codes = build_prefix_codes(
             LosslessModularFormat::Gray,
             31,
             LosslessModularPredictor::Zero,
-            LosslessModularSqueeze::None,
-            None,
+            &transforms,
             &raw_counts,
             &lz77_counts,
         )

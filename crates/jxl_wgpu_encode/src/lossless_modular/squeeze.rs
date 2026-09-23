@@ -1,5 +1,3 @@
-use super::LosslessModularFormat;
-
 /// Explicit separable Squeeze of every image channel within each Modular pass group, after
 /// RCT and optional Palette. Palette's meta channel is excluded.
 /// A fused single-group frame declares the same operation in DC-global. Residual channels are
@@ -43,24 +41,5 @@ impl LosslessModularSqueeze {
 
     pub(super) const fn first_horizontal(self) -> bool {
         matches!(self, Self::Horizontal | Self::HorizontalThenVertical)
-    }
-
-    pub(super) const fn channels(self, format: LosslessModularFormat) -> u32 {
-        format.channel_count() << self.stages()
-    }
-
-    pub(super) fn extent(self, source: [u32; 2], channel: u32, components: u32) -> [u32; 2] {
-        let mut extent = source;
-        for stage in 0..self.stages() {
-            let horizontal = self.first_horizontal() ^ (stage != 0);
-            let axis = usize::from(!horizontal);
-            let residual = (channel / components) & (1 << stage) != 0;
-            extent[axis] = if residual {
-                extent[axis] / 2
-            } else {
-                extent[axis].div_ceil(2)
-            };
-        }
-        extent
     }
 }

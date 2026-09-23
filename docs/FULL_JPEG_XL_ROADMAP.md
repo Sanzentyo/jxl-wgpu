@@ -373,6 +373,12 @@ animations and admission/cancellation cover the new topology. Streamed jobs reje
 peak budget before the first allocation, while retaining independent completion-owned batch leases.
 General transform stacks, global/LF topology and adaptive choices keep `MOD-E02` **Partial**.
 
+The [checked transform plan](ENCODER_ARCHITECTURE.md#modular-transform-planning-direction)
+now owns the supported combinations' operation order, channel mapping, geometry and capacity
+before dispatch. GPU sample selectors and resident/native/browser packet assembly consume the
+same resolved plan; GPU entry counts acquire header authority only after capacity validation.
+This consolidates existing behavior. Arbitrary transform stacks and their topology remain open.
+
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|
 | `MOD-E01` | P1 | **Partial** | Replace the scalar per-group token scan with correct parallel predictor scans, compaction, and hierarchical histogram reduction. Preserve bit-exact artifacts and prove no races at workgroup sizes 32/64/128/256. | — |

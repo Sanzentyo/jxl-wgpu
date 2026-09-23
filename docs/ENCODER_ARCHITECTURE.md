@@ -120,21 +120,10 @@ word 67..    event_count records of:
 plane is copied into a private container box. The ABI is bounded before allocation: at most
 `pixels + ceil(pixels / 8) + 1` events per group channel.
 
-The parameter ABI is one `#[repr(C)]`, `bytemuck::Pod` Rust value and the matching WGSL structure:
-
-```text
-ModularSourceParams / Source = {
-    row_stride, byte_offset, pixel_stride, word_bytes, bit_shift, plane: u32,
-}
-size = 24 bytes, alignment = 4 bytes
-
-ModularParams / Params = {
-    width, height, output_word_offset, channel, channels, sample_mask, rct_type, big_endian: u32,
-    sources: array<Source, 4>,
-    _padding: array<u32, 32>,
-}
-size = 256 bytes, alignment = 4 bytes
-```
+The parameter ABI is one `#[repr(C)]`, `bytemuck::Pod` Rust value and the matching WGSL structure.
+`ModularSourceParams` / `Source` is 24 bytes and `ModularParams` / `Params` is 256 bytes, both
+with four-byte alignment. The [WGSL memory table](WGSL_MEMORY.md#uniform-and-structured-storage-table)
+owns the complete field layout, including the resolved sample source and Squeeze band.
 
 Compile-time and shader validation tests check the ABI. The 256-byte array stride keeps each
 batch parameter range aligned. Source bindings 0/3/4/5 address individual planes; bindings 1/2
@@ -192,13 +181,15 @@ the checked 609-byte Gray8 fixture is unchanged.
 
 ## Modular transform planning direction
 
-The next structural step for `MOD-E02` is a checked transform plan before dispatch
-lowering. This plan remains to be implemented. Current dispatch geometry and transform
-serialization still interpret the RCT/Palette/Squeeze configuration separately.
-`ModularDispatchPlan` already owns GPU parameters, groups, batches and memory bounds;
-retain that execution plan and its completion-owned reservations.
+`ModularTransformPlan` resolves the supported RCT/Palette/Squeeze policy before dispatch
+lowering. A frame shares at most four concrete group shapes through one immutable plan.
+Each shape records ordered wire operations, explicit channel sources/extents/bands and
+Palette capacities. Global RCT placement and single-group fusion are resolved there as well.
+`ModularDispatchPlan` consumes it for GPU parameters, groups, batches and memory bounds;
+resident, native-streamed and browser-streamed assembly retain that same plan. Buffer
+reservations still belong to execution and survive through completion/consumption.
 
-Use these ownership boundaries when extending transform order or channel topology:
+The implementation and further transform extensions use these ownership boundaries:
 
 | Layer | Owns |
 |---|---|
@@ -213,16 +204,20 @@ the meta table followed by source component 0, the index image and source compon
 Squeeze then targets the image channels while preserving the meta prefix. Both the
 resource bounds and the wire operations must follow that same resolved topology.
 
-Derive memory admission, dispatch parameters and transform-header structure from the
-resolved plan. WGSL executes its lowered operations and addresses. GPU-dependent
+Memory admission, dispatch parameters and transform-header structure derive from the
+resolved plan. WGSL receives a working-component/index/table source and an explicit
+Squeeze band instead of reconstructing that mapping from an encoded channel number.
+GPU-dependent
 dimensions remain bounded by the pre-execution capacities and become authoritative
 only after artifact validation. Host planning remains metadata work; pixel transforms,
 dictionary search and residual generation stay on GPU. Replacing flags with enums alone
 does not establish these boundaries.
 
-First migrate the existing supported combinations through this representation while
-preserving public behavior, default bytes, typed rejection and resource lifetime.
-Then extend the plan and its lowering for a new combination. Keep independently parsed
+`PaletteCapacity` validates GPU counts into `ValidatedPaletteCounts`; header emission
+checks those counts against its own planned capacity. Caller policy fields are not
+used as execution results. Existing supported combinations retain public behavior,
+default bytes, typed rejection and resource lifetime. Extend the plan and its lowering
+for a new combination. Keep independently parsed
 wire headers, exact/native/GPU comparisons and invalid-input/ownership cases: tests that
 reuse the planner's own expected topology cannot replace those independent checks.
 General transform stacks and their global/LF/HF topology remain roadmap work until

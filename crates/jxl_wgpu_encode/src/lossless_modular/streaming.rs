@@ -9,15 +9,13 @@ use super::dispatch::{
 };
 use super::grid::LosslessModularGroupGrid;
 use super::lz77::LosslessModularLz77;
-use super::palette::LosslessModularPalette;
 use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
-use super::rct::ResolvedRct;
 use super::serializer::{
     ModularFrameHeader, ModularPacketAssembler, ModularPacketConfig, PacketBuildInput,
     ValidatedModularArtifact, accumulate_artifact_histograms, build_distance_code, build_packets,
     build_prefix_codes, parse_group_artifact_header, parse_planned_artifact,
 };
-use super::squeeze::LosslessModularSqueeze;
+use super::transform::ModularTransformPlan;
 use super::types::{LosslessModularFormat, LosslessModularTreeMode, ModularParams};
 use crate::buffer_pool::EncoderBufferPool;
 use crate::prefix::{LZ77_SYMBOLS, RAW_SYMBOLS};
@@ -124,8 +122,7 @@ impl StreamingModularWorker {
             self.plan.format,
             self.plan.bits_per_sample,
             self.plan.predictor,
-            self.plan.squeeze,
-            self.plan.palette,
+            &self.plan.transforms,
             &aggregate_raw,
             &aggregate_lz77,
         )?;
@@ -145,9 +142,7 @@ impl StreamingModularWorker {
                 bits_per_sample: self.plan.bits_per_sample,
                 exponent_bits_per_sample: self.plan.exponent_bits_per_sample,
                 tree_mode: self.plan.tree_mode,
-                rct: self.plan.rct,
-                squeeze: self.plan.squeeze,
-                palette: self.plan.palette,
+                transforms: Arc::clone(&self.plan.transforms),
                 predictor: self.plan.predictor,
                 weighted_predictor: self.plan.weighted_predictor,
                 lz77: self.plan.lz77,
@@ -673,9 +668,7 @@ pub(super) struct ResidentLosslessModularJob {
     pub(super) bits_per_sample: u8,
     pub(super) exponent_bits_per_sample: u8,
     pub(super) tree_mode: LosslessModularTreeMode,
-    pub(super) rct: Option<ResolvedRct>,
-    pub(super) squeeze: LosslessModularSqueeze,
-    pub(super) palette: Option<LosslessModularPalette>,
+    pub(super) transforms: Arc<ModularTransformPlan>,
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
     pub(super) lz77: LosslessModularLz77,
@@ -783,8 +776,7 @@ impl BrowserStreamingLosslessModularJob {
             self.plan.format,
             self.plan.bits_per_sample,
             self.plan.predictor,
-            self.plan.squeeze,
-            self.plan.palette,
+            &self.plan.transforms,
             &self.aggregate_raw,
             &self.aggregate_lz77,
         )?;
@@ -797,9 +789,7 @@ impl BrowserStreamingLosslessModularJob {
                 bits_per_sample: self.plan.bits_per_sample,
                 exponent_bits_per_sample: self.plan.exponent_bits_per_sample,
                 tree_mode: self.plan.tree_mode,
-                rct: self.plan.rct,
-                squeeze: self.plan.squeeze,
-                palette: self.plan.palette,
+                transforms: Arc::clone(&self.plan.transforms),
                 predictor: self.plan.predictor,
                 weighted_predictor: self.plan.weighted_predictor,
                 lz77: self.plan.lz77,
@@ -934,9 +924,7 @@ impl ResidentLosslessModularJob {
             bits_per_sample: self.bits_per_sample,
             exponent_bits_per_sample: self.exponent_bits_per_sample,
             tree_mode: self.tree_mode,
-            rct: self.rct,
-            squeeze: self.squeeze,
-            palette: self.palette,
+            transforms: Arc::clone(&self.transforms),
             predictor: self.predictor,
             weighted_predictor: self.weighted_predictor,
             lz77: self.lz77,

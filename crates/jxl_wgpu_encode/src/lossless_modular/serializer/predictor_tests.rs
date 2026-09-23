@@ -11,10 +11,8 @@ fn independent_entropy_decoder_reads_every_predictor_and_weighted_header() {
             &mut output,
             &codes,
             TransformHeader {
-                rct: None,
-                squeeze: LosslessModularSqueeze::None,
-                palette: None,
-                channels: 4,
+                operations: &[],
+                palette_counts: None,
             },
             predictor,
             weighted,

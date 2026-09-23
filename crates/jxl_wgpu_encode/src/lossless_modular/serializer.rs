@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use jxl_gpu_bitstream::{
@@ -14,12 +15,13 @@ use super::grid::{LosslessModularGroup, LosslessModularGroupGrid};
 use super::icc::{DEFAULT_PROFILE_LIMIT, PreparedImageHeader};
 use super::lz77::LosslessModularLz77;
 use super::memory::{LosslessModularMemoryLimits, LosslessModularMemoryPlan};
-use super::palette::{LosslessModularPalette, PaletteCounts, encoded_channels};
 use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
-use super::rct::{LosslessModularRctType, ResolvedRct};
+use super::rct::LosslessModularRctType;
 use super::source::lossless_modular_source_spec;
-use super::squeeze::LosslessModularSqueeze;
 use super::streaming::LosslessModularJob;
+use super::transform::{
+    ModularTransformPlan, PlannedPalette, TransformOperation, ValidatedPaletteCounts,
+};
 use super::types::{
     AlphaAssociation, LosslessModularFormat, LosslessModularTreeMode, ModularArtifactHeader,
     ModularEvent, modular_sample_depth,
@@ -708,9 +710,7 @@ pub(super) struct PacketBuildInput<'a> {
     pub(super) bits_per_sample: u8,
     pub(super) exponent_bits_per_sample: u8,
     pub(super) tree_mode: LosslessModularTreeMode,
-    pub(super) rct: Option<ResolvedRct>,
-    pub(super) squeeze: LosslessModularSqueeze,
-    pub(super) palette: Option<LosslessModularPalette>,
+    pub(super) transforms: Arc<ModularTransformPlan>,
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
     pub(super) lz77: LosslessModularLz77,
@@ -788,13 +788,11 @@ pub(super) fn build_prefix_codes(
     format: LosslessModularFormat,
     bits_per_sample: u8,
     predictor: LosslessModularPredictor,
-    squeeze: LosslessModularSqueeze,
-    palette: Option<LosslessModularPalette>,
+    transforms: &ModularTransformPlan,
     aggregate_raw: &RawHistograms,
     aggregate_lz77: &Lz77Histograms,
 ) -> Result<[PrefixCode; 4], EncodeError> {
-    let channels = usize::try_from(encoded_channels(format, squeeze, palette).min(4))
-        .map_err(|_| EncodeError::Backend("Modular channel count overflow".into()))?;
+    let channels = transforms.prefix_channels;
     let unused = PrefixCode::fixed_unused_channel();
     let mut codes = [unused.clone(), unused.clone(), unused.clone(), unused];
     for channel in 0..channels {
@@ -803,11 +801,9 @@ pub(super) fn build_prefix_codes(
         // coefficients. Their wrapping residuals use the full integer alphabet.
         let wide_samples = bits_per_sample > 14
             || predictor != LosslessModularPredictor::Gradient
-            || squeeze != LosslessModularSqueeze::None
-            || palette.is_some();
+            || transforms.extended_prediction_domain;
         let max_raw_token = if predictor != LosslessModularPredictor::Gradient
-            || squeeze != LosslessModularSqueeze::None
-            || palette.is_some()
+            || transforms.extended_prediction_domain
         {
             RAW_SYMBOLS - 1
         } else if (15..=16).contains(&bits_per_sample) {
@@ -838,9 +834,7 @@ pub(super) struct ModularPacketAssembler {
     bits_per_sample: u8,
     exponent_bits_per_sample: u8,
     tree_mode: LosslessModularTreeMode,
-    rct: Option<ResolvedRct>,
-    squeeze: LosslessModularSqueeze,
-    palette: Option<LosslessModularPalette>,
+    transforms: Arc<ModularTransformPlan>,
     predictor: LosslessModularPredictor,
     weighted_predictor: LosslessModularWeightedPredictor,
     lz77: LosslessModularLz77,
@@ -861,9 +855,7 @@ pub(super) struct ModularPacketConfig {
     pub(super) bits_per_sample: u8,
     pub(super) exponent_bits_per_sample: u8,
     pub(super) tree_mode: LosslessModularTreeMode,
-    pub(super) rct: Option<ResolvedRct>,
-    pub(super) squeeze: LosslessModularSqueeze,
-    pub(super) palette: Option<LosslessModularPalette>,
+    pub(super) transforms: Arc<ModularTransformPlan>,
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
     pub(super) lz77: LosslessModularLz77,
@@ -884,9 +876,7 @@ impl ModularPacketAssembler {
             bits_per_sample,
             exponent_bits_per_sample,
             tree_mode,
-            rct,
-            squeeze,
-            palette,
+            transforms,
             predictor,
             weighted_predictor,
             lz77,
@@ -908,10 +898,8 @@ impl ModularPacketAssembler {
                 &mut dc_global,
                 &codes,
                 TransformHeader {
-                    rct: rct.filter(|rct| !rct.local).map(|rct| rct.rct_type),
-                    squeeze: LosslessModularSqueeze::None,
-                    palette: None,
-                    channels: format.channel_count(),
+                    operations: &transforms.global_operations,
+                    palette_counts: None,
                 },
                 predictor,
                 weighted_predictor,
@@ -940,9 +928,7 @@ impl ModularPacketAssembler {
             bits_per_sample,
             exponent_bits_per_sample,
             tree_mode,
-            rct,
-            squeeze,
-            palette,
+            transforms,
             predictor,
             weighted_predictor,
             lz77,
@@ -972,37 +958,26 @@ impl ModularPacketAssembler {
             .ok_or(BackendError::Invariant(
                 "Modular group index exceeds frame grid",
             ))?;
-        let squeeze = self.squeeze.for_extent(source.width, source.height);
-        let channels = usize::try_from(encoded_channels(self.format, squeeze, self.palette))
-            .map_err(|_| EncodeError::Backend("Modular channel count overflow".into()))?;
+        let topology = self.transforms.group(source)?;
+        let channels = topology.channels.len();
         if artifacts.len() != channels {
             return Err(EncodeError::Backend(
                 "GPU group does not contain every Modular channel".into(),
             ));
         }
         let palette_counts = artifacts[0].palette_counts;
-        if palette_counts.is_some() != self.palette.is_some() {
+        if palette_counts.is_some() != topology.palette.is_some() {
             return Err(invalid_gpu_artifact(
                 "palette metadata does not match the group policy",
             ));
         }
-        let palette = palette_counts
-            .zip(self.palette)
-            .map(|(counts, policy)| PaletteHeader {
-                counts,
-                delta_predictor: policy.delta_predictor(),
-                begin: policy.begin(),
-                components: policy.components(self.format),
-            });
         if let Some(group) = &mut self.single_group {
             write_dc_global(
                 group,
                 &self.codes,
                 TransformHeader {
-                    rct: self.rct.map(|rct| rct.rct_type),
-                    squeeze,
-                    palette,
-                    channels: self.format.channel_count(),
+                    operations: &topology.operations,
+                    palette_counts,
                 },
                 self.predictor,
                 self.weighted_predictor,
@@ -1027,10 +1002,8 @@ impl ModularPacketAssembler {
             write_transforms(
                 &mut pass_group,
                 TransformHeader {
-                    rct: self.rct.filter(|rct| rct.local).map(|rct| rct.rct_type),
-                    squeeze,
-                    palette,
-                    channels: self.format.channel_count(),
+                    operations: &topology.operations,
+                    palette_counts,
                 },
             )?;
             if !use_global_tree {
@@ -1092,8 +1065,7 @@ impl ModularPacketAssembler {
                 && self.bits_per_sample == 8
                 && self.exponent_bits_per_sample == 0
                 && self.predictor == LosslessModularPredictor::Gradient
-                && self.squeeze == LosslessModularSqueeze::None
-                && self.palette.is_none()
+                && !self.transforms.extended_prediction_domain
                 && self.lz77 == LosslessModularLz77::ZeroRuns)
                 .then(|| GpuAccelerationArtifact::Gray8Prefix {
                     width: self.width,
@@ -1128,9 +1100,7 @@ pub(super) fn build_packets(
         bits_per_sample,
         exponent_bits_per_sample,
         tree_mode,
-        rct,
-        squeeze,
-        palette,
+        transforms,
         predictor,
         weighted_predictor,
         lz77,
@@ -1138,17 +1108,7 @@ pub(super) fn build_packets(
         group_plans,
         bytes,
     } = input;
-    let expected_artifacts = group_grid
-        .ordered_groups()
-        .try_fold(0usize, |count, group| {
-            count
-                .checked_add(encoded_channels(
-                    format,
-                    squeeze.for_extent(group.width, group.height),
-                    palette,
-                ) as usize)
-                .ok_or(BackendError::Invariant("GPU group plan count overflow"))
-        })?;
+    let expected_artifacts = transforms.dispatches as usize;
     if group_plans.len() != expected_artifacts {
         return Err(EncodeError::Backend(
             "GPU group plan does not match the frame grid".into(),
@@ -1184,8 +1144,7 @@ pub(super) fn build_packets(
         format,
         bits_per_sample,
         predictor,
-        squeeze,
-        palette,
+        &transforms,
         &aggregate_raw,
         &aggregate_lz77,
     )?;
@@ -1198,9 +1157,7 @@ pub(super) fn build_packets(
             bits_per_sample,
             exponent_bits_per_sample,
             tree_mode,
-            rct,
-            squeeze,
-            palette,
+            transforms: Arc::clone(&transforms),
             predictor,
             weighted_predictor,
             lz77,
@@ -1211,11 +1168,7 @@ pub(super) fn build_packets(
     )?;
     let mut start = 0;
     for group in group_grid.ordered_groups() {
-        let channels = encoded_channels(
-            format,
-            squeeze.for_extent(group.width, group.height),
-            palette,
-        ) as usize;
+        let channels = transforms.group(group)?.channels.len();
         let end = start + channels;
         for (channel, plan) in group_plans[start..end].iter().enumerate() {
             if plan.group_index != group.index || plan.channel != channel as u32 {
@@ -1235,7 +1188,7 @@ pub(super) fn build_packets(
 pub(super) struct ValidatedModularArtifact<'a> {
     pub(super) header: ModularArtifactHeader,
     pub(super) events: &'a [ModularEvent],
-    pub(super) palette_counts: Option<PaletteCounts>,
+    pub(super) palette_counts: Option<ValidatedPaletteCounts>,
 }
 
 pub(super) fn parse_planned_artifact<'a>(
@@ -1244,7 +1197,8 @@ pub(super) fn parse_planned_artifact<'a>(
 ) -> Result<ValidatedModularArtifact<'a>, EncodeError> {
     // Check status before reading dynamic dimensions or granting token authority.
     parse_group_artifact_header(plan.max_events, bytes)?;
-    let palette_counts = if let Some(offset) = plan.palette_counts_byte_offset {
+    let palette_counts = if let Some(palette) = plan.palette {
+        let offset = palette.counts_byte_offset;
         let offset = usize::try_from(offset)
             .map_err(|_| invalid_gpu_artifact("palette metadata offset overflow"))?;
         let end = offset
@@ -1255,26 +1209,17 @@ pub(super) fn parse_planned_artifact<'a>(
             .ok_or_else(|| invalid_gpu_artifact("palette metadata is truncated"))?;
         let count = u32::from_le_bytes(value[..4].try_into().expect("four-byte palette count"));
         let deltas = u32::from_le_bytes(value[4..].try_into().expect("four-byte delta count"));
-        if count == 0
-            || count > plan.width
-            || deltas > count
-            || deltas > plan.palette_delta_capacity
-            || plan.palette_delta_capacity > plan.width
-            || count - deltas > plan.width - plan.palette_delta_capacity
-        {
+        if palette.capacity.entries() != plan.width {
             return Err(invalid_gpu_artifact(
-                "palette count exceeds planned capacity",
+                "palette capacity disagrees with channel geometry",
             ));
         }
-        Some(PaletteCounts {
-            entries: count,
-            deltas,
-        })
+        Some(palette.capacity.validate(count, deltas)?)
     } else {
         None
     };
     let mut artifact = parse_group_artifact(
-        palette_counts.map_or(plan.width, |counts| counts.entries),
+        palette_counts.map_or(plan.width, ValidatedPaletteCounts::entries),
         plan.height,
         plan.max_events,
         bytes,
@@ -1524,25 +1469,15 @@ fn invalid_gpu_artifact(reason: &'static str) -> EncodeError {
     BackendError::InvalidArtifact(reason).into()
 }
 
-#[derive(Clone, Copy)]
-struct PaletteHeader {
-    counts: PaletteCounts,
-    delta_predictor: Option<LosslessModularPredictor>,
-    begin: u32,
-    components: u32,
-}
-
-struct TransformHeader {
-    rct: Option<LosslessModularRctType>,
-    squeeze: LosslessModularSqueeze,
-    palette: Option<PaletteHeader>,
-    channels: u32,
+struct TransformHeader<'a> {
+    operations: &'a [TransformOperation],
+    palette_counts: Option<ValidatedPaletteCounts>,
 }
 
 fn write_dc_global(
     output: &mut BitWriter,
     codes: &[PrefixCode; 4],
-    transforms: TransformHeader,
+    transforms: TransformHeader<'_>,
     predictor: LosslessModularPredictor,
     weighted_predictor: LosslessModularWeightedPredictor,
     distance_code: Option<&DistanceCode>,
@@ -1574,110 +1509,110 @@ fn write_weighted_predictor(
     Ok(())
 }
 
-fn write_rct(
+fn write_transforms(
     output: &mut BitWriter,
-    rct: Option<LosslessModularRctType>,
+    transforms: TransformHeader<'_>,
 ) -> Result<(), EncodeError> {
-    if let Some(rct) = rct {
-        output.write_bits(1, 2)?; // one transform
-        write_rct_parameters(output, rct)?;
+    let has_palette = transforms
+        .operations
+        .iter()
+        .any(|operation| matches!(operation, TransformOperation::Palette(_)));
+    if has_palette != transforms.palette_counts.is_some() {
+        return Err(invalid_gpu_artifact(
+            "palette metadata does not match the transform plan",
+        ));
+    }
+    let count = transforms.operations.len();
+    if count >= 2 {
+        output.write_bits(2, 2)?;
+        output.write_bits((count - 2) as u64, 4)?;
     } else {
-        output.write_bits(0, 2)?; // no transforms
+        output.write_bits(count as u64, 2)?;
+    }
+    for operation in transforms.operations {
+        match operation {
+            TransformOperation::Rct(rct) => write_rct_parameters(output, *rct)?,
+            TransformOperation::Palette(palette) => {
+                let counts = transforms
+                    .palette_counts
+                    .ok_or_else(|| invalid_gpu_artifact("missing palette counts"))?;
+                palette
+                    .capacity
+                    .validate(counts.entries(), counts.deltas())?;
+                write_palette_parameters(output, *palette, counts)?;
+            }
+            TransformOperation::Squeeze(steps) => {
+                output.write_bits(2, 2)?;
+                output.write_bits(1, 2)?;
+                output.write_bits((steps.len() - 1) as u64, 4)?;
+                for step in steps {
+                    output.write_bits(u64::from(step.horizontal), 1)?;
+                    output.write_bits(0, 1)?; // residual channels are appended
+                    output.write_bits(0, 2)?;
+                    output.write_bits(u64::from(step.range.begin), 3)?;
+                    if step.range.count <= 3 {
+                        output.write_bits(u64::from(step.range.count - 1), 2)?;
+                    } else {
+                        output.write_bits(3, 2)?;
+                        output.write_bits(u64::from(step.range.count - 4), 4)?;
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
 
-fn write_transforms(
+fn write_palette_parameters(
     output: &mut BitWriter,
-    transforms: TransformHeader,
+    palette: PlannedPalette,
+    counts: ValidatedPaletteCounts,
 ) -> Result<(), EncodeError> {
-    let TransformHeader {
-        rct,
-        squeeze,
-        palette,
-        channels,
-    } = transforms;
-    if squeeze == LosslessModularSqueeze::None && palette.is_none() {
-        return write_rct(output, rct);
-    }
-    let count = u32::from(rct.is_some())
-        + u32::from(palette.is_some())
-        + u32::from(squeeze != LosslessModularSqueeze::None);
-    if count >= 2 {
-        output.write_bits(2, 2)?;
-        output.write_bits(u64::from(count - 2), 4)?;
-    } else {
-        output.write_bits(1, 2)?;
-    }
-    if let Some(rct) = rct {
-        write_rct_parameters(output, rct)?;
-    }
-    if let Some(palette) = palette {
-        output.write_bits(1, 2)?; // Palette
-        output.write_bits(0, 2)?; // begin channel U32 selector
-        output.write_bits(u64::from(palette.begin), 3)?;
-        match palette.components {
-            1 => output.write_bits(0, 2)?,
-            3 => output.write_bits(1, 2)?,
-            4 => output.write_bits(2, 2)?,
-            _ => {
-                output.write_bits(3, 2)?;
-                output.write_bits(u64::from(palette.components - 1), 13)?;
-            }
+    output.write_bits(1, 2)?; // Palette
+    output.write_bits(0, 2)?; // begin channel U32 selector
+    output.write_bits(u64::from(palette.range.begin), 3)?;
+    match palette.range.count {
+        1 => output.write_bits(0, 2)?,
+        3 => output.write_bits(1, 2)?,
+        4 => output.write_bits(2, 2)?,
+        _ => {
+            output.write_bits(3, 2)?;
+            output.write_bits(u64::from(palette.range.count - 1), 13)?;
         }
-        let colors = palette.counts.entries - palette.counts.deltas;
-        let (selector, base, bits) = if colors < 256 {
-            (0, 0, 8)
-        } else if colors < 1280 {
-            (1, 256, 10)
-        } else if colors < 5376 {
-            (2, 1280, 12)
+    }
+    let colors = counts.entries() - counts.deltas();
+    let (selector, base, bits) = if colors < 256 {
+        (0, 0, 8)
+    } else if colors < 1280 {
+        (1, 256, 10)
+    } else if colors < 5376 {
+        (2, 1280, 12)
+    } else {
+        (3, 5376, 16)
+    };
+    output.write_bits(selector, 2)?;
+    output.write_bits(u64::from(colors - base), bits)?;
+    if counts.deltas() != 0 {
+        let (selector, base, bits) = if counts.deltas() < 257 {
+            (1, 1, 8)
+        } else if counts.deltas() < 1281 {
+            (2, 257, 10)
         } else {
-            (3, 5376, 16)
+            (3, 1281, 16)
         };
         output.write_bits(selector, 2)?;
-        output.write_bits(u64::from(colors - base), bits)?;
-        if palette.counts.deltas != 0 {
-            let (selector, base, bits) = if palette.counts.deltas < 257 {
-                (1, 1, 8)
-            } else if palette.counts.deltas < 1281 {
-                (2, 257, 10)
-            } else {
-                (3, 1281, 16)
-            };
-            output.write_bits(selector, 2)?;
-            output.write_bits(u64::from(palette.counts.deltas - base), bits)?;
-        } else {
-            output.write_bits(0, 2)?; // no delta entries
-        }
-        output.write_bits(
-            u64::from(
-                palette
-                    .delta_predictor
-                    .map_or(0, LosslessModularPredictor::value),
-            ),
-            4,
-        )?;
+        output.write_bits(u64::from(counts.deltas() - base), bits)?;
+    } else {
+        output.write_bits(0, 2)?; // no delta entries
     }
-    if squeeze == LosslessModularSqueeze::None {
-        return Ok(());
-    }
-    output.write_bits(2, 2)?; // Squeeze transform
-    output.write_bits(1, 2)?; // explicit parameter count: U32(0, 1+u4, 9+u6, 41+u8)
-    output.write_bits(u64::from(squeeze.stages() - 1), 4)?;
-    for stage in 0..squeeze.stages() {
-        output.write_bits(u64::from(squeeze.first_horizontal() ^ (stage != 0)), 1)?;
-        output.write_bits(0, 1)?; // append residuals after all current channels
-        output.write_bits(0, 2)?; // U32 begin-channel selector
-        output.write_bits(u64::from(palette.is_some()), 3)?; // skip the palette meta channel
-        let count = palette.map_or(channels, |palette| channels - palette.components + 1) << stage;
-        if count <= 3 {
-            output.write_bits(u64::from(count - 1), 2)?;
-        } else {
-            output.write_bits(3, 2)?;
-            output.write_bits(u64::from(count - 4), 4)?;
-        }
-    }
+    output.write_bits(
+        u64::from(
+            palette
+                .delta_predictor
+                .map_or(0, LosslessModularPredictor::value),
+        ),
+        4,
+    )?;
     Ok(())
 }
 
@@ -2175,9 +2110,16 @@ mod rct_wire_tests {
     fn independent_wire_reader_recovers_every_rct_type_and_no_transform() {
         for value in (0..42).map(Some).chain([None]) {
             let mut writer = BitWriter::new();
-            write_rct(
+            let operations: Vec<_> = value
+                .map(|value| TransformOperation::Rct(LosslessModularRctType::new(value).unwrap()))
+                .into_iter()
+                .collect();
+            write_transforms(
                 &mut writer,
-                value.map(|value| LosslessModularRctType::new(value).unwrap()),
+                TransformHeader {
+                    operations: &operations,
+                    palette_counts: None,
+                },
             )
             .unwrap();
             let bytes = writer.into_bytes();

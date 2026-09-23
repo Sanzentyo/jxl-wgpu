@@ -185,7 +185,7 @@ mod native_tests {
                 256,
                 vec![
                     0, 4, 8, 12, 16, 20, 24, 28, 32, 128, 132, 136, 164, 180, 184, 188, 192, 196,
-                    200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 240,
+                    200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 240, 244, 248,
                 ],
             ),
         ] {
@@ -248,11 +248,13 @@ mod native_tests {
             palette_implicit_depth: 58,
             palette_begin: 59,
             palette_components: 60,
-            _padding: [0; 4],
+            sample_source: 61,
+            squeeze_band: 62,
+            _padding: [0; 2],
         };
         let words = bytemuck::cast::<ModularParams, [u32; 64]>(params);
-        assert_eq!(&words[..60], &(1..=60).collect::<Vec<_>>());
-        assert!(words[60..].iter().all(|&word| word == 0));
+        assert_eq!(&words[..62], &(1..=62).collect::<Vec<_>>());
+        assert!(words[62..].iter().all(|&word| word == 0));
     }
 
     #[test]
@@ -726,15 +728,24 @@ mod native_tests {
                 Err(EncodeError::Backend(_))
             ));
         }
+        let grid = crate::LosslessModularGroupGrid::for_extent(1, 1, Default::default()).unwrap();
+        let transforms = crate::lossless_modular::transform::ModularTransformPlan::new(
+            grid,
+            LosslessModularFormat::Rgba,
+            31,
+            0,
+            Default::default(),
+        )
+        .unwrap();
         let raw = [header.raw_counts.map(u64::from); 4];
+
         let runs = [[0; LZ77_SYMBOLS]; 4];
         assert!(
             super::super::serializer::build_prefix_codes(
                 LosslessModularFormat::Rgba,
                 31,
                 crate::LosslessModularPredictor::Gradient,
-                crate::LosslessModularSqueeze::None,
-                None,
+                &transforms,
                 &raw,
                 &runs
             )
@@ -745,8 +756,7 @@ mod native_tests {
                 LosslessModularFormat::Rgba,
                 29,
                 crate::LosslessModularPredictor::Gradient,
-                crate::LosslessModularSqueeze::None,
-                None,
+                &transforms,
                 &raw,
                 &runs
             ),

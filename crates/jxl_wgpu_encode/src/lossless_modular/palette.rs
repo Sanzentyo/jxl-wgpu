@@ -1,4 +1,4 @@
-use super::{LosslessModularFormat, LosslessModularPredictor, LosslessModularSqueeze};
+use super::{LosslessModularFormat, LosslessModularPredictor};
 use crate::EncodeError;
 
 /// Builds an exact first-occurrence palette of selected components in each pass group on the GPU.
@@ -127,10 +127,6 @@ impl LosslessModularPalette {
         }
     }
 
-    pub(super) const fn image_channels(self, format: LosslessModularFormat) -> u32 {
-        format.channel_count() - self.components(format) + 1
-    }
-
     pub(super) fn validate(self, format: LosslessModularFormat) -> Result<(), EncodeError> {
         validate_components(
             self.begin(),
@@ -155,42 +151,6 @@ impl LosslessModularPalette {
     pub const fn delta_predictor(self) -> Option<LosslessModularPredictor> {
         self.delta_predictor
     }
-
-    pub(super) fn capacity(self, width: u32, height: u32) -> u32 {
-        (self.max_colors - self.max_deltas).min(width * height) + self.delta_capacity(width, height)
-    }
-
-    pub(super) fn delta_capacity(self, width: u32, height: u32) -> u32 {
-        self.max_deltas
-            .min(width * height + u32::from(self.implicit))
-    }
-
-    pub(super) fn hash_entries(self, capacity: u32) -> u32 {
-        (2 * (capacity + if self.implicit { 143 } else { 0 })).next_power_of_two()
-    }
-
-    pub(super) fn scratch_words(
-        self,
-        capacity: u32,
-        components: u32,
-        width: u32,
-        height: u32,
-    ) -> u64 {
-        // Total/delta counts, a channel-major table with delta/color partitions, and a
-        // <= 50%-full open-addressed hash table. Equal words in different partitions differ.
-        2 + u64::from(capacity) * u64::from(components)
-            + u64::from(self.hash_entries(capacity))
-            + if self.delta_predictor.is_some() {
-                u64::from(width) * u64::from(height) * u64::from(components)
-            } else {
-                0
-            }
-            + if self.delta_predictor == Some(LosslessModularPredictor::Weighted) {
-                5 * u64::from(width)
-            } else {
-                0
-            }
-    }
 }
 
 fn validate_components(begin: u32, count: u32, channels: u32) -> Result<(), EncodeError> {
@@ -205,26 +165,34 @@ fn validate_components(begin: u32, count: u32, channels: u32) -> Result<(), Enco
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct PaletteCounts {
-    pub(super) entries: u32,
-    pub(super) deltas: u32,
-}
-
-pub(super) const fn encoded_channels(
-    format: LosslessModularFormat,
-    squeeze: LosslessModularSqueeze,
-    palette: Option<LosslessModularPalette>,
-) -> u32 {
-    match palette {
-        Some(palette) => 1 + (palette.image_channels(format) << squeeze.stages()),
-        None => squeeze.channels(format),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lossless_modular::transform::{ModularTransformPlan, PlannedPalette};
+    use crate::lossless_modular::{
+        LosslessModularConfig, LosslessModularGroupGrid, LosslessModularGroupSize,
+    };
+
+    fn planned(policy: LosslessModularPalette, width: u32, height: u32) -> PlannedPalette {
+        let grid = LosslessModularGroupGrid::for_extent(
+            width,
+            height,
+            LosslessModularGroupSize::Pixels1024,
+        )
+        .unwrap();
+        let plan = ModularTransformPlan::new(
+            grid,
+            LosslessModularFormat::Rgba,
+            31,
+            0,
+            LosslessModularConfig {
+                palette: Some(policy),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.group(grid.group(0).unwrap()).unwrap().palette.unwrap()
+    }
 
     #[test]
     fn component_ranges_reject_empty_overflow_and_missing_source_components() {
@@ -319,9 +287,12 @@ mod tests {
                     assert_eq!(palette.max_colors(), colors + deltas);
                     assert_eq!(palette.max_deltas(), deltas);
                     assert_eq!(palette.delta_predictor(), Some(predictor));
-                    assert_eq!(palette.capacity(1024, 1024), colors + deltas);
-                    assert_eq!(palette.capacity(1, 1), 2);
-                    assert_eq!(palette.delta_capacity(1, 1), 1);
+                    assert_eq!(
+                        planned(palette, 1024, 1024).capacity.entries(),
+                        colors + deltas
+                    );
+                    assert_eq!(planned(palette, 1, 1).capacity.entries(), 2);
+                    assert_eq!(planned(palette, 1, 1).capacity.deltas, 1);
                 }
             }
         }
@@ -355,10 +326,10 @@ mod tests {
                 assert!(palette.uses_implicit_entries());
                 assert_eq!(palette.max_deltas(), limit);
                 assert_eq!(palette.delta_predictor(), Some(predictor));
-                assert_eq!(palette.capacity(1, 1), limit.min(2));
-                assert_eq!(palette.capacity(1024, 1024), limit);
-                assert!(palette.hash_entries(limit) >= 2 * (limit + 143));
-                assert!(palette.hash_entries(limit).is_power_of_two());
+                assert_eq!(planned(palette, 1, 1).capacity.entries(), limit.min(2));
+                assert_eq!(planned(palette, 1024, 1024).capacity.entries(), limit);
+                assert!(planned(palette, 1024, 1024).hash_entries >= 2 * (limit + 143));
+                assert!(planned(palette, 1024, 1024).hash_entries.is_power_of_two());
             }
         }
         for limit in [0, LosslessModularPalette::MAX_DELTAS + 1, u32::MAX] {

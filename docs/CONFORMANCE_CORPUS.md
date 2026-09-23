@@ -919,6 +919,15 @@ input generator while keeping prior inputs and assertions unchanged. The indepen
 now checks all ranges with every existing color bucket and Squeeze choice. No production CPU
 codec, extra image allocation, shader binding or synchronization dispatch is introduced.
 
+These same matrices exercise the shared checked transform plan. Additional
+[topology tests](../crates/jxl_wgpu_encode/src/lossless_modular/transform/tests.rs) use a
+hand-worked 5×3 selected-component H/V split to check channel source, band order and odd
+dimensions. Repeated and single-pixel edge groups check shared shape plans, global/fused RCT
+placement and the preserved prefix policy. Invalid static ranges reject before lowering.
+The independent header readers now consume plans through the production writer while retaining
+their expected wire values; missing counts or counts validated for a different capacity are
+rejected. Existing malformed-artifact, admission, cancellation and independent pixel bounds remain.
+
 With the rebuilt native word oracle:
 
 ```console

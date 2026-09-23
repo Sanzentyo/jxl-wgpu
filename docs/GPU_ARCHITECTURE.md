@@ -49,7 +49,9 @@ GPU image source -> GPU prediction/transform/quantization/tokenization
 The lossless Modular encoder can apply caller-selected local Squeeze after RCT, computing one or
 two separable axes directly from source words in the token kernel. Signed-wide averages/tendencies
 require no intermediate image allocation or pixel readback. Each group skips single-pixel axes;
-dispatch, memory planning and wire headers share the resulting channel geometry. Complete channel
+one `ModularTransformPlan` resolves the resulting channel geometry and ordered wire operations
+for dispatch, memory planning and every packet-assembly path. Its per-channel sample source and
+Squeeze band lower directly into GPU parameters. Complete channel
 sets remain together across streamed histogram/serialization batches. A residual outside signed-32
 storage fails artifact validation before any codestream is returned. General transform stacks and
 cross-group/global-LF Squeeze remain outside this encoder policy.

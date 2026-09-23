@@ -200,6 +200,10 @@ one histogram and one serialization submission per batch. Every live batch uses 
 `MemoryBudget`. Its exclusive buffer-pool lease and reservation survive until the map callback and
 mapped-range consumer are both finished, including when the returned future is abandoned.
 Source range accounting excludes gaps between planes and counts shared alignment prefixes once.
+One checked transform plan resolves group-channel geometry, Palette capacity and ordered wire
+operations before allocation. Dispatch and all three resident/native-streamed/browser-streamed
+assembly paths share it; GPU parameters carry the resolved sample source and Squeeze band.
+Actual Palette counts must validate against that plan before they can determine a header.
 Streamed submission checks the reported peak against available budget before allocating its first
 batch, even when a later batch is larger. Each batch still acquires and retains its own reservation;
 concurrent allocations between batches can cause a later typed backpressure failure with no output.

@@ -1,4 +1,61 @@
 use super::*;
+use crate::lossless_modular::transform::{PaletteArtifactPlan, PaletteCapacity};
+use crate::{
+    LosslessModularColorTransform, LosslessModularConfig, LosslessModularGroupSize,
+    LosslessModularPalette, LosslessModularSqueeze,
+};
+
+fn write_planned_transforms(
+    output: &mut BitWriter,
+    channels: u32,
+    rct: Option<LosslessModularRctType>,
+    squeeze: LosslessModularSqueeze,
+    palette: LosslessModularPalette,
+    counts: (u32, u32),
+) {
+    let format = [
+        LosslessModularFormat::Gray,
+        LosslessModularFormat::GrayAlpha,
+        LosslessModularFormat::Rgb,
+        LosslessModularFormat::Rgba,
+    ][channels as usize - 1];
+    let grid =
+        LosslessModularGroupGrid::for_extent(1024, 1024, LosslessModularGroupSize::Pixels1024)
+            .unwrap();
+    let plan = ModularTransformPlan::new(
+        grid,
+        format,
+        31,
+        0,
+        LosslessModularConfig {
+            palette: Some(palette),
+            squeeze,
+            color_transform: rct.map_or(
+                LosslessModularColorTransform::None,
+                LosslessModularColorTransform::GlobalRct,
+            ),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let group = plan.group(grid.group(0).unwrap()).unwrap();
+    write_transforms(
+        output,
+        TransformHeader {
+            operations: &group.operations,
+            palette_counts: Some(
+                group
+                    .palette
+                    .unwrap()
+                    .capacity
+                    .validate(counts.0, counts.1)
+                    .unwrap(),
+            ),
+        },
+    )
+    .unwrap();
+}
+
 use jxl_bitstream::{Bitstream, U};
 
 #[test]
@@ -6,24 +63,14 @@ fn independent_wire_reader_checks_delta_counts_and_every_predictor() {
     for predictor in LosslessModularPredictor::ALL {
         for entries in [1, 256, 257, 1280, 1281, 66816] {
             let mut output = BitWriter::new();
-            write_transforms(
+            write_planned_transforms(
                 &mut output,
-                TransformHeader {
-                    rct: None,
-                    squeeze: LosslessModularSqueeze::None,
-                    channels: 4,
-                    palette: Some(PaletteHeader {
-                        counts: PaletteCounts {
-                            entries,
-                            deltas: entries,
-                        },
-                        delta_predictor: Some(predictor),
-                        begin: 0,
-                        components: 4,
-                    }),
-                },
-            )
-            .unwrap();
+                4,
+                None,
+                LosslessModularSqueeze::None,
+                LosslessModularPalette::deltas(entries, predictor).unwrap(),
+                (entries, entries),
+            );
             let bit_len = output.bit_len();
             let bytes = output.into_bytes();
             let mut bits = Bitstream::new(&bytes);
@@ -52,6 +99,48 @@ fn independent_wire_reader_checks_delta_counts_and_every_predictor() {
 }
 
 #[test]
+fn wire_headers_require_counts_validated_against_their_own_plan() {
+    let grid = LosslessModularGroupGrid::for_extent(5, 3, Default::default()).unwrap();
+    let plan = ModularTransformPlan::new(
+        grid,
+        LosslessModularFormat::Gray,
+        8,
+        0,
+        LosslessModularConfig {
+            palette: Some(LosslessModularPalette::new(1).unwrap()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let group = plan.group(grid.group(0).unwrap()).unwrap();
+    let other_counts = PaletteCapacity {
+        colors: 2,
+        deltas: 0,
+    }
+    .validate(2, 0)
+    .unwrap();
+    for header in [
+        TransformHeader {
+            operations: &group.operations,
+            palette_counts: None,
+        },
+        TransformHeader {
+            operations: &group.operations,
+            palette_counts: Some(other_counts),
+        },
+        TransformHeader {
+            operations: &[],
+            palette_counts: Some(other_counts),
+        },
+    ] {
+        assert!(matches!(
+            write_transforms(&mut BitWriter::new(), header),
+            Err(EncodeError::Backend(BackendError::InvalidArtifact(_)))
+        ));
+    }
+}
+
+#[test]
 fn independent_wire_reader_keeps_palette_geometry_and_skips_its_meta_channel() {
     for channels in 1..=4 {
         for (begin, selected) in
@@ -73,24 +162,17 @@ fn independent_wire_reader_keeps_palette_geometry_and_skips_its_meta_channel() {
                 ] {
                     let rct = (channels >= 3).then(|| LosslessModularRctType::new(41).unwrap());
                     let mut output = BitWriter::new();
-                    write_transforms(
+                    write_planned_transforms(
                         &mut output,
-                        TransformHeader {
-                            rct,
-                            squeeze,
-                            palette: Some(PaletteHeader {
-                                counts: PaletteCounts {
-                                    entries: colors,
-                                    deltas: 0,
-                                },
-                                delta_predictor: None,
-                                begin,
-                                components: selected,
-                            }),
-                            channels,
-                        },
-                    )
-                    .unwrap();
+                        channels,
+                        rct,
+                        squeeze,
+                        LosslessModularPalette::new(colors)
+                            .unwrap()
+                            .with_components(begin, selected)
+                            .unwrap(),
+                        (colors, 0),
+                    );
                     let bit_len = output.bit_len();
                     let bytes = output.into_bytes();
                     let mut bits = Bitstream::new(&bytes);
@@ -180,17 +262,21 @@ fn palette_artifacts_validate_status_count_bounds_and_exact_dynamic_coverage() {
         artifact_byte_offset: 0,
         output_size: bytes.len() as u64,
         max_events: 8,
-        palette_counts_byte_offset: Some(count_offset as u64),
-        palette_delta_capacity: 0,
+        palette: Some(PaletteArtifactPlan {
+            counts_byte_offset: count_offset as u64,
+            capacity: PaletteCapacity {
+                colors: 4,
+                deltas: 0,
+            },
+            scratch_bytes: 8,
+        }),
     };
     assert_eq!(
         parse_planned_artifact(&plan, &bytes)
             .unwrap()
-            .palette_counts,
-        Some(PaletteCounts {
-            entries: 1,
-            deltas: 0
-        })
+            .palette_counts
+            .map(|counts| (counts.entries(), counts.deltas())),
+        Some((1, 0))
     );
     // All counts inside the capacity must still cover their actual table, not its allocation.
     for count in [0u32, 2, 4, 5, u32::MAX] {
@@ -199,7 +285,7 @@ fn palette_artifacts_validate_status_count_bounds_and_exact_dynamic_coverage() {
     }
     bytes[count_offset..count_offset + 4].copy_from_slice(&1u32.to_le_bytes());
     assert!(parse_planned_artifact(&plan, &bytes[..count_offset + 3]).is_err());
-    plan.palette_counts_byte_offset = Some(u64::MAX);
+    plan.palette.as_mut().unwrap().counts_byte_offset = u64::MAX;
     assert!(parse_planned_artifact(&plan, &bytes).is_err());
     bytes[..4].copy_from_slice(&(u32::MAX - 2).to_le_bytes());
     assert!(matches!(
@@ -240,8 +326,14 @@ fn mixed_palette_metadata_rejects_partition_overflow_and_truncation_before_token
         artifact_byte_offset: 0,
         output_size: bytes.len() as u64,
         max_events: 8,
-        palette_counts_byte_offset: Some(offset as u64),
-        palette_delta_capacity: 2,
+        palette: Some(PaletteArtifactPlan {
+            counts_byte_offset: offset as u64,
+            capacity: PaletteCapacity {
+                colors: 1,
+                deltas: 2,
+            },
+            scratch_bytes: 8,
+        }),
     };
     for (entries, deltas) in [(2u32, 1u32), (2, 2)] {
         bytes[offset..offset + 4].copy_from_slice(&entries.to_le_bytes());
@@ -249,8 +341,9 @@ fn mixed_palette_metadata_rejects_partition_overflow_and_truncation_before_token
         assert_eq!(
             parse_planned_artifact(&plan, &bytes)
                 .unwrap()
-                .palette_counts,
-            Some(PaletteCounts { entries, deltas })
+                .palette_counts
+                .map(|counts| (counts.entries(), counts.deltas())),
+            Some((entries, deltas))
         );
     }
     for (entries, deltas) in [
@@ -274,7 +367,7 @@ fn mixed_palette_metadata_rejects_partition_overflow_and_truncation_before_token
     for end in offset..offset + 8 {
         assert!(parse_planned_artifact(&plan, &bytes[..end]).is_err());
     }
-    plan.palette_delta_capacity = 4;
+    plan.palette.as_mut().unwrap().capacity.deltas = 4;
     assert!(parse_planned_artifact(&plan, &bytes).is_err());
 }
 
@@ -284,24 +377,14 @@ fn independent_wire_reader_checks_both_mixed_count_buckets_and_zero_used_deltas(
         for colors in [1, 255, 256, 1279, 1280, 5375, 5376, 70911] {
             for deltas in [0, 1, 256, 257, 1280, 1281, 66816] {
                 let mut output = BitWriter::new();
-                write_transforms(
+                write_planned_transforms(
                     &mut output,
-                    TransformHeader {
-                        rct: None,
-                        squeeze: LosslessModularSqueeze::None,
-                        channels: 3,
-                        palette: Some(PaletteHeader {
-                            counts: PaletteCounts {
-                                entries: colors + deltas,
-                                deltas,
-                            },
-                            delta_predictor: Some(predictor),
-                            begin: 0,
-                            components: 3,
-                        }),
-                    },
-                )
-                .unwrap();
+                    3,
+                    None,
+                    LosslessModularSqueeze::None,
+                    LosslessModularPalette::mixed(colors, deltas.max(1), predictor).unwrap(),
+                    (colors + deltas, deltas),
+                );
                 let bit_len = output.bit_len();
                 let bytes = output.into_bytes();
                 let mut bits = Bitstream::new(&bytes);

@@ -17,6 +17,7 @@ mod squeeze;
 mod streaming;
 #[cfg(test)]
 mod tests;
+mod transform;
 mod types;
 
 pub use color::LosslessModularColorOptions;
