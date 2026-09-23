@@ -45,7 +45,7 @@ for the encoder's intermediate-image precision checks and retain its
 `JXL_PROGRESSIVE_SCALAR_ORACLE` environment variable. Reuse the existing pinned native checkout
 and scalar build; a missing required oracle is a failed check.
 Build the [native Modular word oracle](../tools/jxl_test_support/README.md#native-modular-word-oracle)
-in that same scalar build and retain `JXL_MODULAR_WORD_ORACLE` for exact Delta Palette checks.
+in that same scalar build and retain `JXL_MODULAR_WORD_ORACLE` for exact delta/mixed Palette checks.
 
 Run from the repository root while CI is disabled:
 

@@ -49,9 +49,10 @@ pub(super) struct ModularParams {
     pub(super) palette_hash_mask: u32,
     pub(super) palette_channels: u32,
     pub(super) palette_delta_predictor: u32,
+    pub(super) palette_delta_capacity: u32,
     // An explicit 256-byte array stride keeps every batch boundary valid for the portable
     // storage-buffer offset alignment without hidden Rust padding.
-    pub(super) _padding: [u32; 8],
+    pub(super) _padding: [u32; 7],
 }
 
 /// Fixed storage-buffer header written by `lossless_modular.wgsl`.
@@ -191,7 +192,7 @@ pub struct LosslessModularConfig {
     pub color_transform: super::rct::LosslessModularColorTransform,
     /// One of all fourteen standard predictors, shared by every group and component.
     pub predictor: super::predictor::LosslessModularPredictor,
-    /// Serialized in every Modular header; used when `predictor` is `Weighted`.
+    /// Serialized in every Modular header; used by Weighted token or palette delta prediction.
     pub weighted_predictor: super::predictor::LosslessModularWeightedPredictor,
     /// Zero-run coding or bounded GPU search for arbitrary residual matches.
     pub lz77: super::lz77::LosslessModularLz77,

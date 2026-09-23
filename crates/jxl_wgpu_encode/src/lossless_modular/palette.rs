@@ -5,10 +5,12 @@ use crate::EncodeError;
 /// RCT precedes this transform; optional Squeeze operates on its index channel. A fused
 /// single-group frame declares the palette in DC-global. Exceeding the caller's color limit
 /// fails completion without returning a codestream. [`Self::deltas`] dictionaries contain
-/// predictor residuals instead of colors. Implicit palette entries are not selected.
+/// predictor residuals instead of colors; [`Self::mixed`] retains both. Implicit palette
+/// entries are not selected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LosslessModularPalette {
     max_colors: u32,
+    max_deltas: u32,
     delta_predictor: Option<LosslessModularPredictor>,
 }
 
@@ -24,6 +26,7 @@ impl LosslessModularPalette {
         }
         Ok(Self {
             max_colors,
+            max_deltas: 0,
             delta_predictor: None,
         })
     }
@@ -41,14 +44,39 @@ impl LosslessModularPalette {
         }
         Ok(Self {
             max_colors: max_deltas,
+            max_deltas,
             delta_predictor: Some(predictor),
         })
     }
 
-    /// Maximum dictionary entries (residual tuples for a delta palette).
+    /// Keeps the first `max_colors` distinct post-RCT tuples as absolute entries, then uses
+    /// exact predictor residuals for every other tuple. Absolute matches always take priority.
+    /// Both dictionaries reset per group and have independent nonzero limits. Weighted state
+    /// observes every original sample, including samples represented by absolute entries.
+    pub fn mixed(
+        max_colors: u32,
+        max_deltas: u32,
+        predictor: LosslessModularPredictor,
+    ) -> Result<Self, EncodeError> {
+        Self::new(max_colors)?;
+        Self::deltas(max_deltas, predictor)?;
+        Ok(Self {
+            max_colors: max_colors + max_deltas,
+            max_deltas,
+            delta_predictor: Some(predictor),
+        })
+    }
+
+    /// Maximum total dictionary entries (colors plus residual tuples for a mixed palette).
     #[must_use]
     pub const fn max_colors(self) -> u32 {
         self.max_colors
+    }
+
+    /// Maximum residual entries; zero for a color-only palette.
+    #[must_use]
+    pub const fn max_deltas(self) -> u32 {
+        self.max_deltas
     }
 
     #[must_use]
@@ -57,7 +85,11 @@ impl LosslessModularPalette {
     }
 
     pub(super) fn capacity(self, width: u32, height: u32) -> u32 {
-        self.max_colors.min(width * height)
+        (self.max_colors - self.max_deltas).min(width * height) + self.delta_capacity(width, height)
+    }
+
+    pub(super) fn delta_capacity(self, width: u32, height: u32) -> u32 {
+        self.max_deltas.min(width * height)
     }
 
     pub(super) fn scratch_words(
@@ -67,8 +99,9 @@ impl LosslessModularPalette {
         width: u32,
         height: u32,
     ) -> u64 {
-        // One count, a channel-major word table, and a <= 50%-full open-addressed hash table.
-        1 + u64::from(capacity) * u64::from(components)
+        // Total/delta counts, a channel-major table with delta/color partitions, and a
+        // <= 50%-full open-addressed hash table. Equal words in different partitions differ.
+        2 + u64::from(capacity) * u64::from(components)
             + u64::from((capacity * 2).next_power_of_two())
             + if self.delta_predictor.is_some() {
                 u64::from(width) * u64::from(height) * u64::from(components)
@@ -81,6 +114,12 @@ impl LosslessModularPalette {
                 0
             }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PaletteCounts {
+    pub(super) entries: u32,
+    pub(super) deltas: u32,
 }
 
 pub(super) const fn encoded_channels(
@@ -137,5 +176,43 @@ mod tests {
                 .delta_predictor(),
             None
         );
+    }
+
+    #[test]
+    fn mixed_palette_limits_are_independent_and_preserve_the_combined_capacity() {
+        for predictor in LosslessModularPredictor::ALL {
+            for colors in [
+                1,
+                255,
+                256,
+                1279,
+                1280,
+                5375,
+                5376,
+                LosslessModularPalette::MAX_COLORS,
+            ] {
+                for deltas in [1, 256, 257, 1280, 1281, LosslessModularPalette::MAX_DELTAS] {
+                    let palette = LosslessModularPalette::mixed(colors, deltas, predictor).unwrap();
+                    assert_eq!(palette.max_colors(), colors + deltas);
+                    assert_eq!(palette.max_deltas(), deltas);
+                    assert_eq!(palette.delta_predictor(), Some(predictor));
+                    assert_eq!(palette.capacity(1024, 1024), colors + deltas);
+                    assert_eq!(palette.capacity(1, 1), 2);
+                    assert_eq!(palette.delta_capacity(1, 1), 1);
+                }
+            }
+        }
+        for colors in [0, LosslessModularPalette::MAX_COLORS + 1, u32::MAX] {
+            assert!(
+                matches!(LosslessModularPalette::mixed(colors, 1, LosslessModularPredictor::Zero),
+                Err(EncodeError::InvalidModularPaletteLimit { max_colors }) if max_colors == colors)
+            );
+        }
+        for deltas in [0, LosslessModularPalette::MAX_DELTAS + 1, u32::MAX] {
+            assert!(
+                matches!(LosslessModularPalette::mixed(1, deltas, LosslessModularPredictor::Zero),
+                Err(EncodeError::InvalidModularPaletteDeltaLimit { max_deltas }) if max_deltas == deltas)
+            );
+        }
     }
 }

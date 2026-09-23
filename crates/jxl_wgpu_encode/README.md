@@ -115,11 +115,17 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   each post-RCT component's original neighbors and resets per group/component. The delta
   predictor is independent of the token predictor; both use the configured Weighted coefficients
   with separate state. Every dictionary entry is a delta and the wire color count is zero.
-  `max_colors()` reports dictionary capacity in either mode; `delta_predictor()` distinguishes
-  the policies. Invalid delta limits return `EncodeError::InvalidModularPaletteDeltaLimit`;
-  capacity overflow uses the same completion error and returns no stream. Mixed explicit
-  color/delta tables, implicit entries, component subsets, arbitrary stacks and automatic policy
-  selection remain open.
+  `LosslessModularPalette::mixed(max_colors, max_deltas, predictor)` combines both dictionaries.
+  It retains the first distinct absolute tuples up to the color limit, then uses residual tuples
+  for other colors. An absolute match always takes priority. The two nonzero limits are checked
+  independently; identical words in the two dictionaries remain distinct entries. Weighted delta
+  state observes every original sample, including absolute entries. The wire table places used
+  deltas before used colors, with no unused reserved entries. A group can use zero deltas.
+  `max_colors()` reports total dictionary capacity, including deltas; `max_deltas()` reports the
+  delta limit, and `delta_predictor()` is absent only for the color-only policy. Invalid delta
+  limits return `EncodeError::InvalidModularPaletteDeltaLimit`; capacity overflow uses the same
+  completion error and returns no stream. Implicit entries, component subsets, arbitrary stacks
+  and automatic policy selection remain open.
 - `LosslessModularConfig` selects all four standard PassGroup sizes with
   `LosslessModularGroupSize::{Pixels128, Pixels256, Pixels512, Pixels1024}`, the MA-tree mode,
   reversible color transform, Palette, Squeeze, prediction and LZ77 policy.
@@ -190,14 +196,15 @@ also inside the artifact allocation and its reported scratch subtotal. A complet
 the checked source/artifact binding limits. With Squeeze, these formulas use each transformed
 channel's width, height and area, with up to 16 channels per group; single-pixel edge axes may
 produce fewer. Palette instead has one meta channel plus one, two or four index-image channels.
-Its meta channel reserves `min(max_colors, group_pixels) × source_components` samples; only the
-validated actual color count is encoded. For capacity `k` and `c` source components, Palette adds
-`4 * (1 + k * c + next_power_of_two(2 * k))` scratch bytes per group for the count, dictionary
-and hash table. The peak subtotal is included in the artifact allocation and any readback copy.
-Delta mode additionally retains `4 * group_pixels * source_components` residual bytes and,
+Its meta channel reserves `k × source_components` samples, where `k` is the sum of the separately
+pixel-clamped color and delta limits. Only actual used entries are encoded. For capacity `k` and
+`c` source components, Palette adds `4 * (2 + k * c + next_power_of_two(2 * k))` scratch bytes per
+group for total/delta counts, the partitioned dictionary and hash table. The peak subtotal is
+included in the artifact allocation and any readback copy.
+Delta and mixed modes additionally retain `4 * group_pixels * source_components` residual bytes and,
 for Weighted delta prediction, `20 * group_width` row-state bytes reused between components.
 These are included in `palette_scratch_bytes`, separately from token-predictor scratch.
-These private scratch bytes are mapped with that allocation; host assembly reads the count and
+These private scratch bytes are mapped with that allocation; host assembly reads the counts and
 encoded events, without inspecting dictionary entries or source pixels. Selecting 1024 does not guarantee that every device
 or memory budget can admit it. Batch splitting, peak reservations and exact submission counts
 are recalculated from that geometry. Long zero runs use the full valid prefix alphabet through
@@ -332,6 +339,10 @@ uses the pinned scalar libjxl's original integer planes, including low bits beyo
 and checks the full delta-count wire domain and all predictors. A smooth Gray31 source verifies
 successful encoding with four deltas and fewer bytes than the ordinary Gradient stream, while
 an exact four-color palette rejects it; this does not establish a universal compression gain.
+The [mixed Palette matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-mixed-palette-encoding)
+checks the simultaneous 70,911-color/66,816-delta maximum, equal words in different partitions,
+all predictors, integer/IEEE/RCT/Squeeze composition, animations and resident/streamed ownership.
+It uses the same independent native exact-word and F32 oracles without changing their bounds.
 
 ## Experimental VarDCT profile
 

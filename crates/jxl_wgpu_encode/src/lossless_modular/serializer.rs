@@ -14,7 +14,7 @@ use super::grid::{LosslessModularGroup, LosslessModularGroupGrid};
 use super::icc::{DEFAULT_PROFILE_LIMIT, PreparedImageHeader};
 use super::lz77::LosslessModularLz77;
 use super::memory::{LosslessModularMemoryLimits, LosslessModularMemoryPlan};
-use super::palette::{LosslessModularPalette, encoded_channels};
+use super::palette::{LosslessModularPalette, PaletteCounts, encoded_channels};
 use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
 use super::rct::{LosslessModularRctType, ResolvedRct};
 use super::source::lossless_modular_source_spec;
@@ -980,16 +980,16 @@ impl ModularPacketAssembler {
                 "GPU group does not contain every Modular channel".into(),
             ));
         }
-        let palette_entries = artifacts[0].palette_entries;
-        if palette_entries.is_some() != self.palette.is_some() {
+        let palette_counts = artifacts[0].palette_counts;
+        if palette_counts.is_some() != self.palette.is_some() {
             return Err(invalid_gpu_artifact(
                 "palette metadata does not match the group policy",
             ));
         }
-        let palette = palette_entries
+        let palette = palette_counts
             .zip(self.palette)
-            .map(|(entries, policy)| PaletteHeader {
-                entries,
+            .map(|(counts, policy)| PaletteHeader {
+                counts,
                 delta_predictor: policy.delta_predictor(),
             });
         if let Some(group) = &mut self.single_group {
@@ -1233,7 +1233,7 @@ pub(super) fn build_packets(
 pub(super) struct ValidatedModularArtifact<'a> {
     pub(super) header: ModularArtifactHeader,
     pub(super) events: &'a [ModularEvent],
-    pub(super) palette_entries: Option<u32>,
+    pub(super) palette_counts: Option<PaletteCounts>,
 }
 
 pub(super) fn parse_planned_artifact<'a>(
@@ -1242,32 +1242,42 @@ pub(super) fn parse_planned_artifact<'a>(
 ) -> Result<ValidatedModularArtifact<'a>, EncodeError> {
     // Check status before reading dynamic dimensions or granting token authority.
     parse_group_artifact_header(plan.max_events, bytes)?;
-    let palette_entries = if let Some(offset) = plan.palette_entries_byte_offset {
+    let palette_counts = if let Some(offset) = plan.palette_counts_byte_offset {
         let offset = usize::try_from(offset)
             .map_err(|_| invalid_gpu_artifact("palette metadata offset overflow"))?;
         let end = offset
-            .checked_add(4)
+            .checked_add(8)
             .ok_or_else(|| invalid_gpu_artifact("palette metadata offset overflow"))?;
         let value = bytes
             .get(offset..end)
             .ok_or_else(|| invalid_gpu_artifact("palette metadata is truncated"))?;
-        let count = u32::from_le_bytes(value.try_into().expect("four-byte palette count"));
-        if count == 0 || count > plan.width {
+        let count = u32::from_le_bytes(value[..4].try_into().expect("four-byte palette count"));
+        let deltas = u32::from_le_bytes(value[4..].try_into().expect("four-byte delta count"));
+        if count == 0
+            || count > plan.width
+            || deltas > count
+            || deltas > plan.palette_delta_capacity
+            || plan.palette_delta_capacity > plan.width
+            || count - deltas > plan.width - plan.palette_delta_capacity
+        {
             return Err(invalid_gpu_artifact(
                 "palette count exceeds planned capacity",
             ));
         }
-        Some(count)
+        Some(PaletteCounts {
+            entries: count,
+            deltas,
+        })
     } else {
         None
     };
     let mut artifact = parse_group_artifact(
-        palette_entries.unwrap_or(plan.width),
+        palette_counts.map_or(plan.width, |counts| counts.entries),
         plan.height,
         plan.max_events,
         bytes,
     )?;
-    artifact.palette_entries = palette_entries;
+    artifact.palette_counts = palette_counts;
     Ok(artifact)
 }
 
@@ -1336,7 +1346,7 @@ pub(super) fn parse_group_artifact<'a>(
     Ok(ValidatedModularArtifact {
         header,
         events,
-        palette_entries: None,
+        palette_counts: None,
     })
 }
 
@@ -1514,7 +1524,7 @@ fn invalid_gpu_artifact(reason: &'static str) -> EncodeError {
 
 #[derive(Clone, Copy)]
 struct PaletteHeader {
-    entries: u32,
+    counts: PaletteCounts,
     delta_predictor: Option<LosslessModularPredictor>,
 }
 
@@ -1610,11 +1620,7 @@ fn write_transforms(
                 output.write_bits(u64::from(channels - 1), 13)?;
             }
         }
-        let colors = if palette.delta_predictor.is_some() {
-            0
-        } else {
-            palette.entries
-        };
+        let colors = palette.counts.entries - palette.counts.deltas;
         let (selector, base, bits) = if colors < 256 {
             (0, 0, 8)
         } else if colors < 1280 {
@@ -1626,21 +1632,27 @@ fn write_transforms(
         };
         output.write_bits(selector, 2)?;
         output.write_bits(u64::from(colors - base), bits)?;
-        if let Some(predictor) = palette.delta_predictor {
-            let (selector, base, bits) = if palette.entries < 257 {
+        if palette.counts.deltas != 0 {
+            let (selector, base, bits) = if palette.counts.deltas < 257 {
                 (1, 1, 8)
-            } else if palette.entries < 1281 {
+            } else if palette.counts.deltas < 1281 {
                 (2, 257, 10)
             } else {
                 (3, 1281, 16)
             };
             output.write_bits(selector, 2)?;
-            output.write_bits(u64::from(palette.entries - base), bits)?;
-            output.write_bits(u64::from(predictor.value()), 4)?;
+            output.write_bits(u64::from(palette.counts.deltas - base), bits)?;
         } else {
             output.write_bits(0, 2)?; // no delta entries
-            output.write_bits(0, 4)?; // Zero delta predictor
         }
+        output.write_bits(
+            u64::from(
+                palette
+                    .delta_predictor
+                    .map_or(0, LosslessModularPredictor::value),
+            ),
+            4,
+        )?;
     }
     if squeeze == LosslessModularSqueeze::None {
         return Ok(());

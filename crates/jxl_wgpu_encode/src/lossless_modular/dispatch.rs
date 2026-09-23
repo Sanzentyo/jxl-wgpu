@@ -41,7 +41,8 @@ pub(super) struct ModularGroupPlan {
     pub(super) artifact_byte_offset: u64,
     pub(super) output_size: u64,
     pub(super) max_events: usize,
-    pub(super) palette_entries_byte_offset: Option<u64>,
+    pub(super) palette_counts_byte_offset: Option<u64>,
+    pub(super) palette_delta_capacity: u32,
 }
 
 struct ModularChannelLayout {
@@ -362,6 +363,9 @@ impl LosslessModularBackend {
                 .config
                 .palette
                 .map_or(0, |palette| palette.capacity(group.width, group.height));
+            let palette_delta_capacity = self.config.palette.map_or(0, |palette| {
+                palette.delta_capacity(group.width, group.height)
+            });
             let palette_scratch_bytes = self.config.palette.map_or(0, |palette| {
                 4 * palette.scratch_words(
                     palette_capacity,
@@ -375,7 +379,7 @@ impl LosslessModularBackend {
                 .windows
                 .validate(self.max_storage_binding_size)?;
             let proposed_source_windows = batch_source_windows.merge(group_source.windows);
-            let mut palette_entries_byte_offset = None;
+            let mut palette_counts_byte_offset = None;
             let layouts = (0..channels)
                 .map(|channel| {
                     let [width, height] = if palette_capacity != 0 && channel == 0 {
@@ -393,7 +397,7 @@ impl LosslessModularBackend {
                     };
                     let mut layout = ModularChannelLayout::new(width, height, self.config)?;
                     if palette_capacity != 0 && channel == 0 {
-                        palette_entries_byte_offset = Some(layout.output_size);
+                        palette_counts_byte_offset = Some(layout.output_size);
                         layout.output_size = layout
                             .output_size
                             .checked_add(palette_scratch_bytes)
@@ -459,7 +463,7 @@ impl LosslessModularBackend {
                 .into());
             }
             batch_source_windows = batch_source_windows.merge(group_source.windows);
-            let palette_scratch_word_offset = if let Some(offset) = palette_entries_byte_offset {
+            let palette_scratch_word_offset = if let Some(offset) = palette_counts_byte_offset {
                 align_up(output_size, artifact_alignment)
                     .and_then(|size| size.checked_sub(batch_artifact_offset))
                     .and_then(|size| size.checked_add(offset))
@@ -538,7 +542,8 @@ impl LosslessModularBackend {
                         .palette
                         .and_then(LosslessModularPalette::delta_predictor)
                         .map_or(14, LosslessModularPredictor::value),
-                    _padding: [0; 8],
+                    palette_delta_capacity,
+                    _padding: [0; 7],
                 });
                 groups.push(ModularGroupPlan {
                     group_index: group.index,
@@ -548,11 +553,12 @@ impl LosslessModularBackend {
                     artifact_byte_offset: output_size,
                     output_size: group_output_size,
                     max_events,
-                    palette_entries_byte_offset: if channel == 0 {
-                        palette_entries_byte_offset
+                    palette_counts_byte_offset: if channel == 0 {
+                        palette_counts_byte_offset
                     } else {
                         None
                     },
+                    palette_delta_capacity,
                 });
                 absolute_source_offsets.push(group_source.offsets);
                 output_size = output_size

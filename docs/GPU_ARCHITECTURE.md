@@ -70,6 +70,13 @@ delta prediction owns one additional row-state span reused between components, r
 each scan; entropy prediction retains its separate row state. These spans join the same artifact
 lease and byte budget. Squeeze still acts only on the index image. No host residual calculation,
 dictionary search or additional GPU binding/dispatch is introduced.
+Mixed mode keeps separately bounded absolute and residual partitions in the same dictionary.
+The first distinct absolute tuples fill the color partition; later unknown colors use residuals,
+while existing absolute matches retain priority. Hash identity includes the partition, so an
+equal word tuple cannot alias its prediction delta. Weighted residual generation observes every
+original sample before this choice. GPU table/index reads remap reserved partition offsets to the
+compact wire order of used deltas followed by used colors. The host validates total and delta
+counts against both planned limits and exact token coverage before publishing a transform header.
 
 Before codestream inventory, `jxl_gpu_bitstream::ContainerStreamScanner` can now consume arbitrary
 owned chunks without joining the complete transport. Apart from the inline reconstructed two-byte

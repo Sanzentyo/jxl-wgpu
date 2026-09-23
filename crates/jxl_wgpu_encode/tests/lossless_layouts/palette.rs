@@ -1,5 +1,6 @@
 use super::*;
 pub(crate) mod delta;
+mod mixed;
 use jxl_wgpu_encode::{
     BackendError, LosslessModularColorTransform as Transform, LosslessModularConfig,
     LosslessModularGroupSize as Size, LosslessModularLz77 as Lz77,

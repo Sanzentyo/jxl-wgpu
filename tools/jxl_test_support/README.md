@@ -79,7 +79,7 @@ unmodified native header, entropy, prediction and inverse-transform code; it onl
 original-color one-pass encoder groups and exports their integer planes. Unsupported transports,
 ICC/resampling, global non-RCT transforms in multi-group frames and nonempty LF/HF groups fail.
 Fused single-group transforms and global-RCT/local-transform combinations are supported.
-This supplies the Delta Palette exact-word oracle because jxl-oxide's `jxl-modular` 0.11.3 sizes
+This supplies the delta/mixed Palette exact-word oracle because jxl-oxide's `jxl-modular` 0.11.3 sizes
 its table from the color count alone and can omit delta prediction through its simple path.
 Existing color-only Palette tests retain their jxl-oxide comparisons. Native F32 output and
 independent Rust `jxl` animation composition remain separate checks.

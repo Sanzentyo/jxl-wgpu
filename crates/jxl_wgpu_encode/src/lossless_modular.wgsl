@@ -35,7 +35,8 @@ struct Params {
     palette_hash_mask: u32,
     palette_channels: u32,
     palette_delta_predictor: u32,
-    _padding: array<u32, 8>,
+    palette_delta_capacity: u32,
+    _padding: array<u32, 7>,
 }
 
 @group(0) @binding(0)
@@ -205,10 +206,10 @@ fn squeeze_residual(a: i32, b: i32, previous: i32, average: i32, next: i32) -> i
     return result;
 }
 
-fn palette_color(params: Params, x: u32, y: u32) -> vec4<u32> {
+fn palette_color(params: Params, x: u32, y: u32, delta: bool) -> vec4<u32> {
     var color = vec4<u32>(0u);
     for (var component = 0u; component < params.channels; component += 1u) {
-        if params.palette_delta_predictor < 14u {
+        if delta {
             color[component] = output_words[palette_residual_base(params) + (component * params.source_height + y) * params.source_width + x];
         } else {
             color[component] = bitcast<u32>(transformed_component(params, x, y, component));
@@ -218,25 +219,26 @@ fn palette_color(params: Params, x: u32, y: u32) -> vec4<u32> {
 }
 
 fn palette_hash_base(params: Params) -> u32 {
-    return params.palette_scratch_word_offset + 1u + params.channels * params.palette_capacity;
+    return params.palette_scratch_word_offset + 2u + params.channels * params.palette_capacity;
 }
 
 fn palette_residual_base(params: Params) -> u32 {
     return palette_hash_base(params) + params.palette_hash_mask + 1u;
 }
 
-fn palette_slot(params: Params, color: vec4<u32>) -> u32 {
-    var hash = 2166136261u;
+fn palette_slot(params: Params, color: vec4<u32>, delta: bool) -> u32 {
+    var hash = 2166136261u ^ select(0u, 0x80000000u, delta);
     for (var component = 0u; component < params.channels; component += 1u) {
         hash = (hash ^ color[component]) * 16777619u;
         hash ^= hash >> 16u;
     }
-    let table = params.palette_scratch_word_offset + 1u;
+    let table = params.palette_scratch_word_offset + 2u;
     let heads = palette_hash_base(params);
     for (var probe = 0u; probe <= params.palette_hash_mask; probe += 1u) {
         let slot = (hash + probe) & params.palette_hash_mask;
         let entry = output_words[heads + slot];
         if entry == 0u { return slot; }
+        if (entry - 1u < params.palette_delta_capacity) != delta { continue; }
         var matches = true;
         for (var component = 0u; component < params.channels; component += 1u) {
             if output_words[table + component * params.palette_capacity + entry - 1u] != color[component] {
@@ -249,42 +251,78 @@ fn palette_slot(params: Params, color: vec4<u32>) -> u32 {
 }
 
 fn build_palette(params: Params) -> bool {
-    // The whole artifact allocation, including hash heads, was cleared before this dispatch.
+    // The artifact allocation, including hash heads, was cleared before this dispatch.
     // Only this group's first invocation owns its dictionary and all token channels.
     let count_offset = params.palette_scratch_word_offset;
-    let table = count_offset + 1u;
+    let table = count_offset + 2u;
     let heads = palette_hash_base(params);
-    var count = 0u;
+    var colors = 0u;
+    var deltas = 0u;
+    let color_capacity = params.palette_capacity - params.palette_delta_capacity;
     for (var y = 0u; y < params.source_height; y += 1u) {
         for (var x = 0u; x < params.source_width; x += 1u) {
-            let color = palette_color(params, x, y);
-            let slot = palette_slot(params, color);
+            // Absolute matches take priority. The first distinct tuples fill the color
+            // partition; subsequent new colors use the independent residual partition.
+            var delta = color_capacity == 0u;
+            var color = palette_color(params, x, y, delta);
+            var slot = palette_slot(params, color, delta);
             if slot > params.palette_hash_mask { return false; }
-            if output_words[heads + slot] == 0u {
-                if count == params.palette_capacity { return false; }
-                for (var component = 0u; component < params.channels; component += 1u) {
-                    output_words[table + component * params.palette_capacity + count] = color[component];
-                }
-                count += 1u;
-                output_words[heads + slot] = count;
+            if output_words[heads + slot] != 0u { continue; }
+            if !delta && colors == color_capacity {
+                if params.palette_delta_capacity == 0u { return false; }
+                delta = true;
+                color = palette_color(params, x, y, true);
+                slot = palette_slot(params, color, true);
+                if slot > params.palette_hash_mask { return false; }
+                if output_words[heads + slot] != 0u { continue; }
+            }
+            var entry = params.palette_delta_capacity + colors;
+            if delta {
+                if deltas == params.palette_delta_capacity { return false; }
+                entry = deltas;
+                deltas += 1u;
+            } else {
+                colors += 1u;
+            }
+            for (var component = 0u; component < params.channels; component += 1u) {
+                output_words[table + component * params.palette_capacity + entry] = color[component];
+            }
+            output_words[heads + slot] = entry + 1u;
+        }
+    }
+    output_words[count_offset] = colors + deltas;
+    output_words[count_offset + 1u] = deltas;
+    return true;
+}
+
+fn palette_index(params: Params, x: u32, y: u32) -> i32 {
+    let heads = palette_hash_base(params);
+    if params.palette_capacity != params.palette_delta_capacity {
+        let slot = palette_slot(params, palette_color(params, x, y, false), false);
+        if slot <= params.palette_hash_mask {
+            let entry = output_words[heads + slot];
+            if entry != 0u {
+                // Wire tables contain actual deltas followed immediately by actual colors.
+                return i32(entry - 1u - params.palette_delta_capacity + output_words[params.palette_scratch_word_offset + 1u]);
             }
         }
     }
-    output_words[count_offset] = count;
-    return true;
+    if params.palette_delta_capacity != 0u {
+        let slot = palette_slot(params, palette_color(params, x, y, true), true);
+        if slot <= params.palette_hash_mask {
+            let entry = output_words[heads + slot];
+            if entry != 0u { return i32(entry - 1u); }
+        }
+    }
+    palette_failed = true;
+    return 0;
 }
 
 fn working_component(params: Params, x: u32, y: u32, component: u32) -> i32 {
     if !palette_enabled || params.palette_capacity == 0u {
         return transformed_component(params, x, y, component);
     }
-    let slot = palette_slot(params, palette_color(params, x, y));
-    if slot <= params.palette_hash_mask {
-        let entry = output_words[palette_hash_base(params) + slot];
-        if entry != 0u { return i32(entry - 1u); }
-    }
-    palette_failed = true;
-    return 0;
+    return palette_index(params, x, y);
 }
 
 fn squeeze_first(params: Params, component: u32, band: u32, point: vec2<u32>) -> i32 {
@@ -319,7 +357,9 @@ fn sample_at(params: Params, x: u32, y: u32) -> i32 {
     var channels = params.channels;
     if palette_enabled && params.palette_capacity != 0u {
         if channel == 0u {
-            return bitcast<i32>(output_words[params.palette_scratch_word_offset + 1u + y * params.palette_capacity + x]);
+            let deltas = output_words[params.palette_scratch_word_offset + 1u];
+            let entry = select(params.palette_delta_capacity + x - deltas, x, x < deltas);
+            return bitcast<i32>(output_words[params.palette_scratch_word_offset + 2u + y * params.palette_capacity + entry]);
         }
         channel -= 1u;
         channels = 1u;
