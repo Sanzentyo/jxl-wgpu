@@ -30,6 +30,8 @@ use jxl_wgpu_encode::{
 };
 use source::{Case, Storage, upload};
 
+type FrameOracle = fn(&[u8], &[&[u32]], &Case) -> Vec<f32>;
+
 struct Rig {
     backend: WgpuBackend,
     context: WgpuContext,
@@ -162,13 +164,26 @@ fn check_frame_oracles(encoded: &[u8], frames: &[&[u32]], case: &Case) -> Vec<f3
 }
 
 fn check_frame_samples(encoded: &[u8], frames: &[&[u32]], case: &Case, native: &[f32]) {
+    let planes: Vec<_> = (0..frames.len())
+        .map(|index| modular_integer::original_planes(encoded, index))
+        .collect();
+    check_frame_samples_with_planes(frames, case, native, &planes);
+}
+
+fn check_frame_samples_with_planes(
+    frames: &[&[u32]],
+    case: &Case,
+    native: &[f32],
+    original: &[Vec<Vec<i32>>],
+) {
+    assert_eq!(original.len(), frames.len());
     let pixels = frames[0].len() / case.format.channel_count() as usize;
     let frame_size = pixels * (4 + usize::from(case.format.has_alpha()));
     assert_eq!(native.len(), frame_size * frames.len());
     for (frame_index, expected) in frames.iter().enumerate() {
         let channels = case.format.channel_count() as usize;
         let pixels = expected.len() / channels;
-        let planes = modular_integer::original_planes(encoded, frame_index);
+        let planes = &original[frame_index];
         assert_eq!(planes.len(), channels);
         for (channel, plane) in planes.iter().enumerate() {
             assert_eq!(plane.len(), pixels);

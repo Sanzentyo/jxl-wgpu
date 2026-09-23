@@ -910,7 +910,7 @@ impl ModularPacketAssembler {
                 TransformHeader {
                     rct: rct.filter(|rct| !rct.local).map(|rct| rct.rct_type),
                     squeeze: LosslessModularSqueeze::None,
-                    palette_colors: None,
+                    palette: None,
                     channels: format.channel_count(),
                 },
                 predictor,
@@ -980,12 +980,18 @@ impl ModularPacketAssembler {
                 "GPU group does not contain every Modular channel".into(),
             ));
         }
-        let palette_colors = artifacts[0].palette_colors;
-        if palette_colors.is_some() != self.palette.is_some() {
+        let palette_entries = artifacts[0].palette_entries;
+        if palette_entries.is_some() != self.palette.is_some() {
             return Err(invalid_gpu_artifact(
                 "palette metadata does not match the group policy",
             ));
         }
+        let palette = palette_entries
+            .zip(self.palette)
+            .map(|(entries, policy)| PaletteHeader {
+                entries,
+                delta_predictor: policy.delta_predictor(),
+            });
         if let Some(group) = &mut self.single_group {
             write_dc_global(
                 group,
@@ -993,7 +999,7 @@ impl ModularPacketAssembler {
                 TransformHeader {
                     rct: self.rct.map(|rct| rct.rct_type),
                     squeeze,
-                    palette_colors,
+                    palette,
                     channels: self.format.channel_count(),
                 },
                 self.predictor,
@@ -1021,7 +1027,7 @@ impl ModularPacketAssembler {
                 TransformHeader {
                     rct: self.rct.filter(|rct| rct.local).map(|rct| rct.rct_type),
                     squeeze,
-                    palette_colors,
+                    palette,
                     channels: self.format.channel_count(),
                 },
             )?;
@@ -1227,7 +1233,7 @@ pub(super) fn build_packets(
 pub(super) struct ValidatedModularArtifact<'a> {
     pub(super) header: ModularArtifactHeader,
     pub(super) events: &'a [ModularEvent],
-    pub(super) palette_colors: Option<u32>,
+    pub(super) palette_entries: Option<u32>,
 }
 
 pub(super) fn parse_planned_artifact<'a>(
@@ -1236,7 +1242,7 @@ pub(super) fn parse_planned_artifact<'a>(
 ) -> Result<ValidatedModularArtifact<'a>, EncodeError> {
     // Check status before reading dynamic dimensions or granting token authority.
     parse_group_artifact_header(plan.max_events, bytes)?;
-    let palette_colors = if let Some(offset) = plan.palette_colors_byte_offset {
+    let palette_entries = if let Some(offset) = plan.palette_entries_byte_offset {
         let offset = usize::try_from(offset)
             .map_err(|_| invalid_gpu_artifact("palette metadata offset overflow"))?;
         let end = offset
@@ -1256,12 +1262,12 @@ pub(super) fn parse_planned_artifact<'a>(
         None
     };
     let mut artifact = parse_group_artifact(
-        palette_colors.unwrap_or(plan.width),
+        palette_entries.unwrap_or(plan.width),
         plan.height,
         plan.max_events,
         bytes,
     )?;
-    artifact.palette_colors = palette_colors;
+    artifact.palette_entries = palette_entries;
     Ok(artifact)
 }
 
@@ -1330,7 +1336,7 @@ pub(super) fn parse_group_artifact<'a>(
     Ok(ValidatedModularArtifact {
         header,
         events,
-        palette_colors: None,
+        palette_entries: None,
     })
 }
 
@@ -1506,10 +1512,16 @@ fn invalid_gpu_artifact(reason: &'static str) -> EncodeError {
     BackendError::InvalidArtifact(reason).into()
 }
 
+#[derive(Clone, Copy)]
+struct PaletteHeader {
+    entries: u32,
+    delta_predictor: Option<LosslessModularPredictor>,
+}
+
 struct TransformHeader {
     rct: Option<LosslessModularRctType>,
     squeeze: LosslessModularSqueeze,
-    palette_colors: Option<u32>,
+    palette: Option<PaletteHeader>,
     channels: u32,
 }
 
@@ -1568,14 +1580,14 @@ fn write_transforms(
     let TransformHeader {
         rct,
         squeeze,
-        palette_colors,
+        palette,
         channels,
     } = transforms;
-    if squeeze == LosslessModularSqueeze::None && palette_colors.is_none() {
+    if squeeze == LosslessModularSqueeze::None && palette.is_none() {
         return write_rct(output, rct);
     }
     let count = u32::from(rct.is_some())
-        + u32::from(palette_colors.is_some())
+        + u32::from(palette.is_some())
         + u32::from(squeeze != LosslessModularSqueeze::None);
     if count >= 2 {
         output.write_bits(2, 2)?;
@@ -1586,7 +1598,7 @@ fn write_transforms(
     if let Some(rct) = rct {
         write_rct_parameters(output, rct)?;
     }
-    if let Some(colors) = palette_colors {
+    if let Some(palette) = palette {
         output.write_bits(1, 2)?; // Palette
         output.write_bits(0, 5)?; // begin channel 0
         match channels {
@@ -1598,6 +1610,11 @@ fn write_transforms(
                 output.write_bits(u64::from(channels - 1), 13)?;
             }
         }
+        let colors = if palette.delta_predictor.is_some() {
+            0
+        } else {
+            palette.entries
+        };
         let (selector, base, bits) = if colors < 256 {
             (0, 0, 8)
         } else if colors < 1280 {
@@ -1609,8 +1626,21 @@ fn write_transforms(
         };
         output.write_bits(selector, 2)?;
         output.write_bits(u64::from(colors - base), bits)?;
-        output.write_bits(0, 2)?; // no delta entries
-        output.write_bits(0, 4)?; // Zero delta predictor
+        if let Some(predictor) = palette.delta_predictor {
+            let (selector, base, bits) = if palette.entries < 257 {
+                (1, 1, 8)
+            } else if palette.entries < 1281 {
+                (2, 257, 10)
+            } else {
+                (3, 1281, 16)
+            };
+            output.write_bits(selector, 2)?;
+            output.write_bits(u64::from(palette.entries - base), bits)?;
+            output.write_bits(u64::from(predictor.value()), 4)?;
+        } else {
+            output.write_bits(0, 2)?; // no delta entries
+            output.write_bits(0, 4)?; // Zero delta predictor
+        }
     }
     if squeeze == LosslessModularSqueeze::None {
         return Ok(());
@@ -1622,12 +1652,8 @@ fn write_transforms(
         output.write_bits(u64::from(squeeze.first_horizontal() ^ (stage != 0)), 1)?;
         output.write_bits(0, 1)?; // append residuals after all current channels
         output.write_bits(0, 2)?; // U32 begin-channel selector
-        output.write_bits(u64::from(palette_colors.is_some()), 3)?; // skip the palette meta channel
-        let count = if palette_colors.is_some() {
-            1
-        } else {
-            channels
-        } << stage;
+        output.write_bits(u64::from(palette.is_some()), 3)?; // skip the palette meta channel
+        let count = if palette.is_some() { 1 } else { channels } << stage;
         if count <= 3 {
             output.write_bits(u64::from(count - 1), 2)?;
         } else {

@@ -185,7 +185,7 @@ mod native_tests {
                 256,
                 vec![
                     0, 4, 8, 12, 16, 20, 24, 28, 32, 128, 132, 136, 164, 180, 184, 188, 192, 196,
-                    200, 204, 208, 212, 216, 220,
+                    200, 204, 208, 212, 216, 220, 224,
                 ],
             ),
         ] {
@@ -243,11 +243,12 @@ mod native_tests {
             palette_scratch_word_offset: 53,
             palette_hash_mask: 54,
             palette_channels: 55,
-            _padding: [0; 9],
+            palette_delta_predictor: 56,
+            _padding: [0; 8],
         };
         let words = bytemuck::cast::<ModularParams, [u32; 64]>(params);
-        assert_eq!(&words[..55], &(1..=55).collect::<Vec<_>>());
-        assert!(words[55..].iter().all(|&word| word == 0));
+        assert_eq!(&words[..56], &(1..=56).collect::<Vec<_>>());
+        assert!(words[56..].iter().all(|&word| word == 0));
     }
 
     #[test]

@@ -109,8 +109,17 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   meta channel. The host validates the GPU color count and token coverage before writing the
   local transform header; a fused single-group frame defers its DC-global header until then.
   Exceeding the limit returns `BackendError::ModularPaletteOverflow` without a codestream.
-  Invalid constructor limits return `EncodeError::InvalidModularPaletteLimit`. Delta/implicit
-  entries, component-subset palettes, arbitrary stacks and automatic policy selection remain open.
+  Invalid constructor limits return `EncodeError::InvalidModularPaletteLimit`.
+  `LosslessModularPalette::deltas(max_deltas, predictor)` instead stores exact wrapping residual
+  tuples, with a checked `1..=66_816` entry limit and any of the 14 predictors. Prediction uses
+  each post-RCT component's original neighbors and resets per group/component. The delta
+  predictor is independent of the token predictor; both use the configured Weighted coefficients
+  with separate state. Every dictionary entry is a delta and the wire color count is zero.
+  `max_colors()` reports dictionary capacity in either mode; `delta_predictor()` distinguishes
+  the policies. Invalid delta limits return `EncodeError::InvalidModularPaletteDeltaLimit`;
+  capacity overflow uses the same completion error and returns no stream. Mixed explicit
+  color/delta tables, implicit entries, component subsets, arbitrary stacks and automatic policy
+  selection remain open.
 - `LosslessModularConfig` selects all four standard PassGroup sizes with
   `LosslessModularGroupSize::{Pixels128, Pixels256, Pixels512, Pixels1024}`, the MA-tree mode,
   reversible color transform, Palette, Squeeze, prediction and LZ77 policy.
@@ -185,6 +194,9 @@ Its meta channel reserves `min(max_colors, group_pixels) × source_components` s
 validated actual color count is encoded. For capacity `k` and `c` source components, Palette adds
 `4 * (1 + k * c + next_power_of_two(2 * k))` scratch bytes per group for the count, dictionary
 and hash table. The peak subtotal is included in the artifact allocation and any readback copy.
+Delta mode additionally retains `4 * group_pixels * source_components` residual bytes and,
+for Weighted delta prediction, `20 * group_width` row-state bytes reused between components.
+These are included in `palette_scratch_bytes`, separately from token-predictor scratch.
 These private scratch bytes are mapped with that allocation; host assembly reads the count and
 encoded events, without inspecting dictionary entries or source pixels. Selecting 1024 does not guarantee that every device
 or memory budget can admit it. Batch splitting, peak reservations and exact submission counts
@@ -315,6 +327,11 @@ The [Palette matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-palette-e
 every color-count wire bucket through 70,911, all integer precisions, raw IEEE special words,
 RCT/predictor/Squeeze composition, retained animation output and bounded GPU decoding. Exact
 budgets, cancellation and late streamed capacity failures retain the existing ownership contract.
+The [Delta Palette matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-delta-palette-encoding)
+uses the pinned scalar libjxl's original integer planes, including low bits beyond F32 precision,
+and checks the full delta-count wire domain and all predictors. A smooth Gray31 source verifies
+successful encoding with four deltas and fewer bytes than the ordinary Gradient stream, while
+an exact four-color palette rejects it; this does not establish a universal compression gain.
 
 ## Experimental VarDCT profile
 

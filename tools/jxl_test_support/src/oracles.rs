@@ -9,6 +9,7 @@ pub mod icc_profile;
 pub mod jpeg_coefficients;
 pub mod lf;
 pub mod modular_integer;
+pub mod modular_words;
 pub mod patches;
 pub mod progressive;
 pub mod tone_mapping;

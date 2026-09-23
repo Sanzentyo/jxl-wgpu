@@ -646,7 +646,7 @@ JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossl
 ```
 
 `MOD-E02` stays **Partial**. The selected RCT is uniform across groups/frames; adaptive selection,
-arbitrary transform stacks, delta/implicit Palette and global/LF/HF transform topology remain.
+arbitrary transform stacks, mixed/implicit Palette and global/LF/HF transform topology remain.
 Explicit local Squeeze and exact Palette are covered below.
 
 ## Lossless Modular Squeeze encoding
@@ -695,7 +695,7 @@ content analysis, cross-group Squeeze, general stacks or progressive Modular enc
 ## Lossless Modular Palette encoding
 
 [`lossless_layouts::palette`](../crates/jxl_wgpu_encode/tests/lossless_layouts/palette.rs)
-contains six GPU tests for caller-bounded exact local palettes. Forty geometry cases cover
+contains six direct GPU tests for caller-bounded exact local palettes. Forty geometry cases cover
 Gray/GrayAlpha/RGB/RGBA, shared/local trees, no Squeeze and all four axis policies, fused/separate
 groups, odd tails and one-pixel axes. Forty-two composition cases cover all 42 global/local RCT
 types and every integer precision from 1 through 31 while rotating all predictors, custom Weighted
@@ -735,8 +735,56 @@ JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --lib --test
 ```
 
 `MOD-E02` remains **Partial**. This policy encodes complete component tuples with explicit entries
-after RCT and before optional index Squeeze. Delta/implicit entries, component subsets, automatic
-policy selection, arbitrary stacks, cross-group/global-LF transforms and progressive Modular remain.
+after RCT and before optional index Squeeze. Delta entries are covered below. Mixed/implicit entries,
+component subsets, automatic policy selection, arbitrary stacks, cross-group/global-LF transforms
+and progressive Modular remain.
+
+## Lossless Modular Delta Palette encoding
+
+[`lossless_layouts::palette::delta`](../crates/jxl_wgpu_encode/tests/lossless_layouts/palette/delta.rs)
+adds six GPU tests for exact predictor-residual dictionaries. Forty-two composition cases combine
+every RCT type and every integer precision from 1 through 31 with all 14 delta predictors, all 14
+entropy predictors, custom Weighted parameters, all group sizes, shared/local trees, both entropy
+policies and all five Squeeze choices across the matrix. Twenty-eight more binary16/binary32 cases
+exercise every delta predictor, independent alpha and special words with Weighted entropy coding.
+Packed/planar/split, reversed and shifted big-endian inputs retain canonical packed bytes.
+Six Gray31 cases contain exactly 1/256/257/1280/1281/66,816 distinct delta entries, covering every
+wire-count boundary and the maximum. Independent header tests verify all delta counts and predictors.
+
+The exact-word oracle is [pinned scalar libjxl](../tools/jxl_test_support/README.md#native-modular-word-oracle):
+unmodified native header, entropy and transform code produces original integer planes before
+float conversion or composition. Every source word, including low integer bits and raw IEEE
+representations, must match. This is a separate development executable, with build/runtime version
+checks and no production dependency. jxl-oxide's `jxl-modular` 0.11.3 uses only the wire color count
+for table width and selects its direct-lookup path without considering delta entries; zero-color
+delta tables consequently misdecode or panic there. The existing exact-color matrices keep their
+jxl-oxide oracle. The new cases also require libjxl's original F32 output at the unchanged integer
+`2e-7` bound or exact IEEE bits, plus exact whole/43-byte-fragmented GPU numeric output through
+256-byte windows, retained beyond session drop.
+
+Four three-frame Replace animations retain integer31/raw IEEE32 words, both Squeeze orders,
+changing source layouts, timing and reverse insertion. Two cropped Add/Multiply sequences retain
+native and independent Rust `jxl` composition at the existing `3e-6` color / `4e-7` alpha bounds.
+Eight lifetime cases combine Weighted delta and entropy predictors, all group sizes, greedy LZ77,
+exact/one-byte-short budgets, cancellation, source retirement and pool reuse in resident and
+streamed execution. The added residual image and separate delta Weighted row state are included
+in the tested reservation. Ten negative cases overflow a one-entry dictionary, including after
+a valid streamed batch, and require no returned stream, complete resource release and later reuse.
+Zero and oversized constructor limits are typed errors.
+
+A 257×17 smooth Gray31 image has more than four colors but only four gradient residual tuples per
+group. The exact four-color policy rejects it; the four-delta policy retains every source word and
+produces fewer container bytes than the ordinary Gradient encoder. This is one explicit workload,
+not a general rate or runtime guarantee. No prior fixture, case matrix or tolerance is weakened.
+
+With `JXL_MODULAR_WORD_ORACLE` configured by the test-support instructions:
+
+```console
+JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossless_layouts palette::delta:: -- --test-threads=2
+```
+
+`MOD-E02` remains **Partial**: mixed color/delta dictionaries, implicit entries, component subsets,
+arbitrary transform ordering, adaptive selection and global/LF transform topology remain open.
 
 ## Lossless Modular predictors
 

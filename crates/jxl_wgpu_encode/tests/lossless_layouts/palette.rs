@@ -1,4 +1,5 @@
 use super::*;
+pub(crate) mod delta;
 use jxl_wgpu_encode::{
     BackendError, LosslessModularColorTransform as Transform, LosslessModularConfig,
     LosslessModularGroupSize as Size, LosslessModularLz77 as Lz77,
@@ -63,7 +64,17 @@ fn check(
             .encode_container(upload(&rig.context, &case.canonical(), extent, expected, 0))
             .unwrap()
     );
-    check_oracles(&encoded, expected, &case);
+    if encoder
+        .config()
+        .palette
+        .unwrap()
+        .delta_predictor()
+        .is_some()
+    {
+        delta::check_frame_oracles(&encoded, &[expected], &case);
+    } else {
+        check_oracles(&encoded, expected, &case);
+    }
     color::check_numeric(rig, &encoded, &[expected.to_vec()], &case);
     assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
     encoded.len()
@@ -296,7 +307,6 @@ fn palette_overflow_returns_no_stream_and_releases_resident_and_streamed_jobs() 
 #[test]
 fn palette_scratch_obeys_exact_admission_cancellation_and_pool_reuse() {
     let rig = Rig::new();
-    let case = case(LosslessModularFormat::Rgba, 31, SampleKind::Unsigned);
     for (index, group_size) in Size::ALL.into_iter().enumerate() {
         let config = LosslessModularConfig {
             palette: Some(Palette::new(32).unwrap()),
@@ -308,65 +318,71 @@ fn palette_scratch_obeys_exact_admission_cancellation_and_pool_reuse() {
             color_transform: Transform::LocalRct(Rct::new(41).unwrap()),
             ..Default::default()
         };
-        let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config);
-        for extent in [
-            Extent2d::new(group_size.dimension() + 1, 3),
-            Extent2d::new(group_size.dimension() * 33 + 1, 3),
-        ] {
-            let expected = samples(case, extent, 17);
-            let input = upload(&rig.context, &case, extent, &expected, 4099);
-            let plan = encoder.memory_plan(&input).unwrap();
-            assert!(plan.palette_scratch_bytes > 0);
-            assert_eq!(plan.streaming, plan.group_grid.groups > 2);
-            let limited = |bytes| {
-                LosslessModularEncoder::with_config(
-                    WgpuContext::with_memory_budget(
-                        Arc::new(rig.context.device().clone()),
-                        Arc::new(rig.context.queue().clone()),
-                        NonZeroU64::new(bytes).unwrap(),
-                    )
-                    .unwrap(),
-                    config,
+        check_lifetime(&rig, config, check_frame_oracles);
+    }
+}
+
+fn check_lifetime(rig: &Rig, config: LosslessModularConfig, oracle: FrameOracle) {
+    let group_size = config.group_size;
+    let case = case(LosslessModularFormat::Rgba, 31, SampleKind::Unsigned);
+    let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config);
+    for extent in [
+        Extent2d::new(group_size.dimension() + 1, 3),
+        Extent2d::new(group_size.dimension() * 33 + 1, 3),
+    ] {
+        let expected = samples(case, extent, 17);
+        let input = upload(&rig.context, &case, extent, &expected, 4099);
+        let plan = encoder.memory_plan(&input).unwrap();
+        assert!(plan.palette_scratch_bytes > 0);
+        assert_eq!(plan.streaming, plan.group_grid.groups > 2);
+        let limited = |bytes| {
+            LosslessModularEncoder::with_config(
+                WgpuContext::with_memory_budget(
+                    Arc::new(rig.context.device().clone()),
+                    Arc::new(rig.context.queue().clone()),
+                    NonZeroU64::new(bytes).unwrap(),
                 )
-            };
-            let short = limited(plan.owned_bytes_per_job - 1);
-            let failure = match short.submit(input.clone()) {
-                Ok(job) => pollster::block_on(job).unwrap_err(),
-                Err(error) => error,
-            };
+                .unwrap(),
+                config,
+            )
+        };
+        let short = limited(plan.owned_bytes_per_job - 1);
+        let failure = match short.submit(input.clone()) {
+            Ok(job) => pollster::block_on(job).unwrap_err(),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(failure, EncodeError::MemoryBackpressure(_)),
+            "{failure:?}"
+        );
+        assert_eq!(short.in_flight_memory_stats().reserved_bytes, 0);
+        assert_eq!(short.buffer_pool_stats().allocation_misses, 0);
+        let exact = limited(plan.owned_bytes_per_job);
+        let mut abandoned = input.clone();
+        abandoned.buffer = Arc::new(input.buffer.as_ref().clone());
+        let source = Arc::downgrade(&abandoned.buffer);
+        drop(exact.submit(abandoned).unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while source.upgrade().is_some()
+            || exact.in_flight_memory_stats().reserved_bytes != 0
+            || exact.buffer_pool_stats().leased_buffer_sets != 0
+        {
             assert!(
-                matches!(failure, EncodeError::MemoryBackpressure(_)),
-                "{failure:?}"
+                std::time::Instant::now() < deadline,
+                "cancelled Palette source or GPU memory retained"
             );
-            assert_eq!(short.in_flight_memory_stats().reserved_bytes, 0);
-            assert_eq!(short.buffer_pool_stats().allocation_misses, 0);
-            let exact = limited(plan.owned_bytes_per_job);
-            let mut abandoned = input.clone();
-            abandoned.buffer = Arc::new(input.buffer.as_ref().clone());
-            let source = Arc::downgrade(&abandoned.buffer);
-            drop(exact.submit(abandoned).unwrap());
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while source.upgrade().is_some()
-                || exact.in_flight_memory_stats().reserved_bytes != 0
-                || exact.buffer_pool_stats().leased_buffer_sets != 0
-            {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "cancelled Palette source or GPU memory retained"
-                );
-                rig.context.device().poll(wgpu::PollType::Poll).unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            let encoded = exact.encode(input.clone()).unwrap();
-            assert_eq!(
-                encoded,
-                pollster::block_on(exact.submit(input).unwrap()).unwrap()
-            );
-            assert_eq!(exact.in_flight_memory_stats().reserved_bytes, 0);
-            assert_eq!(exact.buffer_pool_stats().leased_buffer_sets, 0);
-            assert!(exact.buffer_pool_stats().reuse_hits > 0);
-            check_oracles(&encoded, &expected, &case);
-            color::check_numeric(&rig, &encoded, &[expected], &case);
+            rig.context.device().poll(wgpu::PollType::Poll).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        let encoded = exact.encode(input.clone()).unwrap();
+        assert_eq!(
+            encoded,
+            pollster::block_on(exact.submit(input).unwrap()).unwrap()
+        );
+        assert_eq!(exact.in_flight_memory_stats().reserved_bytes, 0);
+        assert_eq!(exact.buffer_pool_stats().leased_buffer_sets, 0);
+        assert!(exact.buffer_pool_stats().reuse_hits > 0);
+        oracle(&encoded, &[&expected], &case);
+        color::check_numeric(rig, &encoded, &[expected], &case);
     }
 }

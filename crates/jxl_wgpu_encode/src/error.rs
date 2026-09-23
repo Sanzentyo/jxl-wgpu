@@ -124,6 +124,9 @@ pub enum PacketError {
 pub enum EncodeError {
     #[error("Modular palette color limit must be in 1..=70911, got {max_colors}")]
     InvalidModularPaletteLimit { max_colors: u32 },
+
+    #[error("Modular delta palette limit {max_deltas} is outside 1..=66816")]
+    InvalidModularPaletteDeltaLimit { max_deltas: u32 },
     #[error(transparent)]
     VarDctMatrix(#[from] jxl_gpu_protocol::VarDctMatrixError),
     #[error("invalid VarDCT coefficient order for family {family}, channel {channel}: {reason}")]

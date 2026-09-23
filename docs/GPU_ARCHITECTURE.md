@@ -63,6 +63,13 @@ validated count and encoded tokens; mapped private dictionary/hash scratch is no
 pixel processing. Actual count controls the meta-channel width and wire header. Capacity overflow
 returns a typed error without a stream. This adds no binding or synchronization dispatch, while
 the expanded artifact geometry can require more batches under the existing limits.
+Delta mode first computes wrapping predictor residuals independently for every post-RCT
+component into a bounded per-group storage span, then builds the tuple dictionary from those
+words. Any of the 14 predictors can be selected independently of entropy prediction. Weighted
+delta prediction owns one additional row-state span reused between components, reset before
+each scan; entropy prediction retains its separate row state. These spans join the same artifact
+lease and byte budget. Squeeze still acts only on the index image. No host residual calculation,
+dictionary search or additional GPU binding/dispatch is introduced.
 
 Before codestream inventory, `jxl_gpu_bitstream::ContainerStreamScanner` can now consume arbitrary
 owned chunks without joining the complete transport. Apart from the inline reconstructed two-byte

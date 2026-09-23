@@ -194,6 +194,18 @@ pub(crate) fn check_animation_words(
     kind: SampleKind,
     bits: u8,
 ) {
+    check_animation_words_with_oracle(rig, encoder, size, format, kind, bits, check_frame_oracles);
+}
+
+pub(crate) fn check_animation_words_with_oracle(
+    rig: &Rig,
+    encoder: &LosslessModularEncoder,
+    size: LosslessModularGroupSize,
+    format: LosslessModularFormat,
+    kind: SampleKind,
+    bits: u8,
+    oracle: FrameOracle,
+) {
     let case = Case {
         format,
         bits,
@@ -261,7 +273,7 @@ pub(crate) fn check_animation_words(
     }
     let encoded = animation.finish_container().unwrap();
     check_header(&encoded, size, &[extent; 3]);
-    check_frame_oracles(
+    oracle(
         &encoded,
         &expected.iter().map(Vec::as_slice).collect::<Vec<_>>(),
         &case,

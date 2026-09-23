@@ -414,7 +414,7 @@ fn accumulate_streaming_batch_histograms(
             &ValidatedModularArtifact {
                 header,
                 events: &[],
-                palette_colors: None,
+                palette_entries: None,
             },
             aggregate_raw,
             aggregate_lz77,

@@ -2,6 +2,51 @@ use super::*;
 use jxl_bitstream::{Bitstream, U};
 
 #[test]
+fn independent_wire_reader_checks_delta_counts_and_every_predictor() {
+    for predictor in LosslessModularPredictor::ALL {
+        for entries in [1, 256, 257, 1280, 1281, 66816] {
+            let mut output = BitWriter::new();
+            write_transforms(
+                &mut output,
+                TransformHeader {
+                    rct: None,
+                    squeeze: LosslessModularSqueeze::None,
+                    channels: 4,
+                    palette: Some(PaletteHeader {
+                        entries,
+                        delta_predictor: Some(predictor),
+                    }),
+                },
+            )
+            .unwrap();
+            let bit_len = output.bit_len();
+            let bytes = output.into_bytes();
+            let mut bits = Bitstream::new(&bytes);
+            assert_eq!(bits.read_u32(0, 1, 2 + U(4), 18 + U(8)).unwrap(), 1);
+            assert_eq!(bits.read_bits(2).unwrap(), 1);
+            assert_eq!(
+                bits.read_u32(U(3), 8 + U(6), 72 + U(10), 1096 + U(13))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(bits.read_u32(1, 3, 4, 1 + U(13)).unwrap(), 4);
+            assert_eq!(
+                bits.read_u32(U(8), 256 + U(10), 1280 + U(12), 5376 + U(16))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                bits.read_u32(0, 1 + U(8), 257 + U(10), 1281 + U(16))
+                    .unwrap(),
+                entries
+            );
+            assert_eq!(bits.read_bits(4).unwrap(), predictor.value());
+            assert_eq!(bits.num_read_bits(), bit_len);
+        }
+    }
+}
+
+#[test]
 fn independent_wire_reader_keeps_palette_geometry_and_skips_its_meta_channel() {
     for channels in 1..=4 {
         for colors in [1, 255, 256, 1279, 1280, 5375, 5376, 70911] {
@@ -25,7 +70,10 @@ fn independent_wire_reader_keeps_palette_geometry_and_skips_its_meta_channel() {
                     TransformHeader {
                         rct,
                         squeeze,
-                        palette_colors: Some(colors),
+                        palette: Some(PaletteHeader {
+                            entries: colors,
+                            delta_predictor: None,
+                        }),
                         channels,
                     },
                 )
@@ -114,12 +162,12 @@ fn palette_artifacts_validate_status_count_bounds_and_exact_dynamic_coverage() {
         artifact_byte_offset: 0,
         output_size: bytes.len() as u64,
         max_events: 8,
-        palette_colors_byte_offset: Some(count_offset as u64),
+        palette_entries_byte_offset: Some(count_offset as u64),
     };
     assert_eq!(
         parse_planned_artifact(&plan, &bytes)
             .unwrap()
-            .palette_colors,
+            .palette_entries,
         Some(1)
     );
     // All counts inside the capacity must still cover their actual table, not its allocation.
@@ -129,7 +177,7 @@ fn palette_artifacts_validate_status_count_bounds_and_exact_dynamic_coverage() {
     }
     bytes[count_offset..].copy_from_slice(&1u32.to_le_bytes());
     assert!(parse_planned_artifact(&plan, &bytes[..count_offset + 3]).is_err());
-    plan.palette_colors_byte_offset = Some(u64::MAX);
+    plan.palette_entries_byte_offset = Some(u64::MAX);
     assert!(parse_planned_artifact(&plan, &bytes).is_err());
     bytes[..4].copy_from_slice(&(u32::MAX - 2).to_le_bytes());
     assert!(matches!(

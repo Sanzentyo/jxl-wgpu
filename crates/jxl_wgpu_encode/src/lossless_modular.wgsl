@@ -34,7 +34,8 @@ struct Params {
     palette_scratch_word_offset: u32,
     palette_hash_mask: u32,
     palette_channels: u32,
-    _padding: array<u32, 9>,
+    palette_delta_predictor: u32,
+    _padding: array<u32, 8>,
 }
 
 @group(0) @binding(0)
@@ -207,13 +208,21 @@ fn squeeze_residual(a: i32, b: i32, previous: i32, average: i32, next: i32) -> i
 fn palette_color(params: Params, x: u32, y: u32) -> vec4<u32> {
     var color = vec4<u32>(0u);
     for (var component = 0u; component < params.channels; component += 1u) {
-        color[component] = bitcast<u32>(transformed_component(params, x, y, component));
+        if params.palette_delta_predictor < 14u {
+            color[component] = output_words[palette_residual_base(params) + (component * params.source_height + y) * params.source_width + x];
+        } else {
+            color[component] = bitcast<u32>(transformed_component(params, x, y, component));
+        }
     }
     return color;
 }
 
 fn palette_hash_base(params: Params) -> u32 {
     return params.palette_scratch_word_offset + 1u + params.channels * params.palette_capacity;
+}
+
+fn palette_residual_base(params: Params) -> u32 {
+    return palette_hash_base(params) + params.palette_hash_mask + 1u;
 }
 
 fn palette_slot(params: Params, color: vec4<u32>) -> u32 {
@@ -529,15 +538,9 @@ fn encode_greedy(params: Params) {
 }
 
 fn encode_tokens(params: Params) {
-    active_params = params;
     squeeze_failed = false;
     palette_failed = false;
-    if params.predictor == 6u {
-        wp_reset();
-        for (var index = 0u; index < params.width * 5u; index += 1u) {
-            output_words[params.wp_scratch_word_offset + index] = 0u;
-        }
-    }
+    reset_prediction(params);
 
     if params.lz77_mode == 1u {
         encode_greedy(params);
@@ -546,6 +549,22 @@ fn encode_tokens(params: Params) {
         return;
     }
 
+    encode_zero_runs(params);
+    if squeeze_failed { output_words[params.output_word_offset] = SQUEEZE_OVERFLOW; }
+    if palette_failed { output_words[params.output_word_offset] = PALETTE_INVALID; }
+}
+
+fn reset_prediction(params: Params) {
+    active_params = params;
+    if params.predictor == 6u {
+        wp_reset();
+        for (var index = 0u; index < params.width * 5u; index += 1u) {
+            output_words[params.wp_scratch_word_offset + index] = 0u;
+        }
+    }
+}
+
+fn encode_zero_runs(params: Params) {
     var run = 0u;
     for (var y = 0u; y < params.height; y += 1u) {
         for (var chunk_x = 0u; chunk_x < params.width; chunk_x += 8u) {
@@ -579,8 +598,30 @@ fn encode_tokens(params: Params) {
         }
     }
     emit_run(params, run);
-    if squeeze_failed { output_words[params.output_word_offset] = SQUEEZE_OVERFLOW; }
-    if palette_failed { output_words[params.output_word_offset] = PALETTE_INVALID; }
+}
+
+fn build_palette_residuals(params: Params) {
+    if params.palette_delta_predictor >= 14u { return; }
+    var source_params = params;
+    source_params.width = params.source_width;
+    source_params.height = params.source_height;
+    source_params.squeeze = 0u;
+    source_params.palette_capacity = 0u; // read post-RCT source words, before Palette or Squeeze
+    source_params.predictor = params.palette_delta_predictor;
+    let residual_base = palette_residual_base(params);
+    let pixels = params.source_width * params.source_height;
+    source_params.wp_scratch_word_offset = residual_base + pixels * params.channels;
+    for (var component = 0u; component < params.channels; component += 1u) {
+        source_params.channel = component;
+        reset_prediction(source_params);
+        for (var y = 0u; y < params.source_height; y += 1u) {
+            for (var x = 0u; x < params.source_width; x += 1u) {
+                let packed = packed_residual(source_params, x, y);
+                // Undo the entropy zigzag; Palette stores raw signed residual words.
+                output_words[residual_base + component * pixels + y * params.source_width + x] = (packed >> 1u) ^ (0u - (packed & 1u));
+            }
+        }
+    }
 }
 
 @compute @workgroup_size(1)
@@ -589,6 +630,7 @@ fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let params = group_params[global_id.x];
     if palette_enabled && params.palette_capacity != 0u {
         if params.channel != 0u { return; }
+        build_palette_residuals(params);
         if !build_palette(params) {
             output_words[params.output_word_offset] = PALETTE_OVERFLOW;
             return;

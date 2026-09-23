@@ -72,6 +72,18 @@ original profile through `oracles::icc_profile`, checks raw integer/IEEE words, 
 color output with the unchanged independent scalar corpus and native-encoded fixture.
 Neither oracle is a production dependency or a fallback.
 
+`oracles::modular_words` reads exact physical-frame component words from the pinned scalar
+libjxl decoder before float conversion or blending. It requires `JXL_MODULAR_WORD_ORACLE` and
+checks the executable's versioned output, dimensions and complete word counts. The helper uses
+unmodified native header, entropy, prediction and inverse-transform code; it only assembles
+original-color one-pass encoder groups and exports their integer planes. Unsupported transports,
+ICC/resampling, global non-RCT transforms in multi-group frames and nonempty LF/HF groups fail.
+Fused single-group transforms and global-RCT/local-transform combinations are supported.
+This supplies the Delta Palette exact-word oracle because jxl-oxide's `jxl-modular` 0.11.3 sizes
+its table from the color count alone and can omit delta prediction through its simple path.
+Existing color-only Palette tests retain their jxl-oxide comparisons. Native F32 output and
+independent Rust `jxl` animation composition remain separate checks.
+
 `fixtures::icc_spots` reads a typed manifest for native ICC/enumerated RGB/Gray sources, both
 codecs and original/XYB stills or reference sequences. Behavior follows the manifest fields and
 is checked against the decoded inventory. Independent interval/CMM reference generation lives
@@ -144,6 +156,21 @@ CMake rejects revisions other than `a7a9c787341cf703dede03c2009fa460cae5e5df` an
 scalar definition to libjxl and its helper together. The helper checks build/runtime version
 0.12.0; Rust verifies its scalar identity before using it. Missing or mismatched helpers fail
 instead of selecting another reference or skipping. This is development-only CPU oracle work.
+
+### Native Modular word oracle
+
+The same CMake project also builds
+[`modular_words.cpp`](test-data/modular_words.cpp) against the existing pinned scalar library.
+Reconfigure the existing build to register the target, without creating another native or Cargo
+build directory. The source requires scalar compilation and libjxl 0.12.0 headers/runtime:
+
+```sh
+cmake -S crates/jxl_wgpu_decode/test-data/modular_ycbcr_generator \
+  -B "$JXL_SCALAR_BUILD" -DCMAKE_BUILD_TYPE=Release -DJXL_SCALAR_ONLY=ON \
+  -DJXL_SOURCE="$JXL_NATIVE_SOURCE"
+cmake --build "$JXL_SCALAR_BUILD" --target decode_modular_words --parallel 4
+export JXL_MODULAR_WORD_ORACLE="$JXL_SCALAR_BUILD/decode_modular_words"
+```
 
 Run the workspace checks from the repository root with Rust 1.98 or later, keeping that oracle
 environment available:
