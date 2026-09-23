@@ -1,6 +1,7 @@
 use super::LosslessModularFormat;
 
-/// Explicit separable Squeeze of every component within each Modular pass group, after RCT.
+/// Explicit separable Squeeze of every image channel within each Modular pass group, after
+/// RCT and optional Palette. Palette's meta channel is excluded.
 /// A fused single-group frame declares the same operation in DC-global. Residual channels are
 /// appended in source-channel order. Axes of length one are skipped per group. No cross-group
 /// filtering or image analysis is performed. The default preserves the existing unsqueezed bytes.

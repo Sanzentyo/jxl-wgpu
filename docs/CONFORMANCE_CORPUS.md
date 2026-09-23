@@ -736,7 +736,7 @@ JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --lib --test
 
 `MOD-E02` remains **Partial**. This policy encodes complete component tuples with explicit entries
 after RCT and before optional index Squeeze. Delta, mixed and implicit entries are covered below.
-Component subsets, automatic policy selection, arbitrary stacks, cross-group/global-LF transforms
+Automatic policy selection, arbitrary stacks, cross-group/global-LF transforms
 and progressive Modular remain.
 
 ## Lossless Modular Delta Palette encoding
@@ -783,8 +783,7 @@ With `JXL_MODULAR_WORD_ORACLE` configured by the test-support instructions:
 JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossless_layouts palette::delta:: -- --test-threads=2
 ```
 
-`MOD-E02` remains **Partial**: component subsets,
-arbitrary transform ordering, adaptive selection and global/LF transform topology remain open.
+`MOD-E02` remains **Partial**: arbitrary transform ordering, adaptive selection and global/LF transform topology remain open.
 
 ## Lossless Modular mixed Palette encoding
 
@@ -827,7 +826,7 @@ With `JXL_MODULAR_WORD_ORACLE` configured by the test-support instructions:
 JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --lib --test lossless_layouts palette -- --test-threads=2
 ```
 
-`MOD-E02` remains **Partial**: component subsets, arbitrary transform ordering,
+`MOD-E02` remains **Partial**: arbitrary transform ordering,
 adaptive choices and global/LF transform topology remain open, as do the other encoder gates.
 
 ## Lossless Modular implicit Palette encoding
@@ -879,8 +878,55 @@ JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --lib --test
 cargo test --locked -p jxl_wgpu_decode --lib modular_palette -- --test-threads=2
 ```
 
-`MOD-E02` remains **Partial** for component subsets, table-free implicit policies, general transform
+`MOD-E02` remains **Partial** for table-free implicit policies, general transform
 stacks and global/LF topology, adaptive choices and the remaining encoder acceptance gates.
+
+## Lossless Modular Palette component selection
+
+[`lossless_layouts::palette::components`](../crates/jxl_wgpu_encode/tests/lossless_layouts/palette/components.rs)
+adds eight GPU tests for the explicit contiguous post-RCT range shared by color, delta, mixed
+and implicit policies. The default still selects all components. Independent header readers check
+the declared begin/count and every Squeeze image-channel range; native inverse transforms provide
+original words, while existing native F32 and whole/fragmented GPU checks keep their bounds.
+
+- 80 stills cover every one of the 20 ranges across Gray/GrayAlpha/RGB/RGBA under all four policies.
+  Unselected components carry independently varying words and do not consume the color table.
+  Both MA-tree modes, every group size, both entropy policies, all Squeeze choices, custom Weighted
+  parameters and packed/planar/split layouts appear across the matrix. The memory plan reports
+  all resulting channels, including the 17-channel single-component/two-axis case.
+- 132 stills cover every 1–31-bit integer depth and binary16/binary32 under each policy, with
+  selected and unselected raw words, IEEE special values, signed zero and low bits beyond F32.
+  These unsqueezed cases retain the complete source domain. Forty-two further cases combine
+  all RCT types, predictors, Squeeze choices and single-pixel axes with representable wide words.
+- 40 cases place native cube or signed-entry tuples in each selected range, including alpha-only
+  ranges. The unchanged native entry function supplies expected tuples, and native pre-inverse
+  index auditing requires all 189 cube pixels or at least 143 negative indices. Unselected words
+  remain independent. Native auditing now locates the index from its parsed begin component.
+- Eight three-frame Replace animations retain integer/IEEE words, timing and per-frame buffer
+  layouts. Four cropped Add/Multiply sequences preserve independent color/alpha references and
+  retained whole/fragmented output, including Squeeze of unselected channels.
+- Eight resident/streamed lifetime cases cover all four policies and group sizes, selected table
+  and delta storage, exact/one-byte-short budgets, cancellation, source retirement and pool reuse.
+  A later batch can be larger than the first, so streamed submission checks peak admission before
+  any buffer checkout. Actual per-batch reservations and later concurrent backpressure remain.
+- Eight capacity failures, including failures after valid streamed batches, publish no stream,
+  release all owned memory and permit a later valid encode. Three out-of-format ranges reject
+  before GPU admission; constructor tests also cover empty/overflowing ranges. Four unselected
+  Squeeze-overflow cases retain the existing typed rejection and release contract.
+
+Existing Palette matrices remain intact. The lifetime helper accepts the new representable-wide
+input generator while keeping prior inputs and assertions unchanged. The independent wire test
+now checks all ranges with every existing color bucket and Squeeze choice. No production CPU
+codec, extra image allocation, shader binding or synchronization dispatch is introduced.
+
+With the rebuilt native word oracle:
+
+```console
+JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --lib --test lossless_layouts palette -- --test-threads=2
+```
+
+`MOD-E02` remains **Partial** for general transform stacks and global/LF topology, table-free
+implicit policies, adaptive selection and the remaining encoder acceptance gates.
 
 ## Lossless Modular predictors
 

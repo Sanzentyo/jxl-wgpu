@@ -28,10 +28,10 @@ fn wide_artifacts_preserve_streamed_and_resident_memory_contracts() {
         LosslessModularEncoder::with_tree_mode(context, LosslessModularTreeMode::LocalPerGroup)
     };
     let short = limited(plan.owned_bytes_per_job - 1);
-    // Streamed native jobs acquire each batch on their worker. Their admission
-    // failure is returned by completion, before a GPU buffer is leased.
+    // Streamed jobs preflight the peak before starting their worker. A budget
+    // that cannot fit the largest batch must fail before any GPU buffer is leased.
     assert!(matches!(
-        pollster::block_on(short.submit(streamed_source.clone()).unwrap()),
+        short.submit(streamed_source.clone()),
         Err(EncodeError::MemoryBackpressure(
             jxl_wgpu::MemoryBudgetError::Exhausted { .. }
         ))

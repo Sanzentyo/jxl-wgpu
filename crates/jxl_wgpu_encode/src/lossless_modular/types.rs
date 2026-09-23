@@ -51,9 +51,11 @@ pub(super) struct ModularParams {
     pub(super) palette_delta_predictor: u32,
     pub(super) palette_delta_capacity: u32,
     pub(super) palette_implicit_depth: u32,
+    pub(super) palette_begin: u32,
+    pub(super) palette_components: u32,
     // An explicit 256-byte array stride keeps every batch boundary valid for the portable
     // storage-buffer offset alignment without hidden Rust padding.
-    pub(super) _padding: [u32; 6],
+    pub(super) _padding: [u32; 4],
 }
 
 /// Fixed storage-buffer header written by `lossless_modular.wgsl`.
@@ -200,7 +202,7 @@ pub struct LosslessModularConfig {
     /// Group-local separable Squeeze after color transformation. GPU validation rejects an
     /// unrepresentable signed residual instead of emitting a lossy result.
     pub squeeze: super::squeeze::LosslessModularSqueeze,
-    /// Optional exact local palette built on GPU after RCT and before index-channel Squeeze.
+    /// Optional exact local palette built on GPU after RCT and before image-channel Squeeze.
     pub palette: Option<super::palette::LosslessModularPalette>,
 }
 

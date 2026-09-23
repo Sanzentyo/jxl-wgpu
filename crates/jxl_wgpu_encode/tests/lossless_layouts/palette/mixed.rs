@@ -4,6 +4,21 @@ use jxl_bitstream::U;
 // Only reads local transform declarations with independent frame/TOC and bit readers.
 // Sample validation uses native original words, not jxl-oxide's delta inverse.
 pub(super) fn local_counts(encoded: &[u8]) -> Vec<(u32, u32, u32)> {
+    local_headers(encoded)
+        .into_iter()
+        .map(|header| (header.colors, header.deltas, header.predictor))
+        .collect()
+}
+
+pub(super) struct LocalPalette {
+    pub(super) begin: u32,
+    pub(super) components: u32,
+    pub(super) colors: u32,
+    pub(super) deltas: u32,
+    pub(super) predictor: u32,
+}
+
+pub(super) fn local_headers(encoded: &[u8]) -> Vec<LocalPalette> {
     let image = jxl_oxide::JxlImage::read_with_defaults(encoded).unwrap();
     let frame = image.frame(0).unwrap();
     assert!(!frame.toc().is_single_entry());
@@ -25,16 +40,15 @@ pub(super) fn local_counts(encoded: &[u8]) -> Vec<(u32, u32, u32)> {
             assert!((1..=3).contains(&count));
             for _ in 0..count {
                 let transform = bits.read_bits(2).unwrap();
-                assert_eq!(
-                    bits.read_u32(U(3), 8 + U(6), 72 + U(10), 1096 + U(13))
-                        .unwrap(),
-                    0
-                );
+                let begin = bits
+                    .read_u32(U(3), 8 + U(6), 72 + U(10), 1096 + U(13))
+                    .unwrap();
                 if transform == 0 {
+                    assert_eq!(begin, 0);
                     bits.read_u32(6, U(2), 2 + U(4), 10 + U(6)).unwrap();
                 } else {
                     assert_eq!(transform, 1);
-                    bits.read_u32(1, 3, 4, 1 + U(13)).unwrap();
+                    let components = bits.read_u32(1, 3, 4, 1 + U(13)).unwrap();
                     let colors = bits
                         .read_u32(U(8), 256 + U(10), 1280 + U(12), 5376 + U(16))
                         .unwrap();
@@ -42,7 +56,13 @@ pub(super) fn local_counts(encoded: &[u8]) -> Vec<(u32, u32, u32)> {
                         .read_u32(0, 1 + U(8), 257 + U(10), 1281 + U(16))
                         .unwrap();
                     let predictor = bits.read_bits(4).unwrap();
-                    return (colors, deltas, predictor);
+                    return LocalPalette {
+                        begin,
+                        components,
+                        colors,
+                        deltas,
+                        predictor,
+                    };
                 }
             }
             panic!("missing palette");

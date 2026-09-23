@@ -991,6 +991,8 @@ impl ModularPacketAssembler {
             .map(|(counts, policy)| PaletteHeader {
                 counts,
                 delta_predictor: policy.delta_predictor(),
+                begin: policy.begin(),
+                components: policy.components(self.format),
             });
         if let Some(group) = &mut self.single_group {
             write_dc_global(
@@ -1526,6 +1528,8 @@ fn invalid_gpu_artifact(reason: &'static str) -> EncodeError {
 struct PaletteHeader {
     counts: PaletteCounts,
     delta_predictor: Option<LosslessModularPredictor>,
+    begin: u32,
+    components: u32,
 }
 
 struct TransformHeader {
@@ -1610,14 +1614,15 @@ fn write_transforms(
     }
     if let Some(palette) = palette {
         output.write_bits(1, 2)?; // Palette
-        output.write_bits(0, 5)?; // begin channel 0
-        match channels {
+        output.write_bits(0, 2)?; // begin channel U32 selector
+        output.write_bits(u64::from(palette.begin), 3)?;
+        match palette.components {
             1 => output.write_bits(0, 2)?,
             3 => output.write_bits(1, 2)?,
             4 => output.write_bits(2, 2)?,
             _ => {
                 output.write_bits(3, 2)?;
-                output.write_bits(u64::from(channels - 1), 13)?;
+                output.write_bits(u64::from(palette.components - 1), 13)?;
             }
         }
         let colors = palette.counts.entries - palette.counts.deltas;
@@ -1665,7 +1670,7 @@ fn write_transforms(
         output.write_bits(0, 1)?; // append residuals after all current channels
         output.write_bits(0, 2)?; // U32 begin-channel selector
         output.write_bits(u64::from(palette.is_some()), 3)?; // skip the palette meta channel
-        let count = if palette.is_some() { 1 } else { channels } << stage;
+        let count = palette.map_or(channels, |palette| channels - palette.components + 1) << stage;
         if count <= 3 {
             output.write_bits(u64::from(count - 1), 2)?;
         } else {

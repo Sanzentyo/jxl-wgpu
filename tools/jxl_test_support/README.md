@@ -86,11 +86,13 @@ independent Rust `jxl` animation composition remain separate checks.
 
 The same native helper's `--implicit-entries` mode exports the unmodified native entry function
 for indices -143 through 188, including its inverse's depth-24 cap. `--palette-audit` counts
-negative implicit, cube implicit and explicit indices immediately before a final Palette inverse;
+negative implicit, cube implicit and explicit indices immediately before a final Palette inverse,
+locating the index channel from the native transform's selected component range;
 Squeeze-after-Palette is intentionally rejected by that audit mode. Ordinary word export still
 uses the complete native transform sequence. Both modes retain build/runtime and output-format
 checks. The encoder's implicit-entry tests require these counts as evidence of actual selection,
-as well as unchanged original words and public native F32 output.
+as well as unchanged original words and public native F32 output. Component-selection tests also
+parse declared ranges with independent jxl-oxide frame/bit readers and preserve unselected words.
 
 `oracles::sample_bits` contains the existing lossless-floating test's exact binary16-to-binary32
 reference arithmetic. Layout tests retain their explicit special-word pairs and use this shared

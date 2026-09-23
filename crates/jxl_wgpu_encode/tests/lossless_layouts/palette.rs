@@ -1,4 +1,5 @@
 use super::*;
+mod components;
 pub(crate) mod delta;
 mod implicit;
 mod mixed;
@@ -325,6 +326,15 @@ fn palette_scratch_obeys_exact_admission_cancellation_and_pool_reuse() {
 }
 
 fn check_lifetime(rig: &Rig, config: LosslessModularConfig, oracle: FrameOracle) {
+    check_lifetime_with_samples(rig, config, oracle, samples);
+}
+
+fn check_lifetime_with_samples(
+    rig: &Rig,
+    config: LosslessModularConfig,
+    oracle: FrameOracle,
+    make_samples: fn(Case, Extent2d, u32) -> Vec<u32>,
+) {
     let group_size = config.group_size;
     let case = case(LosslessModularFormat::Rgba, 31, SampleKind::Unsigned);
     let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config);
@@ -332,7 +342,7 @@ fn check_lifetime(rig: &Rig, config: LosslessModularConfig, oracle: FrameOracle)
         Extent2d::new(group_size.dimension() + 1, 3),
         Extent2d::new(group_size.dimension() * 33 + 1, 3),
     ] {
-        let expected = samples(case, extent, 17);
+        let expected = make_samples(case, extent, 17);
         let input = upload(&rig.context, &case, extent, &expected, 4099);
         let plan = encoder.memory_plan(&input).unwrap();
         assert!(plan.palette_scratch_bytes > 0);
@@ -358,7 +368,11 @@ fn check_lifetime(rig: &Rig, config: LosslessModularConfig, oracle: FrameOracle)
             "{failure:?}"
         );
         assert_eq!(short.in_flight_memory_stats().reserved_bytes, 0);
-        assert_eq!(short.buffer_pool_stats().allocation_misses, 0);
+        assert_eq!(
+            short.buffer_pool_stats().allocation_misses,
+            0,
+            "{config:?}, {extent:?}, {plan:?}"
+        );
         let exact = limited(plan.owned_bytes_per_job);
         let mut abandoned = input.clone();
         abandoned.buffer = Arc::new(input.buffer.as_ref().clone());

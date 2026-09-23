@@ -56,19 +56,22 @@ cross-group/global-LF Squeeze remain outside this encoder policy.
 
 Optional exact local Palette runs between RCT and Squeeze. The first invocation of each group
 builds a first-occurrence component-tuple dictionary and an open-addressed lookup table, then
-encodes its palette meta channel and index-image channels sequentially. Squeeze skips the meta
-channel. Dictionary capacity and hash storage join the existing artifact allocation, cleared
+encodes its palette meta channel, index image and unselected image channels sequentially.
+A caller-selected contiguous post-RCT range determines dictionary height and component-relative
+implicit entries. Unselected components retain their order; the index replaces the selected range.
+Squeeze applies to all resulting image channels and skips the meta channel.
+Dictionary capacity and hash storage join the existing artifact allocation, cleared
 before dispatch and retained through mapped consumption/cancellation. The host consumes the
 validated count and encoded tokens; mapped private dictionary/hash scratch is not used for
 pixel processing. Actual count controls the meta-channel width and wire header. Capacity overflow
 returns a typed error without a stream. This adds no binding or synchronization dispatch, while
 the expanded artifact geometry can require more batches under the existing limits.
-Delta mode first computes wrapping predictor residuals independently for every post-RCT
+Delta mode first computes wrapping predictor residuals independently for every selected post-RCT
 component into a bounded per-group storage span, then builds the tuple dictionary from those
 words. Any of the 14 predictors can be selected independently of entropy prediction. Weighted
 delta prediction owns one additional row-state span reused between components, reset before
 each scan; entropy prediction retains its separate row state. These spans join the same artifact
-lease and byte budget. Squeeze still acts only on the index image. No host residual calculation,
+lease and byte budget. No host residual calculation,
 dictionary search or additional GPU binding/dispatch is introduced.
 Mixed mode keeps separately bounded absolute and residual partitions in the same dictionary.
 The first distinct absolute tuples fill the color partition; later unknown colors use residuals,
@@ -77,6 +80,9 @@ equal word tuple cannot alias its prediction delta. Weighted residual generation
 original sample before this choice. GPU table/index reads remap reserved partition offsets to the
 compact wire order of used deltas followed by used colors. The host validates total and delta
 counts against both planned limits and exact token coverage before publishing a transform header.
+Streamed job admission checks the planned peak before starting a worker or allocating a first batch.
+Actual batch reservations remain independent and completion-owned; intervening concurrent usage
+can still fail a later admission without publishing partial output.
 The implicit policy starts with one declared zero residual and seeds the hash with the 143
 canonical negative entries. Tagged hash values refer to shared WGSL constants rather than extra
 dictionary words. Exact whole-tuple cube matching precedes residual lookup. Cube selection stops

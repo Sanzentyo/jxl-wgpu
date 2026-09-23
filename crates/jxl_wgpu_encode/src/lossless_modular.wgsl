@@ -37,7 +37,9 @@ struct Params {
     palette_delta_predictor: u32,
     palette_delta_capacity: u32,
     palette_implicit_depth: u32,
-    _padding: array<u32, 6>,
+    palette_begin: u32,
+    palette_components: u32,
+    _padding: array<u32, 4>,
 }
 
 @group(0) @binding(0)
@@ -210,18 +212,18 @@ fn squeeze_residual(a: i32, b: i32, previous: i32, average: i32, next: i32) -> i
 
 fn palette_color(params: Params, x: u32, y: u32, delta: bool) -> vec4<u32> {
     var color = vec4<u32>(0u);
-    for (var component = 0u; component < params.channels; component += 1u) {
+    for (var component = 0u; component < params.palette_components; component += 1u) {
         if delta {
             color[component] = output_words[palette_residual_base(params) + (component * params.source_height + y) * params.source_width + x];
         } else {
-            color[component] = bitcast<u32>(transformed_component(params, x, y, component));
+            color[component] = bitcast<u32>(transformed_component(params, x, y, params.palette_begin + component));
         }
     }
     return color;
 }
 
 fn palette_hash_base(params: Params) -> u32 {
-    return params.palette_scratch_word_offset + 2u + params.channels * params.palette_capacity;
+    return params.palette_scratch_word_offset + 2u + params.palette_components * params.palette_capacity;
 }
 
 fn palette_residual_base(params: Params) -> u32 {
@@ -230,7 +232,7 @@ fn palette_residual_base(params: Params) -> u32 {
 
 fn implicit_delta_color(params: Params, index: i32) -> vec4<u32> {
     var color = vec4<u32>(0u);
-    for (var component = 0u; component < params.channels; component += 1u) {
+    for (var component = 0u; component < params.palette_components; component += 1u) {
         color[component] = bitcast<u32>(mp_implicit_palette_value(index, component, params.palette_implicit_depth));
     }
     return color;
@@ -245,7 +247,7 @@ fn implicit_cube_index(params: Params, color: vec4<u32>) -> i32 {
         var index = select(0u, 64u, cube == 1u);
         var stride = 1u;
         var matches = true;
-        for (var component = 0u; component < params.channels; component += 1u) {
+        for (var component = 0u; component < params.palette_components; component += 1u) {
             if component >= 3u {
                 matches = matches && color[component] == 0u;
                 continue;
@@ -269,7 +271,7 @@ fn implicit_cube_index(params: Params, color: vec4<u32>) -> i32 {
 
 fn palette_slot(params: Params, color: vec4<u32>, delta: bool) -> u32 {
     var hash = 2166136261u ^ select(0u, 0x80000000u, delta);
-    for (var component = 0u; component < params.channels; component += 1u) {
+    for (var component = 0u; component < params.palette_components; component += 1u) {
         hash = (hash ^ color[component]) * 16777619u;
         hash ^= hash >> 16u;
     }
@@ -285,7 +287,7 @@ fn palette_slot(params: Params, color: vec4<u32>, delta: bool) -> u32 {
         }
         if (entry - 1u < params.palette_delta_capacity) != delta { continue; }
         var matches = true;
-        for (var component = 0u; component < params.channels; component += 1u) {
+        for (var component = 0u; component < params.palette_components; component += 1u) {
             if output_words[table + component * params.palette_capacity + entry - 1u] != color[component] {
                 matches = false;
             }
@@ -307,7 +309,7 @@ fn build_palette(params: Params) -> bool {
         // A declared zero delta keeps native single-channel inverse code from clamping
         // implicit indices. It counts against the requested explicit delta capacity.
         deltas = 1u;
-        for (var component = 0u; component < params.channels; component += 1u) {
+        for (var component = 0u; component < params.palette_components; component += 1u) {
             output_words[table + component * params.palette_capacity] = 0u;
         }
         for (var index = 1u; index <= 143u; index += 1u) {
@@ -344,7 +346,7 @@ fn build_palette(params: Params) -> bool {
             } else {
                 colors += 1u;
             }
-            for (var component = 0u; component < params.channels; component += 1u) {
+            for (var component = 0u; component < params.palette_components; component += 1u) {
                 output_words[table + component * params.palette_capacity + entry] = color[component];
             }
             output_words[heads + slot] = entry + 1u;
@@ -387,7 +389,9 @@ fn working_component(params: Params, x: u32, y: u32, component: u32) -> i32 {
     if !palette_enabled || params.palette_capacity == 0u {
         return transformed_component(params, x, y, component);
     }
-    return palette_index(params, x, y);
+    if component == params.palette_begin { return palette_index(params, x, y); }
+    let source_component = select(component, component + params.palette_components - 1u, component > params.palette_begin);
+    return transformed_component(params, x, y, source_component);
 }
 
 fn squeeze_first(params: Params, component: u32, band: u32, point: vec2<u32>) -> i32 {
@@ -427,7 +431,7 @@ fn sample_at(params: Params, x: u32, y: u32) -> i32 {
             return bitcast<i32>(output_words[params.palette_scratch_word_offset + 2u + y * params.palette_capacity + entry]);
         }
         channel -= 1u;
-        channels = 1u;
+        channels = params.channels - params.palette_components + 1u;
     }
     if !squeeze_enabled || params.squeeze == 0u { return working_component(params, x, y, channel); }
     let component = channel % channels;
@@ -715,9 +719,9 @@ fn build_palette_residuals(params: Params) {
     source_params.predictor = params.palette_delta_predictor;
     let residual_base = palette_residual_base(params);
     let pixels = params.source_width * params.source_height;
-    source_params.wp_scratch_word_offset = residual_base + pixels * params.channels;
-    for (var component = 0u; component < params.channels; component += 1u) {
-        source_params.channel = component;
+    source_params.wp_scratch_word_offset = residual_base + pixels * params.palette_components;
+    for (var component = 0u; component < params.palette_components; component += 1u) {
+        source_params.channel = params.palette_begin + component;
         reset_prediction(source_params);
         for (var y = 0u; y < params.source_height; y += 1u) {
             for (var x = 0u; x < params.source_width; x += 1u) {

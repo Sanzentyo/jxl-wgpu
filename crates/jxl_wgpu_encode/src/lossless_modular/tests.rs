@@ -185,7 +185,7 @@ mod native_tests {
                 256,
                 vec![
                     0, 4, 8, 12, 16, 20, 24, 28, 32, 128, 132, 136, 164, 180, 184, 188, 192, 196,
-                    200, 204, 208, 212, 216, 220, 224, 228, 232,
+                    200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 240,
                 ],
             ),
         ] {
@@ -246,11 +246,13 @@ mod native_tests {
             palette_delta_predictor: 56,
             palette_delta_capacity: 57,
             palette_implicit_depth: 58,
-            _padding: [0; 6],
+            palette_begin: 59,
+            palette_components: 60,
+            _padding: [0; 4],
         };
         let words = bytemuck::cast::<ModularParams, [u32; 64]>(params);
-        assert_eq!(&words[..58], &(1..=58).collect::<Vec<_>>());
-        assert!(words[58..].iter().all(|&word| word == 0));
+        assert_eq!(&words[..60], &(1..=60).collect::<Vec<_>>());
+        assert!(words[60..].iter().all(|&word| word == 0));
     }
 
     #[test]

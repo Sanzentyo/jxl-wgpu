@@ -302,6 +302,19 @@ impl LosslessModularBackend {
         )?;
         let source_spec = &source_layout.spec;
         let format = source_spec.format;
+        if let Some(palette) = self.config.palette {
+            palette.validate(format)?;
+        }
+        let palette_components = self
+            .config
+            .palette
+            .map_or(0, |palette| palette.components(format));
+        let image_channels = self
+            .config
+            .palette
+            .map_or(format.channel_count(), |palette| {
+                palette.image_channels(format)
+            });
         let rct = self
             .config
             .color_transform
@@ -369,7 +382,7 @@ impl LosslessModularBackend {
             let palette_scratch_bytes = self.config.palette.map_or(0, |palette| {
                 4 * palette.scratch_words(
                     palette_capacity,
-                    format.channel_count(),
+                    palette.components(format),
                     group.width,
                     group.height,
                 )
@@ -383,16 +396,12 @@ impl LosslessModularBackend {
             let layouts = (0..channels)
                 .map(|channel| {
                     let [width, height] = if palette_capacity != 0 && channel == 0 {
-                        [palette_capacity, format.channel_count()]
+                        [palette_capacity, palette_components]
                     } else {
                         squeeze.extent(
                             [group.width, group.height],
                             channel - u32::from(palette_capacity != 0),
-                            if palette_capacity == 0 {
-                                format.channel_count()
-                            } else {
-                                1
-                            },
+                            image_channels,
                         )
                     };
                     let mut layout = ModularChannelLayout::new(width, height, self.config)?;
@@ -547,7 +556,9 @@ impl LosslessModularBackend {
                         .palette
                         .filter(|palette| palette.uses_implicit_entries())
                         .map_or(0, |_| u32::from(source_spec.bits_per_sample)),
-                    _padding: [0; 6],
+                    palette_begin: self.config.palette.map_or(0, LosslessModularPalette::begin),
+                    palette_components,
+                    _padding: [0; 4],
                 });
                 groups.push(ModularGroupPlan {
                     group_index: group.index,
@@ -649,7 +660,7 @@ impl LosslessModularBackend {
                         self.config.palette.map_or(0, |palette| {
                             4 * palette.scratch_words(
                                 params.palette_capacity,
-                                params.channels,
+                                params.palette_components,
                                 params.source_width,
                                 params.source_height,
                             )
@@ -988,6 +999,14 @@ impl GpuEncodeBackend for LosslessModularBackend {
             ));
         }
         if plan.memory.streaming {
+            // A later batch may be larger than the first. Reject an already insufficient
+            // peak budget before starting the worker or allocating its first batch. Batches
+            // still reserve their actual bytes independently as concurrent usage changes.
+            drop(
+                context
+                    .memory_budget()
+                    .try_reserve(plan.memory.owned_bytes_per_job)?,
+            );
             return self.submit_streaming(context, source, plan, request.clone());
         }
         let memory_permit = context

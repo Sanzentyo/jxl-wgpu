@@ -44,3 +44,25 @@ Follow the roadmap's same-commit documentation and acceptance gates for capabili
 changes. Report actual checks, failures, and unavailable toolchains, adapters, or
 oracles; a skipped check is not a pass. Do not claim measured agent or runtime
 improvements from documentation size alone.
+
+## Waiting for final validation
+
+- Start final validation once in a persistent process/session, retaining its handle,
+  process identity, source snapshot, logs, and final receipt. Keep the tested source
+  fixed until completion and reuse the repository's default Cargo output directory.
+- Wait for command completion or 25 minutes, whichever comes first. At every such
+  wakeup, run the [compact status script](tools/validation_status.rb), following the
+  [recording procedure](docs/DEVELOPMENT.md#waiting-for-final-validation). It returns
+  one line: `RUNNING`, `DONE exit=… stable=…`, or `UNKNOWN …`. Do not inspect intermediate
+  logs, tail test output, reanalyse source, or report individual passing cases.
+- On `RUNNING`, wait on the same process/session for another completion event or
+  25-minute interval. Elapsed time, a timeout, or a previous 76-minute measurement
+  never establishes completion; repeat for as long as the actual run needs.
+- On `DONE`, read the final receipt, gate results, and completed logs. Check every
+  gate and inspect failure details before fixing only the affected cases. `DONE`
+  means execution ended, not that validation passed. On `UNKNOWN`, inspect the
+  process/session and missing or invalid evidence; never assume success or start a
+  duplicate run while the original job or its children may still be active.
+- After a fix, run the applicable checks and retain unaffected evidence only when
+  its source and runtime inputs are unchanged. Follow the development document's
+  whitespace/prose rules; such cleanup alone does not require another full GPU run.

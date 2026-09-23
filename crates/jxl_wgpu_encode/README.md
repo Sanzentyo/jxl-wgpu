@@ -102,10 +102,15 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   Squeeze, arbitrary stacks, adaptive transform choices and progressive Modular remain open.
 - `LosslessModularConfig::palette` optionally selects `LosslessModularPalette::new(max_colors)`;
   the default is `None`. The checked limit is `1..=70_911`. Each pass group builds an exact
-  first-occurrence dictionary of complete component tuples on GPU after RCT, including alpha
+  first-occurrence dictionary of selected component tuples on GPU after RCT, including alpha
   and raw IEEE words. Signed zero and distinct NaN payloads remain distinct. The same policy
   applies to every group/frame, with an independent dictionary and actual color count per group.
-  Optional Squeeze transforms only the index channel and its residuals, skipping the palette
+  All components participate by default. `with_components(begin, count)` selects a nonempty
+  contiguous post-RCT range; for example, `with_components(0, 3)` palettes RGB while preserving
+  independent RGBA alpha. `component_range()` reports the explicit range or `None` for all.
+  Empty, overflowing or out-of-format ranges return `EncodeError::InvalidModularPaletteComponents`
+  before GPU job admission. This selection applies to every Palette policy below.
+  Optional Squeeze transforms the index and unselected image channels and their residuals, skipping the palette
   meta channel. The host validates the GPU color count and token coverage before writing the
   local transform header; a fused single-group frame defers its DC-global header until then.
   Exceeding the limit returns `BackendError::ModularPaletteOverflow` without a codestream.
@@ -126,13 +131,14 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   limits return `EncodeError::InvalidModularPaletteDeltaLimit`; capacity overflow uses the same
   completion error and returns no stream.
   `LosslessModularPalette::implicit(max_deltas, predictor)` also selects exact implicit entries.
-  It first matches the complete post-RCT tuple against the 64/125-entry cubes, then looks for an
+  It first matches the selected post-RCT tuple against the 64/125-entry cubes, then looks for an
   exact predictor residual among the 143 canonical signed entries, and finally stores an explicit
   residual. No component is rounded, including alpha or raw IEEE words. The explicit delta limit
   includes one declared zero entry, which avoids native libjxl's single-channel zero-delta index
   clamp. Cube selection is limited to working depths 1–24, where native and normative scaling
   agree; wider integers and binary32 retain implicit signed deltas and exact explicit residuals.
-  `uses_implicit_entries()` identifies this policy. Component subsets, arbitrary stacks, table-free
+  Implicit entry components are relative to the selected range, so an alpha-only selection uses
+  entry component zero. `uses_implicit_entries()` identifies this policy. Arbitrary stacks, table-free
   implicit policies and automatic policy selection remain open.
 - `LosslessModularConfig` selects all four standard PassGroup sizes with
   `LosslessModularGroupSize::{Pixels128, Pixels256, Pixels512, Pixels1024}`, the MA-tree mode,
@@ -194,6 +200,9 @@ one histogram and one serialization submission per batch. Every live batch uses 
 `MemoryBudget`. Its exclusive buffer-pool lease and reservation survive until the map callback and
 mapped-range consumer are both finished, including when the returned future is abandoned.
 Source range accounting excludes gaps between planes and counts shared alignment prefixes once.
+Streamed submission checks the reported peak against available budget before allocating its first
+batch, even when a later batch is larger. Each batch still acquires and retains its own reservation;
+concurrent allocations between batches can cause a later typed backpressure failure with no output.
 
 The selected `group_size` is included in `group_grid`. Larger groups increase each channel's
 worst-case event artifact to `400 + 16 * (pixels + ceil(pixels / 8) + 1)` bytes. Weighted adds
@@ -203,15 +212,16 @@ scratch subtotal is already included in owned bytes and any separate readback co
 also inside the artifact allocation and its reported scratch subtotal. A complete group must fit
 the checked source/artifact binding limits. With Squeeze, these formulas use each transformed
 channel's width, height and area, with up to 16 channels per group; single-pixel edge axes may
-produce fewer. Palette instead has one meta channel plus one, two or four index-image channels.
-Its meta channel reserves `k × source_components` samples, where `k` is the sum of the separately
+produce fewer. Palette has one meta channel plus `(source_components - selected_components + 1)`
+image channels multiplied by one, two or four Squeeze bands, for at most 17 encoded channels.
+Its meta channel reserves `k × selected_components` samples, where `k` is the sum of the separately
 pixel-clamped color and delta limits. The implicit policy instead clamps its delta limit to
 `group_pixels + 1`, including its declared zero entry. Only declared entries are encoded.
-For capacity `k` and `c` source components, Palette adds
+For capacity `k` and `c` selected components, Palette adds
 `4 * (2 + k * c + next_power_of_two(2 * (k + i)))` scratch bytes per group, where `i` is 143 for
 implicit lookup and zero otherwise. This covers total/delta counts, the dictionary and hash table. The peak subtotal is
 included in the artifact allocation and any readback copy.
-Delta, mixed and implicit modes additionally retain `4 * group_pixels * source_components` residual bytes and,
+Delta, mixed and implicit modes additionally retain `4 * group_pixels * selected_components` residual bytes and,
 for Weighted delta prediction, `20 * group_width` row-state bytes reused between components.
 These are included in `palette_scratch_bytes`, separately from token-predictor scratch.
 These private scratch bytes are mapped with that allocation; host assembly reads the counts and
@@ -357,6 +367,10 @@ The [implicit Palette matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-
 uses native implicit entries as inputs and audits native-decoded indices before inversion.
 Both cubes, signed entries, wider exact residuals, RCT/Squeeze, animation and lifetime checks keep
 the original-word and F32 bounds. The declared zero entry and depth policy preserve interoperability.
+The [component-selection matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-palette-component-selection)
+checks every contiguous range in the four input formats with all four policies, unchanged
+unselected components, every integer/IEEE precision, RCT/Squeeze composition, relative implicit
+entries, animation, invalid ranges, overflow and resident/streamed lifetime.
 
 ## Experimental VarDCT profile
 

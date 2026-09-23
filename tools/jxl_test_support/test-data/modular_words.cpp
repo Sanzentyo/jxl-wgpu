@@ -72,9 +72,9 @@ jxl::Status AuditPalette(const jxl::Image& image, const jxl::GroupHeader& header
                          std::array<uint32_t, 3>* counts) {
   JXL_ENSURE(!header.transforms.empty());
   const auto& transform = header.transforms.back();
-  JXL_ENSURE(transform.id == jxl::TransformId::kPalette && transform.begin_c == 0);
-  JXL_ENSURE(image.nb_meta_channels == 1 && image.channel.size() == 2);
-  const auto& indices = image.channel[1];
+  JXL_ENSURE(transform.id == jxl::TransformId::kPalette);
+  JXL_ENSURE(image.nb_meta_channels == 1 && transform.begin_c + 1 < image.channel.size());
+  const auto& indices = image.channel[transform.begin_c + 1];
   for (size_t y = 0; y < indices.h; ++y) for (size_t x = 0; x < indices.w; ++x) {
     const int32_t index = indices.Row(y)[x];
     ++(*counts)[index < 0 ? 0 : uint32_t(index) >= transform.nb_colors + transform.nb_deltas ? 1 : 2];

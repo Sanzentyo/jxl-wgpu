@@ -33,6 +33,11 @@ sequentially, so process-level parallelism does not multiply the two-thread work
 | WGSL, codec/output behavior, or GPU ownership | Tests on an actual adapter with two libtest threads, applicable independent oracles, precision/invalid-input checks, budget admission, cancellation, and retained-output lifetime. |
 | Advertised capability or cross-workspace contract | The full gates below plus the relevant roadmap acceptance evidence. Focused passing tests do not replace these gates. |
 
+Whitespace-only cleanup, such as removing a trailing blank line, does not require repeating
+completed full gates. Confirm that program/shader tokens and test inputs are unchanged, run
+applicable formatting or shader-parse checks, and record the cleanup separately from the full-run
+snapshot. Do not repeat the GPU suite solely for such cleanup.
+
 Integration targets use `tests/<target>/main.rs` with ordinary child modules. Shared
 helpers belong in [jxl_test_support](../tools/jxl_test_support/README.md), not
 cross-target source includes. Remove unused/dead code; necessary platform or
@@ -75,6 +80,43 @@ Record unavailable toolchains, targets, adapters, or oracles as missing evidence
 not successful checks. Do not promote a feature to Done without its acceptance
 evidence or widen tolerances to compensate for a missing oracle. The absence of
 CI runs is not a successful CI result.
+
+## Waiting for final validation
+
+Follow the [25-minute or command-completion policy](../AGENTS.md#waiting-for-final-validation).
+Keep validation in a persistent process/session and send its output to logs. Use a fresh
+ignored evidence directory for each run, without creating another Cargo output directory.
+The runner must wait for all its gates and write `receipt.json` only after they finish,
+including `exit` (the overall integer exit code) and `stable` (whether the tested source
+snapshot stayed unchanged). Retain the individual gate exit codes and logs as well.
+A missing receipt, signal termination, or an incomplete gate inventory is missing evidence.
+
+Before starting its gates, have the persistent runner record its own PID and start
+identity once with the Ruby helper. This also covers runs that finish immediately.
+Use the PID of the runner that owns the whole validation, not a temporary Cargo child.
+`run_directory` below is the directory containing its final receipt:
+
+```sh
+ruby tools/validation_status.rb --record "$run_directory" "$runner_pid"
+ruby tools/validation_status.rb "$run_directory"
+```
+
+For a job already in progress, record its live runner PID once before waiting. If it
+finished before registration, reconcile `UNKNOWN` with the retained session's exit
+status and receipt instead of launching the validation again.
+
+The first command creates `process.json` without overwriting existing evidence. The
+second is the mandatory compact check at each 25-minute wakeup and whenever the command
+returns. It reads process identity and, only after that process has ended, the final
+receipt; it never opens validation logs. A reused PID is not treated as the original run.
+It prints `RUNNING`, `DONE exit=… stable=…`, or `UNKNOWN …`; exit status 2 means the check
+could not establish a state. The helper's exit status 0 is not a validation pass.
+
+On completion, read the receipt, all gate results and completed log summaries; inspect
+the relevant complete failure sections when a gate failed. Confirm all required gates
+ran, rather than relying on the runner's exit code alone. Keep the failed receipt when
+recording a repaired case's rerun. Do not predict completion from historical runtimes or
+restart the entire validation just because a waiting tool timed out.
 
 ## Updating evidence
 
