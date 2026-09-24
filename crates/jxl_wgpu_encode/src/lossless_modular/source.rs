@@ -37,7 +37,10 @@ pub(super) fn lossless_modular_source_spec(
     format: &PixelFormat,
 ) -> Result<LosslessModularSourceSpec, EncodeError> {
     if format.validate().is_err()
-        || !matches!(format.sample_kind, SampleKind::Unsigned | SampleKind::Float)
+        || !matches!(
+            format.sample_kind,
+            SampleKind::Unsigned | SampleKind::Float | SampleKind::CustomFloat(_)
+        )
         || format.chroma_subsampling != ChromaSubsampling::None
         || format.planes.len() > 4
     {
@@ -163,10 +166,11 @@ pub(super) fn lossless_modular_source_spec(
                     PackingFieldKind::Padding => continue,
                     _ => return Err(UnsupportedFeature::InputFormat.into()),
                 };
-                let supported_depth = if format.sample_kind == SampleKind::Float {
-                    matches!(field.bits, 16 | 32)
-                } else {
-                    (1..=31).contains(&field.bits)
+                let supported_depth = match format.sample_kind {
+                    SampleKind::Float => matches!(field.bits, 16 | 32),
+                    SampleKind::CustomFloat(precision) => field.bits == precision.bits(),
+                    SampleKind::Unsigned => (1..=31).contains(&field.bits),
+                    SampleKind::Signed => false,
                 };
                 if !supported_depth
                     || stored[index].is_some()
@@ -226,10 +230,17 @@ pub(super) fn lossless_modular_source_spec(
         color: ModularColorEncoding::from_format(format)?,
         bits_per_sample,
         bytes_per_sample,
-        exponent_bits_per_sample: if format.sample_kind == SampleKind::Float {
-            if bits_per_sample == 16 { 5 } else { 8 }
-        } else {
-            0
+        exponent_bits_per_sample: match format.sample_kind {
+            SampleKind::Float => {
+                let precision = if bits_per_sample == 16 {
+                    jxl_gpu_formats::FloatPrecision::BINARY16
+                } else {
+                    jxl_gpu_formats::FloatPrecision::BINARY32
+                };
+                precision.exponent_bits()
+            }
+            SampleKind::CustomFloat(precision) => precision.exponent_bits(),
+            SampleKind::Unsigned | SampleKind::Signed => 0,
         },
         big_endian: format.byte_order == ByteOrder::Big,
         components,

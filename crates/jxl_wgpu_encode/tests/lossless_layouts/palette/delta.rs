@@ -28,16 +28,7 @@ pub(crate) fn check_frame_oracles(encoded: &[u8], expected: &[&[u32]], case: &Ca
     assert_eq!(original.len(), expected.len());
     for (frame, expected) in original.iter().zip(expected) {
         assert_eq!(frame.bits, u32::from(case.bits));
-        assert_eq!(
-            frame.exponent_bits,
-            if case.kind == SampleKind::Unsigned {
-                0
-            } else if case.bits == 16 {
-                5
-            } else {
-                8
-            }
-        );
+        assert_eq!(frame.exponent_bits, u32::from(case.exponent_bits()));
         assert_eq!(
             u64::from(frame.width)
                 * u64::from(frame.height)

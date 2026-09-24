@@ -127,7 +127,7 @@ fn declaration(case: &Case, color: ColorSpec, intent: IccRenderingIntent) -> Str
 }
 
 fn numeric_request(case: &Case, channel: u32) -> GpuOutputRequest {
-    let request = if case.kind == SampleKind::Float {
+    let request = if case.is_float() {
         GpuOutputRequest::numeric(
             PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X]),
             NumericSampleMapping::NativeFloat,
@@ -184,7 +184,7 @@ pub(super) fn check_numeric(rig: &Rig, encoded: &[u8], frames: &[Vec<u32>], case
                     .skip(channel)
                     .step_by(channels)
                     .flat_map(|&word| {
-                        if case.kind == SampleKind::Float {
+                        if case.is_float() {
                             case.normalized(word).to_bits().to_le_bytes().to_vec()
                         } else {
                             word.to_le_bytes()[..case.bits.next_power_of_two().max(8) as usize / 8]

@@ -1027,6 +1027,7 @@ fn numeric_contract(
             SampleKind::Float => NumericDisplaySource::Floating {
                 non_finite: NumericNonFinitePolicy::Saturate,
             },
+            SampleKind::CustomFloat(_) => panic!("VPI uses native IEEE storage"),
         },
         scale,
         bias,

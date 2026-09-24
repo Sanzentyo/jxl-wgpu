@@ -397,13 +397,10 @@ impl LosslessModularAnimationDescriptor {
         bits_per_sample: u8,
         animation: AnimationHeader,
     ) -> Result<Self, EncodeError> {
-        format.float_pixel_format(bits_per_sample)?;
-        Self::with_precision(
+        Self::from_pixel_format(
             canvas_width,
             canvas_height,
-            format,
-            bits_per_sample,
-            if bits_per_sample == 16 { 5 } else { 8 },
+            &format.float_pixel_format(bits_per_sample)?,
             animation,
         )
     }
@@ -421,11 +418,7 @@ impl LosslessModularAnimationDescriptor {
                 "a Modular animation descriptor requires an animation timebase",
             ));
         }
-        if exponent_bits_per_sample == 0 {
-            format.pixel_format(bits_per_sample)?;
-        } else {
-            format.float_pixel_format(bits_per_sample)?;
-        }
+        // The header uses the same checked precision as still-image serialization.
         image_header(
             canvas_width,
             canvas_height,
@@ -1894,17 +1887,18 @@ fn write_sample_bit_depth(
     exponent_bits_per_sample: u8,
 ) -> Result<(), EncodeError> {
     if exponent_bits_per_sample != 0 {
-        let selector = match (bits_per_sample, exponent_bits_per_sample) {
-            (16, 5) => 1,
-            (32, 8) => 0,
-            _ => {
-                return Err(EncodeError::InvalidConfiguration(
-                    "lossless Modular floating precision must be binary16 or binary32",
-                ));
-            }
-        };
+        jxl_gpu_formats::FloatPrecision::new(bits_per_sample, exponent_bits_per_sample)
+            .map_err(|_| EncodeError::InvalidConfiguration("invalid Modular floating precision"))?;
         output.write_bits(1, 1)?;
-        output.write_bits(selector, 2)?;
+        match bits_per_sample {
+            32 => output.write_bits(0, 2)?,
+            16 => output.write_bits(1, 2)?,
+            24 => output.write_bits(2, 2)?,
+            bits => {
+                output.write_bits(3, 2)?;
+                output.write_bits(u64::from(bits - 1), 6)?;
+            }
+        }
         output.write_bits(u64::from(exponent_bits_per_sample - 1), 4)?;
         return Ok(());
     }

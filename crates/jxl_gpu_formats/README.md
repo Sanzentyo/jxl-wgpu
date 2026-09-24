@@ -12,6 +12,15 @@ buffers. The crate separates:
 
 There is no CUDA or NVIDIA dependency.
 
+`FloatPrecision::new(bits, exponent_bits)` describes binary floating storage with one sign bit,
+2–8 exponent bits and 2–23 trailing significand bits (154 combinations, all exactly representable
+in binary32). `SampleKind::CustomFloat(precision)` binds that precision to each channel field;
+`PixelFormat::validate` rejects a different field width while allowing independent padding and
+word widths. Exponent bias, zeros/subnormals and infinity/NaN follow the documented binary layout.
+The existing `SampleKind::Float` retains IEEE binary16/binary32/binary64 semantics. Custom storage
+is accepted by the Lossless Modular encoder; generic numeric/color classification rejects it
+instead of assuming native F32 arithmetic. Decoded floating output uses native F32 descriptors.
+
 `PixelFormat::rgb_f32(order, planar, color_spec)` describes RGB/BGR/RGBA/BGRA with IEEE 754
 binary32 components. `ColorFormatClass::Rgb { sample, storage, order }` uses `ColorSample::U8`
 or `ColorSample::F32`; floating-point color remains distinct from non-color numeric F32.

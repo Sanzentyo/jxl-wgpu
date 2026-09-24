@@ -827,6 +827,7 @@ fn output_negotiation_covers_all_vpi_pitch_linear_formats() {
                 SampleKind::Unsigned => OutputKind::NumericUnsigned,
                 SampleKind::Signed => OutputKind::NumericSigned,
                 SampleKind::Float => OutputKind::NumericFloat,
+                SampleKind::CustomFloat(_) => panic!("VPI uses native IEEE storage"),
             },
             "{} kind",
             format.name()

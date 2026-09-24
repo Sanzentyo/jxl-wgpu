@@ -47,6 +47,32 @@ const HALF: [(u32, u32); 16] = [
 ];
 
 impl Case {
+    pub(super) fn is_float(self) -> bool {
+        matches!(self.kind, SampleKind::Float | SampleKind::CustomFloat(_))
+    }
+
+    pub(super) fn exponent_bits(self) -> u8 {
+        match self.kind {
+            SampleKind::CustomFloat(precision) => precision.exponent_bits(),
+            SampleKind::Float if self.bits == 16 => 5,
+            SampleKind::Float if self.bits == 32 => 8,
+            SampleKind::Unsigned => 0,
+            _ => panic!("unsupported encoder sample precision"),
+        }
+    }
+
+    pub(super) fn pixel_format(self) -> PixelFormat {
+        match self.kind {
+            SampleKind::CustomFloat(precision) => {
+                assert_eq!(self.bits, precision.bits());
+                self.format.custom_float_pixel_format(precision)
+            }
+            SampleKind::Float => self.format.float_pixel_format(self.bits).unwrap(),
+            SampleKind::Unsigned => self.format.pixel_format(self.bits).unwrap(),
+            SampleKind::Signed => panic!("unsupported signed encoder input"),
+        }
+    }
+
     pub(super) fn canonical(self) -> Self {
         Self {
             storage: Storage::Packed,
@@ -61,7 +87,33 @@ impl Case {
         let mask = u32::MAX >> (32 - self.bits);
         (0..extent.width * extent.height * self.format.channel_count())
             .map(|index| {
-                if self.kind == SampleKind::Float {
+                if let SampleKind::CustomFloat(precision) = self.kind {
+                    let fraction_bits = self.bits - precision.exponent_bits() - 1;
+                    let fraction = (1 << fraction_bits) - 1;
+                    let special = ((1 << precision.exponent_bits()) - 1) << fraction_bits;
+                    let bias = (1 << (precision.exponent_bits() - 1)) - 1;
+                    let values = [
+                        0,
+                        1,
+                        fraction,
+                        1 << fraction_bits,
+                        special - 1,
+                        special,
+                        special | 1,
+                        special | (1 << (fraction_bits - 1)),
+                        special | fraction,
+                        bias << fraction_bits,
+                    ];
+                    // Both signs of every boundary and NaN payload, then deterministic words.
+                    // Components get different phases without omitting any value in a plane.
+                    let channels = self.format.channel_count();
+                    let phase = index / channels + (index % channels) * 7;
+                    if phase % 32 < 20 {
+                        values[(phase % 20 / 2) as usize] | ((phase & 1) << (self.bits - 1))
+                    } else {
+                        index.wrapping_mul(0x9e37_79b9).rotate_left(11) & mask
+                    }
+                } else if self.kind == SampleKind::Float {
                     if self.bits == 16 {
                         HALF[index as usize % HALF.len()].0
                     } else {
@@ -97,6 +149,12 @@ impl Case {
     pub(super) fn normalized(self, word: u32) -> f32 {
         if self.kind == SampleKind::Unsigned {
             (f64::from(word) / f64::from(u32::MAX >> (32 - self.bits))) as f32
+        } else if let SampleKind::CustomFloat(precision) = self.kind {
+            f32::from_bits(jxl_test_support::oracles::sample_bits::custom_binary32(
+                word,
+                precision.bits(),
+                precision.exponent_bits(),
+            ))
         } else if self.bits == 32 {
             f32::from_bits(word)
         } else {
@@ -122,11 +180,7 @@ pub(super) fn upload(
     plane_gap: u64,
 ) -> BufferImageSource {
     let channels = case.format.channel_count() as usize;
-    let mut pixel_format = if case.kind == SampleKind::Float {
-        case.format.float_pixel_format(case.bits).unwrap()
-    } else {
-        case.format.pixel_format(case.bits).unwrap()
-    };
+    let mut pixel_format = case.pixel_format();
     pixel_format.byte_order = case.byte_order;
     let mut order: Vec<_> = (0..channels).collect();
     if case.reversed && case.format == LosslessModularFormat::GrayAlpha {

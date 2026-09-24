@@ -4,6 +4,7 @@ mod alpha;
 mod animation;
 mod ans;
 mod color;
+mod custom_float;
 mod groups;
 mod icc;
 mod lifetime;
@@ -65,11 +66,17 @@ impl Rig {
         let plan = encoder.memory_plan(&input).unwrap();
         assert_eq!(plan.format, case.format);
         assert_eq!(plan.bits_per_sample, case.bits);
-        assert_eq!(
-            plan.exponent_bits_per_sample != 0,
-            case.kind == SampleKind::Float
-        );
+        assert_eq!(plan.exponent_bits_per_sample, case.exponent_bits());
         let encoded = pollster::block_on(encoder.submit_container(input).unwrap()).unwrap();
+        let header = jxl_gpu_bitstream::parse(&encoded, Default::default())
+            .unwrap()
+            .codestream_inventory(Default::default())
+            .unwrap()
+            .image_header;
+        assert_eq!(header.bit_depth, plan.sample_bit_depth());
+        for extra in &header.extra_channels {
+            assert_eq!(extra.bit_depth, header.bit_depth);
+        }
         let canonical = upload(&self.context, &case.canonical(), extent, &expected, 0);
         assert_eq!(
             encoded,
@@ -83,7 +90,7 @@ impl Rig {
 
     fn check_gpu(&self, encoded: &[u8], expected: &[u32], case: &Case, native: &[f32]) {
         for (decoder, fragmented) in self.decoders.iter().zip([false, true]) {
-            let request = if case.kind == SampleKind::Float {
+            let request = if case.is_float() {
                 GpuOutputRequest::color(PixelFormat::rgb_f32(
                     RgbChannelOrder::Rgba,
                     false,
@@ -114,7 +121,7 @@ impl Rig {
                     .is_none()
             );
             drop(session);
-            if case.kind == SampleKind::Float {
+            if case.is_float() {
                 let pixels = expected.len() / case.format.channel_count() as usize;
                 assert_eq!(
                     read(&self.backend, &frame.output().outputs[0]),
@@ -212,7 +219,7 @@ fn check_frame_samples_with_planes(
                     case.normalized(expected[pixel * channels + index])
                 };
                 let actual = native[pixel * 4 + channel];
-                if case.kind == SampleKind::Float {
+                if case.is_float() {
                     assert_eq!(
                         actual.to_bits(),
                         value.to_bits(),
@@ -228,7 +235,7 @@ fn check_frame_samples_with_planes(
             if case.format.has_alpha() {
                 let value = case.normalized(expected[pixel * channels + channels - 1]);
                 let actual = native[pixels * 4 + pixel];
-                if case.kind == SampleKind::Float {
+                if case.is_float() {
                     assert_eq!(actual.to_bits(), value.to_bits());
                 } else {
                     assert!((actual - value).abs() <= 2e-7);

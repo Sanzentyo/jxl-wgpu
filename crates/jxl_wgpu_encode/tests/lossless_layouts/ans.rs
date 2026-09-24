@@ -431,6 +431,10 @@ fn ans_palette_and_ordered_transforms_share_one_group_state_including_empty_plan
 fn ans_exact_budget_cancellation_and_pool_reuse_cover_one_and_many_batches() {
     let rig = Rig::new();
     let case = case(LosslessModularFormat::Rgba, 31, SampleKind::Unsigned);
+    check_lifetime(&rig, case);
+}
+
+pub(super) fn check_lifetime(rig: &Rig, case: Case) {
     let config = config(LosslessModularLz77::Greedy);
     let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config.clone());
     for extent in [Extent2d::new(17, 3), Extent2d::new(16_384, 1)] {

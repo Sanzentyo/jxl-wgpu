@@ -27,9 +27,9 @@ pub use classify::{
 pub use convert::{ConversionError, ConvertedImage, convert_rgb_f32};
 pub use format::{
     ByteOrder, Channel, ChromaLocation, ChromaLocation2d, ChromaOrder, ChromaSubsampling,
-    ColorModel, ColorRange, ColorSpace, ColorSpec, ColorSpecification, Packed422Order,
-    PackingField, PackingFieldKind, PackingWord, PixelFormat, PixelFormatError, PlaneFormat,
-    PlaneSampling, RawPattern, RgbChannelOrder, SampleKind, Swizzle, SwizzleComponent,
+    ColorModel, ColorRange, ColorSpace, ColorSpec, ColorSpecification, FloatPrecision,
+    Packed422Order, PackingField, PackingFieldKind, PackingWord, PixelFormat, PixelFormatError,
+    PlaneFormat, PlaneSampling, RawPattern, RgbChannelOrder, SampleKind, Swizzle, SwizzleComponent,
     TransferFunction, YcbcrEncoding,
 };
 pub use layout::{ImageLayout, LayoutError, PitchLinearPlaneLayout};

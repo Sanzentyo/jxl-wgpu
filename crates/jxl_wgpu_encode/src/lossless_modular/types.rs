@@ -263,6 +263,26 @@ impl LosslessModularFormat {
         Ok(self.packed_pixel_format(bits_per_sample, SampleKind::Float))
     }
 
+    /// Constructs raw binary floating storage with explicitly checked sample/exponent widths.
+    /// Like integer input, each component occupies the low bits of an 8/16/32-bit word.
+    /// All components, including alpha, share this precision. No F32 conversion occurs.
+    ///
+    /// ```
+    /// use jxl_gpu_formats::{FloatPrecision, SampleKind};
+    /// use jxl_wgpu_encode::LosslessModularFormat;
+    /// let precision = FloatPrecision::new(24, 7).unwrap();
+    /// let format = LosslessModularFormat::Rgba.custom_float_pixel_format(precision);
+    /// assert_eq!(format.sample_kind, SampleKind::CustomFloat(precision));
+    /// format.validate().unwrap();
+    /// ```
+    #[must_use]
+    pub fn custom_float_pixel_format(
+        self,
+        precision: jxl_gpu_formats::FloatPrecision,
+    ) -> PixelFormat {
+        self.packed_pixel_format(precision.bits(), SampleKind::CustomFloat(precision))
+    }
+
     fn packed_pixel_format(self, bits_per_sample: u8, sample_kind: SampleKind) -> PixelFormat {
         let storage_bits = bits_per_sample.next_power_of_two().max(8);
         let (model, color_spec, swizzle, channels): (_, _, _, &[Channel]) = match self {

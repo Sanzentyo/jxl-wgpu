@@ -1303,6 +1303,11 @@ impl OutputPlan {
                     SampleKind::Unsigned => OutputKind::NumericUnsigned,
                     SampleKind::Signed => OutputKind::NumericSigned,
                     SampleKind::Float => OutputKind::NumericFloat,
+                    SampleKind::CustomFloat(_) => {
+                        return Err(Error::UnsupportedOutputFormat(
+                            "numeric output requires native sample storage".into(),
+                        ));
+                    }
                 };
                 (
                     kind,

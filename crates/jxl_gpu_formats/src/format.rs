@@ -228,7 +228,57 @@ impl ChromaSubsampling {
 pub enum SampleKind {
     Unsigned,
     Signed,
+    /// IEEE binary16, binary32 or binary64, as selected by the packing field width.
     Float,
+    /// Explicit binary precision. Packing fields must match its total sample width.
+    CustomFloat(FloatPrecision),
+}
+
+/// A sign, biased exponent and trailing significand that fit exactly in binary32.
+///
+/// Exponents have `2..=8` bits and trailing significands have `2..=23` bits, the
+/// floating sample domain of JPEG XL. The most significant bit is the sign; exponent
+/// zero denotes zero/subnormals and an all-ones exponent denotes infinity/NaN.
+/// The bias is `2^(exponent_bits - 1) - 1`. This describes storage, not conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FloatPrecision {
+    bits: u8,
+    exponent_bits: u8,
+}
+
+impl FloatPrecision {
+    pub const BINARY16: Self = Self {
+        bits: 16,
+        exponent_bits: 5,
+    };
+    pub const BINARY32: Self = Self {
+        bits: 32,
+        exponent_bits: 8,
+    };
+
+    pub fn new(bits: u8, exponent_bits: u8) -> Result<Self, PixelFormatError> {
+        let fraction_bits = i16::from(bits) - i16::from(exponent_bits) - 1;
+        if !(2..=8).contains(&exponent_bits) || !(2..=23).contains(&fraction_bits) {
+            return Err(PixelFormatError::InvalidFloatPrecision {
+                bits,
+                exponent_bits,
+            });
+        }
+        Ok(Self {
+            bits,
+            exponent_bits,
+        })
+    }
+
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.bits
+    }
+
+    #[must_use]
+    pub const fn exponent_bits(self) -> u8 {
+        self.exponent_bits
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -524,6 +574,18 @@ impl PixelFormat {
                         plane: plane_index,
                         word: word_index,
                     });
+                }
+                if let SampleKind::CustomFloat(precision) = self.sample_kind {
+                    for field in &word.fields {
+                        if matches!(field.kind, PackingFieldKind::Channel(_))
+                            && field.bits != precision.bits()
+                        {
+                            return Err(PixelFormatError::FloatPackingWidth {
+                                bits: field.bits,
+                                expected: precision.bits(),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -1013,6 +1075,10 @@ pub enum RgbChannelOrder {
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum PixelFormatError {
+    #[error("invalid binary floating precision: {bits} sample bits, {exponent_bits} exponent bits")]
+    InvalidFloatPrecision { bits: u8, exponent_bits: u8 },
+    #[error("floating sample field has {bits} bits; its precision requires {expected}")]
+    FloatPackingWidth { bits: u8, expected: u8 },
     #[error("ICC device storage requires an explicit ICC profile")]
     IccProfileRequired,
     #[error("ICC device space {signature} is incompatible with pixel color model {model:?}")]
@@ -1039,6 +1105,70 @@ pub enum PixelFormatError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_float_precision_and_packing_have_checked_independent_widths() {
+        let mut accepted = 0;
+        for bits in 0..=u8::MAX {
+            for exponent in 0..=u8::MAX {
+                let precision = FloatPrecision::new(bits, exponent);
+                let fraction = i16::from(bits) - i16::from(exponent) - 1;
+                assert_eq!(
+                    precision.is_ok(),
+                    (2..=8).contains(&exponent) && (2..=23).contains(&fraction)
+                );
+                if let Ok(precision) = precision {
+                    accepted += 1;
+                    assert_eq!(precision.bits(), bits);
+                    assert_eq!(precision.exponent_bits(), exponent);
+                    let mut format = PixelFormat::non_color(
+                        SampleKind::CustomFloat(precision),
+                        bits,
+                        &[Channel::X],
+                    );
+                    format.validate().unwrap();
+                    format.planes[0].words[0]
+                        .fields
+                        .push(PackingField::padding(3));
+                    format.validate().unwrap();
+                    format.planes[0].words[0].fields[0].bits = bits + 1;
+                    assert_eq!(
+                        format.validate(),
+                        Err(PixelFormatError::FloatPackingWidth {
+                            bits: bits + 1,
+                            expected: bits
+                        })
+                    );
+                }
+            }
+        }
+        assert_eq!(accepted, 154);
+    }
+
+    #[test]
+    fn custom_float_storage_does_not_acquire_native_arithmetic_or_display_semantics() {
+        for precision in [
+            FloatPrecision::new(16, 8).unwrap(),
+            FloatPrecision::BINARY32,
+        ] {
+            for mut format in [
+                PixelFormat::non_color(SampleKind::Float, precision.bits(), &[Channel::X]),
+                PixelFormat::gray_f32(false, false, ColorSpecification::Default),
+                PixelFormat::rgb_f32(RgbChannelOrder::Rgba, false, ColorSpecification::Default),
+            ] {
+                format.sample_kind = SampleKind::CustomFloat(precision);
+                for plane in &mut format.planes {
+                    for word in &mut plane.words {
+                        for field in &mut word.fields {
+                            field.bits = precision.bits();
+                        }
+                    }
+                }
+                format.validate().unwrap();
+                assert!(crate::classify_pixel_format(&format).is_err());
+            }
+        }
+    }
 
     fn spec() -> ColorSpecification {
         ColorSpecification::Defined(ColorSpec::bt709(

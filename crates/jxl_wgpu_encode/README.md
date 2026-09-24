@@ -2,7 +2,7 @@
 
 GPU-required JPEG XL encoding orchestration for `wgpu`. This crate does not contain a CPU pixel
 encoder or a CPU fallback. `LosslessModularEncoder` reads Gray, GrayAlpha, RGB, or RGBA integer or
-IEEE floating-point pitch-linear storage directly on the GPU and emits a standards-compatible lossless
+binary floating-point pitch-linear storage directly on the GPU and emits a standards-compatible lossless
 Modular codestream or `jxlc` container.
 
 The complete encoder backlog, dependencies, and acceptance gates are tracked in
@@ -24,18 +24,21 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   component; `9..=16` use `u16`, and `17..=31` use `u32`. The valid sample occupies the low
   bits and high padding bits are ignored. `LosslessModularFormat::pixel_format` constructs this
   explicit storage/valid-bits contract, including native-U16 10/12-bit and native-U32 24/31-bit layouts.
-- IEEE binary16 and binary32 use native 16/32-bit words. `LosslessModularFormat::float_pixel_format`
-  constructs these layouts. Encoding preserves every bit, including signed zero, subnormals,
-  infinities and NaN payloads, without floating-point arithmetic. Other floating precisions and
-  binary64 input remain unsupported.
+- All 154 legal floating precisions are supported: one sign bit, 2–8 exponent bits and 2–23
+  trailing significand bits. `jxl_gpu_formats::FloatPrecision::new(bits, exponent_bits)` checks
+  these bounds; `LosslessModularFormat::custom_float_pixel_format(precision)` stores the raw words
+  using `SampleKind::CustomFloat`. The existing `float_pixel_format(16/32)` retains its IEEE
+  layouts and codestream bytes. Encoding preserves every bit, including signed zero, subnormals,
+  infinities and NaN payloads, without floating-point arithmetic. Binary64 is outside JPEG XL's
+  sample domain and remains rejected. Alpha shares the color sample precision.
 - Custom `PixelFormat` layouts may partition Gray/GrayAlpha/RGB/RGBA components among one through four
   full-resolution planes in the same buffer. Packed, planar and split color/alpha layouts are
   supported, including BGR/BGRA and arbitrary bijective component swizzles. Gray also accepts
   `ColorModel::Gray` with `X001` and the color declarations below. GrayAlpha uses `ColorModel::Gray`
   with `X00W`, or another bijective gray/alpha component pair with zero Y/Z swizzle outputs.
 - Each independently endian-addressed 8/16/24/32-bit word may contain multiple equally precise
-  components and padding. Integer fields may occupy any bit position, including MSB alignment;
-  floating fields contain exactly 16 or 32 IEEE bits. Native, Little and Big byte order are supported.
+  components and padding. Integer and floating fields may occupy any bit position, including
+  MSB alignment; floating field widths must match the declared precision. Native, Little and Big byte order are supported.
   All components retain the same declared precision. Missing, duplicated or discarded components,
   signed samples, subsampling and unsupported color metadata are rejected.
 - Plane offsets and row pitches may be unaligned, independently padded and physically reordered.
@@ -79,9 +82,9 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   are unchanged; variable-sized ICC headers use the shared byte budget described below.
 - `LosslessModularConfig::color_transform` selects `Auto`, `None`, `GlobalRct` or `LocalRct`.
   The default `Auto` uses YCoCg (wire type 6) for integer RGB(A) and no transform for Gray/GrayAlpha
-  or IEEE input. `LosslessModularRctType::new(0..=41)` selects every normative operation and
+  or floating input. `LosslessModularRctType::new(0..=41)` selects every normative operation and
   permutation; `IDENTITY` and `YCOCG` are named constants. Explicit RCT requires RGB(A), including
-  embedded RGB ICC and IEEE samples. WGSL transforms raw words with wrapping integer arithmetic,
+  embedded RGB ICC and floating samples. WGSL transforms raw words with wrapping integer arithmetic,
   preserving NaN payloads, signed zero and independent alpha. The host performs no pixel transform.
   Global RCT is declared once in DC-global; local RCT is declared in each pass group independently
   of MA-tree placement. A fused single-group frame declares either choice in DC-global.
@@ -399,6 +402,12 @@ animations preserve those words and retained outputs; finite crop/Add/Multiply a
 both CPU decoders and the GPU. Arithmetic composition follows floating-point blend semantics;
 it is not a promise to preserve original source words after arithmetic. Resident and streamed
 RGBA32 jobs retain the existing exact admission, cancellation and pool-reuse contract.
+
+The [custom floating matrix](../../docs/CONFORMANCE_CORPUS.md#custom-floating-point-modular-encoding)
+extends those checks to every legal precision under Prefix and ANS, with independent original
+words, exact native F32 output, both tree placements, arbitrary field/word packing and bounded GPU
+decoding. Additional cases cover RCT/Palette/Squeeze/Weighted composition, Replace animations,
+precision mismatch before admission, IEEE byte compatibility and resident/streamed ownership.
 
 `EncodeProfile::ModularLossless` carries `sample_bit_depth: SampleBitDepth`, distinguishing
 integer depth from floating depth and exponent width. Matching storage widths do not permit
@@ -779,7 +788,8 @@ encoder.encode(source_13_by_21)
 `LosslessModularEncoder::begin_animation` writes one standard stream-wide animation header and
 keeps a reusable GPU session open for multiple frames. The descriptor fixes the canvas, format,
 sample precision, tick rate, loop count, and timecode presence. Use
-`LosslessModularAnimationDescriptor::new` for integers or `new_float` for binary16/binary32.
+`LosslessModularAnimationDescriptor::new` for integers, `new_float` for binary16/binary32, or
+`from_pixel_format` for explicit floating precision and source color.
 Each frame supplies an exact duration,
 optional timecode, optional signed crop rectangle, color blend contract, one contract per extra
 channel, and the two-bit source/destination reference slots. GrayAlpha and RGBA animation carry

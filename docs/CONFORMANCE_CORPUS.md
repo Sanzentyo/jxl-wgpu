@@ -394,6 +394,49 @@ This target separates floating development checks; capability changes still requ
 [full gates](DEVELOPMENT.md#capability-change-gates). Browser/WASM compilation verifies the shared
 precision metadata/state machine, not browser execution.
 
+## Custom floating-point Modular encoding
+
+[`lossless_layouts::custom_float`](../crates/jxl_wgpu_encode/tests/lossless_layouts/custom_float.rs)
+contains seven GPU tests. Its 308 still cases cover all 154 legal combinations of 2–8 exponent
+bits and 2–23 fraction bits under both Prefix/shared-tree and ANS/local-tree encoding. The 23×5
+sources rotate Gray/GrayAlpha/RGB/RGBA, packed/planar/split storage, shared small fields, 24-bit
+words, component swizzles, both byte orders, shifted fields, unaligned pitches and poisoned gaps.
+Canonical storage must produce identical containers. Parsed image and alpha precision must match
+the admitted memory plan. Each component contains signed zeros, minimum/maximum subnormals,
+minimum normal, maximum finite, infinities and signaling/quiet NaN payloads, plus deterministic words.
+
+jxl-oxide retained working planes must equal every raw input word. Native libjxl 0.12.0 original
+RGBA/alpha output is compared bit-for-bit with an independent F64 dyadic-value oracle; specials
+are assembled explicitly to preserve sign and payload. Whole and 256-byte-window GPU RGBA F32
+output must equal the native result exactly. No source/reference fixtures are replaced or generated
+by a production CPU encoder. GPU capability negotiation additionally rejects every invalid pair
+in the tested 0–34 sample / 0–10 exponent range.
+
+Fourteen 129×5 cases cross both entropy choices with seven boundary/custom precisions, global/local
+RCT, exact color Palette, both separable Squeeze orders and Weighted prediction. Required scalar
+native Modular working words provide an additional exact oracle, including explicit exponent
+metadata. Two IEEE aliases must retain the existing binary16/binary32 containers byte-for-byte;
+mismatched packing is rejected before allocation. Four three-frame Replace animations at 5/2,
+16/8, 24/7 and 31/7 precision use different layouts and byte orders per frame, reversed insertion,
+timing/timecodes and retained whole/bounded numeric output for every color/alpha component.
+A different legal exponent at the same storage width is rejected before frame admission.
+
+Prefix RGBA 5/2 and 24/7 check resident 17×9 and streamed 16,384×1 ownership. ANS RGBA 24/7 and
+32/8 check one-batch 17×3 and multi-batch 16,384×1 ownership; ANS always uses the streaming state
+machine. All eight cases retain one-byte-short/exact budget admission, cancellation through source
+retirement, buffer leases, pool reuse, blocking/Future equality and independent/native/GPU output.
+Format-unit checks cover every u8 precision pair, all 154 legal packing declarations and typed
+rejection by generic numeric/color classification, which must not reinterpret custom words as F32.
+Independent extra-channel precision and broader input color/storage families remain open.
+
+```console
+JXL_REQUIRE_NATIVE_ORACLES=1 cargo test --locked -p jxl_wgpu_encode --test lossless_layouts custom_float_ -- --test-threads=2
+cargo test --locked -p jxl_gpu_formats --all-features custom_float -- --test-threads=2
+```
+
+The first command also requires the existing `JXL_MODULAR_WORD_ORACLE` from the
+[capability gates](DEVELOPMENT.md#capability-change-gates).
+
 ## Lossless Modular buffer layouts
 
 [`lossless_layouts`](../crates/jxl_wgpu_encode/tests/lossless_layouts/main.rs) generates 102 still

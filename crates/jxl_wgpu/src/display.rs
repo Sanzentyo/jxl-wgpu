@@ -1149,6 +1149,7 @@ fn validate_numeric_image(
         SampleKind::Unsigned => 0,
         SampleKind::Signed => 1,
         SampleKind::Float => 2,
+        SampleKind::CustomFloat(_) => return Err(NumericDisplayError::NonNumericFormat.into()),
     };
     let visualization = match contract.channels {
         NumericDisplayChannels::Luma => 0,
@@ -2001,6 +2002,7 @@ mod tests {
                     SampleKind::Float => NumericDisplaySource::Floating {
                         non_finite: NumericNonFinitePolicy::Saturate,
                     },
+                    SampleKind::CustomFloat(_) => panic!("VPI uses native IEEE storage"),
                 },
                 scale: 1.0,
                 bias: 0.0,

@@ -26,22 +26,36 @@ fn separated_sources_keep_exact_admission_cancellation_and_streaming_contracts()
         byte_order: ByteOrder::Big,
         shifted: true,
     };
-    let encoder = LosslessModularEncoder::with_tree_mode(
-        rig.context.clone(),
-        LosslessModularTreeMode::LocalPerGroup,
+    check_case(
+        &rig,
+        case,
+        jxl_wgpu_encode::LosslessModularConfig {
+            tree_mode: LosslessModularTreeMode::LocalPerGroup,
+            ..Default::default()
+        },
+        Extent2d::new(257, 9),
     );
+}
+
+pub(super) fn check_case(
+    rig: &Rig,
+    case: Case,
+    config: jxl_wgpu_encode::LosslessModularConfig,
+    resident_extent: Extent2d,
+) {
+    let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config.clone());
     let limited = |bytes| {
-        LosslessModularEncoder::with_tree_mode(
+        LosslessModularEncoder::with_config(
             WgpuContext::with_memory_budget(
                 Arc::new(rig.context.device().clone()),
                 Arc::new(rig.context.queue().clone()),
                 NonZeroU64::new(bytes).unwrap(),
             )
             .unwrap(),
-            LosslessModularTreeMode::LocalPerGroup,
+            config.clone(),
         )
     };
-    for extent in [Extent2d::new(257, 9), Extent2d::new(16_384, 1)] {
+    for (extent, streaming) in [(resident_extent, false), (Extent2d::new(16_384, 1), true)] {
         let expected = case.samples(extent);
         let input = upload(&rig.context, &case, extent, &expected, 65_539);
         let plan = encoder.memory_plan(&input).unwrap();
@@ -50,7 +64,7 @@ fn separated_sources_keep_exact_admission_cancellation_and_streaming_contracts()
             plan.addressed_bytes_per_job,
             plan.owned_bytes_per_job + plan.peak_source_binding_bytes
         );
-        assert_eq!(plan.streaming, extent.width == 16_384);
+        assert_eq!(plan.streaming, streaming, "{case:?}, {extent:?}");
         if plan.streaming {
             assert_eq!(plan.gpu_submission_count, plan.batch_count * 2);
             assert!(plan.peak_source_binding_bytes < plan.source_binding_bytes);

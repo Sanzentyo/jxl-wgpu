@@ -34,7 +34,7 @@ implementation audits.
 |---|---|
 | Coding mode | Modular lossless |
 | Color models | Gray (`NonColor`/`X000` or `Gray`/`X001`), GrayAlpha (`Gray`/`X00W`), RGB/RGBA with bijective component swizzles; alpha is one extra channel with declared association |
-| Sample depths | every integer `1..=31` or IEEE binary16/binary32, with equal precision across components |
+| Sample depths | every integer `1..=31` or all 154 legal floating precisions (2–8 exponent and 2–23 fraction bits), with equal precision across components |
 | Input | one pitch-linear `wgpu::Buffer`, one through four packed/planar/split planes, 8/16/24/32-bit words, arbitrary field positions, Native/Little/Big byte order, `ChromaSubsampling::None` |
 | Source color | full-range enumerated RGB/Gray, standard/custom primaries and white, Linear/sRGB/BT.709/PQ/HLG/DCI/Gamma, or unchanged embedded RGB/Gray ICC; four intents and positive binary16 image white |
 | Extent | `1..2^30` per axis, further bounded by device limits |
@@ -44,7 +44,7 @@ implementation audits.
 | Progressive passes | `max_progressive_passes = 1` |
 | Implemented stages | `ColorTransform`, `ModularTransform`, `ModularPrediction`, `ModularResidualTokenization`, `HistogramReduction`, plus `AnsSerialization` when selected |
 | Predictor | All 14 explicit standard predictors and caller-selected Weighted coefficients; default Gradient |
-| Modular transforms | caller-selected none or any of 42 RCT types in DC-global or each pass group; default YCoCg for integer RGB(A), none for Gray/GrayAlpha or IEEE samples |
+| Modular transforms | caller-selected none or any of 42 RCT types in DC-global or each pass group; default YCoCg for integer RGB(A), none for Gray/GrayAlpha or floating samples |
 | Entropy | Default Prefix or GPU ANS; ZeroRuns or bounded Greedy LZ77; fixed four-leaf channel MA tree |
 | Filters | Gaborish off, EPF zero iterations |
 | Output | raw codestream or standard `jxlc` container; private `jwgp` index emitted only for single-group Gray8 Prefix containers with default color/intent/intensity |
@@ -207,6 +207,17 @@ word 100..   event_count records of:
 plane is copied into a private container box. The ABI is bounded before allocation: at most
 `pixels + ceil(pixels / 8) + 1` events per group channel.
 
+Source precision belongs to `PixelFormat`, separately from transform or entropy policy.
+`FloatPrecision` checks the sign/exponent/fraction geometry once; `SampleKind::CustomFloat`
+requires every channel packing field to match its total width. Legacy IEEE storage still uses
+`SampleKind::Float`. The checked source specification resolves either form to the same sample
+and exponent widths used by the dispatch/memory plan, capability negotiation and image/alpha
+headers. Animation descriptors infer that specification from their source format and require
+both widths to match on every frame. Header serialization uses the checked precision domain,
+including the 24-bit and general-width buckets, without deriving exponent width from word size.
+The GPU only loads and transforms raw words, so custom precision adds no shader ABI, intermediate
+allocation or submission. A custom descriptor does not grant generic F32 display/output support.
+
 The parameter ABI is one `#[repr(C)]`, `bytemuck::Pod` Rust value and the matching WGSL structure.
 `ModularSourceParams` / `Source` is 24 bytes and `ModularParams` / `Params` is 256 bytes, both
 with four-byte alignment. The [WGSL memory table](WGSL_MEMORY.md#uniform-and-structured-storage-table)
@@ -216,7 +227,7 @@ Compile-time and shader validation tests check the ABI. The 256-byte array strid
 batch parameter range aligned. Source bindings 0/3/4/5 address individual planes; bindings 1/2
 retain artifacts and parameters. Unused sources alias the first plane, and configurations below
 six storage bindings are rejected before pipeline creation. Each component carries its own
-word offset, byte stride, field shift and source-plane selector. Word loads preserve IEEE bits.
+word offset, byte stride, field shift and source-plane selector. Word loads preserve raw floating bits.
 
 Admission revalidates every public image-layout field and its final addressable word. Each group
 uses checked `offset + (height - 1) * row_stride + (width - 1) * pixel_stride + word_bytes`, rounds
@@ -522,7 +533,7 @@ cargo clippy -p jxl_wgpu_encode --all-targets -- -D warnings
 - **Multi-group Modular (Slice 3)**: All four standard PassGroup sizes, multi-group row-major TOC layout,
   two-pass streaming with global histogram aggregation, and out-of-order group completion.
 - **Lossless color and alpha inputs (Slice 4 partial)**: Gray/GrayAlpha/RGB/RGBA at integer depths
-  `1..=31` or IEEE binary16/binary32, with packed/planar/split addressing and declared alpha
+  `1..=31` or every legal floating precision, with packed/planar/split addressing and declared alpha
   association. RGB(A) can select every GPU-side RCT type or no transform, in global or local headers.
 - **Lossless Modular animation (Slice 6)**: Multi-frame `LosslessModularAnimationSession` supporting
   standard timebases, exact durations and timecodes, signed crop rectangles, all 5 blend modes,

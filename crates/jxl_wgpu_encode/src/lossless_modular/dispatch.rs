@@ -206,7 +206,9 @@ impl LosslessModularBackend {
             pipeline,
             buffer_pool: EncoderBufferPool::new(DEFAULT_ENCODER_BUFFER_POOL_BYTES),
             capabilities: EncoderCapabilities {
-                profiles: [(1, 31, 0), (16, 16, 5), (32, 32, 8)]
+                // One sign bit, 2..=8 exponent bits and 2..=23 fraction bits.
+                profiles: std::iter::once((1, 31, 0))
+                    .chain((2..=8).map(|exponent| (exponent + 3, exponent + 24, exponent)))
                     .map(
                         |(min_bits_per_sample, max_bits_per_sample, exponent_bits_per_sample)| {
                             ProfileCapability::ModularLossless {
@@ -216,7 +218,7 @@ impl LosslessModularBackend {
                             }
                         },
                     )
-                    .to_vec(),
+                    .collect(),
                 max_progressive_passes: 1,
                 animation: true,
                 determinism: Determinism::CrossDevice,
