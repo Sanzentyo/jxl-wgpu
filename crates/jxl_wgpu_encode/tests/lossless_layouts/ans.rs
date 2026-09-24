@@ -38,6 +38,104 @@ fn read_global_entropy(bits: &mut jxl_bitstream::Bitstream<'_>) -> jxl_coding::D
     jxl_coding::Decoder::parse(bits, 4).unwrap()
 }
 
+fn coding_header(encoded: &[u8]) -> (u32, u32, u32) {
+    let parsed = jxl_gpu_bitstream::parse(encoded, Default::default()).unwrap();
+    let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+    let section = inventory.frames[0]
+        .sections
+        .iter()
+        .find(|section| {
+            matches!(
+                section.kind,
+                jxl_gpu_bitstream::FrameSectionKind::Single
+                    | jxl_gpu_bitstream::FrameSectionKind::LowFrequencyGlobal
+            )
+        })
+        .unwrap();
+    let start = section.bytes.offset as usize;
+    let mut bits =
+        jxl_bitstream::Bitstream::new(&encoded[start..start + section.bytes.length as usize]);
+    read_global_tree(&mut bits);
+    assert!(bits.read_bool().unwrap());
+    let minimum = bits
+        .read_u32(224, 512, 4096, 8 + jxl_bitstream::U(15))
+        .unwrap();
+    assert_eq!(
+        bits.read_u32(3, 4, 5 + jxl_bitstream::U(2), 9 + jxl_bitstream::U(8))
+            .unwrap(),
+        7
+    );
+    let split = bits.read_bits(4).unwrap();
+    let width = (32 - split.leading_zeros()) as usize;
+    assert_eq!(bits.read_bits(width).unwrap(), 0);
+    assert_eq!(bits.read_bits(width).unwrap(), 0);
+    jxl_coding::read_clusters(&mut bits, 5).unwrap();
+    assert!(!bits.read_bool().unwrap()); // ANS
+    (minimum, split, bits.read_bits(2).unwrap() + 5)
+}
+
+#[test]
+fn ans_selects_wire_alphabets_and_lz77_boundaries_from_gpu_populations() {
+    use jxl_wgpu_encode::{LosslessModularColorTransform, LosslessModularPredictor};
+    let rig = Rig::new();
+    let case = case(LosslessModularFormat::Gray, 31, SampleKind::Unsigned);
+    let extent = Extent2d::new(129, 32);
+    for tree_mode in TREES {
+        for mode in [LosslessModularLz77::ZeroRuns, LosslessModularLz77::Greedy] {
+            let encoder = LosslessModularEncoder::with_config(
+                rig.context.clone(),
+                LosslessModularConfig {
+                    tree_mode,
+                    predictor: LosslessModularPredictor::Zero,
+                    color_transform: LosslessModularColorTransform::None,
+                    ..config(mode)
+                },
+            );
+            for (pattern, expected_log) in [(0, 6), (1, 7), (2, 8)] {
+                let expected: Vec<_> = (0..extent.area().unwrap())
+                    .map(|index| {
+                        if index % extent.width as usize % 32 < 8 {
+                            return 0;
+                        }
+                        let index = index as u32;
+                        let random = (index.wrapping_mul(0x9e37_79b9) ^ (index >> 3)) & 0x000f_ffff;
+                        match pattern {
+                            0 => 1,
+                            1 => random + 1,
+                            _ => (random + 1) << 1,
+                        }
+                    })
+                    .collect();
+                let encoded = encoder
+                    .encode(upload(&rig.context, &case, extent, &expected, 4099))
+                    .unwrap();
+                assert_eq!(
+                    encoded,
+                    encoder
+                        .encode(upload(
+                            &rig.context,
+                            &case.canonical(),
+                            extent,
+                            &expected,
+                            0
+                        ))
+                        .unwrap()
+                );
+                let (threshold, _, log) = coding_header(&encoded);
+                assert_eq!(
+                    log, expected_log,
+                    "pattern={pattern} mode={mode:?} tree={tree_mode:?} threshold={threshold}"
+                );
+                assert!(threshold >= 33 && threshold < 1 << log);
+                let native = check_oracles(&encoded, &expected, &case);
+                rig.check_gpu(&encoded, &expected, &case, &native);
+            }
+            assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
+            assert_eq!(encoder.buffer_pool_stats().leased_buffer_sets, 0);
+        }
+    }
+}
+
 #[test]
 fn ans_adapts_length_headers_to_gpu_matches_without_changing_original_words() {
     use jxl_wgpu_encode::{LosslessModularColorTransform, LosslessModularPredictor};
@@ -73,32 +171,8 @@ fn ans_adapts_length_headers_to_gpu_matches_without_changing_original_words() {
                         ))
                         .unwrap()
                 );
-                let parsed = jxl_gpu_bitstream::parse(&encoded, Default::default()).unwrap();
-                let inventory = parsed.codestream_inventory(Default::default()).unwrap();
-                let section = inventory.frames[0]
-                    .sections
-                    .iter()
-                    .find(|section| {
-                        matches!(
-                            section.kind,
-                            jxl_gpu_bitstream::FrameSectionKind::Single
-                                | jxl_gpu_bitstream::FrameSectionKind::LowFrequencyGlobal
-                        )
-                    })
-                    .unwrap();
-                let start = section.bytes.offset as usize;
-                let mut bits = jxl_bitstream::Bitstream::new(
-                    &encoded[start..start + section.bytes.length as usize],
-                );
-                read_global_tree(&mut bits);
-                assert!(bits.read_bool().unwrap());
-                assert_eq!(bits.read_bits(2).unwrap(), 0); // default min_symbol = 224
-                assert_eq!(bits.read_bits(4).unwrap(), 0b1010); // min_length = 7
-                let split = bits.read_bits(4).unwrap();
+                let (_, split, _) = coding_header(&encoded);
                 assert_eq!(split, expected_split, "zeros={zeros} extent={extent:?}");
-                let width = (32 - split.leading_zeros()) as usize;
-                assert_eq!(bits.read_bits(width).unwrap(), 0);
-                assert_eq!(bits.read_bits(width).unwrap(), 0);
                 let native = check_oracles(&encoded, &expected, &case);
                 rig.check_gpu(&encoded, &expected, &case, &native);
             }
@@ -212,7 +286,7 @@ fn check(rig: &Rig, encoder: &LosslessModularEncoder, case: &Case, extent: Exten
     let input = upload(&rig.context, case, extent, &expected, 4099);
     let plan = encoder.memory_plan(&input).unwrap();
     assert!(plan.streaming);
-    assert_eq!(plan.hybrid_histogram_bytes, 165_768);
+    assert_eq!(plan.hybrid_histogram_bytes, 188_008);
     assert_eq!(plan.gpu_submission_count, 2 * plan.batch_count);
     let encoded = pollster::block_on(encoder.submit_container(input).unwrap()).unwrap();
     let canonical = upload(&rig.context, &case.canonical(), extent, &expected, 0);
@@ -365,7 +439,7 @@ fn ans_exact_budget_cancellation_and_pool_reuse_cover_one_and_many_batches() {
         let plan = encoder.memory_plan(&input).unwrap();
         assert_eq!(plan.batch_count > 1, extent.width == 16_384);
         assert!(plan.ans_output_bytes > 0 && plan.ans_output_bytes < plan.artifact_storage_bytes);
-        assert_eq!(plan.hybrid_histogram_bytes, 165_768);
+        assert_eq!(plan.hybrid_histogram_bytes, 188_008);
         assert!(plan.ans_output_bytes + plan.hybrid_histogram_bytes < plan.artifact_storage_bytes);
         assert_eq!(plan.gpu_submission_count, 2 * plan.batch_count);
         let limited = |bytes| {

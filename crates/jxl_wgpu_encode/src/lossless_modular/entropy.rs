@@ -6,14 +6,17 @@ use jxl_gpu_bitstream::BitWriter;
 use super::dispatch::{ModularDispatchBatch, ModularDispatchPlan};
 use super::lz77::LosslessModularLz77;
 use super::serializer::{DistanceCode, ValidatedModularArtifact};
-use crate::ans::{ALPHABET, AnsCode, TABLE_WORDS};
+use crate::ans::{ALPHABET, AnsAlphabet, AnsCode, AnsHistogram, TABLE_WORDS};
 use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS};
 use crate::{BackendError, EncodeError, WgpuContext};
 
 mod clustering;
+mod coding;
 mod hybrid;
 mod length;
 pub(super) use hybrid::{FrameHistograms, PROFILE_BYTES, PROFILES};
+
+const BATCH_HEADER_WORDS: usize = 11;
 
 /// Entropy coding after lossless GPU tokenization. This selection never changes source words.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -87,12 +90,9 @@ impl EntropyCode {
     }
 
     pub(super) fn write_lz77_config(&self, writer: &mut BitWriter) -> Result<(), EncodeError> {
-        writer.write_bits(1, 1)?; // enabled
-        writer.write_bits(0, 2)?; // min_symbol = 224
-        writer.write_bits(0b1010, 4)?; // min_length = 7
         self.ans()
-            .map_or(length::LengthCoding::canonical(), |code| code.length)
-            .write(writer)
+            .map_or(coding::CodingPlan::canonical(), |code| code.coding)
+            .write_lz77(writer)
     }
 
     pub(super) fn write_empty_stream(&self, writer: &mut BitWriter) -> Result<(), EncodeError> {
@@ -143,7 +143,7 @@ pub(super) struct AnsCodebook {
     /// Distance, then channel 0/1/2/3+. Shared by wire metadata and GPU lowering.
     context_map: clustering::ContextMap,
     mode: LosslessModularLz77,
-    length: length::LengthCoding,
+    coding: coding::CodingPlan,
 }
 
 impl AnsCodebook {
@@ -152,40 +152,46 @@ impl AnsCodebook {
         histograms: &FrameHistograms,
         header_copies: u64,
     ) -> Result<Self, EncodeError> {
-        let mut best: Option<(u128, length::LengthCoding, clustering::ClusteredCode)> = None;
-        for length in length::LengthCoding::candidates() {
-            let lengths = length.histograms(&histograms.lz77)?;
-            let profiles = histograms.candidates(mode, &lengths)?;
-            let clustered = clustering::cluster(&profiles, header_copies)?;
+        let mut best: Option<(u128, coding::CodingPlan, clustering::ClusteredCode)> = None;
+        for coding in coding::CodingPlan::candidates() {
+            let profiles = histograms.candidates(mode, coding)?;
+            let clustered = clustering::cluster(&profiles, header_copies, coding.alphabet)?;
             let mut header = BitWriter::new();
-            length.write(&mut header)?;
+            coding.write_lz77(&mut header)?;
             let cost = clustered.estimated_bits_q20
                 + ((header.bit_len() as u128 * u128::from(header_copies)) << 20);
             if best
                 .as_ref()
-                .is_none_or(|(previous_cost, previous_length, _)| {
-                    (cost, length) < (*previous_cost, *previous_length)
+                .is_none_or(|(previous_cost, previous_coding, _)| {
+                    (cost, coding) < (*previous_cost, *previous_coding)
                 })
             {
-                best = Some((cost, length, clustered));
+                best = Some((cost, coding, clustered));
             }
         }
-        let (_, length, clustered) =
-            best.ok_or(BackendError::Invariant("ANS length search is empty"))?;
+        let (_, coding, clustered) =
+            best.ok_or(BackendError::Invariant("ANS coding search is empty"))?;
+        let context_map = clustered.map;
         Ok(Self {
-            tables: clustered.tables,
-            context_map: clustered.map,
+            tables: clustered.compile()?,
+            context_map,
             mode,
-            length,
+            coding,
         })
     }
 
     /// The selected table owns both its wire configuration and GPU recoding metadata.
     pub(super) fn write_histograms(&self, writer: &mut BitWriter) -> Result<(), EncodeError> {
         writer.write_bits(0, 1)?; // ANS
-        writer.write_bits(3, 2)?; // log alphabet size = 8
+        writer.write_bits(u64::from(self.coding.alphabet.log_size() - 5), 2)?;
         for table in &self.tables {
-            table.config.write(writer)?;
+            if table.code.alphabet() != self.coding.alphabet {
+                return Err(BackendError::Invariant(
+                    "ANS table alphabet differs from its codebook",
+                )
+                .into());
+            }
+            table.config.write(writer, self.coding.alphabet)?;
         }
         for table in &self.tables {
             table.code.write_histogram(writer)?;
@@ -234,7 +240,7 @@ pub(super) struct EntropyBatchPlan {
 
 impl EntropyBatchPlan {
     pub(super) fn bytes(self, channels: usize) -> u64 {
-        4 * (9
+        4 * (BATCH_HEADER_WORDS as u64
             + hybrid::PROFILES as u64
             + 4 * u64::from(self.group_count)
             + 4 * channels as u64
@@ -290,7 +296,12 @@ pub(super) fn validate_encoded_group<'a>(
 }
 
 fn shader_source(body: &str) -> String {
-    format!("{}\n{body}", include_str!("entropy/hybrid.wgsl"))
+    format!(
+        "const PROFILE_COUNT: u32 = {PROFILES}u;\nconst PROFILE_ALPHABET: u32 = {}u;\nconst ANS_TABLE_WORDS: u32 = {}u;\nconst ENTROPY_HEADER_WORDS: u32 = {BATCH_HEADER_WORDS}u;\n{}\n{body}",
+        hybrid::RAW_ALPHABET,
+        TABLE_WORDS + 1,
+        include_str!("entropy/hybrid.wgsl"),
+    )
 }
 
 pub(super) struct AnsPipelines {
@@ -373,11 +384,12 @@ pub(super) fn record(
         "ANS batch has no metadata allocation",
     ))?;
     let groups = &plan.groups[batch.first_dispatch..batch.first_dispatch + batch.dispatch_count];
-    let channel_start = 9 + 4 * entropy.group_count as usize;
+    let channel_start = BATCH_HEADER_WORDS + 4 * entropy.group_count as usize;
     let profiles_start = channel_start + 4 * groups.len();
     let tables_start = profiles_start + hybrid::PROFILES;
     let mut metadata = vec![0u32; tables_start];
-    metadata[..9].copy_from_slice(&[
+    let coding = codebook.map_or(coding::CodingPlan::canonical(), |code| code.coding);
+    metadata[..BATCH_HEADER_WORDS].copy_from_slice(&[
         entropy.group_count,
         tables_start as u32,
         u32::from(plan.lz77 == LosslessModularLz77::Greedy),
@@ -386,9 +398,9 @@ pub(super) fn record(
         (entropy.profile_byte_offset / 4) as u32,
         profiles_start as u32,
         groups.len() as u32,
-        codebook
-            .map_or(length::LengthCoding::canonical(), |code| code.length)
-            .packed(),
+        coding.length.packed(),
+        coding.min_symbol as u32,
+        coding.alphabet.symbols() as u32,
     ]);
     for (target, &config) in metadata[profiles_start..tables_start]
         .iter_mut()
@@ -412,12 +424,13 @@ pub(super) fn record(
                 .iter()
                 .take_while(|next| next.group_index == group.group_index)
                 .count();
-            metadata[9 + job * 4..13 + job * 4].copy_from_slice(&[
-                (channel_start + index * 4) as u32,
-                count as u32,
-                (base + output.byte_offset / 4) as u32,
-                output.capacity_words,
-            ]);
+            metadata[BATCH_HEADER_WORDS + job * 4..BATCH_HEADER_WORDS + (job + 1) * 4]
+                .copy_from_slice(&[
+                    (channel_start + index * 4) as u32,
+                    count as u32,
+                    (base + output.byte_offset / 4) as u32,
+                    output.capacity_words,
+                ]);
             job += 1;
         }
     }

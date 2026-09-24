@@ -76,16 +76,16 @@ fn hybrid_profiling_shader_is_portable_and_configurations_cover_the_admitted_alp
     .validate(&module)
     .unwrap();
     let candidates = HybridConfig::candidates();
-    assert_eq!(candidates.len(), 37);
+    assert_eq!(candidates.len(), 40);
     for split in 0..=8 {
         for msb in 0..=split {
             for lsb in 0..=split - msb {
                 let config = HybridConfig { split, msb, lsb };
-                assert_eq!(candidates.contains(&config), config.max_token() < 224);
+                assert_eq!(candidates.contains(&config), config.max_token() < 235);
             }
         }
     }
-    assert_eq!(PROFILE_BYTES, 165_768);
+    assert_eq!(PROFILE_BYTES, 188_008);
 }
 
 #[test]
@@ -136,9 +136,7 @@ fn all_hybrid_profiles_decode_gpu_words_and_reject_unvalidated_histograms() {
         let candidates = histograms
             .candidates(
                 mode,
-                &length::LengthCoding::canonical()
-                    .histograms(&histograms.lz77)
-                    .unwrap(),
+                coding::CodingPlan::new(228, length::LengthCoding::candidates()[0]).unwrap(),
             )
             .unwrap();
         let artifacts: Vec<_> = channels
@@ -167,7 +165,8 @@ fn all_hybrid_profiles_decode_gpu_words_and_reject_unvalidated_histograms() {
                 tables,
                 context_map: [0, 1, 2, 3, 4],
                 mode,
-                length: length::LengthCoding::canonical(),
+                coding: coding::CodingPlan::new(228, length::LengthCoding::candidates()[0])
+                    .unwrap(),
             }));
             let (plan, result) = gpu_fragment(
                 &context,
@@ -185,8 +184,8 @@ fn all_hybrid_profiles_decode_gpu_words_and_reject_unvalidated_histograms() {
             (base, 0),
             (base, words[base] - 1),
             (base + 1, 1),
-            (base + 2 + 223, 1),
-            (base + 2 + 224, words[base + 2 + 224] + 1),
+            (base + 2 + 234, 1),
+            (base + 2 + 235, words[base + 2 + 235] + 1),
         ] {
             let mut corrupt = words.clone();
             corrupt[index] = value;
@@ -236,9 +235,7 @@ fn adaptive_hybrid_selection_uses_mantissa_and_low_bits_with_exact_extra_costs()
         for profile in histograms
             .candidates(
                 mode,
-                &length::LengthCoding::canonical()
-                    .histograms(&histograms.lz77)
-                    .unwrap(),
+                coding::CodingPlan::new(228, length::LengthCoding::candidates()[0]).unwrap(),
             )
             .unwrap()
         {

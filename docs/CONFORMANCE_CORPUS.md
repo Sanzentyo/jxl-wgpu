@@ -1107,7 +1107,7 @@ GPU ANS serialization is covered separately below.
 ## Lossless Modular GPU ANS encoding
 
 `lossless_layouts::ans` selects GPU ANS explicitly while retaining default Prefix fixture bytes.
-Its ten tests cover Gray/GrayAlpha/RGB/RGBA, all integer depths 1–31 and IEEE16/32 special words,
+Its eleven tests cover Gray/GrayAlpha/RGB/RGBA, all integer depths 1–31 and IEEE16/32 special words,
 all 14 predictors with custom Weighted coefficients, all 42 global/local RCT types, all group sizes,
 both MA placements and both LZ77 policies. Packed/planar/split layouts with poisoned padding,
 unaligned pitches, reversed components and big-endian words must emit the same bytes as canonical
@@ -1120,9 +1120,10 @@ the pinned scalar native word oracle. Whole and 256-byte-window fragmented GPU o
 existing exact component/bit comparisons. Replace animations preserve physical words and timing;
 cropped Add/Multiply composition keeps the existing native/Rust comparison bounds.
 
-The generic ANS table test checks every one of 4096 alias residues with the independent
-`jxl-coding` decoder for empty, every unary symbol, sparse binary, uniform and skewed distributions,
-including `u64::MAX` counts and every active alphabet size. It also checks exact histogram cursor
+The generic ANS table test checks every one of 4096 alias residues for each 32/64/128/256-symbol
+wire alphabet with the independent `jxl-coding` decoder for empty, every unary symbol, sparse
+binary, uniform and skewed distributions, including `u64::MAX` counts and every active alphabet
+size. It also checks exact histogram cursor
 consumption and deterministic normalization. A real GPU serialization test uses five channel
 contexts including an empty channel, all raw token/extra-bit widths through token 32, LZ77 length
 31, overlap, a `2^20 - 7` distance, and context changes under width multipliers 1/17/1024. Independent
@@ -1164,8 +1165,8 @@ and padded/swizzled inputs byte for byte, and check native/original-word plus wh
 decoding under both tree placements and single/multiple groups. The previous every-depth/transform,
 budget, cancellation and late-failure matrix now uses clustered ANS unchanged.
 
-The hybrid profiler covers all 37 configurations representing every u32 with tokens below 224. Two
-GPU profile passes feed 74 serialization dispatches, covering both LZ77 modes, every direct-value
+The hybrid profiler covers all 40 configurations representing every u32 while leaving at least
+21 length symbols. Two GPU profile passes feed 80 serialization dispatches, covering both LZ77 modes, every direct-value
 boundary through 511, all wide exponents, u32 extrema, six channels including an empty one, and
 regular distances across history. Independent `jxl-coding` checks exact values, cursor and final
 state at multipliers 1/17/1024 for every configuration. Two additional actual populations require
@@ -1173,34 +1174,52 @@ selected MSB or LSB retention and verify exact extra-bit accounting. Missing pro
 completion, error flags, illegal tokens, altered counts, truncation, range overflow and aggregate
 overflow cannot produce a codebook. Profiling and serialization shaders receive portable Naga validation.
 
-Eight joint-search cases compare all 31 unions × 37 configurations and all 52 partitions against
+Eight joint-search cases compare all 31 unions × 40 configurations and all 52 partitions against
 independent F64 costs, including repeated headers and deterministic tables/configurations. A
 binding-limit test forces three batches by charging the profile arena, checks disjoint ranges
-and rejects one-byte-short storage or insufficient workgroup limits before allocation.\nThe existing public native/GPU matrix now
-uses adaptive residual/distance coding, with exactly 165,768 histogram bytes admitted per batch;
+and rejects one-byte-short storage or insufficient workgroup limits before allocation.
+The existing public native/GPU matrix uses adaptive residual/distance coding, with exactly
+188,008 histogram bytes admitted per batch;
 its one/multiple-batch exact-budget, cancellation, reuse and late-failure checks remain in force.
 
 LZ77 length selection evaluates splits 0–4 jointly with residual/distance configurations and
 clustering. Every value in the full 20-bit length domain checks exact rebinned histograms and
 extra-bit totals, including weighted counts, empty channels and overflow rejection. The actual
-GPU matrix covers 5 length × 37 residual/distance configurations × 2 LZ77 policies (370 dispatches),
+GPU matrix covers all 394 valid full-domain length/raw/LZ combinations with their smallest sufficient
+alphabet: five length settings and 40 raw settings under both policies, excluding only the three
+228-raw-plus-32-length combinations which cannot fit 256 symbols. It covers
 short direct-value/exponent boundaries, maximum group-length copies and empty channels. Independent
 entropy decoding checks exact words, cursor and state at three width multipliers; malformed
 length tokens, widths and extra bits fail without fragment authority.
 
 Eight GPU-derived distributions/header-multiplicity cases compare global selection against
-independent F64 rates across all 5 length choices, 31 unions, 37 raw configurations and 52 maps.
+independent F64 rates across all 94 threshold/length plans, 31 unions, each plan's supported subset
+of 40 raw configurations and 52 maps. Repeated selection must give identical plans/maps/GPU tables.
 Sixteen public zero-run sources parse selected splits 0/2/3/4 directly, retain canonical versus
 poisoned-layout byte identity, and match native/original-word and whole/bounded GPU output with
 both tree placements and one/multiple groups. Split 1 has the same token mapping as split 0 with
 a longer header, but remains covered explicitly in the complete GPU configuration matrix.
 The previous all-depth, transform, animation, budget and cancellation checks also run with the
-selected length setting. Profiling and submission counts do not increase; only one parameter word
-is added to the admitted batch header.
+selected length setting. Length histograms are still derived from canonical counts; no additional
+GPU profile pass or submission is needed.
 
-`ENT-E01` remains **Partial** for learned/wider contexts, clustering outside Modular ANS, adaptive
-alphabet configurations, cross-channel search and effort selection. This evidence makes no throughput
-or compression-ratio claim, and the rate estimate does not guarantee an always-smaller codestream.
+The symbol-domain tests independently parse all 94 LZ77 headers and check every legal threshold
+between full-u32 configuration boundaries against its retained candidate. Sparse, two-symbol and
+general histograms cover the special short header at 224 and verify the pruning's rate bound.
+Invalid alphabet sizes, counts beyond a selected alphabet, overflowing threshold/length domains and
+wire/GPU alphabet mismatches are rejected. Actual GPU metadata fault injection checks a raw token
+colliding with LZ77 and a length exceeding the alias alphabet; neither yields a validated fragment.
+
+Twelve public Gray31 sources force each 64/128/256-symbol alphabet under both LZ77 policies and
+both tree placements at 129×32. Independent header reads identify the chosen domain; native F32,
+original-word, whole/bounded GPU and poisoned-versus-canonical layout checks retain their bounds.
+Each encoder releases its budget and buffer leases. All existing public ANS ownership/precision
+checks use the expanded profile arena and eleven-word batch header.
+
+`ENT-E01` remains **Partial** for learned/wider contexts, clustering outside Modular ANS,
+input-domain-specific configurations, cross-channel search and effort selection. This evidence
+makes no throughput or compression-ratio claim, and the rate estimate does not guarantee an
+always-smaller codestream.
 
 
 ## Procedural VarDCT encoder matrix

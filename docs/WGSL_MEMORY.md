@@ -983,14 +983,18 @@ three ANS symbols, each requiring at most 16 renormalization bits, plus at most 
 capacities that exceed WGSL u32 bit addressing. The output range cannot overlap any event,
 Palette dictionary, prediction state or transform arena.
 
-`EntropyBatchPlan` appends a storage-offset-aligned parameter suffix: nine header words, four
-words per group, four words per channel, 37 packed candidate configurations, then capacity for
+`EntropyBatchPlan` appends a storage-offset-aligned parameter suffix: eleven header words, four
+words per group, four words per channel, 40 packed candidate configurations, then capacity for
 five 4609-word tables. Each table contains its packed split/MSB/LSB configuration, 256 frequencies,
-256 symbol rank offsets and a 4096-entry reverse alias map. Offsets are relative to the parameter
-suffix or the current artifact binding. Table capacity is 92,180 bytes per batch. Header words
-0–3 hold group count, table start, Greedy flag and distance table; words 4–7 hold channel-descriptor
-start, histogram arena offset, candidate start and channel count. Word 8 contains the global
-LZ77 length configuration selected by the codebook; group descriptors begin at word 9.
+256 symbol rank offsets and a 4096-entry reverse alias map. The selected 64/128/256-symbol wire
+alphabet determines alias bucket width; unused frequency slots remain zero in this fixed ABI.
+Offsets are relative to the parameter suffix or current artifact binding. Table capacity stays
+92,180 bytes per batch. Header words 0–3 hold group count, table start, Greedy flag and distance
+table; words 4–7 hold channel-descriptor start, histogram arena offset, candidate start and channel
+count. Word 8 holds the global length configuration, word 9 the LZ77 threshold and word 10 the
+alias alphabet size. Group descriptors begin at word 11. Header/table/profile strides are lowered
+from shared Rust constants into WGSL. The kernel rejects raw tokens crossing the LZ77 threshold
+and all symbols outside the declared alias alphabet before reading a frequency or reverse map.
 The clustered codebook uploads one to five tables and binds only the populated suffix. Batch word
 three selects the distance table; each channel descriptor contains its resolved cluster ID. Both
 come from the same immutable context map that writes the entropy header. Unused table capacity is
@@ -999,8 +1003,8 @@ The parameter and artifact maxima participate in device limits, batching, budget
 pool leasing. `ans_output_bytes` reports only the compressed allocation subtotal already included
 in artifact bytes; separate readback, when needed, copies that region with the rest of the batch.
 
-The first pass appends a 165,768-byte profile arena after every batch's complete channel ranges:
-two atomic completion/error words, then 37 × 5 × 224 atomic-u32 counters. One invocation per
+The first pass appends a 188,008-byte profile arena after every batch's complete channel ranges:
+two atomic completion/error words, then 40 × 5 × 235 atomic-u32 counters. One invocation per
 channel/configuration reads canonical events and increments residual/distance bins. ZeroRuns
 contributes literal zero and distance one. Length histograms retain their canonical configuration;
 the host derives all five full-range length candidates from those bounded counts.

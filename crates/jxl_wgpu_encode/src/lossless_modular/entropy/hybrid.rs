@@ -1,8 +1,9 @@
 //! Bounded hybrid-uint policy, GPU histogram admission, and validated frame metadata.
 use super::*;
 
-pub(super) const RAW_ALPHABET: usize = 224;
-pub(in super::super) const PROFILES: usize = 37;
+// At least 21 symbols are needed to cover every 20-bit match length.
+pub(super) const RAW_ALPHABET: usize = ALPHABET - length::MIN_SYMBOLS;
+pub(in super::super) const PROFILES: usize = 40;
 pub(in super::super) const PROFILE_BYTES: u64 =
     4 * (2 + PROFILES * clustering::CONTEXTS * RAW_ALPHABET) as u64;
 type RawCounts = [[u64; RAW_ALPHABET]; clustering::CONTEXTS];
@@ -51,6 +52,10 @@ impl HybridConfig {
         self.max_token_for(32)
     }
 
+    pub(super) fn symbols(self, value_bits: u8) -> usize {
+        self.max_token_for(value_bits) + 1
+    }
+
     fn max_token_for(self, value_bits: u8) -> usize {
         if value_bits <= self.split {
             (1 << value_bits) - 1
@@ -64,8 +69,19 @@ impl HybridConfig {
         u32::from(self.split) | (u32::from(self.msb) << 8) | (u32::from(self.lsb) << 16)
     }
 
-    pub(super) fn write(self, writer: &mut BitWriter) -> Result<(), EncodeError> {
-        writer.write_bits(u64::from(self.split), 4)?;
+    pub(super) fn write(
+        self,
+        writer: &mut BitWriter,
+        alphabet: AnsAlphabet,
+    ) -> Result<(), EncodeError> {
+        let log = alphabet.log_size();
+        if self.split > log {
+            return Err(BackendError::Invariant("hybrid split exceeds the ANS alphabet").into());
+        }
+        writer.write_bits(u64::from(self.split), (8 - log.leading_zeros()) as u8)?;
+        if self.split == log {
+            return Ok(());
+        }
         writer.write_bits(u64::from(self.msb), (8 - self.split.leading_zeros()) as u8)?;
         writer.write_bits(
             u64::from(self.lsb),
@@ -251,7 +267,7 @@ impl FrameHistograms {
     pub(super) fn candidates(
         &self,
         mode: LosslessModularLz77,
-        length: &length::LengthHistograms,
+        coding: coding::CodingPlan,
     ) -> Result<Vec<HybridCounts>, EncodeError> {
         if self.profiles.len() != PROFILES {
             return Err(BackendError::InvalidArtifact(
@@ -260,16 +276,19 @@ impl FrameHistograms {
             .into());
         }
         let canonical = self.canonical_raw(mode)?;
+        let length = coding.length.histograms(&self.lz77)?;
         Ok(HybridConfig::candidates()
             .iter()
             .zip(&self.profiles)
+            .filter(|(config, _)| coding.supports(**config))
             .map(|(&config, profile)| {
                 let mut counts = [[0; ALPHABET]; clustering::CONTEXTS];
                 for (target, source) in counts.iter_mut().zip(profile) {
-                    target[..RAW_ALPHABET].copy_from_slice(source);
+                    target[..coding.min_symbol].copy_from_slice(&source[..coding.min_symbol]);
                 }
                 for (target, source) in counts[1..].iter_mut().zip(&length.counts) {
-                    target[RAW_ALPHABET..].copy_from_slice(source);
+                    target[coding.min_symbol..coding.min_symbol + coding.length.symbols()]
+                        .copy_from_slice(&source[..coding.length.symbols()]);
                 }
                 let mut extra_bits = canonical.map(|counts| config.extra_bits(&counts));
                 for (extra, &length_extra) in extra_bits[1..].iter_mut().zip(&length.extra_bits) {

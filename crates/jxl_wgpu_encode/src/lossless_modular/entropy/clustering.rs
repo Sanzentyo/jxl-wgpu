@@ -5,8 +5,10 @@ use super::*;
 pub(super) const CONTEXTS: usize = 5;
 pub(super) type ContextMap = [u8; CONTEXTS];
 
+#[derive(Clone)]
 struct Candidate {
-    code: hybrid::HybridCode,
+    histogram: AnsHistogram,
+    config: hybrid::HybridConfig,
     cost: u128,
 }
 
@@ -17,14 +19,30 @@ struct Partition {
 }
 
 pub(super) struct ClusteredCode {
-    pub(super) tables: Vec<hybrid::HybridCode>,
+    tables: Vec<Candidate>,
     pub(super) map: ContextMap,
     pub(super) estimated_bits_q20: u128,
+}
+
+impl ClusteredCode {
+    /// Materialize reverse aliases only after the global coding choice is final.
+    pub(super) fn compile(self) -> Result<Vec<hybrid::HybridCode>, EncodeError> {
+        self.tables
+            .into_iter()
+            .map(|candidate| {
+                Ok(hybrid::HybridCode {
+                    config: candidate.config,
+                    code: candidate.histogram.compile()?,
+                })
+            })
+            .collect()
+    }
 }
 
 pub(super) fn cluster(
     profiles: &[hybrid::HybridCounts],
     header_copies: u64,
+    alphabet: AnsAlphabet,
 ) -> Result<ClusteredCode, EncodeError> {
     if header_copies == 0 {
         return Err(BackendError::Invariant("ANS codebook has no header").into());
@@ -51,20 +69,18 @@ pub(super) fn cluster(
                             ))?;
                     }
                 }
-                let code = AnsCode::from_counts(&merged)?;
+                let code = AnsHistogram::from_counts(&merged, alphabet)?;
                 let mut header = BitWriter::new();
                 code.write_histogram(&mut header)?;
-                profile.config.write(&mut header)?;
+                profile.config.write(&mut header, alphabet)?;
                 let cost = code.estimated_data_bits(&merged)?
                     + ((extra_bits + header.bit_len() as u128 * u128::from(header_copies)) << 20);
                 if best.as_ref().is_none_or(|previous| {
-                    (cost, profile.config) < (previous.cost, previous.code.config)
+                    (cost, profile.config) < (previous.cost, previous.config)
                 }) {
                     best = Some(Candidate {
-                        code: hybrid::HybridCode {
-                            code,
-                            config: profile.config,
-                        },
+                        histogram: code,
+                        config: profile.config,
                         cost,
                     });
                 }
@@ -84,7 +100,7 @@ pub(super) fn cluster(
     let tables = best
         .subsets
         .iter()
-        .map(|&subset| candidates[subset as usize - 1].code.clone())
+        .map(|&subset| candidates[subset as usize - 1].clone())
         .collect();
     Ok(ClusteredCode {
         tables,

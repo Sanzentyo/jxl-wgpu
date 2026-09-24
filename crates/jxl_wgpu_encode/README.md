@@ -209,17 +209,17 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   order with one shared state per complete group, including Palette and Squeeze channels.
   Its four channel contexts plus distance share one to five distributions selected from all
   52 partitions by integer rate estimates plus serialized metadata, including repeated local
-  headers. Each distribution jointly selects among 37 GPU-profiled split/MSB/LSB settings
-  covering the full u32 range with tokens below LZ77 symbol 224; exact residual/distance extra-bit costs
-  participate in the estimate. The same search selects one global LZ77 length configuration
-  from all five splits 0–4 covering the full 20-bit match domain in 32 reserved symbols,
-  including length extra bits and repeated headers. Normalization to 4096 and the 256-symbol
-  alphabet remain fixed. Canonical tokenization and default Prefix bytes are unchanged. Host work builds
-  bounded histogram/alias metadata and copies already compressed fragments; every ANS symbol,
-  renormalization and extra bit is emitted on GPU. There is no fallback to Prefix.
-  The immutable codebook owns both the wire context map and GPU table selection. This is a
-  size estimate, without an always-smaller-stream guarantee; adaptive alphabet choices,
-  learned contexts and effort policy remain open.
+  headers. Joint selection includes 40 GPU-profiled split/MSB/LSB settings covering all u32
+  residuals/distances and five length splits 0–4 covering the full 20-bit match domain.
+  A checked coding plan resolves the LZ77 start symbol and 64/128/256-symbol alias alphabet
+  together with these settings: 94 full-domain combinations, with exact extra-bit and repeated
+  header costs. Normalization remains 4096 slots. The minimum 33 raw and 21 length symbols
+  exclude a 32-symbol alphabet under this full-domain policy. Canonical tokenization and default
+  Prefix bytes are unchanged. Host work selects bounded histogram metadata and only then builds
+  the chosen reverse aliases; every ANS symbol, renormalization and extra bit is emitted on GPU.
+  There is no fallback to Prefix. The immutable codebook owns the complete wire/GPU symbol domain
+  and context map. This is a size estimate, without an always-smaller-stream guarantee;
+  learned contexts, input-domain-specific configurations and effort policy remain open.
 - One GPU invocation handles each PassGroup/channel pair without Palette. With Palette, the
   group's first invocation builds its dictionary and encodes all its channels sequentially;
   the remaining invocations return. This avoids cross-workgroup synchronization or extra submissions.
@@ -260,10 +260,10 @@ one histogram and one serialization submission per batch. Every live batch uses 
 mapped-range consumer are both finished, including when the returned future is abandoned.
 ANS output is part of the same artifact allocation, lease and budget. For `E` maximum events
 summed across a group's channels, it reserves a 16-byte completion record plus
-`4 * ceil((80 * E + 32) / 32)` compressed bytes. Each batch also reserves 165,768 artifact bytes
-for 37 × 5 × 224 hybrid histogram bins and two completion words. The five-table upper bound
-reserves 92,180 parameter bytes, including each table's selected hybrid setting, plus a 36-byte
-batch header, 16-byte group/channel descriptors and 37 candidate settings in an aligned suffix.
+`4 * ceil((80 * E + 32) / 32)` compressed bytes. Each batch also reserves 188,008 artifact bytes
+for 40 × 5 × 235 hybrid histogram bins and two completion words. The five-table upper bound
+reserves 92,180 parameter bytes, including each table's selected hybrid setting, plus a 44-byte
+batch header, 16-byte group/channel descriptors and 40 candidate settings in an aligned suffix.
 Only the selected one to five tables are uploaded and bound. Admission retains the upper bound
 before the histogram pass, so selection never needs a late reservation or extra submission.
 The corresponding artifact/readback and parameter allocations are included in admission;

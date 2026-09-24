@@ -1,10 +1,11 @@
 //! Global LZ77 length configuration. Canonical event metadata stays unchanged.
 use super::*;
 
-const LENGTH_SYMBOLS: usize = ALPHABET - hybrid::RAW_ALPHABET;
+const LENGTH_SYMBOLS: usize = 32;
 // Complete groups have at most 1024² samples. Canonical length tokens 0..31
 // cover value = copied - 7 through 20 bits; token 32 is outside the ANS contract.
 const LENGTH_BITS: u8 = 20;
+pub(super) const MIN_SYMBOLS: usize = LENGTH_BITS as usize + 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct LengthCoding(hybrid::HybridConfig);
@@ -30,10 +31,14 @@ impl LengthCoding {
         self.0.packed()
     }
 
+    pub(super) fn symbols(self) -> usize {
+        self.0.symbols(LENGTH_BITS)
+    }
+
     pub(super) fn write(self, writer: &mut BitWriter) -> Result<(), EncodeError> {
         // JPEG XL length configurations always declare log_alphabet_size = 8,
         // independently of the eventual entropy distribution's alphabet size.
-        self.0.write(writer)
+        self.0.write(writer, AnsAlphabet::MAX)
     }
 
     pub(super) fn histograms(

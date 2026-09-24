@@ -221,7 +221,7 @@ fn every_partition_and_reversed_cluster_label_decodes_actual_gpu_symbols() {
                         }
                     }),
                     mode,
-                    length: length::LengthCoding::canonical(),
+                    coding: coding::CodingPlan::canonical(),
                 }));
                 let (plan, words) =
                     gpu_fragment(&context, &pipeline, code.ans().unwrap(), &channels, None);
@@ -244,8 +244,12 @@ fn cluster(
             extra_bits: [0; CONTEXTS],
         }],
         copies,
+        AnsAlphabet::MAX,
     )
-    .map(|clustered| (clustered.tables, clustered.map))
+    .and_then(|clustered| {
+        let map = clustered.map;
+        Ok((clustered.compile()?, map))
+    })
 }
 
 #[test]
@@ -271,7 +275,7 @@ fn joint_hybrid_partition_search_matches_exhaustive_f64_costs() {
             })
             .collect();
         for copies in [1, 1000] {
-            // Independent F64 rates for all 31 unions and 37 hybrid choices;
+            // Independent F64 rates for all 31 unions and 40 hybrid choices;
             // Cartesian partition enumeration is independent of the production recursion.
             let mut rates = [[0.0; hybrid::PROFILES]; 31];
             for subset in 1..32 {
@@ -285,7 +289,7 @@ fn joint_hybrid_partition_search_matches_exhaustive_f64_costs() {
                     let code = AnsCode::from_counts(&merged).unwrap();
                     let mut header = BitWriter::new();
                     code.write_histogram(&mut header).unwrap();
-                    profile.config.write(&mut header).unwrap();
+                    profile.config.write(&mut header, AnsAlphabet::MAX).unwrap();
                     let rate = &mut rates[subset - 1][profile_index];
                     *rate = header.bit_len() as f64 * copies as f64;
                     for context in 0..CONTEXTS {
@@ -325,8 +329,9 @@ fn joint_hybrid_partition_search_matches_exhaustive_f64_costs() {
                 }
                 cost
             };
-            let result = super::cluster(&profiles, copies).unwrap();
-            let (tables, map) = (result.tables, result.map);
+            let result = super::cluster(&profiles, copies, AnsAlphabet::MAX).unwrap();
+            let map = result.map;
+            let tables = result.compile().unwrap();
             let minimum = maps()
                 .into_iter()
                 .map(|map| map_rate(map, None))
@@ -338,8 +343,9 @@ fn joint_hybrid_partition_search_matches_exhaustive_f64_costs() {
                 .unwrap() as f64
                 * 2f64.powi(-19);
             assert!(map_rate(map, Some(&tables)) - minimum <= allowance);
-            let result = super::cluster(&profiles, copies).unwrap();
-            let (repeated, next_map) = (result.tables, result.map);
+            let result = super::cluster(&profiles, copies, AnsAlphabet::MAX).unwrap();
+            let next_map = result.map;
+            let repeated = result.compile().unwrap();
             assert_eq!(map, next_map);
             for (first, second) in tables.iter().zip(repeated) {
                 assert_eq!(first.config, second.config);
@@ -347,5 +353,5 @@ fn joint_hybrid_partition_search_matches_exhaustive_f64_costs() {
             }
         }
     }
-    assert!(super::cluster(&[], 1).is_err());
+    assert!(super::cluster(&[], 1, AnsAlphabet::MAX).is_err());
 }

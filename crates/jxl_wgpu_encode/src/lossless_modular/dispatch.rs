@@ -1523,16 +1523,16 @@ mod source_window_tests {
             previous_end = batch.artifact_byte_offset + batch.artifact_binding_size.get();
         }
         assert_eq!(split.output_size, previous_end);
-        backend.max_compute_workgroups_per_dimension = 36;
+        backend.max_compute_workgroups_per_dimension = 39;
         assert!(matches!(
             backend.dispatch_plan(&input),
             Err(EncodeError::Unsupported(UnsupportedFeature::DeviceLimit {
                 name: "max_compute_workgroups_per_dimension",
-                required: 37,
-                available: 36
+                required: 40,
+                available: 39
             }))
         ));
-        backend.max_compute_workgroups_per_dimension = 37;
+        backend.max_compute_workgroups_per_dimension = 40;
         assert!(backend.dispatch_plan(&input).is_ok());
         backend.max_storage_binding_size = limit - 1;
         assert!(

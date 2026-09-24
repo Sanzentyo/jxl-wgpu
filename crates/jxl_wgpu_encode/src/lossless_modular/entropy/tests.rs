@@ -137,7 +137,7 @@ pub(super) fn gpu_fragment(
     limit: Option<u32>,
 ) -> (EntropyArtifactPlan, Vec<u32>) {
     let mut words = Vec::new();
-    let table_start = 13 + 4 * channels.len();
+    let table_start = BATCH_HEADER_WORDS + 4 + 4 * channels.len();
     let mut metadata = vec![
         1,
         table_start as u32,
@@ -145,18 +145,21 @@ pub(super) fn gpu_fragment(
         u32::from(codebook.context_map[0]),
     ];
     metadata.resize(table_start, 0);
-    metadata[8] = codebook.length.packed();
+    metadata[8] = codebook.coding.length.packed();
+    metadata[9] = codebook.coding.min_symbol as u32;
+    metadata[10] = codebook.coding.alphabet.symbols() as u32;
     for (channel, events) in channels.iter().enumerate() {
         let base = words.len();
         words.resize(base + 100, 0);
         words[base] = events.len() as u32;
         words.extend_from_slice(bytemuck::cast_slice(events));
-        metadata[13 + 4 * channel..17 + 4 * channel].copy_from_slice(&[
-            base as u32 + 100,
-            base as u32,
-            events.len() as u32,
-            u32::from(codebook.context_map[channel.min(3) + 1]),
-        ]);
+        metadata[BATCH_HEADER_WORDS + 4 + 4 * channel..BATCH_HEADER_WORDS + 8 + 4 * channel]
+            .copy_from_slice(&[
+                base as u32 + 100,
+                base as u32,
+                events.len() as u32,
+                u32::from(codebook.context_map[channel.min(3) + 1]),
+            ]);
     }
     let output = words.len();
     let mut plan = EntropyArtifactPlan::for_events(
@@ -167,8 +170,8 @@ pub(super) fn gpu_fragment(
     if let Some(limit) = limit {
         plan.capacity_words = limit;
     }
-    metadata[9..13].copy_from_slice(&[
-        13,
+    metadata[BATCH_HEADER_WORDS..BATCH_HEADER_WORDS + 4].copy_from_slice(&[
+        BATCH_HEADER_WORDS as u32 + 4,
         channels.len() as u32,
         output as u32,
         plan.capacity_words,
@@ -438,11 +441,13 @@ fn fixed_codebook(
             extra_bits: [0; clustering::CONTEXTS],
         }],
         copies,
+        AnsAlphabet::MAX,
     )?;
+    let context_map = clustered.map;
     Ok(AnsCodebook {
-        tables: clustered.tables,
-        context_map: clustered.map,
+        tables: clustered.compile()?,
+        context_map,
         mode,
-        length: length::LengthCoding::canonical(),
+        coding: coding::CodingPlan::canonical(),
     })
 }

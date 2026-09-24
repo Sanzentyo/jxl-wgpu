@@ -18,8 +18,8 @@ fn prepend(bits: u32, count: u32) {
 }
 
 fn put_symbol(histogram: u32, symbol: u32) {
-    if failed || symbol >= 256u { failed = true; return; }
-    let table = metadata[1u] + histogram * 4609u + 1u;
+    if failed || symbol >= metadata[10u] { failed = true; return; }
+    let table = metadata[1u] + histogram * ANS_TABLE_WORDS + 1u;
     let frequency = metadata[table + symbol];
     if frequency == 0u || frequency > 4096u { failed = true; return; }
     if (state >> 20u) >= frequency {
@@ -41,13 +41,13 @@ fn put_length(histogram: u32, token: u32, extra_count: u32, extra: u32) {
     let encoded = hybrid_uint(value, metadata[8u]);
     if encoded.token >= 32u { failed = true; return; }
     prepend(encoded.bits, encoded.count);
-    put_symbol(histogram, 224u + encoded.token);
+    put_symbol(histogram, metadata[9u] + encoded.token);
 }
 
 @compute @workgroup_size(1)
 fn encode(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= metadata[0u] { return; }
-    let job = 9u + id.x * 4u;
+    let job = ENTROPY_HEADER_WORDS + id.x * 4u;
     let channels = metadata[job];
     let count = metadata[job + 1u];
     let header = metadata[job + 2u];
@@ -82,8 +82,9 @@ fn encode(@builtin(global_invocation_id) id: vec3<u32>) {
             } else if kind == 0u || (kind == 3u && metadata[2u] == 1u) {
                 if !canonical_valid(token, extra_count, extra) { failed = true; break; }
                 let selected = select(histogram, metadata[3u], kind == 3u);
-                let config = metadata[metadata[1u] + selected * 4609u];
+                let config = metadata[metadata[1u] + selected * ANS_TABLE_WORDS];
                 let encoded = hybrid_uint(canonical_value(token, extra_count, extra), config);
+                if encoded.token >= metadata[9u] { failed = true; break; }
                 prepend(encoded.bits, encoded.count);
                 put_symbol(selected, encoded.token);
             } else { failed = true; break; }
