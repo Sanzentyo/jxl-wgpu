@@ -11,6 +11,7 @@ use jxl_wgpu::{KernelVariant, MemoryPermit};
 use wgpu::util::DeviceExt;
 
 use super::ac::{AcFragments, validate_blocks, validate_transform_fragments};
+use super::animation::{VarDctAnimationDescriptor, VarDctAnimationSession};
 use super::bitstream::{build_frame_packet, image_header, pack_signed_control};
 use super::entropy::{
     HfEntropyPlan, fixed_prefix_code, prefix_entries, read_fragment_slice,
@@ -25,6 +26,7 @@ use super::types::{
     VarDctTopology,
 };
 use super::{raw_matrices, saliency, transforms};
+use crate::frame_header::FrameHeaderPlan;
 use crate::{
     AnimationHeader, BackendError, BitFragment, BufferImageSource, Determinism, EncodeError,
     EncodeProfile, EncoderCapabilities, FrameEncodeRequest, FrameIndex, FrameOptions,
@@ -69,7 +71,7 @@ enum VarDctPipelines {
     },
 }
 
-/// GPU backend for standard VarDCT stills with fixed or mapped transform placement.
+/// GPU backend for standard VarDCT stills and animations with fixed or mapped transforms.
 ///
 /// Sources match the selected transform or map extent; the optimized tiled-DCT8
 /// constructor selects geometry at submission time. Pixels and coefficients remain
@@ -290,7 +292,7 @@ impl VarDctBackend {
                     quantization: config.quantization,
                 }],
                 max_progressive_passes: ProgressivePlan::MAX_PASSES as u8,
-                animation: false,
+                animation: true,
                 determinism: Determinism::SameDevice,
                 implemented_stages,
             },
@@ -659,18 +661,7 @@ fn validate_vardct_request(
     request: &FrameEncodeRequest,
     frame: VarDctFrameLayout,
     config: &VarDctConfig,
-) -> Result<(), EncodeError> {
-    if request.frame_index != FrameIndex::new(0)
-        || !request.is_last
-        || request.animation != AnimationHeader::Still
-        || request.canvas_width != frame.width
-        || request.canvas_height != frame.height
-        || request.options != FrameOptions::default()
-    {
-        return Err(EncodeError::InvalidConfiguration(
-            "the VarDCT profile requires one full-canvas final transform-sized still frame",
-        ));
-    }
+) -> Result<FrameHeaderPlan, EncodeError> {
     if request.progressive != config.progressive {
         return Err(EncodeError::InvalidConfiguration(
             "the requested VarDCT passes do not match the backend configuration",
@@ -685,7 +676,12 @@ fn validate_vardct_request(
             "the requested VarDCT quantization does not match the backend configuration",
         ));
     }
-    Ok(())
+    if request.options.save_before_color_transform {
+        return Err(EncodeError::InvalidConfiguration(
+            "the VarDCT encoder supports only post-color-transform references",
+        ));
+    }
+    FrameHeaderPlan::new(request, (frame.width, frame.height), false)
 }
 
 impl GpuEncodeBackend for VarDctBackend {
@@ -712,7 +708,7 @@ impl GpuEncodeBackend for VarDctBackend {
             return Err(UnsupportedFeature::InputFormat.into());
         };
         let plan = self.dispatch_plan(&source)?;
-        validate_vardct_request(request, plan.frame, &self.config)?;
+        let control = validate_vardct_request(request, plan.frame, &self.config)?;
         let memory_permit = context
             .memory_budget()
             .try_reserve(plan.memory.owned_bytes_per_job)?;
@@ -961,8 +957,7 @@ impl GpuEncodeBackend for VarDctBackend {
             transform_plan: self.transform_plan.clone(),
             raw_matrix_plan: self.raw_matrix_plan.clone(),
             artifact_layout: job_layout,
-            frame_index: request.frame_index,
-            is_last: request.is_last,
+            control,
         })
     }
 }
@@ -1057,8 +1052,7 @@ pub struct VarDctJob {
     frame_layout: VarDctFrameLayout,
     transform_plan: Option<Arc<TransformPlan>>,
     artifact_layout: ArtifactLayout,
-    frame_index: FrameIndex,
-    is_last: bool,
+    control: FrameHeaderPlan,
 }
 
 impl VarDctJob {
@@ -1172,14 +1166,15 @@ impl VarDctJob {
                 return Err(BackendError::InvalidArtifact("unexpected raw matrix artifact").into());
             }
             Ok(GpuFrameArtifacts {
-                frame_index: self.frame_index,
-                is_last: self.is_last,
+                frame_index: self.control.frame_index(),
+                is_last: self.control.is_last(),
                 packets: build_frame_packet(
                     artifact,
                     &self.code,
                     &self.hf_entropy,
                     self.frame_layout,
                     &self.config,
+                    &self.control,
                 )?,
                 acceleration: None,
             })
@@ -1726,6 +1721,15 @@ impl VarDctEncoder {
         self.encoder.backend().memory_plan(source)
     }
 
+    /// Begins an RGB8/XYB animation using this encoder's transform and quantization policy.
+    /// Frame extents must match the selected transform/map, or the tiled backend's limits.
+    pub fn begin_animation(
+        &self,
+        descriptor: VarDctAnimationDescriptor,
+    ) -> Result<VarDctAnimationSession, EncodeError> {
+        VarDctAnimationSession::new(&self.encoder, &self.encoder.backend().config, descriptor)
+    }
+
     pub fn submit(&self, source: BufferImageSource) -> Result<VarDctSubmission, EncodeError> {
         self.submit_inner(source, false)
     }
@@ -1770,7 +1774,7 @@ impl VarDctEncoder {
             .submit_frame(GpuFrameSource::Buffer(source), request)?;
         Ok(VarDctSubmission {
             frame: Some(frame),
-            codestream_header: image_header(width, height)?,
+            codestream_header: image_header(width, height, AnimationHeader::Still)?,
             container,
         })
     }
@@ -1854,6 +1858,15 @@ impl TiledVarDctEncoder {
         })
     }
 
+    /// Begins an RGB8/XYB animation using this encoder's transform and quantization policy.
+    /// Frame extents must match the selected transform/map, or the tiled backend's limits.
+    pub fn begin_animation(
+        &self,
+        descriptor: VarDctAnimationDescriptor,
+    ) -> Result<VarDctAnimationSession, EncodeError> {
+        VarDctAnimationSession::new(&self.encoder, &self.encoder.backend().config, descriptor)
+    }
+
     pub fn submit(&self, source: BufferImageSource) -> Result<VarDctSubmission, EncodeError> {
         self.submit_inner(source, false)
     }
@@ -1899,7 +1912,7 @@ impl TiledVarDctEncoder {
             .submit_frame(GpuFrameSource::Buffer(source), request)?;
         Ok(VarDctSubmission {
             frame: Some(frame_submission),
-            codestream_header: image_header(frame.width, frame.height)?,
+            codestream_header: image_header(frame.width, frame.height, AnimationHeader::Still)?,
             container,
         })
     }

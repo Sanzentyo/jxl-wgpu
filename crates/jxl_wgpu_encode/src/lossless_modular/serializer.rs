@@ -9,7 +9,6 @@ use jxl_gpu_bitstream::{
 };
 
 use super::color::{LosslessModularColorOptions, ModularColorEncoding, ModularImageMetadata};
-use super::dispatch::frame_covers_canvas;
 use super::dispatch::{LosslessModularBackend, ModularGroupPlan};
 use super::entropy::{EncodedGroup, EntropyCode};
 use super::grid::{LosslessModularGroup, LosslessModularGroupGrid};
@@ -26,23 +25,16 @@ use super::types::{
     AlphaAssociation, LosslessModularFormat, LosslessModularTreeMode, ModularArtifactHeader,
     ModularEvent, modular_sample_depth,
 };
+use crate::frame_header::{FrameHeaderPlan, write_animation_header};
 use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS, RawPrefixCode};
 use crate::{
-    AnimationHeader, BackendError, BitFragment, BlendMode, CodestreamAssembler, Determinism,
-    EncodeError, EncodeProfile, EncodeSession, EncoderBufferPoolStats, EncoderCapabilities,
-    FrameBlend, FrameEncodeRequest, FrameGroupLayout, FrameIndex, FrameOptions, FramePacketSet,
-    FrameSubmission, GpuAccelerationArtifact, GpuEncoder, GpuFrameArtifacts, GpuFrameSource,
-    GroupPacket, GroupPacketKind, ProgressivePlan, SessionDescriptor, WgpuContext, assemble_frame,
+    AnimationHeader, BackendError, BitFragment, CodestreamAssembler, Determinism, EncodeError,
+    EncodeProfile, EncodeSession, EncoderBufferPoolStats, EncoderCapabilities, FrameEncodeRequest,
+    FrameGroupLayout, FrameIndex, FrameOptions, FramePacketSet, FrameSubmission,
+    GpuAccelerationArtifact, GpuEncoder, GpuFrameArtifacts, GpuFrameSource, GroupPacket,
+    GroupPacketKind, ProgressivePlan, SessionDescriptor, WgpuContext, assemble_frame,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ModularFrameHeader {
-    pub(super) animation: AnimationHeader,
-    pub(super) canvas_width: u32,
-    pub(super) canvas_height: u32,
-    pub(super) options: FrameOptions,
-    pub(super) is_last: bool,
-}
 /// Convenience API that produces a complete raw codestream or deterministic
 /// `jxlc` container from a GPU-resident Gray, GrayAlpha, RGB, or RGBA integer/IEEE floating buffer.
 pub struct LosslessModularEncoder {
@@ -707,7 +699,7 @@ pub(super) struct PacketBuildInput<'a> {
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
     pub(super) lz77: LosslessModularLz77,
-    pub(super) frame: &'a ModularFrameHeader,
+    pub(super) frame: &'a FrameHeaderPlan,
     pub(super) group_plans: &'a [ModularGroupPlan],
     pub(super) bytes: &'a [u8],
 }
@@ -831,7 +823,7 @@ pub(super) struct ModularPacketAssembler {
     predictor: LosslessModularPredictor,
     weighted_predictor: LosslessModularWeightedPredictor,
     lz77: LosslessModularLz77,
-    frame: ModularFrameHeader,
+    frame: FrameHeaderPlan,
     entropy: Arc<EntropyCode>,
     packets: Vec<GroupPacket>,
     single_group: Option<BitWriter>,
@@ -851,7 +843,7 @@ pub(super) struct ModularPacketConfig {
     pub(super) predictor: LosslessModularPredictor,
     pub(super) weighted_predictor: LosslessModularWeightedPredictor,
     pub(super) lz77: LosslessModularLz77,
-    pub(super) frame: ModularFrameHeader,
+    pub(super) frame: FrameHeaderPlan,
 }
 
 impl ModularPacketAssembler {
@@ -1811,76 +1803,6 @@ pub(super) fn image_header(
     )
 }
 
-pub(super) fn write_animation_header(
-    output: &mut BitWriter,
-    animation: AnimationHeader,
-) -> Result<(), EncodeError> {
-    let AnimationHeader::Animation {
-        ticks_per_second_numerator,
-        ticks_per_second_denominator,
-        num_loops,
-        have_timecodes,
-    } = animation
-    else {
-        return Err(EncodeError::InvalidConfiguration(
-            "animation metadata requires an animation header",
-        ));
-    };
-    let numerator = ticks_per_second_numerator.get();
-    match numerator {
-        100 => output.write_bits(0, 2)?,
-        1000 => output.write_bits(1, 2)?,
-        1..=1024 => {
-            output.write_bits(2, 2)?;
-            output.write_bits(u64::from(numerator - 1), 10)?;
-        }
-        1025..=1_073_741_824 => {
-            output.write_bits(3, 2)?;
-            output.write_bits(u64::from(numerator - 1), 30)?;
-        }
-        _ => {
-            return Err(EncodeError::InvalidConfiguration(
-                "animation ticks-per-second numerator exceeds the JPEG XL limit",
-            ));
-        }
-    }
-    let denominator = ticks_per_second_denominator.get();
-    match denominator {
-        1 => output.write_bits(0, 2)?,
-        1001 => output.write_bits(1, 2)?,
-        2..=256 => {
-            output.write_bits(2, 2)?;
-            output.write_bits(u64::from(denominator - 1), 8)?;
-        }
-        257..=1024 => {
-            output.write_bits(3, 2)?;
-            output.write_bits(u64::from(denominator - 1), 10)?;
-        }
-        _ => {
-            return Err(EncodeError::InvalidConfiguration(
-                "animation ticks-per-second denominator exceeds the JPEG XL limit",
-            ));
-        }
-    }
-    match num_loops {
-        0 => output.write_bits(0, 2)?,
-        1..=7 => {
-            output.write_bits(1, 2)?;
-            output.write_bits(u64::from(num_loops), 3)?;
-        }
-        8..=65_535 => {
-            output.write_bits(2, 2)?;
-            output.write_bits(u64::from(num_loops), 16)?;
-        }
-        _ => {
-            output.write_bits(3, 2)?;
-            output.write_bits(u64::from(num_loops), 32)?;
-        }
-    }
-    output.write_bits(u64::from(have_timecodes), 1)?;
-    Ok(())
-}
-
 fn write_sample_bit_depth(
     output: &mut BitWriter,
     bits_per_sample: u8,
@@ -1946,7 +1868,7 @@ fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), Enco
 
 pub(super) fn frame_header(
     format: LosslessModularFormat,
-    frame: &ModularFrameHeader,
+    frame: &FrameHeaderPlan,
     group_size: super::types::LosslessModularGroupSize,
 ) -> Result<BitFragment, EncodeError> {
     let mut output = BitWriter::new();
@@ -1962,149 +1884,9 @@ pub(super) fn frame_header(
     output.write_bits(u64::from(group_size.size_shift()), 2)?;
     output.write_bits(0, 2)?; // one pass
 
-    let have_crop = frame.options.crop.is_some();
-    output.write_bits(u64::from(have_crop), 1)?;
-    if let Some(crop) = frame.options.crop {
-        write_frame_dimension(&mut output, pack_signed(crop.x()))?;
-        write_frame_dimension(&mut output, pack_signed(crop.y()))?;
-        write_frame_dimension(&mut output, crop.width())?;
-        write_frame_dimension(&mut output, crop.height())?;
-    }
-
-    let full_frame =
-        frame_covers_canvas(frame.options.crop, frame.canvas_width, frame.canvas_height);
-    write_blending_info(
-        &mut output,
-        frame.options.color_blend,
-        format.has_alpha(),
-        full_frame,
-    )?;
-    if format.has_alpha() {
-        let alpha_blend = frame
-            .options
-            .extra_channel_blends
-            .first()
-            .copied()
-            .unwrap_or_default();
-        write_blending_info(&mut output, alpha_blend, true, full_frame)?;
-    }
-
-    if let AnimationHeader::Animation { have_timecodes, .. } = frame.animation {
-        write_frame_duration(&mut output, frame.options.timing.duration_ticks)?;
-        if have_timecodes {
-            output.write_bits(
-                u64::from(frame.options.timing.timecode.ok_or(
-                    EncodeError::InvalidConfiguration(
-                        "animated frame is missing its declared timecode",
-                    ),
-                )?),
-                32,
-            )?;
-        }
-    }
-    output.write_bits(u64::from(frame.is_last), 1)?;
-    if !frame.is_last {
-        output.write_bits(u64::from(frame.options.save_as_reference.get()), 2)?;
-        let can_be_referenced =
-            frame.options.timing.duration_ticks == 0 || frame.options.save_as_reference.get() != 0;
-        if frame.options.color_blend.mode == BlendMode::Replace && full_frame && can_be_referenced {
-            output.write_bits(u64::from(frame.options.save_before_color_transform), 1)?;
-        }
-    }
-
-    output.write_bits(0, 2)?; // empty frame name
-    output.write_bits(0, 1)?; // non-default restoration filter
-    output.write_bits(0, 1)?; // no Gaborish
-    output.write_bits(0, 2)?; // no EPF iterations
-    output.write_bits(0, 2)?; // no restoration-filter extensions
-    output.write_bits(0, 2)?; // no frame extensions
+    frame.append_to(&mut output)?;
     let bit_len = output.bit_len();
     BitFragment::new(output.into_bytes(), bit_len).map_err(Into::into)
-}
-
-fn write_blending_info(
-    output: &mut BitWriter,
-    blend: FrameBlend,
-    has_alpha: bool,
-    full_frame: bool,
-) -> Result<(), EncodeError> {
-    write_blend_mode(output, blend.mode)?;
-    let uses_alpha = matches!(blend.mode, BlendMode::Blend | BlendMode::MultiplyAdd);
-    if has_alpha && uses_alpha {
-        output.write_bits(0, 2)?; // alpha extra-channel index zero
-    }
-    if (has_alpha && uses_alpha) || blend.mode == BlendMode::Multiply {
-        output.write_bits(u64::from(blend.clamp), 1)?;
-    } else if blend.clamp {
-        return Err(EncodeError::InvalidConfiguration(
-            "the selected JPEG XL blend mode has no clamp field",
-        ));
-    }
-    // Each channel's own mode determines whether its reference source is present.
-    if blend.mode != BlendMode::Replace || !full_frame {
-        output.write_bits(u64::from(blend.source_reference.get()), 2)?;
-    }
-    Ok(())
-}
-
-fn write_blend_mode(output: &mut BitWriter, mode: BlendMode) -> Result<(), EncodeError> {
-    match mode {
-        BlendMode::Replace => output.write_bits(0, 2)?,
-        BlendMode::Add => output.write_bits(1, 2)?,
-        BlendMode::Blend => output.write_bits(2, 2)?,
-        BlendMode::MultiplyAdd => {
-            output.write_bits(3, 2)?;
-            output.write_bits(0, 2)?;
-        }
-        BlendMode::Multiply => {
-            output.write_bits(3, 2)?;
-            output.write_bits(1, 2)?;
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn pack_signed(value: i32) -> u32 {
-    if value >= 0 {
-        (value as u32) << 1
-    } else {
-        (u32::try_from(-i64::from(value)).expect("an i32 magnitude fits u32") << 1).wrapping_sub(1)
-    }
-}
-
-fn write_frame_dimension(output: &mut BitWriter, value: u32) -> Result<(), EncodeError> {
-    let (selector, offset, bits) = if value < 256 {
-        (0, 0, 8)
-    } else if value < 2_304 {
-        (1, 256, 11)
-    } else if value < 18_688 {
-        (2, 2_304, 14)
-    } else if value < 18_688 + (1 << 30) {
-        (3, 18_688, 30)
-    } else {
-        return Err(EncodeError::InvalidConfiguration(
-            "animation frame crop coordinate exceeds the JPEG XL limit",
-        ));
-    };
-    output.write_bits(selector, 2)?;
-    output.write_bits(u64::from(value - offset), bits)?;
-    Ok(())
-}
-
-fn write_frame_duration(output: &mut BitWriter, duration: u32) -> Result<(), EncodeError> {
-    match duration {
-        0 => output.write_bits(0, 2)?,
-        1 => output.write_bits(1, 2)?,
-        2..=255 => {
-            output.write_bits(2, 2)?;
-            output.write_bits(u64::from(duration), 8)?;
-        }
-        _ => {
-            output.write_bits(3, 2)?;
-            output.write_bits(u64::from(duration), 32)?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

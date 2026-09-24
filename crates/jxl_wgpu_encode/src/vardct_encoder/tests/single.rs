@@ -114,7 +114,10 @@ fn all_27_strategies_emit_native_checked_nonzero_ac_and_interoperate() {
             let nonzero = check_ac(&words, bits, &coefficients, oracle, config.clone());
             assert!(nonzero > 0, "textured input must emit nonzero AC");
             let frame = assemble_frame(artifacts.packets).unwrap();
-            let mut stream = image_header(width, height).unwrap().bytes().to_vec();
+            let mut stream = image_header(width, height, crate::AnimationHeader::Still)
+                .unwrap()
+                .bytes()
+                .to_vec();
             stream.extend_from_slice(frame.bytes());
             let convenience =
                 VarDctEncoder::new_with_config(context.clone(), strategy, config.clone()).unwrap();

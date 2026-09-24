@@ -389,7 +389,10 @@ pub fn assemble_frame(packet_set: FramePacketSet) -> Result<EncodedFrame, Packet
     })
 }
 
-fn append_fragment(writer: &mut BitWriter, fragment: &BitFragment) -> Result<(), PacketError> {
+pub(crate) fn append_fragment(
+    writer: &mut BitWriter,
+    fragment: &BitFragment,
+) -> Result<(), PacketError> {
     for bit_index in 0..fragment.bit_len {
         let bit = (fragment.bytes[bit_index / 8] >> (bit_index % 8)) & 1;
         writer

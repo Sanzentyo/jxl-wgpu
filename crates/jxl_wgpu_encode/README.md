@@ -785,6 +785,24 @@ encoder.encode(source_13_by_21)
 
 ## Animation sessions
 
+`VarDctEncoder::begin_animation` and `TiledVarDctEncoder::begin_animation` accept a checked
+`VarDctAnimationDescriptor` and return `VarDctAnimationSession`. The descriptor fixes canvas,
+timebase, loops and timecodes; the encoder fixes RGB8 sRGB/D65 input, XYB coding, transform policy,
+quantization, matrices/orders and AC passes. Single transforms and maps retain their source
+extent on each frame; tiled DCT8 accepts separately checked crop extents through its 16K axis
+bound. Both support Replace/Add/Multiply, signed crops, hidden zero-duration regular frames and
+four post-color-transform references. Alpha-weighted modes, extra-channel contracts and
+pre-color-transform reference storage are rejected. Mixed Modular/VarDCT sessions, reference-only
+frame types, frame names, previews and frame-index emission remain unimplemented.
+
+Both codecs lower frame options once into a checked, immutable `FrameHeaderPlan` before GPU
+admission. Resident, native-streamed and browser-streamed Modular jobs and VarDCT jobs append
+that plan's bounded control bits after their codec-specific prefix. The same plan supplies the
+artifact's physical frame index and final flag. Invalid controls or budget admission failures
+do not advance the session or close its final-frame slot. No new GPU allocation, binding,
+submission or map is introduced by animation control. See the
+[VarDCT animation evidence](../../docs/CONFORMANCE_CORPUS.md#vardct-animation-encoding).
+
 `LosslessModularEncoder::begin_animation` writes one standard stream-wide animation header and
 keeps a reusable GPU session open for multiple frames. The descriptor fixes the canvas, format,
 sample precision, tick rate, loop count, and timecode presence. Use
@@ -802,7 +820,7 @@ Frame submissions own their GPU work and therefore do not borrow the session. Ca
 multiple frames in flight, complete each with blocking `wait` or await the same runtime-neutral
 `Future`, and insert completed artifacts in any order. Final assembly restores normative frame
 order and rejects duplicates, gaps, or an invalid final-frame flag. All live frame jobs share the
-same byte-weighted `MemoryBudget` and buffer pool as still encoding.
+same byte-weighted `MemoryBudget` as still encoding; Modular also uses its existing buffer pool.
 
 ```rust,no_run
 # use std::num::NonZeroU32;

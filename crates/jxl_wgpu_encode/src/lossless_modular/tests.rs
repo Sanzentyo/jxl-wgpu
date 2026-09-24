@@ -14,7 +14,7 @@ use super::grid::{LosslessModularGroup, LosslessModularGroupGrid};
 #[cfg(not(target_arch = "wasm32"))]
 use super::memory::{align_up, event_capacity};
 #[cfg(not(target_arch = "wasm32"))]
-use super::serializer::{ModularFrameHeader, frame_header, image_header, parse_group_artifact};
+use super::serializer::{frame_header, image_header, parse_group_artifact};
 #[cfg(not(target_arch = "wasm32"))]
 use super::source::lossless_modular_source_spec;
 #[cfg(not(target_arch = "wasm32"))]
@@ -28,6 +28,8 @@ use crate::EncodeError;
 use crate::LosslessModularSubmission;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::buffer_pool::EncoderBufferPool;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::frame_header::FrameHeaderPlan;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::prefix::{LZ77_SYMBOLS, RAW_SYMBOLS};
 #[cfg(not(target_arch = "wasm32"))]
@@ -387,7 +389,15 @@ mod native_tests {
         let budget = jxl_wgpu::MemoryBudget::new(std::num::NonZeroU64::new(1024).unwrap());
         let mut assembler = CodestreamAssembler::new(header.finish(&budget).unwrap().0).unwrap();
         let slot_one = crate::ReferenceSlot::new(1).unwrap();
-        let first = ModularFrameHeader {
+        let first_request = crate::FrameEncodeRequest {
+            frame_index: FrameIndex::new(0),
+            profile: crate::EncodeProfile::ModularLossless {
+                sample_bit_depth: jxl_gpu_bitstream::SampleBitDepth::Integer {
+                    bits_per_sample: 12,
+                },
+            },
+            progressive: crate::ProgressivePlan::single(),
+            minimum_determinism: crate::Determinism::CrossDevice,
             animation,
             canvas_width: 4,
             canvas_height: 3,
@@ -401,7 +411,15 @@ mod native_tests {
             },
             is_last: false,
         };
-        let second = ModularFrameHeader {
+        let second_request = crate::FrameEncodeRequest {
+            frame_index: FrameIndex::new(1),
+            profile: crate::EncodeProfile::ModularLossless {
+                sample_bit_depth: jxl_gpu_bitstream::SampleBitDepth::Integer {
+                    bits_per_sample: 12,
+                },
+            },
+            progressive: crate::ProgressivePlan::single(),
+            minimum_determinism: crate::Determinism::CrossDevice,
             animation,
             canvas_width: 4,
             canvas_height: 3,
@@ -425,6 +443,8 @@ mod native_tests {
             },
             is_last: true,
         };
+        let first = FrameHeaderPlan::new(&first_request, (4, 3), true).unwrap();
+        let second = FrameHeaderPlan::new(&second_request, (3, 2), true).unwrap();
         for (index, frame) in [(0, first), (1, second)] {
             let packets = FramePacketSet::new(
                 frame_header(LosslessModularFormat::Rgba, &frame, Default::default()).unwrap(),
@@ -435,7 +455,7 @@ mod native_tests {
             assembler
                 .insert(GpuFrameArtifacts {
                     frame_index: FrameIndex::new(index),
-                    is_last: frame.is_last,
+                    is_last: frame.is_last(),
                     packets,
                     acceleration: None,
                 })

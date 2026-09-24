@@ -14,17 +14,15 @@ use super::grid::LosslessModularGroupGrid;
 use super::lz77::LosslessModularLz77;
 use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
 use super::serializer::{
-    ModularFrameHeader, ModularPacketAssembler, ModularPacketConfig, PacketBuildInput,
-    ValidatedModularArtifact, accumulate_artifact_histograms, build_packets,
-    parse_group_artifact_header, parse_planned_artifact,
+    ModularPacketAssembler, ModularPacketConfig, PacketBuildInput, ValidatedModularArtifact,
+    accumulate_artifact_histograms, build_packets, parse_group_artifact_header,
+    parse_planned_artifact,
 };
 use super::transform::ModularTransformPlan;
 use super::types::{LosslessModularFormat, LosslessModularTreeMode, ModularParams};
 use crate::buffer_pool::EncoderBufferPool;
-use crate::{
-    BackendError, EncodeError, FrameEncodeRequest, FrameIndex, GpuEncodeJob, GpuFrameArtifacts,
-    WgpuContext,
-};
+use crate::frame_header::FrameHeaderPlan;
+use crate::{BackendError, EncodeError, GpuEncodeJob, GpuFrameArtifacts, WgpuContext};
 
 #[cfg(not(target_arch = "wasm32"))]
 impl LosslessModularBackend {
@@ -33,7 +31,7 @@ impl LosslessModularBackend {
         context: &WgpuContext,
         source: crate::BufferImageSource,
         plan: ModularDispatchPlan,
-        request: FrameEncodeRequest,
+        header: FrameHeaderPlan,
     ) -> Result<LosslessModularJob, EncodeError> {
         let completion = Arc::new(StreamingCompletion::default());
         let worker_completion = Arc::clone(&completion);
@@ -46,7 +44,7 @@ impl LosslessModularBackend {
             direct_mapping: self.direct_mapping,
             source,
             plan,
-            request,
+            header,
             cancelled: Arc::clone(&cancelled),
         };
         std::thread::Builder::new()
@@ -71,7 +69,7 @@ impl LosslessModularBackend {
         context: &WgpuContext,
         source: crate::BufferImageSource,
         plan: ModularDispatchPlan,
-        request: FrameEncodeRequest,
+        header: FrameHeaderPlan,
     ) -> Result<LosslessModularJob, EncodeError> {
         Ok(LosslessModularJob {
             state: LosslessModularJobState::Streaming(Box::new(
@@ -80,7 +78,7 @@ impl LosslessModularBackend {
                     self,
                     source,
                     plan,
-                    request,
+                    header,
                 )?,
             )),
         })
@@ -96,7 +94,7 @@ struct StreamingModularWorker {
     direct_mapping: bool,
     source: crate::BufferImageSource,
     plan: ModularDispatchPlan,
-    request: FrameEncodeRequest,
+    header: FrameHeaderPlan,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -112,13 +110,7 @@ impl StreamingModularWorker {
         }
 
         let entropy = Arc::new(EntropyCode::from_histograms(&self.plan, &histograms)?);
-        let frame = ModularFrameHeader {
-            animation: self.request.animation,
-            canvas_width: self.request.canvas_width,
-            canvas_height: self.request.canvas_height,
-            options: self.request.options.clone(),
-            is_last: self.request.is_last,
-        };
+        let frame = self.header.clone();
         let mut assembler = ModularPacketAssembler::new(
             ModularPacketConfig {
                 width: self.plan.width,
@@ -144,8 +136,8 @@ impl StreamingModularWorker {
         }
         let (packets, acceleration) = assembler.finish()?;
         Ok(GpuFrameArtifacts {
-            frame_index: self.request.frame_index,
-            is_last: self.request.is_last,
+            frame_index: self.header.frame_index(),
+            is_last: self.header.is_last(),
             packets,
             acceleration,
         })
@@ -709,9 +701,7 @@ pub(super) struct ResidentLosslessModularJob {
     pub(super) lz77: LosslessModularLz77,
     pub(super) width: u32,
     pub(super) height: u32,
-    pub(super) frame_index: FrameIndex,
-    pub(super) is_last: bool,
-    pub(super) header: ModularFrameHeader,
+    pub(super) header: FrameHeaderPlan,
 }
 
 pub(super) struct EncodeJobLifetime {
@@ -741,7 +731,7 @@ pub(super) struct BrowserStreamingLosslessModularJob {
     direct_mapping: bool,
     source: crate::BufferImageSource,
     plan: ModularDispatchPlan,
-    request: FrameEncodeRequest,
+    header: FrameHeaderPlan,
     cursor: StreamingCursor,
     pending: Option<PendingStreamingBatch>,
     histograms: FrameHistograms,
@@ -755,7 +745,7 @@ impl BrowserStreamingLosslessModularJob {
         backend: &LosslessModularBackend,
         source: crate::BufferImageSource,
         plan: ModularDispatchPlan,
-        request: FrameEncodeRequest,
+        header: FrameHeaderPlan,
     ) -> Result<Self, EncodeError> {
         let cursor = StreamingCursor::new(plan.batches.len())?;
         let mut job = Self {
@@ -766,7 +756,7 @@ impl BrowserStreamingLosslessModularJob {
             direct_mapping: backend.direct_mapping,
             source,
             plan,
-            request,
+            header,
             cursor,
             pending: None,
             histograms: FrameHistograms::default(),
@@ -823,13 +813,7 @@ impl BrowserStreamingLosslessModularJob {
                 predictor: self.plan.predictor,
                 weighted_predictor: self.plan.weighted_predictor,
                 lz77: self.plan.lz77,
-                frame: ModularFrameHeader {
-                    animation: self.request.animation,
-                    canvas_width: self.request.canvas_width,
-                    canvas_height: self.request.canvas_height,
-                    options: self.request.options.clone(),
-                    is_last: self.request.is_last,
-                },
+                frame: self.header.clone(),
             },
             entropy,
         )?);
@@ -842,8 +826,8 @@ impl BrowserStreamingLosslessModularJob {
         ))?;
         let (packets, acceleration) = assembler.finish()?;
         Ok(GpuFrameArtifacts {
-            frame_index: self.request.frame_index,
-            is_last: self.request.is_last,
+            frame_index: self.header.frame_index(),
+            is_last: self.header.is_last(),
             packets,
             acceleration,
         })
@@ -965,8 +949,8 @@ impl ResidentLosslessModularJob {
         drop(lifetime);
         let (packets, acceleration) = result?;
         Ok(GpuFrameArtifacts {
-            frame_index: self.frame_index,
-            is_last: self.is_last,
+            frame_index: self.header.frame_index(),
+            is_last: self.header.is_last(),
             packets,
             acceleration,
         })

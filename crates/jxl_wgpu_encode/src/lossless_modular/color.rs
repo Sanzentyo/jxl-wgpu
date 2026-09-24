@@ -349,7 +349,7 @@ fn write_enum(output: &mut BitWriter, value: u32) -> Result<(), EncodeError> {
 
 fn write_xy(output: &mut BitWriter, value: ChromaticityInventory) -> Result<(), EncodeError> {
     for coordinate in [value.x, value.y] {
-        let packed = super::serializer::pack_signed(coordinate);
+        let packed = crate::frame_header::pack_signed(coordinate);
         let (selector, offset, bits) = match packed {
             0..524_288 => (0, 0, 19),
             524_288..1_048_576 => (1, 524_288, 19),

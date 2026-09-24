@@ -132,11 +132,12 @@ fn signed_hf_metadata_endpoints_interoperate_through_whole_and_fragmented_packet
         &hf,
         VarDctFrameLayout::single(VarDctStrategy::Dct8),
         &VarDctConfig::default(),
+        &still_control(8, 8),
     )
     .unwrap();
     let header = packets.frame_header.clone();
     let layout = packets.layout;
-    let image = image_header(8, 8).unwrap();
+    let image = image_header(8, 8, crate::AnimationHeader::Still).unwrap();
     let mut base = image.bytes().to_vec();
     base.extend_from_slice(assemble_frame(packets).unwrap().bytes());
     let plan = packet(&base);

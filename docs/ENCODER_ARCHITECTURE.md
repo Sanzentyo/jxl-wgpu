@@ -26,6 +26,29 @@ The repository does not vendor or retain `libjxl` as an upstream source tree. Th
 use ordinary Cargo dependencies; official source is consulted only for specification and
 implementation audits.
 
+## Frame control and animation
+
+`FrameHeaderPlan` owns regular-frame crop geometry, per-channel blend-field presence, timing,
+reference-field presence and finality. Construction validates source/crop agreement and wire
+bounds, then compiles at most 256 control bits before GPU memory admission. Its fields are
+private; frame jobs use the retained bits and index/finality accessors instead of reinterpreting
+caller options after GPU completion. `LosslessModularBackend` uses this representation in
+resident, native-streamed and browser-streamed execution, and `VarDctBackend` uses it after its
+own quantization/progression checks. Codec-specific headers supply coding mode, group geometry
+and pass layout; the common plan supplies the regular-frame suffix and disabled restoration.
+The stream serializers also share one checked animation-timebase writer.
+
+`VarDctAnimationDescriptor` compiles bounded RGB8/XYB image metadata. Both VarDCT frontends create
+`VarDctAnimationSession` around the existing generic `EncodeSession` and `CodestreamAssembler`.
+Frames retain the encoder's immutable transform/quantizer/pass policy, with independently checked
+tiled crop extents. Failed submissions leave the frame index and finality available for retry;
+completed artifacts may be inserted in any order. Reference slots describe codestream metadata,
+not host-computed image state: the GPU encodes each supplied source and the decoder composes it.
+This profile emits post-color-transform references and rejects pre-transform storage, alpha
+blends and extra-channel contracts. Fixed frame metadata does not change GPU ABI, allocations,
+submission/map counts or the existing completion/cancellation ownership. Syntax and conformance
+scope remain in the [animation corpus](CONFORMANCE_CORPUS.md#vardct-animation-encoding).
+
 ## Implemented profile
 
 `LosslessModularBackend` advertises exactly:

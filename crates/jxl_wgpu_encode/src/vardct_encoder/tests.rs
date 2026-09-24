@@ -1,6 +1,7 @@
 //! Existing VarDCT semantic, ABI, and GPU interoperability tests.
 
 mod ac;
+mod animation;
 mod artifact;
 mod matrices;
 mod mixed;
@@ -50,6 +51,27 @@ use super::types::{
 };
 use super::{VarDctConfig, VarDctQuantization};
 use crate::{BufferImageSource, EncodeError, UnsupportedFeature, WgpuContext, assemble_frame};
+
+fn still_control(width: u32, height: u32) -> crate::frame_header::FrameHeaderPlan {
+    crate::frame_header::FrameHeaderPlan::new(
+        &crate::FrameEncodeRequest {
+            frame_index: crate::FrameIndex::new(0),
+            is_last: true,
+            profile: crate::EncodeProfile::VarDct {
+                quantization: VarDctQuantization::default(),
+            },
+            progressive: crate::ProgressivePlan::single(),
+            minimum_determinism: crate::Determinism::SameDevice,
+            animation: crate::AnimationHeader::Still,
+            canvas_width: width,
+            canvas_height: height,
+            options: crate::FrameOptions::default(),
+        },
+        (width, height),
+        false,
+    )
+    .unwrap()
+}
 
 // Explicit test-only control fragment, independent of GPU artifact layout.
 struct DcFixture {
@@ -359,11 +381,15 @@ fn fixed_control_plane_decodes_as_standard_black_vardct() {
             &hf_entropy,
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
             &VarDctConfig::default(),
+            &still_control(8, 8),
         )
         .unwrap(),
     )
     .unwrap();
-    let mut codestream = image_header(8, 8).unwrap().bytes().to_vec();
+    let mut codestream = image_header(8, 8, crate::AnimationHeader::Still)
+        .unwrap()
+        .bytes()
+        .to_vec();
     codestream.extend_from_slice(frame.bytes());
     let decoded = decode_rgb8(&codestream);
     assert_eq!(decoded, vec![0; 8 * 8 * 3]);
@@ -383,11 +409,15 @@ fn fixed_control_plane_accepts_nonzero_quantized_xyb_dc() {
             &hf_entropy,
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
             &VarDctConfig::default(),
+            &still_control(8, 8),
         )
         .unwrap(),
     )
     .unwrap();
-    let mut codestream = image_header(8, 8).unwrap().bytes().to_vec();
+    let mut codestream = image_header(8, 8, crate::AnimationHeader::Still)
+        .unwrap()
+        .bytes()
+        .to_vec();
     codestream.extend_from_slice(frame.bytes());
     let decoded = decode_rgb8(&codestream);
     for pixel in decoded.as_chunks::<3>().0.iter() {
@@ -410,11 +440,15 @@ fn custom_lf_metadata_roundtrips_through_the_standard_control_plane() {
             &hf_entropy,
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
             &config_with_lf(metadata),
+            &still_control(8, 8),
         )
         .unwrap(),
     )
     .unwrap();
-    let mut codestream = image_header(8, 8).unwrap().bytes().to_vec();
+    let mut codestream = image_header(8, 8, crate::AnimationHeader::Still)
+        .unwrap()
+        .bytes()
+        .to_vec();
     codestream.extend_from_slice(frame.bytes());
     let inventory =
         jxl_gpu_bitstream::parse(&codestream, jxl_gpu_bitstream::ParseLimits::default())

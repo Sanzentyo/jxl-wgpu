@@ -6,7 +6,7 @@
 //! JPEG XL bitstream/container assembly.
 //!
 //! [`LosslessModularEncoder`] implements standard multi-group lossless Modular Gray/GrayAlpha/RGB/RGBA
-//! for every unsigned integer depth in `1..=31` and IEEE binary16/binary32. Packed, planar and
+//! for every unsigned integer depth in `1..=31` and every legal floating sample precision. Packed, planar and
 //! split pitch-linear buffers support component swizzles and explicit word bit/byte order.
 //! [`LosslessModularConfig`] selects group geometry, all 42 RCT types and all 14 predictors,
 //! including checked custom Weighted/SelfCorrecting parameters. [`LosslessModularLz77`] selects
@@ -29,6 +29,9 @@
 //! explicit global/LF controls and per-transform HF multipliers; content-adaptive strategy search,
 //! distance control and progressive encoding
 //! remain incomplete. [`TiledVarDctEncoder`] provides an optimized DCT8 workgroup path.
+//! Both frontends expose [`VarDctAnimationSession`] for RGB8/XYB timed crops, Replace/Add/Multiply,
+//! hidden frames and four post-color-transform references, using the same checked frame control
+//! as Modular. Each frame retains the encoder's quantization and progressive AC configuration.
 //! [`VarDctCoefficientOrders`] selects independent X/Y/B permutations for every standard size class;
 //! GPU serializers consume them without exposing image coefficients to the host.
 //!
@@ -50,6 +53,7 @@ mod ans;
 mod buffer_pool;
 mod capability;
 mod error;
+mod frame_header;
 mod gpu;
 mod lossless_modular;
 mod packet;
@@ -93,9 +97,10 @@ pub use session::{
     GpuAccelerationArtifact, GpuFrameArtifacts, ReferenceSlot, SessionDescriptor,
 };
 pub use vardct_encoder::{
-    TiledVarDctEncoder, TiledVarDctGrid, VarDctBackend, VarDctCoefficientOrders,
-    VarDctColorEncoding, VarDctConfig, VarDctDequantMatrices, VarDctEncoder, VarDctGroupOrder,
-    VarDctHfMultiplier, VarDctJob, VarDctKernelLayout, VarDctLfMetadata, VarDctMatrixEncoding,
-    VarDctMemoryPlan, VarDctQuantization, VarDctRawMatrix, VarDctStrategy, VarDctStrategyMap,
-    VarDctSubmission, VarDctTransform, VarDctTransformMemoryPlan,
+    TiledVarDctEncoder, TiledVarDctGrid, VarDctAnimationDescriptor, VarDctAnimationSession,
+    VarDctBackend, VarDctCoefficientOrders, VarDctColorEncoding, VarDctConfig,
+    VarDctDequantMatrices, VarDctEncoder, VarDctGroupOrder, VarDctHfMultiplier, VarDctJob,
+    VarDctKernelLayout, VarDctLfMetadata, VarDctMatrixEncoding, VarDctMemoryPlan,
+    VarDctQuantization, VarDctRawMatrix, VarDctStrategy, VarDctStrategyMap, VarDctSubmission,
+    VarDctTransform, VarDctTransformMemoryPlan,
 };

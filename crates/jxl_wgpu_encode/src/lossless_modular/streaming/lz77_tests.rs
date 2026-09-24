@@ -5,6 +5,7 @@ use crate::{
     LosslessModularConfig, LosslessModularFormat, LosslessModularGroupSize, LosslessModularLz77,
     LosslessModularPredictor, ProgressivePlan,
 };
+use crate::{FrameEncodeRequest, FrameIndex};
 use wgpu::util::DeviceExt;
 
 #[test]

@@ -279,7 +279,10 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
         }
         assert!(nonzero > 0, "mixed textured images must retain AC");
         let frame = assemble_frame(artifacts.packets).unwrap();
-        let mut stream = image_header(width, height).unwrap().bytes().to_vec();
+        let mut stream = image_header(width, height, crate::AnimationHeader::Still)
+            .unwrap()
+            .bytes()
+            .to_vec();
         stream.extend_from_slice(frame.bytes());
         let rust = decode_rgb8_sized(&stream, w, h);
         let mut session = decoder

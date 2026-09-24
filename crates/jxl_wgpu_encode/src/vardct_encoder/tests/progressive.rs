@@ -129,7 +129,7 @@ fn fragments(
         artifact.packets.layout.passes() as usize,
         config.progressive.passes().len()
     );
-    let mut bytes = image_header(extent.width, extent.height)
+    let mut bytes = image_header(extent.width, extent.height, crate::AnimationHeader::Still)
         .unwrap()
         .bytes()
         .to_vec();

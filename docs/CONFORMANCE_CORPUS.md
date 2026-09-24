@@ -1657,6 +1657,53 @@ window without touching its host-parsed descriptor and must return typed
 quant-matrix scales; a lower-level actual-GPU artifact test observes non-default scale multipliers
 for all three channels directly in the resident resource vectors.
 
+## VarDCT animation encoding
+
+`jxl_wgpu_encode::vardct_encoder::tests::animation` covers seven RGB8/XYB sequences with
+24 physical frames and 20 presentations. Two six-frame tiled sequences at 17×9 differ only in
+timecode presence and raw/container transport. They combine Replace, signed 9×7 and 5×6 crops,
+Add, clamped/unclamped Multiply, hidden zero-duration regular frames and every reference slot.
+Durations include 0, 1, 257, 65,536 and `u32::MAX`; timebase is 60,000/1001. Three two-frame,
+five-pass tiled sequences cover 1×1, 257×17 and 2057×1, center-first groups, variable source
+extents and a zero-duration final presentation. Single DCT8 and a mixed map add two three-frame,
+five-pass sequences with overhanging crops and smaller canvases. Other timebases exercise
+1024/256 and 1000/1024, with loop counts through `u32::MAX`. Metadata checks retain exact canvas,
+crop, mode, reference, pass count, timing and finality; futures complete in reverse insertion
+order and raw/container assembly restores physical order.
+
+Each physical source is independently encoded as a still and decoded by native libjxl 0.12.0.
+A separate signal-domain composition calculation uses these samples, the declared crop and
+four reference slots, without production header or blend helpers. Native libjxl and jxl-oxide
+0.12.6 decode the complete animation independently; both agree with this calculation, and GPU
+RGBA-F32 agrees with native output and the calculation at `2e-4 * (1 + abs(reference))` per sample,
+including extended values. Rounded sRGB8 differs by at most one code. Whole and fragmented
+43-byte transport through 256-byte GPU windows produce identical bytes, timing and presentation
+counts. Outputs remain immutable after session destruction and release their reservations.
+The declared test quantizers `(35252, 16, 12)` retain source PSNR above 30 dB; this is a corpus
+bound, not a general perceptual-quality guarantee. Every still also retains the Rust `jxl`
+one-code comparison.
+
+Rust `jxl` 0.6.0 disagrees after the six-frame sequence's hidden clamped Multiply with extended
+background samples: presentation 2, component 178 is `0` instead of native/independent
+`-0.009156705`; component 206 is `0.26932108` instead of `0.33393678` (rounded codes 69 vs 85).
+Therefore it is not the composed-image authority for this family. The unchanged F32 bound uses
+native libjxl, independent jxl-oxide and explicit composition; no pixels are clamped or tolerances
+widened to imitate the disagreement. The Rust still comparisons remain separate.
+
+Negative tests cover empty/oversized canvases, timebase limits, missing/unexpected timecodes,
+source/crop mismatches, unrepresentable signed coordinates, extra/alpha blend contracts, absent
+clamp fields, pre-transform reference storage, final-frame reference destinations and closed
+sessions. Every rejection precedes GPU admission and preserves the frame index. Exact and
+one-byte-deficient budgets cover overlapping submissions, failed-final retry, completed packet
+retention, dropped session/job ownership and successful reuse after GPU completion. These tests
+require an actual adapter and the native oracle. The common `FrameHeaderPlan` also replaces the
+old Modular control serializer in resident, native-streamed and browser-streamed paths; existing
+Modular still, animation, precision and lifetime tests remain unchanged in scope.
+
+This extends `FRAME-05`. It does not provide mixed Modular/VarDCT streams, VarDCT pre-transform
+reference storage or extra-channel blending, reference-only frame types, names, previews or
+frame-index writing. GPU image/entropy work and its memory plan are unchanged.
+
 ## Progressive VarDCT encoding
 
 `vardct_encoder/tests/progressive.rs` and its child modules exercise GPU spectral and quantized

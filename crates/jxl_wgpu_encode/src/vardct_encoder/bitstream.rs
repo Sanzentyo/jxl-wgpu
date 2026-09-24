@@ -6,9 +6,10 @@ use super::entropy::VarDctPrefixCode;
 use super::entropy::{HfEntropyPlan, write_prefix_config};
 use super::types::{DcFragmentDescriptor, VarDctArtifactData, VarDctFrameLayout};
 use super::{VarDctConfig, VarDctQuantization};
+use crate::frame_header::{FrameHeaderPlan, write_animation_header};
 use crate::{
-    BackendError, BitFragment, EncodeError, FrameGroupLayout, FramePacketSet, GroupPacket,
-    GroupPacketKind,
+    AnimationHeader, BackendError, BitFragment, EncodeError, FrameGroupLayout, FramePacketSet,
+    GroupPacket, GroupPacketKind,
 };
 
 fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), EncodeError> {
@@ -35,19 +36,44 @@ fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), Enco
     Ok(())
 }
 
-pub(super) fn image_header(width: u32, height: u32) -> Result<BitFragment, EncodeError> {
+pub(super) fn image_header(
+    width: u32,
+    height: u32,
+    animation: AnimationHeader,
+) -> Result<BitFragment, EncodeError> {
     let mut output = BitWriter::new();
     output.write_bits(0x0aff, 16)?;
     output.write_bits(0, 1)?; // dimensions are not encoded as multiples of eight
     write_size(&mut output, height, true)?;
     write_size(&mut output, width, false)?;
-    output.write_bits(1, 1)?; // all-default image metadata: 8-bit, XYB, sRGB presentation
+    if animation.is_animation() {
+        output.write_bits(0, 1)?; // explicit image metadata
+        output.write_bits(1, 1)?; // extra fields contain the animation timebase
+        output.write_bits(0, 3)?; // identity orientation
+        output.write_bits(0, 1)?; // no intrinsic size
+        output.write_bits(0, 1)?; // no preview
+        output.write_bits(1, 1)?; // animation present
+        write_animation_header(&mut output, animation)?;
+        output.write_bits(0, 1)?; // integer samples
+        output.write_bits(0, 2)?; // eight bits per sample
+        output.write_bits(1, 1)?; // 16-bit Modular buffers are sufficient
+        output.write_bits(0, 2)?; // no extra channels
+        output.write_bits(1, 1)?; // XYB encoded
+        output.write_bits(1, 1)?; // default sRGB presentation
+        output.write_bits(1, 1)?; // default tone mapping
+        output.write_bits(0, 2)?; // no image extensions
+    } else {
+        output.write_bits(1, 1)?; // all-default image metadata: 8-bit, XYB, sRGB presentation
+    }
     output.write_bits(1, 1)?; // default opsin inverse matrix and upsampling weights
     output.align_to_byte()?;
     Ok(BitFragment::byte_aligned(output.into_bytes())?)
 }
 
-fn frame_header(progressive: &crate::ProgressivePlan) -> Result<BitFragment, EncodeError> {
+fn frame_header(
+    progressive: &crate::ProgressivePlan,
+    control: &FrameHeaderPlan,
+) -> Result<BitFragment, EncodeError> {
     let mut output = BitWriter::new();
     output.write_bits(0, 1)?; // non-default so restoration can be disabled
     output.write_bits(0, 2)?; // regular frame
@@ -86,15 +112,7 @@ fn frame_header(progressive: &crate::ProgressivePlan) -> Result<BitFragment, Enc
             )?;
         }
     }
-    output.write_bits(0, 1)?; // full-canvas frame
-    output.write_bits(0, 2)?; // replace blending
-    output.write_bits(1, 1)?; // final frame
-    output.write_bits(0, 2)?; // empty frame name
-    output.write_bits(0, 1)?; // non-default restoration filter
-    output.write_bits(0, 1)?; // no Gaborish
-    output.write_bits(0, 2)?; // no EPF
-    output.write_bits(0, 2)?; // no restoration extensions
-    output.write_bits(0, 2)?; // no frame extensions
+    control.append_to(&mut output)?;
     let bit_len = output.bit_len();
     Ok(BitFragment::new(output.into_bytes(), bit_len)?)
 }
@@ -357,6 +375,7 @@ pub(super) fn build_frame_packet(
     hf_entropy: &HfEntropyPlan,
     frame: VarDctFrameLayout,
     config: &VarDctConfig,
+    control: &FrameHeaderPlan,
 ) -> Result<FramePacketSet, EncodeError> {
     config.group_order.validate(frame)?;
     config
@@ -383,7 +402,7 @@ pub(super) fn build_frame_packet(
         artifact.ac.append_group(&mut group, frame, 0, 0)?;
         group.align_to_byte()?;
         return Ok(FramePacketSet::new(
-            frame_header(&config.progressive)?,
+            frame_header(&config.progressive, control)?,
             FrameGroupLayout::new(1, 1, 1)?,
             [GroupPacket::new(
                 GroupPacketKind::Single,
@@ -462,7 +481,7 @@ pub(super) fn build_frame_packet(
     }
     config.group_order.apply(
         FramePacketSet::new(
-            frame_header(&config.progressive)?,
+            frame_header(&config.progressive, control)?,
             FrameGroupLayout::new(lf_groups, ac_groups, passes)?,
             packets,
         )?,

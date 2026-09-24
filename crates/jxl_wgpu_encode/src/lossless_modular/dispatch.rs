@@ -2,8 +2,6 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use jxl_gpu_bitstream::BitWriter;
-
 use super::entropy::{EntropyArtifactPlan, EntropyBatchPlan, LosslessModularEntropyCoding};
 use super::grid::LosslessModularGroupGrid;
 use super::lz77::LosslessModularLz77;
@@ -11,7 +9,6 @@ use super::memory::{
     LosslessModularMemoryLimits, LosslessModularMemoryPlan, align_up, event_capacity,
 };
 use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
-use super::serializer::{ModularFrameHeader, pack_signed, write_animation_header};
 use super::source::{ModularSourceLayout, ModularSourceWindows};
 use super::streaming::{
     EncodeJobLifetime, LosslessModularJob, LosslessModularJobState, MapCompletion,
@@ -24,11 +21,11 @@ use super::types::{
     modular_sample_depth,
 };
 use crate::buffer_pool::EncoderBufferPool;
+use crate::frame_header::FrameHeaderPlan;
 use crate::{
-    AnimationHeader, BackendError, DEFAULT_ENCODER_BUFFER_POOL_BYTES, Determinism, EncodeError,
-    EncodeProfile, EncoderBufferPoolStats, EncoderCapabilities, FrameEncodeRequest, FrameIndex,
-    FrameOptions, GpuEncodeBackend, GpuFrameSource, KernelStage, ProfileCapability,
-    UnsupportedFeature, WgpuContext,
+    BackendError, DEFAULT_ENCODER_BUFFER_POOL_BYTES, Determinism, EncodeError, EncodeProfile,
+    EncoderBufferPoolStats, EncoderCapabilities, FrameEncodeRequest, GpuEncodeBackend,
+    GpuFrameSource, KernelStage, ProfileCapability, UnsupportedFeature, WgpuContext,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -961,137 +958,8 @@ fn modular_dispatch_batch(
 pub(super) fn validate_modular_frame_request(
     request: &FrameEncodeRequest,
     plan: &ModularDispatchPlan,
-) -> Result<(), EncodeError> {
-    if request.canvas_width == 0 || request.canvas_height == 0 {
-        return Err(EncodeError::InvalidConfiguration(
-            "the JPEG XL animation canvas must be non-empty",
-        ));
-    }
-    match request.animation {
-        AnimationHeader::Still => {
-            if request.frame_index != FrameIndex::new(0)
-                || !request.is_last
-                || request.options != FrameOptions::default()
-                || request.canvas_width != plan.width
-                || request.canvas_height != plan.height
-            {
-                return Err(EncodeError::InvalidConfiguration(
-                    "a still lossless Modular request must be one full-canvas final frame",
-                ));
-            }
-        }
-        AnimationHeader::Animation { have_timecodes, .. } => {
-            write_animation_header(&mut BitWriter::new(), request.animation)?;
-            if request.options.timing.timecode.is_some() != have_timecodes {
-                return Err(EncodeError::InvalidConfiguration(
-                    "frame timecode presence must match the animation header",
-                ));
-            }
-            let (frame_width, frame_height) = request
-                .options
-                .crop
-                .map_or((request.canvas_width, request.canvas_height), |crop| {
-                    (crop.width(), crop.height())
-                });
-            if let Some(crop) = request.options.crop {
-                for value in [
-                    pack_signed(crop.x()),
-                    pack_signed(crop.y()),
-                    crop.width(),
-                    crop.height(),
-                ] {
-                    if value >= 18_688 + (1 << 30) {
-                        return Err(EncodeError::InvalidConfiguration(
-                            "animation frame crop coordinate exceeds the JPEG XL limit",
-                        ));
-                    }
-                }
-            }
-            if frame_width != plan.width || frame_height != plan.height {
-                return Err(EncodeError::InvalidConfiguration(
-                    "the GPU source extent must match the animation frame crop",
-                ));
-            }
-            let extra_channels = usize::from(plan.format.has_alpha());
-            if !request.options.extra_channel_blends.is_empty()
-                && request.options.extra_channel_blends.len() != extra_channels
-            {
-                return Err(EncodeError::InvalidConfiguration(
-                    "animation extra-channel blend count does not match the source format",
-                ));
-            }
-            if !plan.format.has_alpha()
-                && matches!(
-                    request.options.color_blend.mode,
-                    crate::BlendMode::Blend | crate::BlendMode::MultiplyAdd
-                )
-            {
-                return Err(EncodeError::InvalidConfiguration(
-                    "alpha-weighted animation blending requires a GrayAlpha or RGBA source",
-                ));
-            }
-            let color_uses_clamp = request.options.color_blend.mode == crate::BlendMode::Multiply
-                || (plan.format.has_alpha()
-                    && matches!(
-                        request.options.color_blend.mode,
-                        crate::BlendMode::Blend | crate::BlendMode::MultiplyAdd
-                    ));
-            if request.options.color_blend.clamp && !color_uses_clamp {
-                return Err(EncodeError::InvalidConfiguration(
-                    "the selected JPEG XL color blend mode has no clamp field",
-                ));
-            }
-            if request.options.extra_channel_blends.iter().any(|blend| {
-                blend.clamp
-                    && !matches!(
-                        blend.mode,
-                        crate::BlendMode::Blend
-                            | crate::BlendMode::MultiplyAdd
-                            | crate::BlendMode::Multiply
-                    )
-            }) {
-                return Err(EncodeError::InvalidConfiguration(
-                    "the selected JPEG XL extra-channel blend mode has no clamp field",
-                ));
-            }
-            if request.is_last && request.options.save_as_reference != Default::default() {
-                return Err(EncodeError::InvalidConfiguration(
-                    "the final JPEG XL frame cannot be saved as a reference",
-                ));
-            }
-            let full_frame = frame_covers_canvas(
-                request.options.crop,
-                request.canvas_width,
-                request.canvas_height,
-            );
-            let resets_canvas =
-                request.options.color_blend.mode == crate::BlendMode::Replace && full_frame;
-            let can_be_referenced = !request.is_last
-                && (request.options.timing.duration_ticks == 0
-                    || request.options.save_as_reference.get() != 0);
-            let writes_save_before = resets_canvas && can_be_referenced;
-            if request.options.save_before_color_transform && !writes_save_before {
-                return Err(EncodeError::InvalidConfiguration(
-                    "save-before-color-transform is not present for this frame contract",
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn frame_covers_canvas(
-    crop: Option<crate::FrameCrop>,
-    canvas_width: u32,
-    canvas_height: u32,
-) -> bool {
-    let Some(crop) = crop else {
-        return true;
-    };
-    i64::from(crop.x()) <= 0
-        && i64::from(crop.y()) <= 0
-        && i64::from(crop.x()) + i64::from(crop.width()) >= i64::from(canvas_width)
-        && i64::from(crop.y()) + i64::from(crop.height()) >= i64::from(canvas_height)
+) -> Result<FrameHeaderPlan, EncodeError> {
+    FrameHeaderPlan::new(request, (plan.width, plan.height), plan.format.has_alpha())
 }
 
 impl GpuEncodeBackend for LosslessModularBackend {
@@ -1118,7 +986,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
             return Err(UnsupportedFeature::InputFormat.into());
         };
         let plan = self.dispatch_plan(&source)?;
-        validate_modular_frame_request(request, &plan)?;
+        let header = validate_modular_frame_request(request, &plan)?;
         if request.profile
             != (EncodeProfile::ModularLossless {
                 sample_bit_depth: modular_sample_depth(
@@ -1140,7 +1008,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
                     .memory_budget()
                     .try_reserve(plan.memory.owned_bytes_per_job)?,
             );
-            return self.submit_streaming(context, source, plan, request.clone());
+            return self.submit_streaming(context, source, plan, header);
         }
         let memory_permit = context
             .memory_budget()
@@ -1292,15 +1160,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
                 lz77: plan.lz77,
                 width: plan.width,
                 height: plan.height,
-                frame_index: request.frame_index,
-                is_last: request.is_last,
-                header: ModularFrameHeader {
-                    animation: request.animation,
-                    canvas_width: request.canvas_width,
-                    canvas_height: request.canvas_height,
-                    options: request.options.clone(),
-                    is_last: request.is_last,
-                },
+                header,
             })),
         })
     }
@@ -1309,6 +1169,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod source_window_tests {
     use super::*;
+    use crate::{AnimationHeader, FrameIndex, FrameOptions};
     use crate::{
         BufferImageSource, CodestreamAssembler, GpuEncodeJob, LosslessModularEncoder,
         ProgressivePlan,

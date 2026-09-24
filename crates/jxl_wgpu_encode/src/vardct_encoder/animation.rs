@@ -1,0 +1,141 @@
+//! Checked stream metadata and ordered assembly for RGB8/XYB animations.
+
+use super::bitstream::image_header;
+use super::{VarDctBackend, VarDctConfig, VarDctJob};
+use crate::{
+    AnimationHeader, BitFragment, BufferImageSource, CodestreamAssembler, Determinism, EncodeError,
+    EncodeProfile, EncodeSession, FrameIndex, FrameOptions, FrameSubmission, GpuEncoder,
+    GpuFrameArtifacts, GpuFrameSource, SessionDescriptor,
+};
+
+/// Stream-wide canvas and timebase for a VarDCT animation.
+///
+/// Every frame uses RGB8 sRGB/D65 sources and the encoder's fixed configuration. Cropped
+/// sources may have different extents when using [`super::TiledVarDctEncoder`]; a single
+/// transform or strategy map keeps its own source extent on every frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VarDctAnimationDescriptor {
+    canvas_width: u32,
+    canvas_height: u32,
+    animation: AnimationHeader,
+    header: BitFragment,
+}
+
+impl VarDctAnimationDescriptor {
+    /// Checks the canvas/timebase and compiles the bounded stream header.
+    pub fn new(
+        canvas_width: u32,
+        canvas_height: u32,
+        animation: AnimationHeader,
+    ) -> Result<Self, EncodeError> {
+        if !animation.is_animation() {
+            return Err(EncodeError::InvalidConfiguration(
+                "a VarDCT animation descriptor requires an animation timebase",
+            ));
+        }
+        let header = image_header(canvas_width, canvas_height, animation)?;
+        Ok(Self {
+            canvas_width,
+            canvas_height,
+            animation,
+            header,
+        })
+    }
+
+    #[must_use]
+    pub const fn canvas_width(&self) -> u32 {
+        self.canvas_width
+    }
+
+    #[must_use]
+    pub const fn canvas_height(&self) -> u32 {
+        self.canvas_height
+    }
+
+    #[must_use]
+    pub const fn animation(&self) -> AnimationHeader {
+        self.animation
+    }
+}
+
+/// Independent GPU frame submissions and deterministic animation assembly.
+///
+/// Supports Replace, Add and Multiply, signed crops, hidden zero-duration frames,
+/// timecodes and four post-color-transform reference slots. Pre-color-transform storage is
+/// rejected until the profile supports its consumers. Alpha-weighted modes require an alpha source and
+/// are rejected by this RGB-only profile. Frame controls are checked before GPU admission;
+/// failure leaves the frame index and final-frame state available for retry.
+pub struct VarDctAnimationSession {
+    descriptor: VarDctAnimationDescriptor,
+    session: EncodeSession<VarDctBackend>,
+    assembler: CodestreamAssembler,
+}
+
+impl VarDctAnimationSession {
+    pub(super) fn new(
+        encoder: &GpuEncoder<VarDctBackend>,
+        config: &VarDctConfig,
+        descriptor: VarDctAnimationDescriptor,
+    ) -> Result<Self, EncodeError> {
+        let session = encoder.begin_session(SessionDescriptor {
+            profile: EncodeProfile::VarDct {
+                quantization: config.quantization,
+            },
+            progressive: config.progressive.clone(),
+            minimum_determinism: Determinism::SameDevice,
+            animation: descriptor.animation,
+            canvas_width: descriptor.canvas_width,
+            canvas_height: descriptor.canvas_height,
+        })?;
+        let assembler = CodestreamAssembler::new(descriptor.header.clone())?;
+        Ok(Self {
+            descriptor,
+            session,
+            assembler,
+        })
+    }
+
+    #[must_use]
+    pub const fn descriptor(&self) -> &VarDctAnimationDescriptor {
+        &self.descriptor
+    }
+
+    #[must_use]
+    pub const fn next_frame_index(&self) -> FrameIndex {
+        self.session.next_frame_index()
+    }
+
+    pub fn submit_frame(
+        &mut self,
+        source: BufferImageSource,
+        options: FrameOptions,
+    ) -> Result<FrameSubmission<VarDctJob>, EncodeError> {
+        self.session
+            .submit_frame(GpuFrameSource::Buffer(source), options)
+    }
+
+    pub fn submit_last_frame(
+        &mut self,
+        source: BufferImageSource,
+        options: FrameOptions,
+    ) -> Result<FrameSubmission<VarDctJob>, EncodeError> {
+        self.session
+            .submit_last_frame(GpuFrameSource::Buffer(source), options)
+    }
+
+    /// Inserts one validated GPU artifact, in any completion order.
+    pub fn insert(&mut self, frame: GpuFrameArtifacts) -> Result<(), EncodeError> {
+        self.assembler.insert(frame)?;
+        Ok(())
+    }
+
+    pub fn finish_raw(self) -> Result<Vec<u8>, EncodeError> {
+        self.session.ensure_closed()?;
+        Ok(self.assembler.finish_raw()?)
+    }
+
+    pub fn finish_container(self) -> Result<Vec<u8>, EncodeError> {
+        self.session.ensure_closed()?;
+        self.assembler.finish_container()
+    }
+}

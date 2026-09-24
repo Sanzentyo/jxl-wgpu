@@ -1,10 +1,11 @@
-//! Standard VarDCT still-image encoder frontend.
+//! Standard VarDCT still-image and animation encoder frontends.
 //!
 //! [`VarDctEncoder`] encodes one transform or a validated [`VarDctStrategyMap`] with resident coefficients, while
 //! [`TiledVarDctEncoder`] uses regular DCT8 blocks across checked AC- and LF-group grids. Their
 //! control syntax shares the deterministic frame assembler with the lossless Modular encoder.
 
 mod ac;
+mod animation;
 mod bitstream;
 mod dispatch;
 mod entropy;
@@ -21,6 +22,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+pub use animation::{VarDctAnimationDescriptor, VarDctAnimationSession};
 pub use dispatch::{TiledVarDctEncoder, VarDctBackend, VarDctEncoder, VarDctJob, VarDctSubmission};
 pub use group_order::VarDctGroupOrder;
 pub use matrices::{VarDctDequantMatrices, VarDctMatrixEncoding, VarDctRawMatrix};
