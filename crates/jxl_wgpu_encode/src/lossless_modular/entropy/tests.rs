@@ -3,7 +3,8 @@ use super::*;
 
 #[test]
 fn ans_shader_is_portable_and_capacity_checks_bit_addressing() {
-    let module = naga::front::wgsl::parse_str(include_str!("../entropy.wgsl")).unwrap();
+    let module =
+        naga::front::wgsl::parse_str(&shader_source(include_str!("../entropy.wgsl"))).unwrap();
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::empty(),
@@ -80,7 +81,7 @@ fn unvalidated_ans_fragments_cannot_gain_packet_authority() {
     );
     assert!(
         EntropyCode::Ans(Box::new(
-            AnsCodebook::new(
+            fixed_codebook(
                 LosslessModularLz77::ZeroRuns,
                 &[[0; RAW_SYMBOLS]; 4],
                 &[[0; LZ77_SYMBOLS]; 4],
@@ -135,9 +136,8 @@ pub(super) fn gpu_fragment(
     channels: &[Vec<ModularEvent>],
     limit: Option<u32>,
 ) -> (EntropyArtifactPlan, Vec<u32>) {
-    use wgpu::util::DeviceExt;
     let mut words = Vec::new();
-    let table_start = 8 + 4 * channels.len();
+    let table_start = 12 + 4 * channels.len();
     let mut metadata = vec![
         1,
         table_start as u32,
@@ -150,7 +150,7 @@ pub(super) fn gpu_fragment(
         words.resize(base + 100, 0);
         words[base] = events.len() as u32;
         words.extend_from_slice(bytemuck::cast_slice(events));
-        metadata[8 + 4 * channel..12 + 4 * channel].copy_from_slice(&[
+        metadata[12 + 4 * channel..16 + 4 * channel].copy_from_slice(&[
             base as u32 + 100,
             base as u32,
             events.len() as u32,
@@ -166,25 +166,45 @@ pub(super) fn gpu_fragment(
     if let Some(limit) = limit {
         plan.capacity_words = limit;
     }
-    metadata[4..8].copy_from_slice(&[8, channels.len() as u32, output as u32, plan.capacity_words]);
+    metadata[8..12].copy_from_slice(&[
+        12,
+        channels.len() as u32,
+        output as u32,
+        plan.capacity_words,
+    ]);
     // A sentinel beyond the admitted output detects writes past the declared capacity.
     words.resize(output + plan.bytes() as usize / 4 + 1, 0);
     *words.last_mut().unwrap() = 0xfeed_cafe;
     for table in &codebook.tables {
-        metadata.extend_from_slice(table.gpu_words());
+        metadata.push(table.config.packed());
+        metadata.extend_from_slice(table.code.gpu_words());
     }
+    (
+        plan,
+        dispatch_gpu(context, pipeline, &words, &metadata, [1, 1, 1]),
+    )
+}
+
+pub(super) fn dispatch_gpu(
+    context: &WgpuContext,
+    pipeline: &wgpu::ComputePipeline,
+    words: &[u32],
+    metadata: &[u32],
+    workgroups: [u32; 3],
+) -> Vec<u32> {
+    use wgpu::util::DeviceExt;
     let storage = context
         .device()
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("ANS test events/output"),
-            contents: bytemuck::cast_slice(&words),
+            contents: bytemuck::cast_slice(words),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
     let params = context
         .device()
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("ANS test tables"),
-            contents: bytemuck::cast_slice(&metadata),
+            contents: bytemuck::cast_slice(metadata),
             usage: wgpu::BufferUsages::STORAGE,
         });
     let readback = context.device().create_buffer(&wgpu::BufferDescriptor {
@@ -214,7 +234,7 @@ pub(super) fn gpu_fragment(
         let mut pass = command.begin_compute_pass(&Default::default());
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bindings, &[]);
-        pass.dispatch_workgroups(1, 1, 1);
+        pass.dispatch_workgroups(workgroups[0], workgroups[1], workgroups[2]);
     }
     command.copy_buffer_to_buffer(&storage, 0, &readback, 0, storage.size());
     context.queue().submit([command.finish()]);
@@ -234,7 +254,7 @@ pub(super) fn gpu_fragment(
     assert_eq!(result.last(), Some(&0xfeed_cafe));
     drop(mapped);
     readback.unmap();
-    (plan, result)
+    result
 }
 
 pub(super) fn independent_decode(
@@ -308,7 +328,7 @@ fn gpu_ans_preserves_shared_state_all_extra_widths_long_matches_and_capacity_fai
             [1; RAW_SYMBOLS]
         };
         let code = EntropyCode::Ans(Box::new(
-            AnsCodebook::new(mode, &raw_counts, &lz_counts, &distance, 1).unwrap(),
+            fixed_codebook(mode, &raw_counts, &lz_counts, &distance, 1).unwrap(),
         ));
         let mut channels = Vec::new();
         let mut expected = Vec::new();
@@ -380,7 +400,7 @@ fn gpu_ans_preserves_shared_state_all_extra_widths_long_matches_and_capacity_fai
             gpu_fragment(&context, &pipeline, code.ans().unwrap(), &channels, Some(1));
         assert_eq!(words[short.byte_offset as usize / 4], 2);
         assert!(validate_encoded_group(short, bytemuck::cast_slice(&words), &artifacts).is_err());
-        let missing = AnsCodebook::new(
+        let missing = fixed_codebook(
             mode,
             &[[0; RAW_SYMBOLS]; 4],
             &[[0; LZ77_SYMBOLS]; 4],
@@ -392,4 +412,35 @@ fn gpu_ans_preserves_shared_state_all_extra_widths_long_matches_and_capacity_fai
         assert_eq!(words[plan.byte_offset as usize / 4], 2);
         assert!(validate_encoded_group(plan, bytemuck::cast_slice(&words), &artifacts).is_err());
     }
+}
+
+fn fixed_codebook(
+    mode: LosslessModularLz77,
+    raw: &[[u64; RAW_SYMBOLS]; 4],
+    lz77: &[[u64; LZ77_SYMBOLS]; 4],
+    distance: &[u64; RAW_SYMBOLS],
+    copies: u64,
+) -> Result<AnsCodebook, EncodeError> {
+    let mut counts = [[0; ALPHABET]; clustering::CONTEXTS];
+    counts[0][..RAW_SYMBOLS].copy_from_slice(distance);
+    if mode == LosslessModularLz77::ZeroRuns {
+        counts[0][1] = lz77.iter().flatten().sum();
+    }
+    for channel in 0..4 {
+        counts[channel + 1][..RAW_SYMBOLS].copy_from_slice(&raw[channel]);
+        counts[channel + 1][224..].copy_from_slice(&lz77[channel][..32]);
+    }
+    let (tables, context_map) = clustering::cluster(
+        &[hybrid::HybridCounts {
+            config: Default::default(),
+            counts,
+            extra_bits: [0; clustering::CONTEXTS],
+        }],
+        copies,
+    )?;
+    Ok(AnsCodebook {
+        tables,
+        context_map,
+        mode,
+    })
 }

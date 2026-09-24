@@ -983,10 +983,13 @@ three ANS symbols, each requiring at most 16 renormalization bits, plus at most 
 capacities that exceed WGSL u32 bit addressing. The output range cannot overlap any event,
 Palette dictionary, prediction state or transform arena.
 
-`EntropyBatchPlan` appends a storage-offset-aligned parameter suffix: four header words, four
-words per group, four words per channel, then capacity for five 4608-word tables. Each table contains 256
-frequencies, 256 symbol rank offsets and a 4096-entry reverse alias map. Offsets are relative
-to the parameter suffix or the current artifact binding. Table capacity is 92,160 bytes per batch.
+`EntropyBatchPlan` appends a storage-offset-aligned parameter suffix: eight header words, four
+words per group, four words per channel, 37 packed candidate configurations, then capacity for
+five 4609-word tables. Each table contains its packed split/MSB/LSB configuration, 256 frequencies,
+256 symbol rank offsets and a 4096-entry reverse alias map. Offsets are relative to the parameter
+suffix or the current artifact binding. Table capacity is 92,180 bytes per batch. Header words
+0–3 hold group count, table start, Greedy flag and distance table; words 4–7 hold channel-descriptor
+start, histogram arena offset, candidate start and channel count.
 The clustered codebook uploads one to five tables and binds only the populated suffix. Batch word
 three selects the distance table; each channel descriptor contains its resolved cluster ID. Both
 come from the same immutable context map that writes the entropy header. Unused table capacity is
@@ -994,6 +997,18 @@ not shader-accessible, and the pre-histogram allocation/budget remains the five-
 The parameter and artifact maxima participate in device limits, batching, budget admission and
 pool leasing. `ans_output_bytes` reports only the compressed allocation subtotal already included
 in artifact bytes; separate readback, when needed, copies that region with the rest of the batch.
+
+The first pass appends a 165,768-byte profile arena after every batch's complete channel ranges:
+two atomic completion/error words, then 37 × 5 × 224 atomic-u32 counters. One invocation per
+channel/configuration reads canonical events and increments residual/distance bins. ZeroRuns
+contributes literal zero and distance one; length symbols use the original fixed configuration.
+All profiles use the same hybrid function as the serializer. An admitted batch is at most u32
+bytes; each 16-byte event contributes at most two counts, so atomic counters cannot overflow.
+The host checks completed invocations, zero errors, all canonical event semantics, legal profile
+alphabets and equality after coarsening each profile to canonical buckets, then aggregates with
+checked u64 addition. `hybrid_histogram_bytes` exposes this artifact subtotal; it participates
+in batch boundaries, readback, budget and cancellation before any allocation. The profiling
+pass shares the token submission and map. The second submission retains the same reservation.
 
 The second pass clears the artifact allocation, regenerates tokens, then dispatches the ANS
 kernel before mapping/copying. One invocation visits channels/events backwards, checks symbol

@@ -11,6 +11,8 @@ use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS};
 use crate::{BackendError, EncodeError, WgpuContext};
 
 mod clustering;
+mod hybrid;
+pub(super) use hybrid::{FrameHistograms, PROFILE_BYTES, PROFILES};
 
 /// Entropy coding after lossless GPU tokenization. This selection never changes source words.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -32,9 +34,7 @@ pub(super) enum EntropyCode {
 impl EntropyCode {
     pub(super) fn from_histograms(
         plan: &ModularDispatchPlan,
-        raw: &[[u64; RAW_SYMBOLS]; 4],
-        lz77: &[[u64; LZ77_SYMBOLS]; 4],
-        distance: &[u64; RAW_SYMBOLS],
+        histograms: &FrameHistograms,
     ) -> Result<Self, EncodeError> {
         match plan.entropy {
             LosslessModularEntropyCoding::Prefix => Ok(Self::Prefix {
@@ -43,16 +43,14 @@ impl EntropyCode {
                     plan.bits_per_sample,
                     plan.predictor,
                     &plan.transforms,
-                    raw,
-                    lz77,
+                    &histograms.raw,
+                    &histograms.lz77,
                 )?),
-                distance: super::serializer::build_distance_code(plan.lz77, distance)?,
+                distance: super::serializer::build_distance_code(plan.lz77, &histograms.distance)?,
             }),
             LosslessModularEntropyCoding::Ans => Ok(Self::Ans(Box::new(AnsCodebook::new(
                 plan.lz77,
-                raw,
-                lz77,
-                distance,
+                histograms,
                 1 + if plan.group_grid.groups > 1
                     && plan.tree_mode == super::types::LosslessModularTreeMode::LocalPerGroup
                 {
@@ -131,7 +129,7 @@ impl EntropyCode {
 }
 
 pub(super) struct AnsCodebook {
-    tables: Vec<AnsCode>,
+    tables: Vec<hybrid::HybridCode>,
     /// Distance, then channel 0/1/2/3+. Shared by wire metadata and GPU lowering.
     context_map: clustering::ContextMap,
     mode: LosslessModularLz77,
@@ -140,37 +138,11 @@ pub(super) struct AnsCodebook {
 impl AnsCodebook {
     pub(super) fn new(
         mode: LosslessModularLz77,
-        raw: &[[u64; RAW_SYMBOLS]; 4],
-        lz77: &[[u64; LZ77_SYMBOLS]; 4],
-        distance: &[u64; RAW_SYMBOLS],
+        histograms: &FrameHistograms,
         header_copies: u64,
     ) -> Result<Self, EncodeError> {
-        let mut counts = [[0u64; ALPHABET]; clustering::CONTEXTS];
-        if mode == LosslessModularLz77::ZeroRuns {
-            if distance.iter().any(|&count| count != 0) {
-                return Err(BackendError::InvalidArtifact(
-                    "zero-run ANS contains explicit distances",
-                )
-                .into());
-            }
-            counts[0][1] = lz77.iter().flatten().try_fold(0u64, |sum, &count| {
-                sum.checked_add(count).ok_or(BackendError::InvalidArtifact(
-                    "ANS distance histogram overflow",
-                ))
-            })?;
-        } else {
-            counts[0][..RAW_SYMBOLS].copy_from_slice(distance);
-        }
-        for channel in 0..4 {
-            if lz77[channel][32] != 0 {
-                return Err(
-                    BackendError::InvalidArtifact("ANS LZ77 alphabet exceeds 256 symbols").into(),
-                );
-            }
-            counts[channel + 1][..RAW_SYMBOLS].copy_from_slice(&raw[channel]);
-            counts[channel + 1][224..].copy_from_slice(&lz77[channel][..32]);
-        }
-        let (tables, context_map) = clustering::cluster(&counts, header_copies)?;
+        let profiles = histograms.candidates(mode)?;
+        let (tables, context_map) = clustering::cluster(&profiles, header_copies)?;
         Ok(Self {
             tables,
             context_map,
@@ -178,15 +150,15 @@ impl AnsCodebook {
         })
     }
 
-    /// Common LZ77/context map has already been written; every hybrid alphabet uses split=0.
+    /// The selected table owns both its wire configuration and GPU recoding metadata.
     pub(super) fn write_histograms(&self, writer: &mut BitWriter) -> Result<(), EncodeError> {
         writer.write_bits(0, 1)?; // ANS
         writer.write_bits(3, 2)?; // log alphabet size = 8
-        for _ in &self.tables {
-            writer.write_bits(0, 4)?;
+        for table in &self.tables {
+            table.config.write(writer)?;
         }
         for table in &self.tables {
-            table.write_histogram(writer)?;
+            table.code.write_histogram(writer)?;
         }
         Ok(())
     }
@@ -227,14 +199,16 @@ impl EntropyArtifactPlan {
 pub(super) struct EntropyBatchPlan {
     pub(super) parameter_offset: u64,
     pub(super) group_count: u32,
+    pub(super) profile_byte_offset: u64,
 }
 
 impl EntropyBatchPlan {
     pub(super) fn bytes(self, channels: usize) -> u64 {
-        4 * (4
+        4 * (8
+            + hybrid::PROFILES as u64
             + 4 * u64::from(self.group_count)
             + 4 * channels as u64
-            + clustering::CONTEXTS as u64 * TABLE_WORDS as u64)
+            + clustering::CONTEXTS as u64 * (TABLE_WORDS as u64 + 1))
     }
 }
 
@@ -285,12 +259,47 @@ pub(super) fn validate_encoded_group<'a>(
     })
 }
 
+fn shader_source(body: &str) -> String {
+    format!("{}\n{body}", include_str!("entropy/hybrid.wgsl"))
+}
+
+pub(super) struct AnsPipelines {
+    pub(super) encode: Arc<wgpu::ComputePipeline>,
+    pub(super) profile: wgpu::ComputePipeline,
+}
+
+impl AnsPipelines {
+    pub(super) fn new(context: &WgpuContext) -> Arc<Self> {
+        let module = context
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Modular hybrid histogram shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    shader_source(include_str!("entropy/profile.wgsl")).into(),
+                ),
+            });
+        Arc::new(Self {
+            encode: pipeline(context),
+            profile: context
+                .device()
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("Modular hybrid histogram pipeline"),
+                    layout: None,
+                    module: &module,
+                    entry_point: Some("profile"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                }),
+        })
+    }
+}
+
 pub(super) fn pipeline(context: &WgpuContext) -> Arc<wgpu::ComputePipeline> {
     let module = context
         .device()
         .create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Modular GPU ANS serialization"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("entropy.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader_source(include_str!("entropy.wgsl")).into()),
         });
     Arc::new(
         context
@@ -309,7 +318,7 @@ pub(super) fn pipeline(context: &WgpuContext) -> Arc<wgpu::ComputePipeline> {
 pub(super) struct AnsSubmission<'a> {
     pub(super) plan: &'a ModularDispatchPlan,
     pub(super) batch: &'a ModularDispatchBatch,
-    pub(super) codebook: &'a AnsCodebook,
+    pub(super) codebook: Option<&'a AnsCodebook>,
     pub(super) context: &'a WgpuContext,
     pub(super) pipeline: &'a wgpu::ComputePipeline,
     pub(super) parameters: &'a wgpu::Buffer,
@@ -334,15 +343,26 @@ pub(super) fn record(
         "ANS batch has no metadata allocation",
     ))?;
     let groups = &plan.groups[batch.first_dispatch..batch.first_dispatch + batch.dispatch_count];
-    let channel_start = 4 + 4 * entropy.group_count as usize;
-    let tables_start = channel_start + 4 * groups.len();
+    let channel_start = 8 + 4 * entropy.group_count as usize;
+    let profiles_start = channel_start + 4 * groups.len();
+    let tables_start = profiles_start + hybrid::PROFILES;
     let mut metadata = vec![0u32; tables_start];
-    metadata[..4].copy_from_slice(&[
+    metadata[..8].copy_from_slice(&[
         entropy.group_count,
         tables_start as u32,
-        u32::from(codebook.mode == LosslessModularLz77::Greedy),
-        u32::from(codebook.context_map[0]),
+        u32::from(plan.lz77 == LosslessModularLz77::Greedy),
+        u32::from(codebook.map_or(0, |code| code.context_map[0])),
+        channel_start as u32,
+        (entropy.profile_byte_offset / 4) as u32,
+        profiles_start as u32,
+        groups.len() as u32,
     ]);
+    for (target, &config) in metadata[profiles_start..tables_start]
+        .iter_mut()
+        .zip(hybrid::HybridConfig::candidates())
+    {
+        *target = config.packed();
+    }
     let mut job = 0;
     for (index, group) in groups.iter().enumerate() {
         let base = (group.artifact_byte_offset - batch.artifact_byte_offset) / 4;
@@ -350,14 +370,16 @@ pub(super) fn record(
             base as u32 + super::types::OUTPUT_HEADER_WORDS as u32,
             base as u32,
             group.max_events as u32,
-            u32::from(codebook.context_map[group.channel.min(3) as usize + 1]),
+            u32::from(codebook.map_or(group.channel.min(3) as u8 + 1, |code| {
+                code.context_map[group.channel.min(3) as usize + 1]
+            })),
         ]);
         if let Some(output) = group.entropy {
             let count = groups[index..]
                 .iter()
                 .take_while(|next| next.group_index == group.group_index)
                 .count();
-            metadata[4 + job * 4..8 + job * 4].copy_from_slice(&[
+            metadata[8 + job * 4..12 + job * 4].copy_from_slice(&[
                 (channel_start + index * 4) as u32,
                 count as u32,
                 (base + output.byte_offset / 4) as u32,
@@ -369,8 +391,11 @@ pub(super) fn record(
     if job != entropy.group_count as usize {
         return Err(BackendError::Invariant("ANS group inventory mismatch").into());
     }
-    for table in &codebook.tables {
-        metadata.extend_from_slice(table.gpu_words());
+    if let Some(codebook) = codebook {
+        for table in &codebook.tables {
+            metadata.push(table.config.packed());
+            metadata.extend_from_slice(table.code.gpu_words());
+        }
     }
     let metadata_bytes = metadata.len() as u64 * 4;
     if metadata_bytes > entropy.bytes(groups.len()) {
@@ -402,12 +427,20 @@ pub(super) fn record(
             ],
         });
     let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("Modular ANS group serialization"),
+        label: Some(if codebook.is_some() {
+            "Modular ANS group serialization"
+        } else {
+            "Modular hybrid histogram profiling"
+        }),
         timestamp_writes: None,
     });
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, &bindings, &[]);
-    pass.dispatch_workgroups(entropy.group_count, 1, 1);
+    if codebook.is_some() {
+        pass.dispatch_workgroups(entropy.group_count, 1, 1);
+    } else {
+        pass.dispatch_workgroups(groups.len() as u32, hybrid::PROFILES as u32, 1);
+    }
     Ok(())
 }
 

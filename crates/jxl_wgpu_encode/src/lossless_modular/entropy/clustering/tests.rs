@@ -126,7 +126,7 @@ fn exhaustive_selection_matches_independent_f64_cost_and_is_deterministic() {
                 tables
                     .iter()
                     .zip(&repeated)
-                    .all(|(a, b)| a.gpu_words() == b.gpu_words())
+                    .all(|(a, b)| a.config == b.config && a.code.gpu_words() == b.code.gpu_words())
             );
             let best = maps()
                 .into_iter()
@@ -199,7 +199,10 @@ fn every_partition_and_reversed_cluster_label_decodes_actual_gpu_symbols() {
                             .map(|(_, counts)| counts[symbol])
                             .sum()
                     });
-                    AnsCode::from_counts(&merged).unwrap()
+                    hybrid::HybridCode {
+                        config: Default::default(),
+                        code: AnsCode::from_counts(&merged).unwrap(),
+                    }
                 })
                 .collect();
             // Reverse labels as well, so the distance table is not assumed to be table zero.
@@ -227,4 +230,118 @@ fn every_partition_and_reversed_cluster_label_decodes_actual_gpu_symbols() {
             }
         }
     }
+}
+
+fn cluster(
+    counts: &[[u64; ALPHABET]; CONTEXTS],
+    copies: u64,
+) -> Result<(Vec<hybrid::HybridCode>, ContextMap), EncodeError> {
+    super::cluster(
+        &[hybrid::HybridCounts {
+            config: Default::default(),
+            counts: *counts,
+            extra_bits: [0; CONTEXTS],
+        }],
+        copies,
+    )
+}
+
+#[test]
+fn joint_hybrid_partition_search_matches_exhaustive_f64_costs() {
+    for seed in 0..4 {
+        let profiles: Vec<_> = hybrid::HybridConfig::candidates()
+            .iter()
+            .enumerate()
+            .map(|(index, &config)| hybrid::HybridCounts {
+                config,
+                counts: std::array::from_fn(|context| {
+                    std::array::from_fn(|symbol| {
+                        if symbol % (index + 2) == context % (index + 2) {
+                            1 << ((symbol + context + seed) % 18)
+                        } else {
+                            0
+                        }
+                    })
+                }),
+                extra_bits: std::array::from_fn(|context| {
+                    (index * 19 + context * 7 + seed) as u128 * 113
+                }),
+            })
+            .collect();
+        for copies in [1, 1000] {
+            // Independent F64 rates for all 31 unions and 37 hybrid choices;
+            // Cartesian partition enumeration is independent of the production recursion.
+            let mut rates = [[0.0; hybrid::PROFILES]; 31];
+            for subset in 1..32 {
+                for (profile_index, profile) in profiles.iter().enumerate() {
+                    let merged = std::array::from_fn(|symbol| {
+                        (0..CONTEXTS)
+                            .filter(|&context| subset & (1 << context) != 0)
+                            .map(|context| profile.counts[context][symbol])
+                            .sum()
+                    });
+                    let code = AnsCode::from_counts(&merged).unwrap();
+                    let mut header = BitWriter::new();
+                    code.write_histogram(&mut header).unwrap();
+                    profile.config.write(&mut header).unwrap();
+                    let rate = &mut rates[subset - 1][profile_index];
+                    *rate = header.bit_len() as f64 * copies as f64;
+                    for context in 0..CONTEXTS {
+                        if subset & (1 << context) != 0 {
+                            *rate += profile.extra_bits[context] as f64;
+                        }
+                    }
+                    for (&count, &frequency) in merged.iter().zip(code.gpu_words()) {
+                        if count != 0 {
+                            *rate += count as f64 * (12.0 - f64::from(frequency).log2());
+                        }
+                    }
+                }
+            }
+            let map_rate = |map: ContextMap, configurations: Option<&[hybrid::HybridCode]>| {
+                let clusters = *map.iter().max().unwrap() as usize + 1;
+                let width = if clusters == 1 {
+                    0
+                } else {
+                    (clusters - 1).ilog2() + 1
+                };
+                let mut cost = (3 + CONTEXTS as u64 * u64::from(width)) as f64 * copies as f64;
+                for cluster in 0..clusters {
+                    let subset: usize = (0..CONTEXTS)
+                        .filter(|&context| map[context] as usize == cluster)
+                        .map(|context| 1 << context)
+                        .sum();
+                    cost += if let Some(tables) = configurations {
+                        let index = profiles
+                            .iter()
+                            .position(|profile| profile.config == tables[cluster].config)
+                            .unwrap();
+                        rates[subset - 1][index]
+                    } else {
+                        rates[subset - 1].into_iter().fold(f64::INFINITY, f64::min)
+                    };
+                }
+                cost
+            };
+            let (tables, map) = super::cluster(&profiles, copies).unwrap();
+            let minimum = maps()
+                .into_iter()
+                .map(|map| map_rate(map, None))
+                .fold(f64::INFINITY, f64::min);
+            let allowance = profiles
+                .iter()
+                .map(|profile| profile.counts.iter().flatten().sum::<u64>())
+                .max()
+                .unwrap() as f64
+                * 2f64.powi(-19);
+            assert!(map_rate(map, Some(&tables)) - minimum <= allowance);
+            let (repeated, next_map) = super::cluster(&profiles, copies).unwrap();
+            assert_eq!(map, next_map);
+            for (first, second) in tables.iter().zip(repeated) {
+                assert_eq!(first.config, second.config);
+                assert_eq!(first.code.gpu_words(), second.code.gpu_words());
+            }
+        }
+    }
+    assert!(super::cluster(&[], 1).is_err());
 }

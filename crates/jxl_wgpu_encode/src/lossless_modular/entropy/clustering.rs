@@ -6,7 +6,7 @@ pub(super) const CONTEXTS: usize = 5;
 pub(super) type ContextMap = [u8; CONTEXTS];
 
 struct Candidate {
-    code: AnsCode,
+    code: hybrid::HybridCode,
     cost: u128,
 }
 
@@ -17,9 +17,9 @@ struct Partition {
 }
 
 pub(super) fn cluster(
-    counts: &[[u64; ALPHABET]; CONTEXTS],
+    profiles: &[hybrid::HybridCounts],
     header_copies: u64,
-) -> Result<(Vec<AnsCode>, ContextMap), EncodeError> {
+) -> Result<(Vec<hybrid::HybridCode>, ContextMap), EncodeError> {
     if header_copies == 0 {
         return Err(BackendError::Invariant("ANS codebook has no header").into());
     }
@@ -28,25 +28,42 @@ pub(super) fn cluster(
     // then the lexicographically smaller map. No floating-point choices occur.
     let candidates = (1..1u8 << CONTEXTS)
         .map(|subset| {
-            let mut merged = [0u64; ALPHABET];
-            for (context, counts) in counts.iter().enumerate() {
-                if subset & (1 << context) == 0 {
-                    continue;
+            let mut best: Option<Candidate> = None;
+            for profile in profiles {
+                let mut merged = [0u64; ALPHABET];
+                let mut extra_bits = 0;
+                for (context, counts) in profile.counts.iter().enumerate() {
+                    if subset & (1 << context) == 0 {
+                        continue;
+                    }
+                    extra_bits += profile.extra_bits[context];
+                    for (total, &count) in merged.iter_mut().zip(counts) {
+                        *total = total
+                            .checked_add(count)
+                            .ok_or(BackendError::InvalidArtifact(
+                                "clustered ANS histogram overflow",
+                            ))?;
+                    }
                 }
-                for (total, &count) in merged.iter_mut().zip(counts) {
-                    *total = total
-                        .checked_add(count)
-                        .ok_or(BackendError::InvalidArtifact(
-                            "clustered ANS histogram overflow",
-                        ))?;
+                let code = AnsCode::from_counts(&merged)?;
+                let mut header = BitWriter::new();
+                code.write_histogram(&mut header)?;
+                profile.config.write(&mut header)?;
+                let cost = code.estimated_data_bits(&merged)?
+                    + ((extra_bits + header.bit_len() as u128 * u128::from(header_copies)) << 20);
+                if best.as_ref().is_none_or(|previous| {
+                    (cost, profile.config) < (previous.cost, previous.code.config)
+                }) {
+                    best = Some(Candidate {
+                        code: hybrid::HybridCode {
+                            code,
+                            config: profile.config,
+                        },
+                        cost,
+                    });
                 }
             }
-            let code = AnsCode::from_counts(&merged)?;
-            let mut header = BitWriter::new();
-            code.write_histogram(&mut header)?;
-            let cost = code.estimated_data_bits(&merged)?
-                + (((header.bit_len() as u128 + 4) * u128::from(header_copies)) << 20);
-            Ok(Candidate { code, cost })
+            best.ok_or_else(|| BackendError::Invariant("ANS hybrid search is empty").into())
         })
         .collect::<Result<Vec<_>, EncodeError>>()?;
     let mut best = None;

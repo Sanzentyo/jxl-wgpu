@@ -7,7 +7,9 @@ use jxl_wgpu::MemoryPermit;
 use super::dispatch::{
     LosslessModularBackend, ModularDispatchBatch, ModularDispatchPlan, ModularGroupPlan,
 };
-use super::entropy::{AnsCodebook, EntropyCode, validate_encoded_group};
+use super::entropy::{
+    AnsCodebook, AnsPipelines, EntropyCode, FrameHistograms, validate_encoded_group,
+};
 use super::grid::LosslessModularGroupGrid;
 use super::lz77::LosslessModularLz77;
 use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
@@ -19,7 +21,6 @@ use super::serializer::{
 use super::transform::ModularTransformPlan;
 use super::types::{LosslessModularFormat, LosslessModularTreeMode, ModularParams};
 use crate::buffer_pool::EncoderBufferPool;
-use crate::prefix::{LZ77_SYMBOLS, RAW_SYMBOLS};
 use crate::{
     BackendError, EncodeError, FrameEncodeRequest, FrameIndex, GpuEncodeJob, GpuFrameArtifacts,
     WgpuContext,
@@ -90,7 +91,7 @@ impl LosslessModularBackend {
 struct StreamingModularWorker {
     context: WgpuContext,
     pipeline: Arc<wgpu::ComputePipeline>,
-    ans_pipeline: Option<Arc<wgpu::ComputePipeline>>,
+    ans_pipeline: Option<Arc<AnsPipelines>>,
     buffer_pool: Arc<EncoderBufferPool>,
     direct_mapping: bool,
     source: crate::BufferImageSource,
@@ -102,29 +103,15 @@ struct StreamingModularWorker {
 #[cfg(not(target_arch = "wasm32"))]
 impl StreamingModularWorker {
     fn run(&self) -> Result<GpuFrameArtifacts, EncodeError> {
-        let mut aggregate_raw = [[0u64; RAW_SYMBOLS]; 4];
-        let mut aggregate_lz77 = [[0u64; LZ77_SYMBOLS]; 4];
-        let mut aggregate_distance = [0u64; RAW_SYMBOLS];
+        let mut histograms = FrameHistograms::default();
         for batch in &self.plan.batches {
             ensure_streaming_job_active(&self.cancelled)?;
             self.with_batch(batch, None, |bytes| {
-                accumulate_streaming_batch_histograms(
-                    &self.plan,
-                    batch,
-                    bytes,
-                    &mut aggregate_raw,
-                    &mut aggregate_lz77,
-                    &mut aggregate_distance,
-                )
+                accumulate_streaming_batch_histograms(&self.plan, batch, bytes, &mut histograms)
             })?;
         }
 
-        let entropy = Arc::new(EntropyCode::from_histograms(
-            &self.plan,
-            &aggregate_raw,
-            &aggregate_lz77,
-            &aggregate_distance,
-        )?);
+        let entropy = Arc::new(EntropyCode::from_histograms(&self.plan, &histograms)?);
         let frame = ModularFrameHeader {
             animation: self.request.animation,
             canvas_width: self.request.canvas_width,
@@ -186,24 +173,29 @@ impl StreamingModularWorker {
 }
 
 fn entropy_stage<'a>(
-    pipeline: Option<&'a wgpu::ComputePipeline>,
+    pipeline: Option<&'a AnsPipelines>,
     codebook: Option<&'a AnsCodebook>,
-) -> Result<Option<(&'a wgpu::ComputePipeline, &'a AnsCodebook)>, EncodeError> {
-    codebook
-        .map(|codebook| {
-            pipeline
-                .map(|pipeline| (pipeline, codebook))
-                .ok_or_else(|| {
-                    BackendError::Invariant("ANS serialization pipeline is absent").into()
-                })
-        })
-        .transpose()
+) -> Result<Option<(&'a wgpu::ComputePipeline, Option<&'a AnsCodebook>)>, EncodeError> {
+    match (pipeline, codebook) {
+        (Some(pipelines), codebook) => Ok(Some((
+            if codebook.is_some() {
+                &pipelines.encode
+            } else {
+                &pipelines.profile
+            },
+            codebook,
+        ))),
+        (None, None) => Ok(None),
+        (None, Some(_)) => {
+            Err(BackendError::Invariant("ANS serialization pipeline is absent").into())
+        }
+    }
 }
 
 struct StreamingBatchContext<'a> {
     context: &'a WgpuContext,
     pipeline: &'a wgpu::ComputePipeline,
-    entropy: Option<(&'a wgpu::ComputePipeline, &'a AnsCodebook)>,
+    entropy: Option<(&'a wgpu::ComputePipeline, Option<&'a AnsCodebook>)>,
     buffer_pool: &'a Arc<EncoderBufferPool>,
     direct_mapping: bool,
     source: &'a crate::BufferImageSource,
@@ -410,9 +402,7 @@ fn accumulate_streaming_batch_histograms(
     plan: &ModularDispatchPlan,
     batch: &ModularDispatchBatch,
     bytes: &[u8],
-    aggregate_raw: &mut [[u64; RAW_SYMBOLS]; 4],
-    aggregate_lz77: &mut [[u64; LZ77_SYMBOLS]; 4],
-    aggregate_distance: &mut [u64; RAW_SYMBOLS],
+    aggregate: &mut FrameHistograms,
 ) -> Result<(), EncodeError> {
     let end_dispatch = batch
         .first_dispatch
@@ -420,25 +410,38 @@ fn accumulate_streaming_batch_histograms(
         .ok_or(EncodeError::InvalidSource(
             "artifact batch dispatch range overflow",
         ))?;
+    let mut histograms = FrameHistograms::default();
     for dispatch in batch.first_dispatch..end_dispatch {
-        let group_plan = plan.groups.get(dispatch).ok_or(EncodeError::InvalidSource(
+        let group = plan.groups.get(dispatch).ok_or(EncodeError::InvalidSource(
             "artifact batch dispatch range is invalid",
         ))?;
-        let artifact_bytes = streaming_artifact_bytes(group_plan, batch, bytes)?;
-        let header = parse_group_artifact_header(group_plan.max_events, artifact_bytes)?;
-        accumulate_artifact_histograms(
-            group_plan.channel as usize,
-            &ValidatedModularArtifact {
-                header,
+        let data = streaming_artifact_bytes(group, batch, bytes)?;
+        let artifact = if batch.entropy.is_some() {
+            parse_planned_artifact(group, data)?
+        } else {
+            ValidatedModularArtifact {
+                header: parse_group_artifact_header(group.max_events, data)?,
                 events: &[],
                 palette_counts: None,
-            },
-            aggregate_raw,
-            aggregate_lz77,
-            aggregate_distance,
+            }
+        };
+        accumulate_artifact_histograms(
+            group.channel as usize,
+            &artifact,
+            &mut histograms.raw,
+            &mut histograms.lz77,
+            &mut histograms.distance,
         )?;
     }
-    Ok(())
+    if let Some(entropy) = batch.entropy {
+        histograms.read_profiles(
+            plan.lz77,
+            entropy.profile_byte_offset,
+            batch.dispatch_count,
+            bytes,
+        )?;
+    }
+    aggregate.accumulate(histograms)
 }
 
 fn serialize_streaming_batch(
@@ -733,7 +736,7 @@ impl Drop for EncodeJobLifetime {
 pub(super) struct BrowserStreamingLosslessModularJob {
     context: WgpuContext,
     pipeline: Arc<wgpu::ComputePipeline>,
-    ans_pipeline: Option<Arc<wgpu::ComputePipeline>>,
+    ans_pipeline: Option<Arc<AnsPipelines>>,
     buffer_pool: Arc<EncoderBufferPool>,
     direct_mapping: bool,
     source: crate::BufferImageSource,
@@ -741,9 +744,7 @@ pub(super) struct BrowserStreamingLosslessModularJob {
     request: FrameEncodeRequest,
     cursor: StreamingCursor,
     pending: Option<PendingStreamingBatch>,
-    aggregate_raw: [[u64; RAW_SYMBOLS]; 4],
-    aggregate_lz77: [[u64; LZ77_SYMBOLS]; 4],
-    aggregate_distance: [u64; RAW_SYMBOLS],
+    histograms: FrameHistograms,
     assembler: Option<ModularPacketAssembler>,
 }
 
@@ -768,9 +769,7 @@ impl BrowserStreamingLosslessModularJob {
             request,
             cursor,
             pending: None,
-            aggregate_raw: [[0; RAW_SYMBOLS]; 4],
-            aggregate_lz77: [[0; LZ77_SYMBOLS]; 4],
-            aggregate_distance: [0; RAW_SYMBOLS],
+            histograms: FrameHistograms::default(),
             assembler: None,
         };
         job.submit_current_batch()?;
@@ -810,12 +809,7 @@ impl BrowserStreamingLosslessModularJob {
     }
 
     fn begin_serialization(&mut self) -> Result<(), EncodeError> {
-        let entropy = Arc::new(EntropyCode::from_histograms(
-            &self.plan,
-            &self.aggregate_raw,
-            &self.aggregate_lz77,
-            &self.aggregate_distance,
-        )?);
+        let entropy = Arc::new(EntropyCode::from_histograms(&self.plan, &self.histograms)?);
         self.assembler = Some(ModularPacketAssembler::new(
             ModularPacketConfig {
                 width: self.plan.width,
@@ -891,9 +885,7 @@ impl BrowserStreamingLosslessModularJob {
                         &self.plan,
                         &batch,
                         bytes,
-                        &mut self.aggregate_raw,
-                        &mut self.aggregate_lz77,
-                        &mut self.aggregate_distance,
+                        &mut self.histograms,
                     )
                 }),
                 StreamingPass::Serialize => {

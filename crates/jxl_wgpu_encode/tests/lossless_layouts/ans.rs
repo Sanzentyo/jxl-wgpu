@@ -138,6 +138,7 @@ fn check(rig: &Rig, encoder: &LosslessModularEncoder, case: &Case, extent: Exten
     let input = upload(&rig.context, case, extent, &expected, 4099);
     let plan = encoder.memory_plan(&input).unwrap();
     assert!(plan.streaming);
+    assert_eq!(plan.hybrid_histogram_bytes, 165_768);
     assert_eq!(plan.gpu_submission_count, 2 * plan.batch_count);
     let encoded = pollster::block_on(encoder.submit_container(input).unwrap()).unwrap();
     let canonical = upload(&rig.context, &case.canonical(), extent, &expected, 0);
@@ -290,6 +291,8 @@ fn ans_exact_budget_cancellation_and_pool_reuse_cover_one_and_many_batches() {
         let plan = encoder.memory_plan(&input).unwrap();
         assert_eq!(plan.batch_count > 1, extent.width == 16_384);
         assert!(plan.ans_output_bytes > 0 && plan.ans_output_bytes < plan.artifact_storage_bytes);
+        assert_eq!(plan.hybrid_histogram_bytes, 165_768);
+        assert!(plan.ans_output_bytes + plan.hybrid_histogram_bytes < plan.artifact_storage_bytes);
         assert_eq!(plan.gpu_submission_count, 2 * plan.batch_count);
         let limited = |bytes| {
             LosslessModularEncoder::with_config(

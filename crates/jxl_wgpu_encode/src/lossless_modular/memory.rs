@@ -38,6 +38,8 @@ pub struct LosslessModularMemoryPlan {
     /// Peak GPU ANS output capacity, already included in artifact bytes; zero for Prefix.
     /// Immutable ANS tables and descriptors are included in `parameter_storage_bytes`.
     pub ans_output_bytes: u64,
+    /// Peak GPU hybrid-uint histogram storage, included in artifact bytes; zero for Prefix.
+    pub hybrid_histogram_bytes: u64,
     /// Sum of the worst-case artifact ranges across every batch. This is diagnostic only; the
     /// encoder never allocates the sum as one GPU buffer.
     pub total_artifact_bytes: u64,

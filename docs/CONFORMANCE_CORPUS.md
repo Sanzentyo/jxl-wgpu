@@ -1164,8 +1164,24 @@ and padded/swizzled inputs byte for byte, and check native/original-word plus wh
 decoding under both tree placements and single/multiple groups. The previous every-depth/transform,
 budget, cancellation and late-failure matrix now uses clustered ANS unchanged.
 
+The hybrid profiler covers all 37 configurations representing every u32 with tokens below 224. Two
+GPU profile passes feed 74 serialization dispatches, covering both LZ77 modes, every direct-value
+boundary through 511, all wide exponents, u32 extrema, six channels including an empty one, and
+regular distances across history. Independent `jxl-coding` checks exact values, cursor and final
+state at multipliers 1/17/1024 for every configuration. Two additional actual populations require
+selected MSB or LSB retention and verify exact extra-bit accounting. Missing profiles, incomplete
+completion, error flags, illegal tokens, altered counts, truncation, range overflow and aggregate
+overflow cannot produce a codebook. Profiling and serialization shaders receive portable Naga validation.
+
+Eight joint-search cases compare all 31 unions × 37 configurations and all 52 partitions against
+independent F64 costs, including repeated headers and deterministic tables/configurations. A
+binding-limit test forces three batches by charging the profile arena, checks disjoint ranges
+and rejects one-byte-short storage or insufficient workgroup limits before allocation.\nThe existing public native/GPU matrix now
+uses adaptive residual/distance coding, with exactly 165,768 histogram bytes admitted per batch;
+its one/multiple-batch exact-budget, cancellation, reuse and late-failure checks remain in force.
+
 `ENT-E01` remains **Partial** for learned/wider contexts, clustering outside Modular ANS, adaptive
-hybrid configurations, cross-channel search and effort selection. This evidence makes no throughput
+length/alphabet configurations, cross-channel search and effort selection. This evidence makes no throughput
 or compression-ratio claim, and the rate estimate does not guarantee an always-smaller codestream.
 
 

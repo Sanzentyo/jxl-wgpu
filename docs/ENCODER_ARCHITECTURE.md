@@ -104,7 +104,8 @@ both trees, every operation/permutation, source-word preservation and ownership.
 ### Entropy planning and ANS serialization
 
 `LosslessModularEntropyCoding` is the caller's policy. The checked dispatch plan owns group
-output capacities and aligned per-batch metadata storage before admission. `EntropyCode` owns
+output capacities, hybrid histogram storage and aligned per-batch metadata before admission.
+`EntropyCode` owns
 one immutable frame codebook; `EncodedGroup` is granted only after GPU completion, event/histogram
 validation and fragment checks. Native and browser schedulers share those boundaries.
 
@@ -112,24 +113,37 @@ ANS reuses the two-pass batch scheduler even for a single batch: GPU histograms 
 retokenization and ANS in the second submission. Four channel contexts (0/1/2/3+) and distance
 share one to five distributions. Their immutable codebook owns the context map consumed by
 both wire metadata and GPU descriptor lowering; neither consumer reinterprets the choice.
+The same codebook owns a hybrid-uint configuration for each shared distribution.
 Distributions are normalized to 4096 using exact integer largest-remainder allocation with symbol-order ties.
 Each observed symbol receives at least one slot. The host serializes small/general histogram
 metadata and builds alias reverse maps; it never codes ANS image symbols. Shared `ans.rs` owns
 these table rules independently of Modular transforms and leaves room for other encoder consumers.
 
-Clustering caches the 31 nonempty histogram unions and examines all 52 partitions of the five
-contexts. Its objective combines Q20 normalized cross-entropy estimates with the actual histogram,
-hybrid-configuration and simple-context-map bit lengths. Header cost is charged once for a shared
+The first submission profiles 37 hybrid configurations on GPU after canonical tokenization.
+These are all split/MSB/LSB combinations representing every u32 with tokens below the reserved
+LZ77 threshold of 224 in the current 256-symbol alphabet. Canonical events retain split/MSB/LSB
+`0/0/0`; one shared WGSL helper recodes residuals and distances for profiling and final emission.
+LZ77 length coding retains `4/0/0`. A batch-wide atomic histogram arena has fixed capacity,
+independent of group count. Host code validates complete canonical events before accepting
+profile completion and coarsens each profile back to the canonical histograms for comparison.
+It aggregates only this bounded metadata, without host residual recoding.
+
+For each of the 31 nonempty context unions, clustering selects the best of 37 configurations,
+then examines all 52 partitions of the five contexts. It retains only one candidate per union.
+Its objective combines Q20 normalized cross-entropy, exact residual/distance extra-bit counts
+derived from canonical histograms, and the actual histogram, hybrid-configuration and simple-context-map bit lengths. Header cost is charged once for a shared
 tree or single group, and once plus every PassGroup for multi-group local trees. ZeroRuns contributes
 one distance symbol per run. Checked histogram sums reject overflow; fixed-point binary logarithms
 and u128 cost accumulation avoid host-libm decisions. Equal costs prefer fewer clusters, then the
-lexicographically smaller map. This searches the existing contexts, without learning a new MA tree.
-State-dependent renormalization, fixed extra bits and final packet alignment are not simulated;
+lexicographically smaller map; hybrid ties use split, MSB and LSB order. This searches the existing
+contexts, without learning a new MA tree.
+State-dependent renormalization and final packet alignment are not simulated;
 the estimated minimum is not a guarantee that every resulting codestream is smaller.
 
 Before histograms are available, the dispatch plan still admits the five-table maximum. The second
 pass uploads and binds only selected tables, within that reservation, and retains the same batch
-lease. Clustering changes neither output capacity nor the number of submissions.
+lease. Profiling adds a compute pass within the first submission, without an extra submit/map.
+Its storage participates in batch splitting; selection never requires a late allocation.
 
 One serial invocation per group visits all channels/events backwards, expands ZeroRuns into
 literal/length/distance symbols, and prepends renormalization words and hybrid extra bits. It then
@@ -141,13 +155,14 @@ symbol count and zero tail padding before packet assembly. A failed stage never 
 
 The existing exclusive parameter/artifact/readback lease includes tables, group/channel descriptors
 and worst-case compressed storage through mapping, consumption and cancellation. The public memory
-plan reports `ans_output_bytes` as an artifact subtotal and two submissions per batch. GPU binding
-and bit-address limits are checked before admission. See the [ABI](WGSL_MEMORY.md#modular-ans-serialization)
+plan reports `ans_output_bytes` and `hybrid_histogram_bytes` as artifact subtotals and two submissions
+per batch. GPU binding and bit-address limits are checked before admission. See the [ABI](WGSL_MEMORY.md#modular-ans-serialization)
 and [independent evidence](CONFORMANCE_CORPUS.md#lossless-modular-gpu-ans-encoding).
 The default Prefix path and private Gray8 acceleration index keep their previous byte contract;
 ANS containers omit that Prefix-specific index. This stage establishes correctness, with no
 measured throughput or compression-ratio claim. Learned contexts, clustering outside this bounded
-Modular ANS codebook, adaptive hybrid choices, effort policy and parallelism within a group remain future work.
+Modular ANS codebook, adaptive LZ77 length/alphabet choices, effort policy and parallelism within
+a group remain future work.
 
 ### GPU artifact ABI
 

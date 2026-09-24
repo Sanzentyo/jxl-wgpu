@@ -128,7 +128,7 @@ pub(super) struct ModularDispatchPlan {
 /// The host validates artifacts and assembles the selected entropy stream.
 pub struct LosslessModularBackend {
     pipeline: Option<Arc<wgpu::ComputePipeline>>,
-    pub(super) ans_pipeline: Option<Arc<wgpu::ComputePipeline>>,
+    pub(super) ans_pipeline: Option<Arc<super::entropy::AnsPipelines>>,
     pub(super) buffer_pool: Arc<EncoderBufferPool>,
     capabilities: EncoderCapabilities,
     max_storage_binding_size: u64,
@@ -202,7 +202,7 @@ impl LosslessModularBackend {
         Self {
             ans_pipeline: (pipeline.is_some()
                 && config.entropy == LosslessModularEntropyCoding::Ans)
-                .then(|| super::entropy::pipeline(context)),
+                .then(|| super::entropy::AnsPipelines::new(context)),
             pipeline,
             buffer_pool: EncoderBufferPool::new(DEFAULT_ENCODER_BUFFER_POOL_BYTES),
             capabilities: EncoderCapabilities {
@@ -326,10 +326,15 @@ impl LosslessModularBackend {
         )?);
         let channels = transforms.max_channels;
         let dispatches = transforms.dispatches;
-        if dispatches > self.max_compute_workgroups_per_dimension {
+        let max_dispatch_dimension = if self.config.entropy == LosslessModularEntropyCoding::Ans {
+            dispatches.max(super::entropy::PROFILES as u32)
+        } else {
+            dispatches
+        };
+        if max_dispatch_dimension > self.max_compute_workgroups_per_dimension {
             return Err(UnsupportedFeature::DeviceLimit {
                 name: "max_compute_workgroups_per_dimension",
-                required: u64::from(dispatches),
+                required: u64::from(max_dispatch_dimension),
                 available: u64::from(self.max_compute_workgroups_per_dimension),
             }
             .into());
@@ -356,6 +361,11 @@ impl LosslessModularBackend {
         let mut absolute_source_offsets = Vec::with_capacity(dispatch_count);
         let mut batches =
             Vec::with_capacity(dispatch_count.div_ceil(MAX_DISPATCHES_PER_ARTIFACT_BINDING));
+        let profile_bytes = if self.config.entropy == LosslessModularEntropyCoding::Ans {
+            super::entropy::PROFILE_BYTES
+        } else {
+            0
+        };
         let mut output_size = 0u64;
         let mut batch_first_dispatch = 0usize;
         let mut batch_artifact_offset = 0u64;
@@ -426,6 +436,7 @@ impl LosslessModularBackend {
             let batch_dispatches = parameters.len() - batch_first_dispatch;
             let proposed_batch_bytes = proposed_output_size
                 .checked_sub(batch_artifact_offset)
+                .and_then(|bytes| bytes.checked_add(profile_bytes))
                 .ok_or(EncodeError::InvalidSource(
                     "artifact batch offset underflow",
                 ))?;
@@ -447,10 +458,17 @@ impl LosslessModularBackend {
                         absolute_source_offsets: &absolute_source_offsets,
                         parameters: &mut parameters,
                         max_storage_binding_size: self.max_storage_binding_size,
+                        profile_bytes,
                     },
                 )?);
                 batch_first_dispatch = parameters.len();
                 batch_source_windows = ModularSourceWindows::default();
+                output_size =
+                    output_size
+                        .checked_add(profile_bytes)
+                        .ok_or(EncodeError::InvalidSource(
+                            "hybrid histogram range overflow",
+                        ))?;
                 output_size = align_up(output_size, artifact_alignment).ok_or(
                     EncodeError::InvalidSource("artifact batch alignment overflow"),
                 )?;
@@ -464,11 +482,14 @@ impl LosslessModularBackend {
             }
             if proposed_output_size
                 .checked_sub(batch_artifact_offset)
+                .and_then(|bytes| bytes.checked_add(profile_bytes))
                 .is_none_or(|bytes| bytes > self.max_storage_binding_size)
             {
                 return Err(UnsupportedFeature::DeviceLimit {
                     name: "max_storage_buffer_binding_size",
-                    required: proposed_output_size.saturating_sub(batch_artifact_offset),
+                    required: proposed_output_size
+                        .saturating_sub(batch_artifact_offset)
+                        .saturating_add(profile_bytes),
                     available: self.max_storage_binding_size,
                 }
                 .into());
@@ -641,8 +662,15 @@ impl LosslessModularBackend {
                     absolute_source_offsets: &absolute_source_offsets,
                     parameters: &mut parameters,
                     max_storage_binding_size: self.max_storage_binding_size,
+                    profile_bytes,
                 },
             )?);
+            output_size =
+                output_size
+                    .checked_add(profile_bytes)
+                    .ok_or(EncodeError::InvalidSource(
+                        "hybrid histogram range overflow",
+                    ))?;
         }
         for batch in &mut batches {
             for group in &groups[batch.first_dispatch..batch.first_dispatch + batch.dispatch_count]
@@ -667,6 +695,7 @@ impl LosslessModularBackend {
                 let entropy = EntropyBatchPlan {
                     parameter_offset,
                     group_count,
+                    profile_byte_offset: batch.artifact_binding_size.get() - profile_bytes,
                 };
                 batch.parameter_bytes = parameter_offset
                     .checked_add(entropy.bytes(batch.dispatch_count))
@@ -802,6 +831,7 @@ impl LosslessModularBackend {
             weighted_predictor_scratch_bytes,
             lz77_scratch_bytes,
             palette_scratch_bytes,
+            hybrid_histogram_bytes: profile_bytes,
             ans_output_bytes: batches
                 .iter()
                 .map(|batch| {
@@ -860,6 +890,7 @@ struct ModularBatchFinalizeContext<'a> {
     absolute_source_offsets: &'a [[u64; 4]],
     parameters: &'a mut [ModularParams],
     max_storage_binding_size: u64,
+    profile_bytes: u64,
 }
 
 fn modular_dispatch_batch(
@@ -882,12 +913,19 @@ fn modular_dispatch_batch(
             "artifact batch must contain at least one dispatch",
         ));
     }
-    let artifact_binding_bytes =
-        artifact_end
-            .checked_sub(artifact_byte_offset)
-            .ok_or(EncodeError::InvalidSource(
-                "artifact batch byte range underflow",
-            ))?;
+    let artifact_binding_bytes = artifact_end
+        .checked_sub(artifact_byte_offset)
+        .and_then(|bytes| bytes.checked_add(context.profile_bytes))
+        .ok_or(EncodeError::InvalidSource(
+            "artifact batch byte range underflow",
+        ))?;
+    // Each event occupies 16 bytes and contributes at most two profile counts.
+    // A u32-addressable byte range therefore cannot overflow any atomic histogram.
+    if context.profile_bytes != 0 && artifact_binding_bytes > u64::from(u32::MAX) {
+        return Err(EncodeError::InvalidSource(
+            "hybrid histogram batch exceeds u32 addressing",
+        ));
+    }
     if artifact_binding_bytes > context.max_storage_binding_size {
         return Err(UnsupportedFeature::DeviceLimit {
             name: "max_storage_buffer_binding_size",
@@ -1433,6 +1471,75 @@ mod source_window_tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn hybrid_histograms_participate_in_batch_limits_before_allocation() {
+        let render = pollster::block_on(jxl_wgpu::WgpuBackend::request_default(Default::default()))
+            .expect("required GPU adapter");
+        let context = WgpuContext::from_backend(&render);
+        let layout = ImageLayout::packed(
+            Extent2d::new(257, 2),
+            LosslessModularFormat::Gray.pixel_format(8).unwrap(),
+        )
+        .unwrap();
+        let buffer = context.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hybrid histogram admission source"),
+            size: layout.logical_size.next_multiple_of(4),
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let input = BufferImageSource::new(Arc::new(buffer), layout).unwrap();
+        let mut backend = LosslessModularBackend::with_config(
+            &context,
+            LosslessModularConfig {
+                entropy: LosslessModularEntropyCoding::Ans,
+                group_size: super::super::types::LosslessModularGroupSize::Pixels128,
+                ..Default::default()
+            },
+        );
+        let initial = backend.dispatch_plan(&input).unwrap();
+        assert_eq!(initial.batches.len(), 1);
+        let limit = initial.groups[0].output_size + super::super::entropy::PROFILE_BYTES;
+        backend.max_storage_binding_size = limit;
+        let split = backend.dispatch_plan(&input).unwrap();
+        assert_eq!(split.batches.len(), 3);
+        assert_eq!(split.memory.gpu_submission_count, 6);
+        let mut previous_end = 0;
+        for batch in &split.batches {
+            assert!(batch.artifact_byte_offset >= previous_end);
+            assert!(batch.artifact_binding_size.get() <= limit);
+            assert_eq!(batch.dispatch_count, 1);
+            let group = &split.groups[batch.first_dispatch];
+            let profile_offset = batch.entropy.unwrap().profile_byte_offset;
+            assert_eq!(
+                group.artifact_byte_offset + group.output_size,
+                batch.artifact_byte_offset + profile_offset
+            );
+            assert_eq!(
+                profile_offset + super::super::entropy::PROFILE_BYTES,
+                batch.artifact_binding_size.get()
+            );
+            previous_end = batch.artifact_byte_offset + batch.artifact_binding_size.get();
+        }
+        assert_eq!(split.output_size, previous_end);
+        backend.max_compute_workgroups_per_dimension = 36;
+        assert!(matches!(
+            backend.dispatch_plan(&input),
+            Err(EncodeError::Unsupported(UnsupportedFeature::DeviceLimit {
+                name: "max_compute_workgroups_per_dimension",
+                required: 37,
+                available: 36
+            }))
+        ));
+        backend.max_compute_workgroups_per_dimension = 37;
+        assert!(backend.dispatch_plan(&input).is_ok());
+        backend.max_storage_binding_size = limit - 1;
+        assert!(
+            matches!(backend.dispatch_plan(&input), Err(EncodeError::Unsupported(UnsupportedFeature::DeviceLimit { name: "max_storage_buffer_binding_size", required, available })) if required == limit && available == limit - 1)
+        );
+        assert_eq!(backend.buffer_pool_stats().allocation_misses, 0);
+        assert_eq!(context.memory_stats().reserved_bytes, 0);
     }
 
     #[test]
