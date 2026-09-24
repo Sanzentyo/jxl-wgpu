@@ -7,35 +7,11 @@ use super::entropy::VarDctPrefixCode;
 use super::entropy::{HfEntropyPlan, write_prefix_config};
 use super::types::{DcFragmentDescriptor, VarDctArtifactData, VarDctFrameLayout};
 use super::{VarDctConfig, VarDctQuantization};
-use crate::frame_header::{FrameHeaderPlan, write_animation_header};
+use crate::frame_header::FrameHeaderPlan;
 use crate::{
     AnimationHeader, BackendError, BitFragment, EncodeError, FrameGroupLayout, FramePacketSet,
     GroupPacket, GroupPacketKind,
 };
-
-fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), EncodeError> {
-    if !(1..(1 << 30)).contains(&size) {
-        return Err(EncodeError::InvalidConfiguration(
-            "VarDCT dimensions must be in 1..2^30",
-        ));
-    }
-    let value = size - 1;
-    let (selector, bits) = if value < 1 << 9 {
-        (0, 9)
-    } else if value < 1 << 13 {
-        (1, 13)
-    } else if value < 1 << 18 {
-        (2, 18)
-    } else {
-        (3, 30)
-    };
-    output.write_bits(selector, 2)?;
-    output.write_bits(u64::from(value), bits)?;
-    if ratio {
-        output.write_bits(0, 3)?;
-    }
-    Ok(())
-}
 
 pub(super) fn image_header(
     width: u32,
@@ -43,76 +19,7 @@ pub(super) fn image_header(
     animation: AnimationHeader,
     color: VarDctColorPlan,
 ) -> Result<BitFragment, EncodeError> {
-    ImageHeaderPlan::new(width, height, animation)?.encode(color)
-}
-
-/// Checked geometry/timebase, bound to the backend's color plan when a sequence begins.
-/// Retaining these fragments avoids interpreting color policy in the public descriptor.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ImageHeaderPlan {
-    prefix: BitFragment,
-    animation: Option<BitFragment>,
-}
-
-impl ImageHeaderPlan {
-    pub(super) fn new(
-        width: u32,
-        height: u32,
-        animation: AnimationHeader,
-    ) -> Result<Self, EncodeError> {
-        let fragment = |writer: BitWriter| {
-            let bits = writer.bit_len();
-            BitFragment::new(writer.into_bytes(), bits).map_err(EncodeError::from)
-        };
-        let mut prefix = BitWriter::new();
-        prefix.write_bits(0x0aff, 16)?;
-        prefix.write_bits(0, 1)?; // dimensions are not multiples of eight
-        write_size(&mut prefix, height, true)?;
-        write_size(&mut prefix, width, false)?;
-        let animation = if animation.is_animation() {
-            let mut writer = BitWriter::new();
-            write_animation_header(&mut writer, animation)?;
-            Some(fragment(writer)?)
-        } else {
-            None
-        };
-        Ok(Self {
-            prefix: fragment(prefix)?,
-            animation,
-        })
-    }
-
-    pub(super) fn encode(&self, color: VarDctColorPlan) -> Result<BitFragment, EncodeError> {
-        let mut output = BitWriter::new();
-        crate::packet::append_fragment(&mut output, &self.prefix)?;
-        let has_animation = self.animation.is_some();
-        if has_animation || !color.xyb_encoded() {
-            output.write_bits(0, 1)?; // explicit image metadata
-            output.write_bits(u64::from(has_animation), 1)?;
-            if let Some(animation) = &self.animation {
-                output.write_bits(0, 3)?; // identity orientation
-                output.write_bits(0, 1)?; // no intrinsic size
-                output.write_bits(0, 1)?; // no preview
-                output.write_bits(1, 1)?; // animation present
-                crate::packet::append_fragment(&mut output, animation)?;
-            }
-            output.write_bits(0, 1)?; // integer samples
-            output.write_bits(0, 2)?; // eight bits per sample
-            output.write_bits(1, 1)?; // 16-bit Modular buffers are sufficient
-            output.write_bits(0, 2)?; // no extra channels
-            output.write_bits(u64::from(color.xyb_encoded()), 1)?;
-            output.write_bits(1, 1)?; // default sRGB presentation
-            if has_animation {
-                output.write_bits(1, 1)?; // default tone mapping (present only with extra fields)
-            }
-            output.write_bits(0, 2)?; // no image extensions
-        } else {
-            output.write_bits(1, 1)?; // all-default image metadata: 8-bit, XYB, sRGB presentation
-        }
-        output.write_bits(1, 1)?; // default opsin inverse matrix and upsampling weights
-        output.align_to_byte()?;
-        Ok(BitFragment::byte_aligned(output.into_bytes())?)
-    }
+    crate::Rgb8SequenceDescriptor::new(width, height, animation)?.image_header(color.xyb_encoded())
 }
 
 fn frame_header(

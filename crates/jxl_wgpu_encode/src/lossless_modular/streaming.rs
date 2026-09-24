@@ -100,7 +100,8 @@ struct StreamingModularWorker {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl StreamingModularWorker {
-    fn run(&self) -> Result<GpuFrameArtifacts, EncodeError> {
+    // Consume the worker so its source and plan are released before completion is published.
+    fn run(self) -> Result<GpuFrameArtifacts, EncodeError> {
         let mut histograms = FrameHistograms::default();
         for batch in &self.plan.batches {
             ensure_streaming_job_active(&self.cancelled)?;
@@ -339,11 +340,10 @@ fn submit_streaming_batch(
         wgpu::MapMode::Read,
         0..artifact_bytes,
         move |result| {
-            if result.is_ok() {
-                callback_lifetime.mapped.store(true, Ordering::Release);
-            }
-            callback_completion.complete(result.map_err(BackendError::ArtifactMapping));
-            drop(callback_lifetime);
+            callback_completion.complete_mapping(
+                callback_lifetime,
+                result.map_err(BackendError::ArtifactMapping),
+            );
         },
     );
     let poll_permit = context.submission_poller().try_reserve()?;
@@ -496,6 +496,20 @@ pub(super) struct MapState {
 }
 
 impl MapCompletion {
+    pub(super) fn complete_mapping(
+        &self,
+        lifetime: Arc<EncodeJobLifetime>,
+        result: Result<(), BackendError>,
+    ) {
+        if result.is_ok() {
+            lifetime.mapped.store(true, Ordering::Release);
+        }
+        // A waiter can run synchronously from wake(), or on another thread immediately.
+        // It must own the only remaining job reference before it can finish or reuse the budget.
+        drop(lifetime);
+        self.complete(result);
+    }
+
     pub(super) fn complete(&self, result: Result<(), BackendError>) {
         let waker = {
             let mut state = self
@@ -999,3 +1013,6 @@ impl GpuEncodeJob for LosslessModularJob {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod lz77_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod completion_tests;

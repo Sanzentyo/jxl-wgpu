@@ -912,6 +912,19 @@ All-family exact-budget, cancellation, independent entropy and corruption tests 
 
 ## Progressive VarDCT encoding
 
+Mixed Modular/VarDCT sequence selection adds no shader ABI or image allocation. The common
+RGB8 descriptor fixes image geometry/timebase and original-sRGB metadata; per-frame coding
+chooses an existing backend's checked dispatch plan. `MixedModeMemoryPlan` exposes that plan's
+exact resources, including reference-only VarDCT lowering to one complete pass. Both codecs
+reserve from the same context budget. Resident completion retains its permit through artifact
+validation; streamed Modular keeps its existing bounded batch ownership through cancellation.
+The wrapper does not keep a second budget or release a selected job's resources independently.
+The shared resident/streamed Modular map callback releases its lifetime reference before
+publishing completion or waking a waiter, so a completed job cannot race that reference when
+returning its reservation and pool lease. Native streamed workers consume and release their
+source/plan before publishing the frame result. Abandoned jobs retain callback ownership until
+the actual map completion; notification does not authorize early GPU resource release.
+
 `VarDctKernelParams` remains a 768-byte storage record. Word 170 is the AC pass count,
 word 171 is the per-pass AC word stride, and words 172–182 hold eleven descriptors:
 `coefficient_square | (shift << 8)`. Words 183–184 now hold the optional saliency word offset

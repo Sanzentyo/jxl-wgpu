@@ -54,7 +54,8 @@ packet assembly all consume that configuration. `memory_plan_for_request` uses t
 path as submission; `memory_plan` retains the configured regular-frame estimate. No shader binding
 or ownership rules change, and regular frames retain their requested progression.
 
-`VarDctSequenceDescriptor` compiles bounded image geometry and optional timebase fragments.
+`Rgb8SequenceDescriptor` compiles bounded image geometry and optional timebase fragments;
+`VarDctSequenceDescriptor` remains an alias.
 Sequence creation binds them to the backend's immutable `VarDctColorPlan`, which lowers the
 typed XYB/original-RGB selection once. That same plan supplies image metadata, the presence
 of frame color/matrix-scale fields, GPU normalization and HF channel multipliers. Jobs retain
@@ -63,8 +64,23 @@ from other configuration. Original RGB transforms normalized sRGB components wit
 channel multipliers; XYB retains linearization, opsin conversion and its standard X/B scales.
 LF/correlation and matrix/order policy remain explicit and independent of color selection.
 All source-dependent operations stay on the GPU, using the existing allocations and completion
-lease. This prepares a common image domain for mixed coding modes; a mixed-codec sequence API
-is still unimplemented. [Original-RGB evidence](CONFORMANCE_CORPUS.md#original-rgb-vardct-encoding).
+lease. [Original-RGB evidence](CONFORMANCE_CORPUS.md#original-rgb-vardct-encoding).
+
+`MixedModeEncoder` binds this same image plan to original RGB and hosts both existing codec
+backends. Its immutable per-codec `FrameCoding` values contain profile and progression; the
+caller selects one for each physical frame. The generic `EncodeSession` retains the sole
+frame counter, finality, canvas and timebase, validates before admission, and advances only
+after successful submission. Fixed-codec sessions use this same submission path. Geometry
+belongs to the selected backend: a fixed VarDCT transform/map does not constrain Modular sources.
+Both codecs accept the exact common interleaved RGB8/default-sRGB format and post-transform
+references. XYB configuration and incompatible source/reference contracts fail before admission.
+
+Memory queries and submissions share each backend's frame preparation, including reference-only
+VarDCT pass lowering. The selected job keeps its existing completion/cancellation ownership;
+both draw from the same context byte budget. The wrapper adds no image buffers, shader parameters,
+submissions or readbacks. Completed packets enter the existing assembler and index planner.
+Explicit selection, resource bounds and validated results remain separate; automatic mode
+or quality selection is not implemented. [Mixed-codec evidence](CONFORMANCE_CORPUS.md#mixed-codec-sequence-encoding).
 
 Both VarDCT frontends create
 `VarDctSequenceSession` around the existing generic `EncodeSession` and `CodestreamAssembler`.

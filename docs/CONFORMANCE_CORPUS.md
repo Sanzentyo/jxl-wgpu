@@ -1713,8 +1713,55 @@ requires one-frame sequence bytes to equal the corresponding still API.
 
 Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib original_rgb -- --test-threads=2`.
 Native tools and an actual GPU are required. No fixture or reference is replaced. Mixed
-Modular/VarDCT sequence selection, other VarDCT source colors/precisions, extra channels,
+Modular/VarDCT sequence selection has [separate evidence](#mixed-codec-sequence-encoding); other VarDCT source colors/precisions, extra channels,
 pre-transform reference encoding and adaptive quality selection remain outside this evidence.
+
+## Mixed-codec sequence encoding
+
+`vardct_encoder/tests/animation/mixed_mode.rs` exercises `MixedModeEncoder` on Apple M5/Metal
+(2026-09-25). Twelve seven-frame streams cross still/animation, Prefix/ANS Modular and
+single-DCT8 (8×8), mixed-map (25×17) or tiled DCT8 (259×19) VarDCT. The first codec alternates
+between still and animation, covering both directions of cross-codec reference consumption.
+Each stream includes two reference-only producers, hidden regular layers, signed crops,
+Replace/Add/Multiply, all four slots and reuse of an older reference after intervening physical frames.
+Animations preserve the 60000/1001 clock, loop count, nonzero durations and timecodes. Still
+streams omit timing. Inventory checks the actual physical coding modes and every frame control;
+Modular/reference-only frames have one pass and regular VarDCT frames have five.
+
+Modular uses local RCT type 17, Weighted prediction, horizontal-then-vertical Squeeze and
+128-pixel groups. Prefix uses resident scheduling; ANS exercises native streamed completion.
+VarDCT uses original RGB and quantizers `(35252, 16, 12)`. Every physical source is also
+encoded through its existing standalone API. Native libjxl 0.12.0 and Rust `jxl` physical
+decoding agree within `2e-4 * (1 + abs(reference))` per finite F32 component and one rounded
+RGB8 code. Source PSNR exceeds 30 dB at these quantizers; Modular RGB8 and native original
+words are exact. This bound is corpus evidence, not a general quality guarantee.
+
+Independent composition of Rust-decoded physical stills is compared with native and jxl-oxide
+whole-stream output and actual GPU output. Whole input and fragmented 256-byte GPU windows
+produce identical bytes. Plain `jxli` containers seek every presentation through the same
+cross-codec dependencies, and retained GPU outputs survive session destruction. All original
+precision bounds and input/output lifetime checks remain in force; no oracle fallback is used.
+
+Additional cases require byte-identical forced single-frame output to both existing encoders
+under Prefix and ANS, exact and one-byte-deficient admission for each selected mode,
+cross-codec budget competition with failed-final retry, abandoned resident/streamed jobs,
+encoder reuse and complete reservation release. Invalid color/frame controls and fixed-VarDCT
+source extents fail without advancing sequence state. Larger cropped Modular input remains
+valid beside a fixed 8×8 VarDCT frame. Unclosed/incomplete sequences cannot finish.
+
+The full run exposed a map-notification race in the existing late Squeeze-overflow rejection
+case: the waiter could finish before the callback released its reservation reference. The
+shared Modular callback now drops that reference before notification, and streamed workers
+release their source/plan before publishing their result. A synchronous wake probe checks
+reference counts, reserved bytes and pool leases at notification for success/error and
+retained/abandoned jobs, including actual GPU mapping. The late-overflow case keeps its original
+immediate-zero checks; no added delay or weaker assertion masks the race.
+
+Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib mixed_mode -- --test-threads=2`,
+with the required native tools and `JXL_MODULAR_WORD_ORACLE` from the development procedure.
+The common encoder contract remains interleaved RGB8/default sRGB with post-transform references.
+Automatic mode/quality selection, other common color/precision/alpha contracts and pre-transform
+references are not claimed. No fixture/reference or GPU ABI is replaced.
 
 ## VarDCT animation encoding
 
@@ -1844,7 +1891,7 @@ sequences seek presentation zero through every hidden producer, use a 1/1 clock 
 duration, and retain output after session destruction. Non-final VarDCT admission covers exact
 and one-byte-deficient budgets, failed-final retry, cancellation, GPU-delayed release and reuse.
 Unclosed sequences fail assembly. A one-frame sequence is byte-identical to the existing VarDCT
-still API. Full capability gates remain required; mixed coding modes, VarDCT pre-transform
+still API. Full capability gates remain required; VarDCT pre-transform
 references, arbitrary extras, names and previews keep `FRAME-05` Partial.
 
 ## Progressive VarDCT encoding

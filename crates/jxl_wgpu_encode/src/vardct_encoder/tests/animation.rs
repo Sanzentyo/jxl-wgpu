@@ -12,6 +12,7 @@ use jxl_test_support::oracles::progressive::native_updates;
 use jxl_wgpu_decode::WgpuDecodeEngine;
 
 mod layered_still;
+mod mixed_mode;
 mod original_color;
 mod reference_only;
 
@@ -281,6 +282,37 @@ fn check_sequence_in_domain(
     passes: usize,
     (color, oracle): (VarDctColorTransform, CompositionOracle),
 ) {
+    let passes: Vec<_> = layers
+        .iter()
+        .map(|layer| {
+            if layer.options.kind == crate::FrameKind::ReferenceOnly {
+                1
+            } else {
+                passes
+            }
+        })
+        .collect();
+    check_sequence_with_passes(
+        backend,
+        encoded,
+        descriptor,
+        layers,
+        samples,
+        &passes,
+        (color, oracle),
+    );
+}
+
+fn check_sequence_with_passes(
+    backend: &WgpuBackend,
+    encoded: &[u8],
+    descriptor: &VarDctAnimationDescriptor,
+    layers: &[Layer],
+    samples: &[Vec<f32>],
+    passes: &[usize],
+    (color, oracle): (VarDctColorTransform, CompositionOracle),
+) {
+    assert_eq!(passes.len(), layers.len());
     let width = descriptor.canvas_width() as usize;
     let height = descriptor.canvas_height() as usize;
     let inventory = jxl_gpu_bitstream::parse(encoded, Default::default())
@@ -350,14 +382,7 @@ fn check_sequence_in_domain(
             frame.save_as_reference,
             u32::from(options.save_as_reference.get())
         );
-        assert_eq!(
-            frame.num_passes as usize,
-            if options.kind == crate::FrameKind::ReferenceOnly {
-                1
-            } else {
-                passes
-            }
-        );
+        assert_eq!(frame.num_passes as usize, passes[index]);
         assert_eq!(
             frame.frame_type,
             if options.kind == crate::FrameKind::ReferenceOnly {

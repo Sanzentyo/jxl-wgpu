@@ -1,10 +1,7 @@
 //! VarDCT contracts, ABI records, and frame geometry.
 
 use jxl_gpu_bitstream::FiniteF16;
-use jxl_gpu_formats::{
-    ByteOrder, Channel, ChromaSubsampling, ColorModel, ColorSpecification, PixelFormat,
-    PlaneFormat, PlaneSampling, SampleKind, Swizzle,
-};
+use jxl_gpu_formats::PixelFormat;
 use jxl_gpu_protocol::Extent2d;
 
 pub use jxl_gpu_protocol::TransformKind as VarDctStrategy;
@@ -148,20 +145,7 @@ impl VarDctColorEncoding {
     #[must_use]
     pub fn pixel_format(self) -> PixelFormat {
         match self {
-            Self::SrgbD65 => PixelFormat {
-                model: ColorModel::Rgb,
-                color_spec: ColorSpecification::Default,
-                chroma_subsampling: ChromaSubsampling::None,
-                sample_kind: SampleKind::Unsigned,
-                byte_order: ByteOrder::Native,
-                swizzle: Swizzle::XYZ1,
-                planes: vec![PlaneFormat::separate_words(
-                    PlaneSampling::FULL,
-                    1,
-                    &[Channel::X, Channel::Y, Channel::Z],
-                    8,
-                )],
-            },
+            Self::SrgbD65 => crate::rgb8::source_format(),
         }
     }
 }

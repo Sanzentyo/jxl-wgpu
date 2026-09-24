@@ -1,11 +1,10 @@
 //! Checked stream metadata and ordered assembly for RGB8 frame sequences.
 
-use super::bitstream::ImageHeaderPlan;
 use super::{VarDctBackend, VarDctConfig, VarDctJob};
 use crate::{
-    AnimationHeader, BufferImageSource, CodestreamAssembler, Determinism, EncodeError,
-    EncodeProfile, EncodeSession, FrameIndex, FrameOptions, FrameSubmission, GpuEncoder,
-    GpuFrameArtifacts, GpuFrameSource, SessionDescriptor,
+    BufferImageSource, CodestreamAssembler, Determinism, EncodeError, EncodeProfile, EncodeSession,
+    FrameIndex, FrameOptions, FrameSubmission, GpuEncoder, GpuFrameArtifacts, GpuFrameSource,
+    SessionDescriptor,
 };
 
 /// Compatibility name for [`VarDctSequenceDescriptor`].
@@ -14,51 +13,8 @@ pub type VarDctAnimationDescriptor = VarDctSequenceDescriptor;
 /// Compatibility name for [`VarDctSequenceSession`].
 pub type VarDctAnimationSession = VarDctSequenceSession;
 
-/// Stream-wide canvas and optional timebase for a VarDCT layered still or animation.
-///
-/// Every frame uses RGB8 sRGB/D65 sources and the encoder's fixed configuration, including
-/// its XYB or original-RGB coding domain. Cropped
-/// sources may have different extents when using [`super::TiledVarDctEncoder`]; a single
-/// transform or strategy map keeps its own source extent on every frame.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VarDctSequenceDescriptor {
-    canvas_width: u32,
-    canvas_height: u32,
-    animation: AnimationHeader,
-    header: ImageHeaderPlan,
-}
-
-impl VarDctSequenceDescriptor {
-    /// Checks the canvas/timebase. The encoder binds its color policy at `begin_sequence`.
-    pub fn new(
-        canvas_width: u32,
-        canvas_height: u32,
-        animation: AnimationHeader,
-    ) -> Result<Self, EncodeError> {
-        let header = ImageHeaderPlan::new(canvas_width, canvas_height, animation)?;
-        Ok(Self {
-            canvas_width,
-            canvas_height,
-            animation,
-            header,
-        })
-    }
-
-    #[must_use]
-    pub const fn canvas_width(&self) -> u32 {
-        self.canvas_width
-    }
-
-    #[must_use]
-    pub const fn canvas_height(&self) -> u32 {
-        self.canvas_height
-    }
-
-    #[must_use]
-    pub const fn animation(&self) -> AnimationHeader {
-        self.animation
-    }
-}
+/// Compatibility name for the common RGB8 sequence descriptor.
+pub type VarDctSequenceDescriptor = crate::Rgb8SequenceDescriptor;
 
 /// Independent GPU frame submissions and deterministic sequence assembly.
 ///
@@ -85,12 +41,11 @@ impl VarDctSequenceSession {
             },
             progressive: config.progressive.clone(),
             minimum_determinism: Determinism::SameDevice,
-            animation: descriptor.animation,
-            canvas_width: descriptor.canvas_width,
-            canvas_height: descriptor.canvas_height,
+            animation: descriptor.animation(),
+            canvas_width: descriptor.canvas_width(),
+            canvas_height: descriptor.canvas_height(),
         })?;
-        let assembler =
-            CodestreamAssembler::new(descriptor.header.encode(encoder.backend().color_plan)?)?;
+        let assembler = CodestreamAssembler::new(encoder.backend().sequence_header(&descriptor)?)?;
         Ok(Self {
             descriptor,
             session,

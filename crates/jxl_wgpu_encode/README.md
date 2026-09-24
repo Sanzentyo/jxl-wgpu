@@ -799,8 +799,40 @@ encoder.encode(source_13_by_21)
 
 ## Frame sequences
 
+### Mixed Modular and VarDCT frames
+
+`MixedModeEncoder::new(context, MixedModeConfig)` accepts explicit per-frame choices through
+`MixedModeFrameEncoding::{Modular, VarDct}`. `begin_sequence(Rgb8SequenceDescriptor)` creates
+one layered still or animation with a shared RGB8 sRGB/D65 image contract. Sources use the
+interleaved native-U8 RGB format returned by `VarDctColorEncoding::SrgbD65.pixel_format()`;
+unaligned offsets and padded pitches remain supported. The default config uses original-RGB
+VarDCT, tiled DCT8 and default lossless Modular. An explicit XYB configuration is rejected.
+
+`MixedModeConfig` fixes each codec's policy. `vardct_transform` selects `TiledDct8`,
+`Single(strategy)` or `Map(checked_map)`. Fixed transform/map extents constrain VarDCT sources
+only; Modular and tiled sources can vary per frame. Modular retains its configured Prefix/ANS,
+predictor and transform policies. Regular VarDCT frames retain configured AC progression;
+reference-only VarDCT frames use one implicit complete pass. The common contract supports
+Replace/Add/Multiply, signed crops, hidden layers, timecodes and four post-transform reference
+slots across codec boundaries. Alpha, ICC, other source precision/color, pre-transform
+references and automatic mode selection require broader contracts and remain unsupported.
+Modular preserves its physical source words; including VarDCT does not make the presentation lossless.
+
+The session's `submit_frame` and `submit_last_frame` take the source, encoding choice and
+`FrameOptions`. `memory_plan(source, encoding, options, is_last)` uses the same checks without
+advancing state or reserving memory and returns a `MixedModeMemoryPlan`. Both modes share the
+context's byte budget; streamed Modular jobs reserve their existing live-batch peak. Failed
+admission leaves the index and finality available for retry. Wait/Future completion, cancellation,
+out-of-order insertion, and raw/plain/indexed-container assembly reuse the existing ownership
+and validation boundaries. See the compiled usage example on
+[`MixedModeEncoder`](src/mixed_encoder.rs) and the
+[mixed-codec corpus](../../docs/CONFORMANCE_CORPUS.md#mixed-codec-sequence-encoding).
+
+### Fixed-codec sequences
+
 `begin_sequence` on either codec accepts a `LosslessModularSequenceDescriptor` or
-`VarDctSequenceDescriptor` and returns its corresponding `SequenceSession`. Descriptors select
+`VarDctSequenceDescriptor` (an alias of `Rgb8SequenceDescriptor`) and returns its corresponding
+`SequenceSession`. Descriptors select
 `AnimationHeader::Still` for a layered still or `AnimationHeader::Animation` for a timed sequence.
 The former omits animation metadata and requires zero duration and no timecode on every frame.
 Non-final regular layers and reference-only producers remain hidden; the final regular layer

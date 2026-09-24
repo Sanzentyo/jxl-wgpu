@@ -1,6 +1,6 @@
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use super::entropy::{EntropyArtifactPlan, EntropyBatchPlan, LosslessModularEntropyCoding};
 use super::grid::LosslessModularGroupGrid;
@@ -264,6 +264,37 @@ impl LosslessModularBackend {
         source: &crate::BufferImageSource,
     ) -> Result<LosslessModularMemoryPlan, EncodeError> {
         Ok(self.dispatch_plan(source)?.memory)
+    }
+
+    /// Computes exact resources after the same frame-control and precision checks as submission.
+    pub fn memory_plan_for_request(
+        &self,
+        source: &crate::BufferImageSource,
+        request: &FrameEncodeRequest,
+    ) -> Result<LosslessModularMemoryPlan, EncodeError> {
+        Ok(self.prepare_frame(source, request)?.0.memory)
+    }
+
+    fn prepare_frame(
+        &self,
+        source: &crate::BufferImageSource,
+        request: &FrameEncodeRequest,
+    ) -> Result<(ModularDispatchPlan, FrameHeaderPlan), EncodeError> {
+        let plan = self.dispatch_plan(source)?;
+        let header = validate_modular_frame_request(request, &plan)?;
+        if request.profile
+            != (EncodeProfile::ModularLossless {
+                sample_bit_depth: modular_sample_depth(
+                    plan.bits_per_sample,
+                    plan.exponent_bits_per_sample,
+                ),
+            })
+        {
+            return Err(EncodeError::InvalidConfiguration(
+                "requested Modular depth does not match the source valid bits",
+            ));
+        }
+        Ok((plan, header))
     }
 
     #[must_use]
@@ -985,20 +1016,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
         let GpuFrameSource::Buffer(source) = source else {
             return Err(UnsupportedFeature::InputFormat.into());
         };
-        let plan = self.dispatch_plan(&source)?;
-        let header = validate_modular_frame_request(request, &plan)?;
-        if request.profile
-            != (EncodeProfile::ModularLossless {
-                sample_bit_depth: modular_sample_depth(
-                    plan.bits_per_sample,
-                    plan.exponent_bits_per_sample,
-                ),
-            })
-        {
-            return Err(EncodeError::InvalidConfiguration(
-                "requested Modular depth does not match the source valid bits",
-            ));
-        }
+        let (plan, header) = self.prepare_frame(&source, request)?;
         if plan.memory.streaming {
             // A later batch may be larger than the first. Reject an already insufficient
             // peak budget before starting the worker or allocating its first batch. Batches
@@ -1127,11 +1145,10 @@ impl GpuEncodeBackend for LosslessModularBackend {
             wgpu::MapMode::Read,
             0..plan.output_size,
             move |result| {
-                if result.is_ok() {
-                    callback_lifetime.mapped.store(true, Ordering::Release);
-                }
-                callback_completion.complete(result.map_err(BackendError::ArtifactMapping));
-                drop(callback_lifetime);
+                callback_completion.complete_mapping(
+                    callback_lifetime,
+                    result.map_err(BackendError::ArtifactMapping),
+                );
             },
         );
         let poll_permit = context.submission_poller().try_reserve()?;

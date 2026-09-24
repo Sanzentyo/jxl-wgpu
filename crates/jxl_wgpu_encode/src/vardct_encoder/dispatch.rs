@@ -322,6 +322,13 @@ impl VarDctBackend {
         self.config.lf_metadata
     }
 
+    pub(crate) fn sequence_header(
+        &self,
+        descriptor: &crate::Rgb8SequenceDescriptor,
+    ) -> Result<BitFragment, EncodeError> {
+        descriptor.image_header(self.color_plan.xyb_encoded())
+    }
+
     /// Computes memory admission and source binding with the configured regular-frame passes.
     /// Use `memory_plan_for_request` for a reference-only frame's implicit single pass.
     pub fn memory_plan(&self, source: &BufferImageSource) -> Result<VarDctMemoryPlan, EncodeError> {

@@ -29,9 +29,13 @@
 //! explicit global/LF controls and per-transform HF multipliers; content-adaptive strategy search,
 //! distance control and progressive encoding
 //! remain incomplete. [`TiledVarDctEncoder`] provides an optimized DCT8 workgroup path.
-//! Both frontends expose [`VarDctAnimationSession`] for RGB8/XYB timed crops, Replace/Add/Multiply,
+//! Both frontends expose [`VarDctAnimationSession`] for RGB8 timed crops in XYB or original sRGB, Replace/Add/Multiply,
 //! hidden frames and four post-color-transform references, using the same checked frame control
 //! as Modular. Each frame retains the encoder's quantization and progressive AC configuration.
+//! [`MixedModeEncoder`] selects Modular or VarDCT explicitly for each physical frame under one
+//! checked [`Rgb8SequenceDescriptor`]. Its shared original-sRGB contract supports layered stills,
+//! animations and post-color-transform references across both codecs. Automatic mode selection
+//! and broader common source color/precision contracts remain unimplemented.
 //! [`VarDctCoefficientOrders`] selects independent X/Y/B permutations for every standard size class;
 //! GPU serializers consume them without exposing image coefficients to the host.
 //!
@@ -56,9 +60,11 @@ mod error;
 mod frame_header;
 mod gpu;
 mod lossless_modular;
+mod mixed_encoder;
 mod packet;
 mod permutation;
 mod prefix;
+mod rgb8;
 mod session;
 mod vardct_encoder;
 
@@ -88,10 +94,15 @@ pub use lossless_modular::{
     LosslessModularSubmission, LosslessModularTransform, LosslessModularTreeMode,
     LosslessModularWeightedPredictor,
 };
+pub use mixed_encoder::{
+    MixedModeConfig, MixedModeEncoder, MixedModeFrameEncoding, MixedModeJob, MixedModeMemoryPlan,
+    MixedModeSequenceSession, VarDctTransformSelection,
+};
 pub use packet::{
     BitFragment, EncodedFrame, FrameGroupLayout, FramePacketSet, GroupPacket, GroupPacketKind,
     assemble_frame,
 };
+pub use rgb8::Rgb8SequenceDescriptor;
 pub use session::{
     AnimationHeader, BlendMode, CodestreamAssembler, EncodeSession, FrameBlend, FrameCrop,
     FrameEncodeRequest, FrameIndex, FrameKind, FrameOptions, FrameSubmission, FrameTiming,

@@ -302,6 +302,13 @@ pub struct EncodeSession<B> {
     closed: bool,
 }
 
+/// Per-frame coding policy; canvas, timebase and sequence state stay in the session.
+#[derive(Clone)]
+pub(crate) struct FrameCoding {
+    pub(crate) profile: EncodeProfile,
+    pub(crate) progressive: ProgressivePlan,
+}
+
 impl<B: GpuEncodeBackend> EncodeSession<B> {
     pub(crate) fn new(encoder: GpuEncoder<B>, descriptor: SessionDescriptor) -> Self {
         Self {
@@ -330,9 +337,7 @@ impl<B: GpuEncodeBackend> EncodeSession<B> {
         source: GpuFrameSource,
         options: FrameOptions,
     ) -> Result<FrameSubmission<B::Job>, EncodeError> {
-        let submission = self.submit(source, options, true)?;
-        self.closed = true;
-        Ok(submission)
+        self.submit(source, options, true)
     }
 
     pub fn ensure_closed(&self) -> Result<(), EncodeError> {
@@ -349,29 +354,58 @@ impl<B: GpuEncodeBackend> EncodeSession<B> {
         options: FrameOptions,
         is_last: bool,
     ) -> Result<FrameSubmission<B::Job>, EncodeError> {
+        let coding = FrameCoding {
+            profile: self.descriptor.profile,
+            progressive: self.descriptor.progressive.clone(),
+        };
+        self.submit_with_coding(source, options, is_last, &coding)
+    }
+
+    pub(crate) fn encoder(&self) -> &GpuEncoder<B> {
+        &self.encoder
+    }
+
+    pub(crate) fn request_for(
+        &self,
+        options: FrameOptions,
+        is_last: bool,
+        coding: &FrameCoding,
+    ) -> Result<FrameEncodeRequest, EncodeError> {
         if self.closed {
             return Err(EncodeError::SessionClosed);
         }
+        self.next_frame
+            .checked_add(1)
+            .ok_or(EncodeError::InvalidConfiguration(
+                "too many physical frames",
+            ))?;
         validate_frame_timing(self.descriptor.animation, &options)?;
         let frame_index = FrameIndex(self.next_frame);
-        let request = FrameEncodeRequest {
+        Ok(FrameEncodeRequest {
             frame_index,
             is_last,
-            profile: self.descriptor.profile,
-            progressive: self.descriptor.progressive.clone(),
+            profile: coding.profile,
+            progressive: coding.progressive.clone(),
             minimum_determinism: self.descriptor.minimum_determinism,
             animation: self.descriptor.animation,
             canvas_width: self.descriptor.canvas_width,
             canvas_height: self.descriptor.canvas_height,
             options,
-        };
+        })
+    }
+
+    pub(crate) fn submit_with_coding(
+        &mut self,
+        source: GpuFrameSource,
+        options: FrameOptions,
+        is_last: bool,
+        coding: &FrameCoding,
+    ) -> Result<FrameSubmission<B::Job>, EncodeError> {
+        let request = self.request_for(options, is_last, coding)?;
         let submission = self.encoder.submit_frame(source, request)?;
-        self.next_frame =
-            self.next_frame
-                .checked_add(1)
-                .ok_or(EncodeError::InvalidConfiguration(
-                    "too many physical frames",
-                ))?;
+        // Overflow was checked before submission. Admission failures leave both fields unchanged.
+        self.next_frame += 1;
+        self.closed = is_last;
         Ok(submission)
     }
 }
