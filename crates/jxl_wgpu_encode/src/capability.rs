@@ -220,6 +220,7 @@ impl Default for ProgressivePlan {
 pub struct EncoderCapabilities {
     pub profiles: Vec<ProfileCapability>,
     pub max_progressive_passes: u8,
+    /// Supports multiple physical frames, including layered stills and timed animations.
     pub animation: bool,
     pub determinism: Determinism,
     pub implemented_stages: Vec<KernelStage>,
@@ -254,7 +255,9 @@ impl EncoderCapabilities {
                 requested: requested_passes,
             });
         }
-        if (request.animation.is_animation() || request.frame_index.get() != 0) && !self.animation {
+        if (request.animation.is_animation() || request.frame_index.get() != 0 || !request.is_last)
+            && !self.animation
+        {
             return Err(UnsupportedFeature::Animation);
         }
         if self.determinism < request.minimum_determinism {
@@ -343,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn animation_header_is_negotiated_even_for_frame_zero() {
+    fn frame_sequences_are_negotiated_even_for_frame_zero() {
         let capabilities = EncoderCapabilities {
             profiles: vec![ProfileCapability::ModularLossless {
                 min_bits_per_sample: 8,
@@ -375,6 +378,14 @@ mod tests {
         };
         assert_eq!(
             capabilities.negotiate(&request),
+            Err(UnsupportedFeature::Animation)
+        );
+        let mut still = request;
+        still.animation = AnimationHeader::Still;
+        assert_eq!(capabilities.negotiate(&still), Ok(()));
+        still.is_last = false;
+        assert_eq!(
+            capabilities.negotiate(&still),
             Err(UnsupportedFeature::Animation)
         );
     }

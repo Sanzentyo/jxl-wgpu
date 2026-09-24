@@ -26,7 +26,7 @@ The repository does not vendor or retain `libjxl` as an upstream source tree. Th
 use ordinary Cargo dependencies; official source is consulted only for specification and
 implementation audits.
 
-## Frame control and animation
+## Frame control and sequences
 
 `FrameHeaderPlan` owns regular/reference-only kind, crop geometry, per-channel blend-field presence,
 timing, reference-field presence, pass-bundle presence and finality. Construction validates source/crop agreement and wire
@@ -38,7 +38,14 @@ own quantization/progression checks. Codec-specific headers supply coding mode, 
 and pass layout; the common plan supplies the wire kind, field presence, suffix and disabled restoration.
 The stream serializers also share one checked animation-timebase writer.
 
-Reference-only animation frames omit timing, blending, finality and the pass bundle. Their origin
+Image timing and physical-frame controls are separate contracts. `AnimationHeader::Still` omits
+time fields but permits any number of hidden regular/reference-only layers before one final
+regular frame. The same `FrameHeaderPlan` checks all crop, blend and reference controls; there
+is no separate still-frame serializer. A shared timing validator is used by generic sessions
+and direct backend requests. The existing `animation` capability also guards layered sequences,
+including their first non-final frame, before GPU admission.
+
+Reference-only frames omit timing, blending, finality and the pass bundle. Their origin
 is zero, and a post-color-transform reference must cover the canvas; Modular also permits smaller
 pre-transform references. The plan rejects caller fields that this syntax cannot retain before
 admission. VarDCT derives an immutable per-frame configuration with one complete coefficient pass
@@ -47,8 +54,12 @@ packet assembly all consume that configuration. `memory_plan_for_request` uses t
 path as submission; `memory_plan` retains the configured regular-frame estimate. No shader binding
 or ownership rules change, and regular frames retain their requested progression.
 
-`VarDctAnimationDescriptor` compiles bounded RGB8/XYB image metadata. Both VarDCT frontends create
-`VarDctAnimationSession` around the existing generic `EncodeSession` and `CodestreamAssembler`.
+`VarDctSequenceDescriptor` compiles bounded RGB8/XYB image metadata. Both VarDCT frontends create
+`VarDctSequenceSession` around the existing generic `EncodeSession` and `CodestreamAssembler`.
+Modular uses the corresponding sequence descriptor/session, preserving its source format/precision/
+color contract and budgeted ICC header. Both descriptor kinds accept still or animated metadata.
+Legacy animation type names are aliases; `begin_animation` checks the timebase and delegates to
+`begin_sequence`, so it does not maintain a second execution path.
 Frames retain the encoder's immutable transform/quantizer policy and the legal progression above, with independently checked
 tiled crop extents. Failed submissions leave the frame index and finality available for retry;
 completed artifacts may be inserted in any order. Reference slots describe codestream metadata,
@@ -57,7 +68,8 @@ This profile emits post-color-transform references and rejects pre-transform sto
 blends and extra-channel contracts. Frame control adds no GPU allocation, binding, submission or
 map of its own; the effective pass layout determines existing artifact sizes. Completion and
 cancellation ownership remain unchanged. Syntax and conformance
-scope remain in the [animation corpus](CONFORMANCE_CORPUS.md#vardct-animation-encoding).
+scope remain in the [animation](CONFORMANCE_CORPUS.md#vardct-animation-encoding) and
+[layered-still](CONFORMANCE_CORPUS.md#layered-still-encoding) corpus.
 
 Indexed container assembly has a separate authority boundary after frame ordering.
 `CodestreamAssembler::finish_indexed_container` inventories the actual output headers under
@@ -427,7 +439,7 @@ reserved before queue submission and saturation is a typed retryable error. A br
 
 `EncoderCapabilities::negotiate` is authoritative. A backend must only list profiles and stages it
 executes. `LosslessModularBackend` reports `animation = true` and `max_progressive_passes = 1`.
-Multi-frame animation sessions are orchestrated via `LosslessModularAnimationSession`.
+Layered-still and animation sessions are orchestrated via `LosslessModularSequenceSession`.
 
 ## Deterministic packet assembly
 

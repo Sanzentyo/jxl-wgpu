@@ -2,7 +2,7 @@
 //! admission; GPU jobs retain this bounded immutable plan instead of reinterpreting options.
 use crate::{
     AnimationHeader, BitFragment, BlendMode, EncodeError, FrameBlend, FrameEncodeRequest,
-    FrameIndex, FrameKind, FrameOptions, ProgressivePlan,
+    FrameIndex, FrameKind, ProgressivePlan,
 };
 use jxl_gpu_bitstream::BitWriter;
 
@@ -150,14 +150,16 @@ fn validate_frame(
 ) -> Result<(), EncodeError> {
     if request.canvas_width == 0 || request.canvas_height == 0 {
         return Err(EncodeError::InvalidConfiguration(
-            "the JPEG XL animation canvas must be non-empty",
+            "the JPEG XL canvas must be non-empty",
         ));
     }
-    if request.options.kind == FrameKind::ReferenceOnly {
+    if request.animation.is_animation() {
         write_animation_header(&mut BitWriter::new(), request.animation)?;
-        validate_extent(request, source_extent)?;
+    }
+    crate::session::validate_frame_timing(request.animation, &request.options)?;
+    validate_extent(request, source_extent)?;
+    if request.options.kind == FrameKind::ReferenceOnly {
         if request.is_last
-            || request.options.timing != Default::default()
             || request.options.color_blend != FrameBlend::default()
             || !request.options.extra_channel_blends.is_empty()
         {
@@ -187,91 +189,67 @@ fn validate_frame(
         }
         return Ok(());
     }
-    match request.animation {
-        AnimationHeader::Still => {
-            if request.frame_index != FrameIndex::new(0)
-                || !request.is_last
-                || request.options != FrameOptions::default()
-                || request.canvas_width != source_extent.0
-                || request.canvas_height != source_extent.1
-            {
-                return Err(EncodeError::InvalidConfiguration(
-                    "a still encode request must be one full-canvas final frame",
-                ));
-            }
-        }
-        AnimationHeader::Animation { have_timecodes, .. } => {
-            write_animation_header(&mut BitWriter::new(), request.animation)?;
-            if request.options.timing.timecode.is_some() != have_timecodes {
-                return Err(EncodeError::InvalidConfiguration(
-                    "frame timecode presence must match the animation header",
-                ));
-            }
-            validate_extent(request, source_extent)?;
-            let extra_channels = usize::from(has_alpha);
-            if !request.options.extra_channel_blends.is_empty()
-                && request.options.extra_channel_blends.len() != extra_channels
-            {
-                return Err(EncodeError::InvalidConfiguration(
-                    "animation extra-channel blend count does not match the source format",
-                ));
-            }
-            if !has_alpha
-                && matches!(
-                    request.options.color_blend.mode,
-                    crate::BlendMode::Blend | crate::BlendMode::MultiplyAdd
-                )
-            {
-                return Err(EncodeError::InvalidConfiguration(
-                    "alpha-weighted animation blending requires an alpha source",
-                ));
-            }
-            let color_uses_clamp = request.options.color_blend.mode == crate::BlendMode::Multiply
-                || (has_alpha
-                    && matches!(
-                        request.options.color_blend.mode,
-                        crate::BlendMode::Blend | crate::BlendMode::MultiplyAdd
-                    ));
-            if request.options.color_blend.clamp && !color_uses_clamp {
-                return Err(EncodeError::InvalidConfiguration(
-                    "the selected JPEG XL color blend mode has no clamp field",
-                ));
-            }
-            if request.options.extra_channel_blends.iter().any(|blend| {
-                blend.clamp
-                    && !matches!(
-                        blend.mode,
-                        crate::BlendMode::Blend
-                            | crate::BlendMode::MultiplyAdd
-                            | crate::BlendMode::Multiply
-                    )
-            }) {
-                return Err(EncodeError::InvalidConfiguration(
-                    "the selected JPEG XL extra-channel blend mode has no clamp field",
-                ));
-            }
-            if request.is_last && request.options.save_as_reference != Default::default() {
-                return Err(EncodeError::InvalidConfiguration(
-                    "the final JPEG XL frame cannot be saved as a reference",
-                ));
-            }
-            let full_frame = frame_covers_canvas(
-                request.options.crop,
-                request.canvas_width,
-                request.canvas_height,
-            );
-            let resets_canvas =
-                request.options.color_blend.mode == crate::BlendMode::Replace && full_frame;
-            let can_be_referenced = !request.is_last
-                && (request.options.timing.duration_ticks == 0
-                    || request.options.save_as_reference.get() != 0);
-            let writes_save_before = resets_canvas && can_be_referenced;
-            if request.options.save_before_color_transform && !writes_save_before {
-                return Err(EncodeError::InvalidConfiguration(
-                    "save-before-color-transform is not present for this frame contract",
-                ));
-            }
-        }
+    let extra_channels = usize::from(has_alpha);
+    if !request.options.extra_channel_blends.is_empty()
+        && request.options.extra_channel_blends.len() != extra_channels
+    {
+        return Err(EncodeError::InvalidConfiguration(
+            "extra-channel blend count does not match the source format",
+        ));
+    }
+    if !has_alpha
+        && matches!(
+            request.options.color_blend.mode,
+            crate::BlendMode::Blend | crate::BlendMode::MultiplyAdd
+        )
+    {
+        return Err(EncodeError::InvalidConfiguration(
+            "alpha-weighted blending requires an alpha source",
+        ));
+    }
+    let color_uses_clamp = request.options.color_blend.mode == crate::BlendMode::Multiply
+        || (has_alpha
+            && matches!(
+                request.options.color_blend.mode,
+                crate::BlendMode::Blend | crate::BlendMode::MultiplyAdd
+            ));
+    if request.options.color_blend.clamp && !color_uses_clamp {
+        return Err(EncodeError::InvalidConfiguration(
+            "the selected JPEG XL color blend mode has no clamp field",
+        ));
+    }
+    if request.options.extra_channel_blends.iter().any(|blend| {
+        blend.clamp
+            && !matches!(
+                blend.mode,
+                crate::BlendMode::Blend
+                    | crate::BlendMode::MultiplyAdd
+                    | crate::BlendMode::Multiply
+            )
+    }) {
+        return Err(EncodeError::InvalidConfiguration(
+            "the selected JPEG XL extra-channel blend mode has no clamp field",
+        ));
+    }
+    if request.is_last && request.options.save_as_reference != Default::default() {
+        return Err(EncodeError::InvalidConfiguration(
+            "the final JPEG XL frame cannot be saved as a reference",
+        ));
+    }
+    let full_frame = frame_covers_canvas(
+        request.options.crop,
+        request.canvas_width,
+        request.canvas_height,
+    );
+    let resets_canvas = request.options.color_blend.mode == crate::BlendMode::Replace && full_frame;
+    let can_be_referenced = !request.is_last
+        && (request.options.timing.duration_ticks == 0
+            || request.options.save_as_reference.get() != 0);
+    let writes_save_before = resets_canvas && can_be_referenced;
+    if request.options.save_before_color_transform && !writes_save_before {
+        return Err(EncodeError::InvalidConfiguration(
+            "save-before-color-transform is not present for this frame contract",
+        ));
     }
     Ok(())
 }
@@ -295,14 +273,14 @@ fn validate_extent(
         ] {
             if value >= 18_688 + (1 << 30) {
                 return Err(EncodeError::InvalidConfiguration(
-                    "animation frame crop coordinate exceeds the JPEG XL limit",
+                    "frame crop coordinate exceeds the JPEG XL limit",
                 ));
             }
         }
     }
     if frame_width != source_extent.0 || frame_height != source_extent.1 {
         return Err(EncodeError::InvalidConfiguration(
-            "the GPU source extent must match the animation frame crop",
+            "the GPU source extent must match the frame crop",
         ));
     }
     Ok(())
@@ -453,7 +431,7 @@ fn write_frame_dimension(output: &mut BitWriter, value: u32) -> Result<(), Encod
         (3, 18_688, 30)
     } else {
         return Err(EncodeError::InvalidConfiguration(
-            "animation frame crop coordinate exceeds the JPEG XL limit",
+            "frame crop coordinate exceeds the JPEG XL limit",
         ));
     };
     output.write_bits(selector, 2)?;

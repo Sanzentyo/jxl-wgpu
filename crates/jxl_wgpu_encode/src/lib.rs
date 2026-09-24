@@ -83,9 +83,10 @@ pub use lossless_modular::{
     LosslessModularGroupGrid, LosslessModularGroupSize, LosslessModularInFlightMemory,
     LosslessModularJob, LosslessModularLocalTransforms, LosslessModularLz77,
     LosslessModularMemoryLimits, LosslessModularMemoryPlan, LosslessModularPalette,
-    LosslessModularPredictor, LosslessModularRctType, LosslessModularSqueeze,
-    LosslessModularSqueezeStep, LosslessModularSubmission, LosslessModularTransform,
-    LosslessModularTreeMode, LosslessModularWeightedPredictor,
+    LosslessModularPredictor, LosslessModularRctType, LosslessModularSequenceDescriptor,
+    LosslessModularSequenceSession, LosslessModularSqueeze, LosslessModularSqueezeStep,
+    LosslessModularSubmission, LosslessModularTransform, LosslessModularTreeMode,
+    LosslessModularWeightedPredictor,
 };
 pub use packet::{
     BitFragment, EncodedFrame, FrameGroupLayout, FramePacketSet, GroupPacket, GroupPacketKind,
@@ -101,6 +102,7 @@ pub use vardct_encoder::{
     VarDctBackend, VarDctCoefficientOrders, VarDctColorEncoding, VarDctConfig,
     VarDctDequantMatrices, VarDctEncoder, VarDctGroupOrder, VarDctHfMultiplier, VarDctJob,
     VarDctKernelLayout, VarDctLfMetadata, VarDctMatrixEncoding, VarDctMemoryPlan,
-    VarDctQuantization, VarDctRawMatrix, VarDctStrategy, VarDctStrategyMap, VarDctSubmission,
-    VarDctTransform, VarDctTransformMemoryPlan,
+    VarDctQuantization, VarDctRawMatrix, VarDctSequenceDescriptor, VarDctSequenceSession,
+    VarDctStrategy, VarDctStrategyMap, VarDctSubmission, VarDctTransform,
+    VarDctTransformMemoryPlan,
 };

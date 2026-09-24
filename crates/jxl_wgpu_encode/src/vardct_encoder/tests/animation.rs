@@ -11,6 +11,7 @@ use jxl_test_support::oracles::extra_channels::{floats, rust_frame_planes};
 use jxl_test_support::oracles::progressive::native_updates;
 use jxl_wgpu_decode::WgpuDecodeEngine;
 
+mod layered_still;
 mod reference_only;
 
 fn timebase(numerator: u32, denominator: u32, loops: u32, timecodes: bool) -> AnimationHeader {
@@ -99,7 +100,7 @@ fn compare(label: &str, actual: &[f32], expected: &[f32]) {
     }
 }
 
-// Independent signal-domain composition of separately native-decoded stills. This does not
+// Independent signal-domain composition of separately Rust-decoded stills. This does not
 // consume encoder frame plans, decoder inventories, or production blending helpers.
 fn compose(width: usize, height: usize, layers: &[Layer], samples: &[Vec<f32>]) -> Vec<Vec<f32>> {
     let blank: Vec<_> = (0..width * height)
@@ -188,7 +189,11 @@ fn encode_layers(
             &decoded[..4],
             &decode_rgb8_sized(&baseline, layer.width, layer.height)[..3]
         );
-        samples.push(decoded);
+        let mut rust = rust_frame_planes(&baseline);
+        assert_eq!(rust.len(), 1);
+        let rust = rust.remove(0).0;
+        compare("Rust/native physical source", &rust, &decoded);
+        samples.push(rust);
         let submitted = if index + 1 == layers.len() {
             session.submit_last_frame(source, layer.options.clone())
         } else {
@@ -221,13 +226,39 @@ fn encode_layers(
     (encoded, samples)
 }
 
-fn check_animation(
+fn check_sequence(
     backend: &WgpuBackend,
     encoded: &[u8],
     descriptor: &VarDctAnimationDescriptor,
     layers: &[Layer],
     samples: &[Vec<f32>],
     passes: usize,
+) {
+    check_sequence_with_oracle(
+        backend,
+        encoded,
+        descriptor,
+        layers,
+        samples,
+        passes,
+        CompositionOracle::JxlOxide,
+    );
+}
+
+enum CompositionOracle {
+    JxlOxide,
+    /// Native whole-stream output plus explicit composition of independently Rust-decoded stills.
+    IndependentStills,
+}
+
+fn check_sequence_with_oracle(
+    backend: &WgpuBackend,
+    encoded: &[u8],
+    descriptor: &VarDctAnimationDescriptor,
+    layers: &[Layer],
+    samples: &[Vec<f32>],
+    passes: usize,
+    oracle: CompositionOracle,
 ) {
     let width = descriptor.canvas_width() as usize;
     let height = descriptor.canvas_height() as usize;
@@ -239,26 +270,34 @@ fn check_animation(
         (inventory.image_header.width, inventory.image_header.height),
         (width as u32, height as u32)
     );
-    let animation = inventory.image_header.animation.unwrap();
-    let AnimationHeader::Animation {
-        ticks_per_second_numerator,
-        ticks_per_second_denominator,
-        num_loops,
-        have_timecodes,
-    } = descriptor.animation()
-    else {
-        unreachable!()
+    let (ticks_per_second_numerator, ticks_per_second_denominator) = match descriptor.animation() {
+        AnimationHeader::Still => {
+            assert!(inventory.image_header.animation.is_none());
+            (1, 1)
+        }
+        AnimationHeader::Animation {
+            ticks_per_second_numerator,
+            ticks_per_second_denominator,
+            num_loops,
+            have_timecodes,
+        } => {
+            let animation = inventory.image_header.animation.unwrap();
+            assert_eq!(
+                animation.ticks_per_second_numerator,
+                ticks_per_second_numerator.get()
+            );
+            assert_eq!(
+                animation.ticks_per_second_denominator,
+                ticks_per_second_denominator.get()
+            );
+            assert_eq!(animation.num_loops, num_loops);
+            assert_eq!(animation.have_timecodes, have_timecodes);
+            (
+                ticks_per_second_numerator.get(),
+                ticks_per_second_denominator.get(),
+            )
+        }
     };
-    assert_eq!(
-        animation.ticks_per_second_numerator,
-        ticks_per_second_numerator.get()
-    );
-    assert_eq!(
-        animation.ticks_per_second_denominator,
-        ticks_per_second_denominator.get()
-    );
-    assert_eq!(animation.num_loops, num_loops);
-    assert_eq!(animation.have_timecodes, have_timecodes);
     assert!(inventory.image_header.xyb_encoded);
     assert_eq!(inventory.frames.len(), layers.len());
     for (index, (frame, layer)) in inventory.frames.iter().zip(layers).enumerate() {
@@ -324,10 +363,33 @@ fn check_animation(
     let native = native_updates(encoded, false).expect("required native animation oracle");
     let native: Vec<_> = native.iter().filter(|update| update.complete).collect();
 
-    let oxide = jxl_oxide::JxlImage::read_with_defaults(encoded).unwrap();
+    let other: Option<Vec<Vec<f32>>> = if matches!(oracle, CompositionOracle::JxlOxide) {
+        let oxide = jxl_oxide::JxlImage::read_with_defaults(encoded).unwrap();
+        Some(
+            (0..oxide.num_loaded_keyframes())
+                .map(|index| {
+                    let render = oxide.render_frame(index).unwrap().image_all_channels();
+                    render
+                        .buf()
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
+                        .flat_map(|p| [p[0], p[1], p[2], 1.0])
+                        .collect()
+                })
+                .collect(),
+        )
+    } else {
+        // jxl-oxide panics on empty off-canvas foregrounds; Rust jxl rejects oversized
+        // ReferenceOnly internal buffers. Keep these inputs and compare native whole-stream
+        // output and GPU output to independent composition of Rust-decoded physical stills.
+        None
+    };
     assert_eq!(native.len(), expected.len());
 
-    assert_eq!(oxide.num_loaded_keyframes(), expected.len());
+    if let Some(other) = &other {
+        assert_eq!(other.len(), expected.len());
+    }
     for (index, (native, expected)) in native.iter().zip(&expected).enumerate() {
         assert_eq!(
             (native.duration, native.timecode),
@@ -342,18 +404,13 @@ fn check_animation(
             &floats(&native.pixels),
             expected,
         );
-        let render = oxide.render_frame(index).unwrap().image_all_channels();
-        let rgba: Vec<_> = render
-            .buf()
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .flat_map(|p| [p[0], p[1], p[2], 1.0])
-            .collect();
-        compare(&format!("jxl-oxide presentation {index}"), &rgba, expected);
-        // Composed F32 uses libjxl and jxl-oxide. Rust jxl 0.6.0 disagrees after a hidden
-        // clamped Multiply with an extended background; see the corpus's measured witness.
-        // Every independently encoded still above retains its separate Rust one-code check.
+        if let Some(other) = &other {
+            compare(
+                &format!("jxl-oxide presentation {index}"),
+                &other[index],
+                expected,
+            );
+        }
     }
     let readback = ImageReadbackPipeline::new(backend);
     let format = PixelFormat::rgb_f32(
@@ -440,8 +497,8 @@ fn check_animation(
         if let Some(index) =
             jxl_gpu_bitstream::FrameIndex::from_container(&parsed, Default::default()).unwrap()
         {
-            assert_eq!(index.tick_numerator(), ticks_per_second_denominator.get());
-            assert_eq!(index.tick_denominator(), ticks_per_second_numerator);
+            assert_eq!(index.tick_numerator(), ticks_per_second_denominator);
+            assert_eq!(index.tick_denominator().get(), ticks_per_second_numerator);
             assert_eq!(
                 index
                     .entries()
@@ -573,7 +630,7 @@ fn indexed_animation_restores_an_old_reference_across_a_new_independent_frame() 
             .restart_presentation(),
         0
     );
-    check_animation(&backend, &encoded, &desc, &layers, &samples, 1);
+    check_sequence(&backend, &encoded, &desc, &layers, &samples, 1);
 }
 
 #[test]
@@ -620,7 +677,7 @@ fn tiled_animation_composes_signed_crops_hidden_frames_and_all_reference_slots()
             |s| encoder.encode(s).unwrap(),
             timecodes,
         );
-        check_animation(&backend, &encoded, &desc, &layers, &samples, 1);
+        check_sequence(&backend, &encoded, &desc, &layers, &samples, 1);
     }
 }
 
@@ -658,7 +715,7 @@ fn progressive_animation_crosses_ac_and_lf_groups_with_variable_source_extents()
             |s| encoder.encode(s).unwrap(),
             false,
         );
-        check_animation(&backend, &encoded, &desc, &layers, &samples, 5);
+        check_sequence(&backend, &encoded, &desc, &layers, &samples, 5);
     }
 }
 
@@ -718,7 +775,7 @@ fn single_and_mixed_transform_animations_share_the_frame_contract() {
             |s| encoder.encode(s).unwrap(),
             true,
         );
-        check_animation(&backend, &encoded, &desc, &layers, &samples, 5);
+        check_sequence(&backend, &encoded, &desc, &layers, &samples, 5);
     }
 }
 
@@ -732,7 +789,6 @@ fn animation_descriptor_checks_wire_dimensions_and_timebase_bounds() {
         ));
     }
     for animation in [
-        AnimationHeader::Still,
         timebase(u32::MAX, 1, 0, false),
         timebase(100, 1025, 0, false),
     ] {

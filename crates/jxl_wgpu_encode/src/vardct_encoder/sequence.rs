@@ -1,4 +1,4 @@
-//! Checked stream metadata and ordered assembly for RGB8/XYB animations.
+//! Checked stream metadata and ordered assembly for RGB8/XYB frame sequences.
 
 use super::bitstream::image_header;
 use super::{VarDctBackend, VarDctConfig, VarDctJob};
@@ -8,31 +8,32 @@ use crate::{
     GpuFrameArtifacts, GpuFrameSource, SessionDescriptor,
 };
 
-/// Stream-wide canvas and timebase for a VarDCT animation.
+/// Compatibility name for [`VarDctSequenceDescriptor`].
+pub type VarDctAnimationDescriptor = VarDctSequenceDescriptor;
+
+/// Compatibility name for [`VarDctSequenceSession`].
+pub type VarDctAnimationSession = VarDctSequenceSession;
+
+/// Stream-wide canvas and optional timebase for a VarDCT layered still or animation.
 ///
 /// Every frame uses RGB8 sRGB/D65 sources and the encoder's fixed configuration. Cropped
 /// sources may have different extents when using [`super::TiledVarDctEncoder`]; a single
 /// transform or strategy map keeps its own source extent on every frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VarDctAnimationDescriptor {
+pub struct VarDctSequenceDescriptor {
     canvas_width: u32,
     canvas_height: u32,
     animation: AnimationHeader,
     header: BitFragment,
 }
 
-impl VarDctAnimationDescriptor {
+impl VarDctSequenceDescriptor {
     /// Checks the canvas/timebase and compiles the bounded stream header.
     pub fn new(
         canvas_width: u32,
         canvas_height: u32,
         animation: AnimationHeader,
     ) -> Result<Self, EncodeError> {
-        if !animation.is_animation() {
-            return Err(EncodeError::InvalidConfiguration(
-                "a VarDCT animation descriptor requires an animation timebase",
-            ));
-        }
         let header = image_header(canvas_width, canvas_height, animation)?;
         Ok(Self {
             canvas_width,
@@ -58,24 +59,24 @@ impl VarDctAnimationDescriptor {
     }
 }
 
-/// Independent GPU frame submissions and deterministic animation assembly.
+/// Independent GPU frame submissions and deterministic sequence assembly.
 ///
 /// Supports Replace, Add and Multiply, signed crops, hidden zero-duration frames,
 /// timecodes and four post-color-transform reference slots. Pre-color-transform storage is
 /// rejected until the profile supports its consumers. Alpha-weighted modes require an alpha source and
 /// are rejected by this RGB-only profile. Frame controls are checked before GPU admission;
 /// failure leaves the frame index and final-frame state available for retry.
-pub struct VarDctAnimationSession {
-    descriptor: VarDctAnimationDescriptor,
+pub struct VarDctSequenceSession {
+    descriptor: VarDctSequenceDescriptor,
     session: EncodeSession<VarDctBackend>,
     assembler: CodestreamAssembler,
 }
 
-impl VarDctAnimationSession {
+impl VarDctSequenceSession {
     pub(super) fn new(
         encoder: &GpuEncoder<VarDctBackend>,
         config: &VarDctConfig,
-        descriptor: VarDctAnimationDescriptor,
+        descriptor: VarDctSequenceDescriptor,
     ) -> Result<Self, EncodeError> {
         let session = encoder.begin_session(SessionDescriptor {
             profile: EncodeProfile::VarDct {
@@ -96,7 +97,7 @@ impl VarDctAnimationSession {
     }
 
     #[must_use]
-    pub const fn descriptor(&self) -> &VarDctAnimationDescriptor {
+    pub const fn descriptor(&self) -> &VarDctSequenceDescriptor {
         &self.descriptor
     }
 

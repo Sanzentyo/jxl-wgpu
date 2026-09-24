@@ -1691,8 +1691,9 @@ crop, mode, reference, pass count, timing and finality; futures complete in reve
 order and raw/container assembly restores physical order. A four-layer 9×7 indexed sequence
 checks old-reference restoration across a newer independent frame, as described above.
 
-Each physical source is independently encoded as a still and decoded by native libjxl 0.12.0.
-A separate signal-domain composition calculation uses these samples, the declared crop and
+Each physical source is independently encoded as a still and decoded by native libjxl 0.12.0
+and Rust `jxl` 0.6.0, retaining both F32 and one-code agreement. A separate signal-domain
+composition calculation uses the Rust-decoded samples, the declared crop and
 four reference slots, without production header or blend helpers. Native libjxl and jxl-oxide
 0.12.6 decode the complete animation independently; both agree with this calculation, and GPU
 RGBA-F32 agrees with native output and the calculation at `2e-4 * (1 + abs(reference))` per sample,
@@ -1721,7 +1722,7 @@ old Modular control serializer in resident, native-streamed and browser-streamed
 Modular still, animation, precision and lifetime tests remain unchanged in scope.
 
 This extends `FRAME-05`. It does not provide mixed Modular/VarDCT streams, VarDCT pre-transform
-reference storage or extra-channel blending, layered stills, names or previews.
+reference storage or extra-channel blending, names or previews.
 Plain frame-index writing uses the shared metadata plan described in the
 [index checkpoint](#frame-index-and-seek-checkpoint). GPU image/entropy work and its memory plan
 are unchanged.
@@ -1758,8 +1759,53 @@ one-byte-deficient and exact budgets check rejection, overlapping admission, unc
 completion, abandoned jobs/sessions, GPU-delayed release and successful reuse. Tests require the
 real adapter and native oracles; no skipped producer entropy is treated as validated.
 
-`FRAME-05` remains Partial. Layered stills, mixed coding modes, VarDCT pre-transform references,
+`FRAME-05` remains Partial. Mixed coding modes, VarDCT pre-transform references,
 arbitrary extra channels, names, previews and broader indexing policy remain open.
+
+## Layered-still encoding
+
+`layered_still` child modules in the Modular/native and VarDCT/animation encoder tests cover
+sequences without animation metadata. Shared frame planning admits hidden regular and
+reference-only producers, followed by exactly one final presentation. The public sequence
+descriptors/sessions own the same format, timing and assembly contracts as their animation aliases.
+
+Ten seven-layer Modular sequences cross Prefix/ANS with Gray8, straight/associated RGBA8,
+straight GrayAlpha32F and associated RGBA32F on 257×3 canvases. They include a reference-only
+prefix, all five alpha-capable blend modes, independent color/alpha references, all four slots,
+negative and fully off-canvas crops and a cropped final layer. Scalar native libjxl compares
+every original word in all 70 physical frames; public libjxl and Rust `jxl` independently compare
+the ten complete compositions. GPU preserved-alpha RGBA-F32 uses the existing scaled bounds
+of `3e-6` for color and `4e-7` for alpha. Prefix resident and ANS streamed execution both retain
+the same checks. No non-final layer may carry duration/timecode or close the stream as a
+reference-only final frame; failed submission preserves the frame index and budget.
+
+Four VarDCT sequences add 13 physical frames. Single DCT8 and a mixed strategy map encode four
+layers on 7×7 and 24×16 canvases with 8×8 and 25×17 physical sources. Tiled DCT8 uses a 257×17
+canvas, a 259×19 reference source and a 9×7 partial layer; the fourth case is a single 9×7
+cropped final layer on an otherwise empty 17×9 canvas. Reference producers use one implicit
+pass; regular layers retain five AC passes. They combine negative and fully off-canvas crops,
+Add, clamped Multiply and post-transform reference chains. Native full-stream F32 output and
+GPU output agree with explicit composition of independent Rust-decoded physical stills at
+`2e-4 * (1 + abs(reference))`, with one-code rounded sRGB8 agreement and the existing >30 dB
+source PSNR bound. Existing animation cases retain their additional full-stream jxl-oxide check.
+
+The composed-still Rust oracle limits are explicit: jxl-oxide 0.12.6 / jxl-render 0.12.4 panics
+in `SharedSubgrid::from_buf` on an empty off-canvas foreground; Rust `jxl` 0.6.0 rejects its
+internal reference buffer when an 8×8 reference-only producer belongs to a 7×7 canvas
+(`InvalidOutputBufferSize(28, 7, 8, 8, Grayscale, F32)`). These inputs remain in the tests.
+There is no error-triggered oracle fallback or changed tolerance: this family uses native
+whole-stream decoding and Rust physical-still decoding followed by an independent signal-domain
+composition calculation. Neither production frame plans nor production blending helpers supply
+expected pixels. The failed full-stream oracle probes are not claimed as passing coverage.
+
+All new layered streams omit animation metadata, duration and timecodes and produce one image.
+Whole input and 43-byte fragments through 256-byte GPU windows agree byte for byte. Indexed
+sequences seek presentation zero through every hidden producer, use a 1/1 clock and zero
+duration, and retain output after session destruction. Non-final VarDCT admission covers exact
+and one-byte-deficient budgets, failed-final retry, cancellation, GPU-delayed release and reuse.
+Unclosed sequences fail assembly. A one-frame sequence is byte-identical to the existing VarDCT
+still API. Full capability gates remain required; mixed coding modes, VarDCT pre-transform
+references, arbitrary extras, names and previews keep `FRAME-05` Partial.
 
 ## Progressive VarDCT encoding
 

@@ -11,13 +11,16 @@ use jxl_wgpu::{KernelVariant, MemoryPermit};
 use wgpu::util::DeviceExt;
 
 use super::ac::{AcFragments, validate_blocks, validate_transform_fragments};
-use super::animation::{VarDctAnimationDescriptor, VarDctAnimationSession};
 use super::bitstream::{build_frame_packet, image_header, pack_signed_control};
 use super::entropy::{
     HfEntropyPlan, fixed_prefix_code, prefix_entries, read_fragment_slice,
     validate_fragment_padding,
 };
 use super::entropy::{UINT_SYMBOLS, VarDctPrefixCode};
+use super::sequence::{
+    VarDctAnimationDescriptor, VarDctAnimationSession, VarDctSequenceDescriptor,
+    VarDctSequenceSession,
+};
 use super::strategy_map::{TransformPlan, VarDctStrategyMap, VarDctTransform};
 use super::types::{
     ARTIFACT_READY, ArtifactLayout, DcFragmentDescriptor, HEADER_WORDS, HF_QUANTIZATION,
@@ -1763,7 +1766,20 @@ impl VarDctEncoder {
         &self,
         descriptor: VarDctAnimationDescriptor,
     ) -> Result<VarDctAnimationSession, EncodeError> {
-        VarDctAnimationSession::new(&self.encoder, &self.encoder.backend().config, descriptor)
+        if !descriptor.animation().is_animation() {
+            return Err(EncodeError::InvalidConfiguration(
+                "begin_animation requires an animation timebase",
+            ));
+        }
+        self.begin_sequence(descriptor)
+    }
+
+    /// Begins a layered still or timed animation with the encoder's fixed codec policy.
+    pub fn begin_sequence(
+        &self,
+        descriptor: VarDctSequenceDescriptor,
+    ) -> Result<VarDctSequenceSession, EncodeError> {
+        VarDctSequenceSession::new(&self.encoder, &self.encoder.backend().config, descriptor)
     }
 
     pub fn submit(&self, source: BufferImageSource) -> Result<VarDctSubmission, EncodeError> {
@@ -1911,7 +1927,20 @@ impl TiledVarDctEncoder {
         &self,
         descriptor: VarDctAnimationDescriptor,
     ) -> Result<VarDctAnimationSession, EncodeError> {
-        VarDctAnimationSession::new(&self.encoder, &self.encoder.backend().config, descriptor)
+        if !descriptor.animation().is_animation() {
+            return Err(EncodeError::InvalidConfiguration(
+                "begin_animation requires an animation timebase",
+            ));
+        }
+        self.begin_sequence(descriptor)
+    }
+
+    /// Begins a layered still or timed animation with the encoder's fixed codec policy.
+    pub fn begin_sequence(
+        &self,
+        descriptor: VarDctSequenceDescriptor,
+    ) -> Result<VarDctSequenceSession, EncodeError> {
+        VarDctSequenceSession::new(&self.encoder, &self.encoder.backend().config, descriptor)
     }
 
     pub fn submit(&self, source: BufferImageSource) -> Result<VarDctSubmission, EncodeError> {

@@ -150,10 +150,10 @@ pub struct FrameBlend {
 /// Whether a physical frame can produce a presentation or only populate a reference slot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FrameKind {
-    /// A normal frame, including a hidden animation layer with zero duration.
+    /// A normal frame, including a hidden layer with zero duration.
     #[default]
     Regular,
-    /// A non-final animation frame that only stores a reference, without timing or blending.
+    /// A non-final frame that only stores a reference, without timing or blending.
     ReferenceOnly,
 }
 
@@ -322,11 +322,6 @@ impl<B: GpuEncodeBackend> EncodeSession<B> {
         source: GpuFrameSource,
         options: FrameOptions,
     ) -> Result<FrameSubmission<B::Job>, EncodeError> {
-        if !self.descriptor.animation.is_animation() {
-            return Err(EncodeError::InvalidConfiguration(
-                "a still-image session must use submit_last_frame",
-            ));
-        }
         self.submit(source, options, false)
     }
 
@@ -357,7 +352,7 @@ impl<B: GpuEncodeBackend> EncodeSession<B> {
         if self.closed {
             return Err(EncodeError::SessionClosed);
         }
-        validate_frame_options(self.descriptor.animation, &options)?;
+        validate_frame_timing(self.descriptor.animation, &options)?;
         let frame_index = FrameIndex(self.next_frame);
         let request = FrameEncodeRequest {
             frame_index,
@@ -375,13 +370,13 @@ impl<B: GpuEncodeBackend> EncodeSession<B> {
             self.next_frame
                 .checked_add(1)
                 .ok_or(EncodeError::InvalidConfiguration(
-                    "too many animation frames",
+                    "too many physical frames",
                 ))?;
         Ok(submission)
     }
 }
 
-fn validate_frame_options(
+pub(crate) fn validate_frame_timing(
     animation: AnimationHeader,
     options: &FrameOptions,
 ) -> Result<(), EncodeError> {

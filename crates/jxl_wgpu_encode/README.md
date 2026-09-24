@@ -783,19 +783,53 @@ encoder.encode(source_13_by_21)
 # }
 ```
 
-## Animation sessions
+## Frame sequences
 
-`VarDctEncoder::begin_animation` and `TiledVarDctEncoder::begin_animation` accept a checked
-`VarDctAnimationDescriptor` and return `VarDctAnimationSession`. The descriptor fixes canvas,
-timebase, loops and timecodes; the encoder fixes RGB8 sRGB/D65 input, XYB coding, transform policy,
+`begin_sequence` on either codec accepts a `LosslessModularSequenceDescriptor` or
+`VarDctSequenceDescriptor` and returns its corresponding `SequenceSession`. Descriptors select
+`AnimationHeader::Still` for a layered still or `AnimationHeader::Animation` for a timed sequence.
+The former omits animation metadata and requires zero duration and no timecode on every frame.
+Non-final regular layers and reference-only producers remain hidden; the final regular layer
+produces exactly one still image. Crops, blend modes, references, finality and admission use the
+same checked rules in both sequence kinds. A single cropped final layer is also supported.
+Call `submit_frame` for producers and `submit_last_frame` for the final layer, then insert the
+completed artifacts and finish normally. Indexed stills describe one presentation with zero
+duration and a 1/1 clock. [Layered-still evidence](../../docs/CONFORMANCE_CORPUS.md#layered-still-encoding).
+
+```rust,no_run
+# use jxl_wgpu_encode::{AnimationHeader, BufferImageSource, FrameCrop, FrameOptions,
+#     LosslessModularEncoder, LosslessModularFormat, LosslessModularSequenceDescriptor};
+# fn layered_still(encoder: &LosslessModularEncoder, background: BufferImageSource,
+#     patch: BufferImageSource) -> Result<Vec<u8>, jxl_wgpu_encode::EncodeError> {
+let mut sequence = encoder.begin_sequence(LosslessModularSequenceDescriptor::new(
+    640, 480, LosslessModularFormat::Rgba, 8, AnimationHeader::Still,
+)?)?;
+let base = sequence.submit_frame(background, FrameOptions::default())?; // hidden slot 0
+let final_layer = sequence.submit_last_frame(patch, FrameOptions {
+    crop: Some(FrameCrop::new(100, 100, 64, 64)?),
+    ..FrameOptions::default()
+})?;
+sequence.insert(base.wait()?)?;
+sequence.insert(final_layer.wait()?)?;
+sequence.finish_raw()
+# }
+```
+
+The former `LosslessModularAnimationDescriptor/Session` and `VarDctAnimationDescriptor/Session`
+names remain type aliases. Their constructors now also accept `Still`; `begin_animation` retains
+its requirement for an animation timebase and delegates to the same sequence implementation.
+Existing `encode`/`submit` still APIs retain their single full-canvas output and bytes.
+
+`VarDctEncoder::begin_sequence` and `TiledVarDctEncoder::begin_sequence` share the same descriptor
+and session. The descriptor fixes canvas and optional timebase; the encoder fixes RGB8 sRGB/D65 input, XYB coding, transform policy,
 quantization, matrices/orders and AC passes. Single transforms and maps retain their source
 extent on each frame; tiled DCT8 accepts separately checked crop extents through its 16K axis
 bound. Both support Replace/Add/Multiply, signed crops, hidden zero-duration regular frames and
 four post-color-transform references. Alpha-weighted modes, extra-channel contracts and
-pre-color-transform reference storage are rejected. Mixed Modular/VarDCT sessions, layered stills,
+pre-color-transform reference storage are rejected. Mixed Modular/VarDCT sessions,
 frame names and previews remain unimplemented.
 
-Both codecs accept `FrameOptions { kind: FrameKind::ReferenceOnly, .. }` in animation sessions.
+Both codecs accept `FrameOptions { kind: FrameKind::ReferenceOnly, .. }` in either sequence kind.
 Such a frame stores its decoded source in any of the four `save_as_reference` slots without a
 presentation or blend. It must be non-final, retain default timing/color blend and an empty
 extra-channel blend list, even when the animation declares timecodes. Its optional crop describes
@@ -815,10 +849,10 @@ do not advance the session or close its final-frame slot. No new GPU allocation,
 submission or map is introduced by animation control. See the
 [VarDCT animation evidence](../../docs/CONFORMANCE_CORPUS.md#vardct-animation-encoding).
 
-`LosslessModularEncoder::begin_animation` writes one standard stream-wide animation header and
-keeps a reusable GPU session open for multiple frames. The descriptor fixes the canvas, format,
-sample precision, tick rate, loop count, and timecode presence. Use
-`LosslessModularAnimationDescriptor::new` for integers, `new_float` for binary16/binary32, or
+`LosslessModularEncoder::begin_sequence` writes one stream-wide image header and keeps a reusable
+GPU session open for multiple frames. The descriptor fixes the canvas, format, sample precision,
+optional tick rate, loop count, and timecode presence. Use
+`LosslessModularSequenceDescriptor::new` for integers, `new_float` for binary16/binary32, or
 `from_pixel_format` for explicit floating precision and source color.
 Each regular frame supplies an exact duration,
 optional timecode, optional signed crop rectangle, color blend contract, one contract per extra
@@ -834,7 +868,7 @@ multiple frames in flight, complete each with blocking `wait` or await the same 
 order and rejects duplicates, gaps, or an invalid final-frame flag. All live frame jobs share the
 same byte-weighted `MemoryBudget` as still encoding; Modular also uses its existing buffer pool.
 
-Both animation sessions and the generic `CodestreamAssembler` expose
+Both sequence sessions and the generic `CodestreamAssembler` expose
 `finish_indexed_container(inventory_limits, index_limits)` for opt-in plain `jxli` plus `jxlc`
 output. After ordering artifacts, this bounded metadata pass inventories the actual assembled
 headers and uses the shared `FrameSequencePlan` to generate every independent presentation anchor.

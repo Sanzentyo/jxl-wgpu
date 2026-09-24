@@ -219,15 +219,28 @@ impl LosslessModularEncoder {
         self.submit_container(source)?.wait()
     }
 
-    /// Starts a reusable multi-frame animation session.
-    ///
-    /// Every returned frame submission supports both [`Future`] and blocking
-    /// [`FrameSubmission::wait`]. Submissions do not borrow this session, so multiple GPU frames
-    /// can remain in flight and their completed artifacts may be inserted in any order.
+    /// Starts a timed animation. For a layered still use [`Self::begin_sequence`].
     pub fn begin_animation(
         &self,
         descriptor: LosslessModularAnimationDescriptor,
     ) -> Result<LosslessModularAnimationSession, EncodeError> {
+        if !descriptor.animation.is_animation() {
+            return Err(EncodeError::InvalidConfiguration(
+                "begin_animation requires an animation timebase",
+            ));
+        }
+        self.begin_sequence(descriptor)
+    }
+
+    /// Starts a reusable layered-still or animation sequence.
+    ///
+    /// Every returned frame submission supports both [`Future`] and blocking
+    /// [`FrameSubmission::wait`]. Submissions do not borrow this session, so multiple GPU frames
+    /// can remain in flight and their completed artifacts may be inserted in any order.
+    pub fn begin_sequence(
+        &self,
+        descriptor: LosslessModularSequenceDescriptor,
+    ) -> Result<LosslessModularSequenceSession, EncodeError> {
         self.config()
             .color_transform
             .resolve(descriptor.format, descriptor.exponent_bits_per_sample)?;
@@ -255,7 +268,7 @@ impl LosslessModularEncoder {
             canvas_width: descriptor.canvas_width,
             canvas_height: descriptor.canvas_height,
         })?;
-        Ok(LosslessModularAnimationSession {
+        Ok(LosslessModularSequenceSession {
             session,
             assembler: CodestreamAssembler::new(codestream_header)?,
             descriptor,
@@ -326,9 +339,15 @@ impl LosslessModularEncoder {
     }
 }
 
-/// Stream-wide contract for one lossless Modular animation.
+/// Compatibility name for [`LosslessModularSequenceDescriptor`].
+pub type LosslessModularAnimationDescriptor = LosslessModularSequenceDescriptor;
+
+/// Compatibility name for [`LosslessModularSequenceSession`].
+pub type LosslessModularAnimationSession = LosslessModularSequenceSession;
+
+/// Stream-wide contract for one lossless Modular layered still or animation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LosslessModularAnimationDescriptor {
+pub struct LosslessModularSequenceDescriptor {
     canvas_width: u32,
     canvas_height: u32,
     format: LosslessModularFormat,
@@ -338,7 +357,7 @@ pub struct LosslessModularAnimationDescriptor {
     color: ModularColorEncoding,
 }
 
-impl LosslessModularAnimationDescriptor {
+impl LosslessModularSequenceDescriptor {
     /// Infers stream components, precision and color from a supported source format.
     ///
     /// Frame storage may differ, but every submitted frame must have the same encoded color
@@ -381,7 +400,7 @@ impl LosslessModularAnimationDescriptor {
         )
     }
 
-    /// Starts an animation with native IEEE binary16 or binary32 source components.
+    /// Describes native IEEE binary16 or binary32 source components.
     pub fn new_float(
         canvas_width: u32,
         canvas_height: u32,
@@ -405,11 +424,6 @@ impl LosslessModularAnimationDescriptor {
         exponent_bits_per_sample: u8,
         animation: AnimationHeader,
     ) -> Result<Self, EncodeError> {
-        if !animation.is_animation() {
-            return Err(EncodeError::InvalidConfiguration(
-                "a Modular animation descriptor requires an animation timebase",
-            ));
-        }
         // The header uses the same checked precision as still-image serialization.
         image_header(
             canvas_width,
@@ -462,17 +476,17 @@ impl LosslessModularAnimationDescriptor {
     }
 }
 
-/// Multi-frame assembly state for a standard lossless Modular animation.
-pub struct LosslessModularAnimationSession {
+/// Multi-frame assembly state for a lossless Modular layered still or animation.
+pub struct LosslessModularSequenceSession {
     session: EncodeSession<LosslessModularBackend>,
     assembler: CodestreamAssembler,
-    descriptor: LosslessModularAnimationDescriptor,
+    descriptor: LosslessModularSequenceDescriptor,
     metadata_permit: Option<jxl_wgpu::MemoryPermit>,
 }
 
-impl LosslessModularAnimationSession {
+impl LosslessModularSequenceSession {
     #[must_use]
-    pub const fn descriptor(&self) -> &LosslessModularAnimationDescriptor {
+    pub const fn descriptor(&self) -> &LosslessModularSequenceDescriptor {
         &self.descriptor
     }
 
@@ -540,7 +554,7 @@ impl LosslessModularAnimationSession {
             || spec.color != self.descriptor.color
         {
             return Err(EncodeError::InvalidConfiguration(
-                "every animation frame must match the stream format, sample precision and color",
+                "every frame must match the stream format, sample precision and color",
             ));
         }
         Ok(())

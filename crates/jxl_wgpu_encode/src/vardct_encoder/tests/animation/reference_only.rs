@@ -52,7 +52,7 @@ fn exercise(
         })
         .collect();
     let (encoded, samples) = encode_layers(context, session, &layers, still, true);
-    check_animation(backend, &encoded, &desc, &layers, &samples, 5);
+    check_sequence(backend, &encoded, &desc, &layers, &samples, 5);
     let parsed = jxl_gpu_bitstream::parse(&encoded, Default::default()).unwrap();
     let index = jxl_gpu_bitstream::FrameIndex::from_container(&parsed, Default::default())
         .unwrap()

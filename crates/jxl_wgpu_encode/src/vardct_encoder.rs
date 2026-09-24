@@ -5,7 +5,6 @@
 //! control syntax shares the deterministic frame assembler with the lossless Modular encoder.
 
 mod ac;
-mod animation;
 mod bitstream;
 mod dispatch;
 mod entropy;
@@ -15,6 +14,7 @@ mod orders;
 mod quantization;
 mod raw_matrices;
 mod saliency;
+mod sequence;
 mod strategy_map;
 mod transforms;
 mod types;
@@ -22,12 +22,15 @@ mod types;
 #[cfg(test)]
 mod tests;
 
-pub use animation::{VarDctAnimationDescriptor, VarDctAnimationSession};
 pub use dispatch::{TiledVarDctEncoder, VarDctBackend, VarDctEncoder, VarDctJob, VarDctSubmission};
 pub use group_order::VarDctGroupOrder;
 pub use matrices::{VarDctDequantMatrices, VarDctMatrixEncoding, VarDctRawMatrix};
 pub use orders::VarDctCoefficientOrders;
 pub use quantization::{VarDctConfig, VarDctHfMultiplier, VarDctQuantization};
+pub use sequence::{
+    VarDctAnimationDescriptor, VarDctAnimationSession, VarDctSequenceDescriptor,
+    VarDctSequenceSession,
+};
 pub use strategy_map::{VarDctStrategyMap, VarDctTransform};
 pub use types::{
     TiledVarDctGrid, VarDctColorEncoding, VarDctKernelLayout, VarDctLfMetadata, VarDctMemoryPlan,

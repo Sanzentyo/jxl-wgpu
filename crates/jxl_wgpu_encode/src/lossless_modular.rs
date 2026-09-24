@@ -37,7 +37,7 @@ pub use predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
 pub use rct::{LosslessModularColorTransform, LosslessModularRctType};
 pub use serializer::{
     LosslessModularAnimationDescriptor, LosslessModularAnimationSession, LosslessModularEncoder,
-    LosslessModularSubmission,
+    LosslessModularSequenceDescriptor, LosslessModularSequenceSession, LosslessModularSubmission,
 };
 pub use squeeze::{LosslessModularSqueeze, LosslessModularSqueezeStep};
 pub use streaming::LosslessModularJob;

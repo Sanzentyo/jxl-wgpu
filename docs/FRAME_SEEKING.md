@@ -80,7 +80,7 @@ but editing codestream headers or frame data requires rebuilding the index.
 
 ## Encoder index emission
 
-`CodestreamAssembler`, `LosslessModularAnimationSession` and `VarDctAnimationSession` expose
+`CodestreamAssembler`, `LosslessModularSequenceSession` and `VarDctSequenceSession` expose
 `finish_indexed_container(inventory_limits, index_limits)`. They emit a plain `jxli` and ordinary
 `jxlc` after all completed GPU frame artifacts are ordered. Existing `finish_raw` and
 `finish_container` remain unindexed. Indexed assembly inventories the actual serialized headers,
@@ -96,7 +96,7 @@ or subtraction of the first duration. Still images use a zero-duration interval 
 Inventory limits bound all retained header/ICC/TOC metadata and physical frames; index limits
 independently bound displayed frames, entry count and payload bytes. Failure returns a typed
 error with no container. This host operation does not check frame entropy or reconstruct pixels.
-The encoder currently emits regular main-image frames; preview emission, caller-selected sparse
+The encoder emits regular and reference-only main-image frames; preview emission, caller-selected sparse
 index policies and compressed indexes are outside this API's current scope.
 
 ## Dependency and ownership bounds
