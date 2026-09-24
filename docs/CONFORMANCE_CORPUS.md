@@ -1721,10 +1721,45 @@ old Modular control serializer in resident, native-streamed and browser-streamed
 Modular still, animation, precision and lifetime tests remain unchanged in scope.
 
 This extends `FRAME-05`. It does not provide mixed Modular/VarDCT streams, VarDCT pre-transform
-reference storage or extra-channel blending, reference-only frame types, names or previews.
+reference storage or extra-channel blending, layered stills, names or previews.
 Plain frame-index writing uses the shared metadata plan described in the
 [index checkpoint](#frame-index-and-seek-checkpoint). GPU image/entropy work and its memory plan
 are unchanged.
+
+## Reference-only frame encoding
+
+The `reference_only` child modules in encoder Modular/native and VarDCT/animation tests add seven
+sequences with 60 physical frames and 28 presentations. They exercise animation `ReferenceOnly`
+syntax through the same immutable control plan, without changing the regular-frame corpus above.
+
+Three RGB8/XYB sequences use single DCT8 at 8×8, a mixed strategy map at 25×17 and tiled DCT8
+with a 257×17 canvas and 259×19 reference sources. Each has four reference/presentation pairs,
+covering slots 0–3 and Add composition. The backend requests five AC passes; inventories require
+one implicit complete pass for each reference and five for each presentation. Native libjxl,
+jxl-oxide and explicit composition of independently decoded stills retain the same F32 and
+one-code bounds above. All use indexed containers: whole and 43-byte fragmented input through
+256-byte GPU windows retain sequential output, exact timing and every independently sought target,
+including outputs held after session destruction. The timebase is 60,000/1001 with timecodes
+present only on regular frames.
+
+Four Modular sequences cross Gray/RGBA with Prefix/ANS. Each has a 257×3 canvas, an initial 3×2
+pre-transform reference and four post-transform reference/Add pairs. The tiny reference is
+unused and later overwritten; scalar native libjxl still checks every original word in all nine
+physical frames, including this producer. Prefix exercises resident completion and ANS streamed
+completion. Rust `jxl` and native libjxl agree exactly with explicit integer composition; whole
+and bounded GPU RGBA8 output agrees exactly too. Reverse completion restores physical order.
+The timebase is 24,000/1001, loops are two, and only presentations carry durations/timecodes.
+
+Negative controls reject final reference-only frames, duration/timecode fields, color/extra blend
+fields, nonzero origins, source/crop mismatches, too-small post-transform extents and VarDCT
+pre-transform storage before admission. An unfinished sequence cannot produce an indexed
+container. Request-specific memory planning uses the same effective one-pass layout as dispatch:
+one-byte-deficient and exact budgets check rejection, overlapping admission, unchanged indices,
+completion, abandoned jobs/sessions, GPU-delayed release and successful reuse. Tests require the
+real adapter and native oracles; no skipped producer entropy is treated as validated.
+
+`FRAME-05` remains Partial. Layered stills, mixed coding modes, VarDCT pre-transform references,
+arbitrary extra channels, names, previews and broader indexing policy remain open.
 
 ## Progressive VarDCT encoding
 

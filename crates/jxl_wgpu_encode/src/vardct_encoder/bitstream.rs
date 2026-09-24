@@ -76,40 +76,42 @@ fn frame_header(
 ) -> Result<BitFragment, EncodeError> {
     let mut output = BitWriter::new();
     output.write_bits(0, 1)?; // non-default so restoration can be disabled
-    output.write_bits(0, 2)?; // regular frame
+    control.write_kind(&mut output)?;
     output.write_bits(0, 1)?; // VarDCT
     output.write_bits(0, 2)?; // no frame flags
     output.write_bits(0, 2)?; // no upsampling
     output.write_bits(3, 3)?; // default X quant-matrix scale
     output.write_bits(2, 3)?; // default B quant-matrix scale
-    let passes = progressive.passes();
-    write_u32(
-        &mut output,
-        passes.len() as u32,
-        [(1, 0), (2, 0), (3, 0), (4, 3)],
-    )?;
-    if passes.len() > 1 {
+    if control.has_passes() {
+        let passes = progressive.passes();
         write_u32(
             &mut output,
-            progressive.downsampling().len() as u32,
-            [(0, 0), (1, 0), (2, 0), (3, 1)],
+            passes.len() as u32,
+            [(1, 0), (2, 0), (3, 0), (4, 3)],
         )?;
-        for pass in &passes[..passes.len() - 1] {
-            output.write_bits(u64::from(pass.shift), 2)?;
-        }
-        for point in progressive.downsampling() {
+        if passes.len() > 1 {
             write_u32(
                 &mut output,
-                u32::from(point.factor),
-                [(1, 0), (2, 0), (4, 0), (8, 0)],
+                progressive.downsampling().len() as u32,
+                [(0, 0), (1, 0), (2, 0), (3, 1)],
             )?;
-        }
-        for point in progressive.downsampling() {
-            write_u32(
-                &mut output,
-                u32::from(point.last_pass),
-                [(0, 0), (1, 0), (2, 0), (0, 3)],
-            )?;
+            for pass in &passes[..passes.len() - 1] {
+                output.write_bits(u64::from(pass.shift), 2)?;
+            }
+            for point in progressive.downsampling() {
+                write_u32(
+                    &mut output,
+                    u32::from(point.factor),
+                    [(1, 0), (2, 0), (4, 0), (8, 0)],
+                )?;
+            }
+            for point in progressive.downsampling() {
+                write_u32(
+                    &mut output,
+                    u32::from(point.last_pass),
+                    [(0, 0), (1, 0), (2, 0), (0, 3)],
+                )?;
+            }
         }
     }
     control.append_to(&mut output)?;

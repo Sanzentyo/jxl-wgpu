@@ -2,16 +2,17 @@
 //! admission; GPU jobs retain this bounded immutable plan instead of reinterpreting options.
 use crate::{
     AnimationHeader, BitFragment, BlendMode, EncodeError, FrameBlend, FrameEncodeRequest,
-    FrameIndex, FrameOptions,
+    FrameIndex, FrameKind, FrameOptions, ProgressivePlan,
 };
 use jxl_gpu_bitstream::BitWriter;
 
-/// The shared regular-frame suffix: crop, blending, timing, references and disabled restoration.
+/// The checked frame kind and suffix: crop, blending, timing, references and disabled restoration.
 /// The supported fields occupy at most 256 bits, independent of image dimensions and pixels.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FrameHeaderPlan {
     frame_index: FrameIndex,
     is_last: bool,
+    kind: FrameKind,
     suffix: BitFragment,
 }
 
@@ -22,12 +23,15 @@ impl FrameHeaderPlan {
         has_alpha: bool,
     ) -> Result<Self, EncodeError> {
         validate_frame(request, source_extent, has_alpha)?;
+        let regular = request.options.kind == FrameKind::Regular;
         let mut output = BitWriter::new();
         let have_crop = request.options.crop.is_some();
         output.write_bits(u64::from(have_crop), 1)?;
         if let Some(crop) = request.options.crop {
-            write_frame_dimension(&mut output, pack_signed(crop.x()))?;
-            write_frame_dimension(&mut output, pack_signed(crop.y()))?;
+            if regular {
+                write_frame_dimension(&mut output, pack_signed(crop.x()))?;
+                write_frame_dimension(&mut output, pack_signed(crop.y()))?;
+            }
             write_frame_dimension(&mut output, crop.width())?;
             write_frame_dimension(&mut output, crop.height())?;
         }
@@ -37,43 +41,46 @@ impl FrameHeaderPlan {
             request.canvas_width,
             request.canvas_height,
         );
-        write_blending_info(
-            &mut output,
-            request.options.color_blend,
-            has_alpha,
-            full_frame,
-        )?;
-        if has_alpha {
-            let alpha_blend = request
-                .options
-                .extra_channel_blends
-                .first()
-                .copied()
-                .unwrap_or_default();
-            write_blending_info(&mut output, alpha_blend, true, full_frame)?;
-        }
-
-        if let AnimationHeader::Animation { have_timecodes, .. } = request.animation {
-            write_frame_duration(&mut output, request.options.timing.duration_ticks)?;
-            if have_timecodes {
-                output.write_bits(
-                    u64::from(request.options.timing.timecode.ok_or(
-                        EncodeError::InvalidConfiguration(
-                            "animated frame is missing its declared timecode",
-                        ),
-                    )?),
-                    32,
-                )?;
+        if regular {
+            write_blending_info(
+                &mut output,
+                request.options.color_blend,
+                has_alpha,
+                full_frame,
+            )?;
+            if has_alpha {
+                let alpha_blend = request
+                    .options
+                    .extra_channel_blends
+                    .first()
+                    .copied()
+                    .unwrap_or_default();
+                write_blending_info(&mut output, alpha_blend, true, full_frame)?;
             }
+
+            if let AnimationHeader::Animation { have_timecodes, .. } = request.animation {
+                write_frame_duration(&mut output, request.options.timing.duration_ticks)?;
+                if have_timecodes {
+                    output.write_bits(
+                        u64::from(request.options.timing.timecode.ok_or(
+                            EncodeError::InvalidConfiguration(
+                                "animated frame is missing its declared timecode",
+                            ),
+                        )?),
+                        32,
+                    )?;
+                }
+            }
+            output.write_bits(u64::from(request.is_last), 1)?;
         }
-        output.write_bits(u64::from(request.is_last), 1)?;
         if !request.is_last {
             output.write_bits(u64::from(request.options.save_as_reference.get()), 2)?;
             let can_be_referenced = request.options.timing.duration_ticks == 0
                 || request.options.save_as_reference.get() != 0;
-            if request.options.color_blend.mode == BlendMode::Replace
-                && full_frame
-                && can_be_referenced
+            if !regular
+                || (request.options.color_blend.mode == BlendMode::Replace
+                    && full_frame
+                    && can_be_referenced)
             {
                 output.write_bits(u64::from(request.options.save_before_color_transform), 1)?;
             }
@@ -94,6 +101,7 @@ impl FrameHeaderPlan {
         Ok(Self {
             frame_index: request.frame_index,
             is_last: request.is_last,
+            kind: request.options.kind,
             suffix: BitFragment::new(output.into_bytes(), bit_len)?,
         })
     }
@@ -104,6 +112,30 @@ impl FrameHeaderPlan {
 
     pub(crate) const fn is_last(&self) -> bool {
         self.is_last
+    }
+
+    pub(crate) fn write_kind(&self, writer: &mut BitWriter) -> Result<(), EncodeError> {
+        writer.write_bits(
+            match self.kind {
+                FrameKind::Regular => 0,
+                FrameKind::ReferenceOnly => 2,
+            },
+            2,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) const fn has_passes(&self) -> bool {
+        matches!(self.kind, FrameKind::Regular)
+    }
+
+    /// Reference-only syntax omits the pass bundle and implies one complete coefficient pass.
+    pub(crate) fn effective_progressive(&self, requested: &ProgressivePlan) -> ProgressivePlan {
+        if self.has_passes() {
+            requested.clone()
+        } else {
+            ProgressivePlan::single()
+        }
     }
 
     pub(crate) fn append_to(&self, writer: &mut BitWriter) -> Result<(), EncodeError> {
@@ -120,6 +152,40 @@ fn validate_frame(
         return Err(EncodeError::InvalidConfiguration(
             "the JPEG XL animation canvas must be non-empty",
         ));
+    }
+    if request.options.kind == FrameKind::ReferenceOnly {
+        write_animation_header(&mut BitWriter::new(), request.animation)?;
+        validate_extent(request, source_extent)?;
+        if request.is_last
+            || request.options.timing != Default::default()
+            || request.options.color_blend != FrameBlend::default()
+            || !request.options.extra_channel_blends.is_empty()
+        {
+            return Err(EncodeError::InvalidConfiguration(
+                "reference-only frames cannot be final or carry timing/blending fields",
+            ));
+        }
+        if request
+            .options
+            .crop
+            .is_some_and(|crop| crop.x() != 0 || crop.y() != 0)
+        {
+            return Err(EncodeError::InvalidConfiguration(
+                "reference-only frame origins must be zero",
+            ));
+        }
+        if !request.options.save_before_color_transform
+            && !frame_covers_canvas(
+                request.options.crop,
+                request.canvas_width,
+                request.canvas_height,
+            )
+        {
+            return Err(EncodeError::InvalidConfiguration(
+                "post-color-transform reference-only frames must cover the canvas",
+            ));
+        }
+        return Ok(());
     }
     match request.animation {
         AnimationHeader::Still => {
@@ -141,31 +207,7 @@ fn validate_frame(
                     "frame timecode presence must match the animation header",
                 ));
             }
-            let (frame_width, frame_height) = request
-                .options
-                .crop
-                .map_or((request.canvas_width, request.canvas_height), |crop| {
-                    (crop.width(), crop.height())
-                });
-            if let Some(crop) = request.options.crop {
-                for value in [
-                    pack_signed(crop.x()),
-                    pack_signed(crop.y()),
-                    crop.width(),
-                    crop.height(),
-                ] {
-                    if value >= 18_688 + (1 << 30) {
-                        return Err(EncodeError::InvalidConfiguration(
-                            "animation frame crop coordinate exceeds the JPEG XL limit",
-                        ));
-                    }
-                }
-            }
-            if frame_width != source_extent.0 || frame_height != source_extent.1 {
-                return Err(EncodeError::InvalidConfiguration(
-                    "the GPU source extent must match the animation frame crop",
-                ));
-            }
+            validate_extent(request, source_extent)?;
             let extra_channels = usize::from(has_alpha);
             if !request.options.extra_channel_blends.is_empty()
                 && request.options.extra_channel_blends.len() != extra_channels
@@ -230,6 +272,38 @@ fn validate_frame(
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_extent(
+    request: &FrameEncodeRequest,
+    source_extent: (u32, u32),
+) -> Result<(), EncodeError> {
+    let (frame_width, frame_height) = request
+        .options
+        .crop
+        .map_or((request.canvas_width, request.canvas_height), |crop| {
+            (crop.width(), crop.height())
+        });
+    if let Some(crop) = request.options.crop {
+        for value in [
+            pack_signed(crop.x()),
+            pack_signed(crop.y()),
+            crop.width(),
+            crop.height(),
+        ] {
+            if value >= 18_688 + (1 << 30) {
+                return Err(EncodeError::InvalidConfiguration(
+                    "animation frame crop coordinate exceeds the JPEG XL limit",
+                ));
+            }
+        }
+    }
+    if frame_width != source_extent.0 || frame_height != source_extent.1 {
+        return Err(EncodeError::InvalidConfiguration(
+            "the GPU source extent must match the animation frame crop",
+        ));
     }
     Ok(())
 }

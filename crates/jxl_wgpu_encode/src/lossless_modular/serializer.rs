@@ -1886,7 +1886,7 @@ pub(super) fn frame_header(
 ) -> Result<BitFragment, EncodeError> {
     let mut output = BitWriter::new();
     output.write_bits(0, 1)?; // non-default frame header
-    output.write_bits(0, 2)?; // regular frame
+    frame.write_kind(&mut output)?;
     output.write_bits(1, 1)?; // Modular encoding
     output.write_bits(0, 2)?; // zero frame flags
     output.write_bits(0, 1)?; // no YCbCr transform
@@ -1895,7 +1895,9 @@ pub(super) fn frame_header(
         output.write_bits(0, 2)?; // alpha upsampling factor one
     }
     output.write_bits(u64::from(group_size.size_shift()), 2)?;
-    output.write_bits(0, 2)?; // one pass
+    if frame.has_passes() {
+        output.write_bits(0, 2)?; // one pass when present
+    }
 
     frame.append_to(&mut output)?;
     let bit_len = output.bit_len();

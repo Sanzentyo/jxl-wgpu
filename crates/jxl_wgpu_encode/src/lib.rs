@@ -93,7 +93,7 @@ pub use packet::{
 };
 pub use session::{
     AnimationHeader, BlendMode, CodestreamAssembler, EncodeSession, FrameBlend, FrameCrop,
-    FrameEncodeRequest, FrameIndex, FrameOptions, FrameSubmission, FrameTiming,
+    FrameEncodeRequest, FrameIndex, FrameKind, FrameOptions, FrameSubmission, FrameTiming,
     GpuAccelerationArtifact, GpuFrameArtifacts, ReferenceSlot, SessionDescriptor,
 };
 pub use vardct_encoder::{

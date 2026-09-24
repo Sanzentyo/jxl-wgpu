@@ -147,8 +147,19 @@ pub struct FrameBlend {
     pub clamp: bool,
 }
 
+/// Whether a physical frame can produce a presentation or only populate a reference slot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FrameKind {
+    /// A normal frame, including a hidden animation layer with zero duration.
+    #[default]
+    Regular,
+    /// A non-final animation frame that only stores a reference, without timing or blending.
+    ReferenceOnly,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FrameOptions {
+    pub kind: FrameKind,
     pub timing: FrameTiming,
     pub crop: Option<FrameCrop>,
     pub color_blend: FrameBlend,
@@ -374,6 +385,14 @@ fn validate_frame_options(
     animation: AnimationHeader,
     options: &FrameOptions,
 ) -> Result<(), EncodeError> {
+    if options.kind == FrameKind::ReferenceOnly {
+        if options.timing != FrameTiming::default() {
+            return Err(EncodeError::InvalidConfiguration(
+                "reference-only frames cannot carry duration or timecode",
+            ));
+        }
+        return Ok(());
+    }
     if !animation.is_animation()
         && (options.timing.duration_ticks != 0 || options.timing.timecode.is_some())
     {

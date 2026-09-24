@@ -72,6 +72,7 @@ mod wasm_compile_contract {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod native_tests {
+    mod reference_only;
     use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 

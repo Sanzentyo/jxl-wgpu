@@ -11,6 +11,8 @@ use jxl_test_support::oracles::extra_channels::{floats, rust_frame_planes};
 use jxl_test_support::oracles::progressive::native_updates;
 use jxl_wgpu_decode::WgpuDecodeEngine;
 
+mod reference_only;
+
 fn timebase(numerator: u32, denominator: u32, loops: u32, timecodes: bool) -> AnimationHeader {
     AnimationHeader::Animation {
         ticks_per_second_numerator: numerator.try_into().unwrap(),
@@ -276,7 +278,22 @@ fn check_animation(
             frame.save_as_reference,
             u32::from(options.save_as_reference.get())
         );
-        assert_eq!(frame.num_passes as usize, passes);
+        assert_eq!(
+            frame.num_passes as usize,
+            if options.kind == crate::FrameKind::ReferenceOnly {
+                1
+            } else {
+                passes
+            }
+        );
+        assert_eq!(
+            frame.frame_type,
+            if options.kind == crate::FrameKind::ReferenceOnly {
+                jxl_gpu_bitstream::FrameType::ReferenceOnly
+            } else {
+                jxl_gpu_bitstream::FrameType::Regular
+            }
+        );
         let mode = match options.color_blend.mode {
             BlendMode::Replace => jxl_gpu_bitstream::FrameBlendMode::Replace,
             BlendMode::Add => jxl_gpu_bitstream::FrameBlendMode::Add,

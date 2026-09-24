@@ -792,13 +792,25 @@ quantization, matrices/orders and AC passes. Single transforms and maps retain t
 extent on each frame; tiled DCT8 accepts separately checked crop extents through its 16K axis
 bound. Both support Replace/Add/Multiply, signed crops, hidden zero-duration regular frames and
 four post-color-transform references. Alpha-weighted modes, extra-channel contracts and
-pre-color-transform reference storage are rejected. Mixed Modular/VarDCT sessions, reference-only
-frame types, frame names and previews remain unimplemented.
+pre-color-transform reference storage are rejected. Mixed Modular/VarDCT sessions, layered stills,
+frame names and previews remain unimplemented.
+
+Both codecs accept `FrameOptions { kind: FrameKind::ReferenceOnly, .. }` in animation sessions.
+Such a frame stores its decoded source in any of the four `save_as_reference` slots without a
+presentation or blend. It must be non-final, retain default timing/color blend and an empty
+extra-channel blend list, even when the animation declares timecodes. Its optional crop describes
+only dimensions: the origin must be `(0, 0)`. Post-color-transform storage must cover the canvas;
+Modular also accepts bounded smaller references with `save_before_color_transform = true`.
+Reference-only syntax implies a single complete pass. VarDCT lowers the configured progression
+to that pass before planning GPU parameters, packets and resource bounds; regular frames retain
+their configured progression. `memory_plan_for_request` reports this exact per-frame admission,
+while `memory_plan` continues to report the configured regular-frame resources. See the
+[reference-only evidence](../../docs/CONFORMANCE_CORPUS.md#reference-only-frame-encoding).
 
 Both codecs lower frame options once into a checked, immutable `FrameHeaderPlan` before GPU
 admission. Resident, native-streamed and browser-streamed Modular jobs and VarDCT jobs append
 that plan's bounded control bits after their codec-specific prefix. The same plan supplies the
-artifact's physical frame index and final flag. Invalid controls or budget admission failures
+wire frame kind, pass-bundle presence, physical frame index and final flag. Invalid controls or budget admission failures
 do not advance the session or close its final-frame slot. No new GPU allocation, binding,
 submission or map is introduced by animation control. See the
 [VarDCT animation evidence](../../docs/CONFORMANCE_CORPUS.md#vardct-animation-encoding).
@@ -808,7 +820,7 @@ keeps a reusable GPU session open for multiple frames. The descriptor fixes the 
 sample precision, tick rate, loop count, and timecode presence. Use
 `LosslessModularAnimationDescriptor::new` for integers, `new_float` for binary16/binary32, or
 `from_pixel_format` for explicit floating precision and source color.
-Each frame supplies an exact duration,
+Each regular frame supplies an exact duration,
 optional timecode, optional signed crop rectangle, color blend contract, one contract per extra
 channel, and the two-bit source/destination reference slots. GrayAlpha and RGBA animation carry
 alpha as a standard extra channel with the encoder's declared association. Alpha-weighted

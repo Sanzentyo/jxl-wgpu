@@ -28,25 +28,35 @@ implementation audits.
 
 ## Frame control and animation
 
-`FrameHeaderPlan` owns regular-frame crop geometry, per-channel blend-field presence, timing,
-reference-field presence and finality. Construction validates source/crop agreement and wire
+`FrameHeaderPlan` owns regular/reference-only kind, crop geometry, per-channel blend-field presence,
+timing, reference-field presence, pass-bundle presence and finality. Construction validates source/crop agreement and wire
 bounds, then compiles at most 256 control bits before GPU memory admission. Its fields are
 private; frame jobs use the retained bits and index/finality accessors instead of reinterpreting
 caller options after GPU completion. `LosslessModularBackend` uses this representation in
 resident, native-streamed and browser-streamed execution, and `VarDctBackend` uses it after its
 own quantization/progression checks. Codec-specific headers supply coding mode, group geometry
-and pass layout; the common plan supplies the regular-frame suffix and disabled restoration.
+and pass layout; the common plan supplies the wire kind, field presence, suffix and disabled restoration.
 The stream serializers also share one checked animation-timebase writer.
+
+Reference-only animation frames omit timing, blending, finality and the pass bundle. Their origin
+is zero, and a post-color-transform reference must cover the canvas; Modular also permits smaller
+pre-transform references. The plan rejects caller fields that this syntax cannot retain before
+admission. VarDCT derives an immutable per-frame configuration with one complete coefficient pass
+from the checked control plan. The dispatch layout, GPU parameters, resource estimate and completed
+packet assembly all consume that configuration. `memory_plan_for_request` uses the same preparation
+path as submission; `memory_plan` retains the configured regular-frame estimate. No shader binding
+or ownership rules change, and regular frames retain their requested progression.
 
 `VarDctAnimationDescriptor` compiles bounded RGB8/XYB image metadata. Both VarDCT frontends create
 `VarDctAnimationSession` around the existing generic `EncodeSession` and `CodestreamAssembler`.
-Frames retain the encoder's immutable transform/quantizer/pass policy, with independently checked
+Frames retain the encoder's immutable transform/quantizer policy and the legal progression above, with independently checked
 tiled crop extents. Failed submissions leave the frame index and finality available for retry;
 completed artifacts may be inserted in any order. Reference slots describe codestream metadata,
 not host-computed image state: the GPU encodes each supplied source and the decoder composes it.
 This profile emits post-color-transform references and rejects pre-transform storage, alpha
-blends and extra-channel contracts. Fixed frame metadata does not change GPU ABI, allocations,
-submission/map counts or the existing completion/cancellation ownership. Syntax and conformance
+blends and extra-channel contracts. Frame control adds no GPU allocation, binding, submission or
+map of its own; the effective pass layout determines existing artifact sizes. Completion and
+cancellation ownership remain unchanged. Syntax and conformance
 scope remain in the [animation corpus](CONFORMANCE_CORPUS.md#vardct-animation-encoding).
 
 Indexed container assembly has a separate authority boundary after frame ordering.
@@ -71,7 +81,7 @@ GPU pixels, entropy, submission ownership and the unindexed assembly APIs are un
 | Source color | full-range enumerated RGB/Gray, standard/custom primaries and white, Linear/sRGB/BT.709/PQ/HLG/DCI/Gamma, or unchanged embedded RGB/Gray ICC; four intents and positive binary16 image white |
 | Extent | `1..2^30` per axis, further bounded by device limits |
 | Frame/group layout | selectable 128/256/512/1024-square PassGroups (default 256), LF groups eight times wider/taller, multi-group, row-major TOC |
-| Animation | `true` (5 blend modes, signed crop, 4 reference slots, timecodes) |
+| Animation | `true` (5 blend modes, signed crop, 4 reference slots, reference-only frames, timecodes) |
 | Determinism | `CrossDevice` integer GPU artifacts and deterministic host assembly |
 | Progressive passes | `max_progressive_passes = 1` |
 | Implemented stages | `ColorTransform`, `ModularTransform`, `ModularPrediction`, `ModularResidualTokenization`, `HistogramReduction`, plus `AnsSerialization` when selected |

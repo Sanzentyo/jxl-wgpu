@@ -317,13 +317,40 @@ impl VarDctBackend {
         self.config.lf_metadata
     }
 
-    /// Computes the exact memory admission and source binding before a job is
-    /// submitted.
+    /// Computes memory admission and source binding with the configured regular-frame passes.
+    /// Use `memory_plan_for_request` for a reference-only frame's implicit single pass.
     pub fn memory_plan(&self, source: &BufferImageSource) -> Result<VarDctMemoryPlan, EncodeError> {
-        Ok(self.dispatch_plan(source)?.memory)
+        Ok(self.dispatch_plan(source, &self.config.progressive)?.memory)
     }
 
-    fn dispatch_plan(&self, source: &BufferImageSource) -> Result<VarDctDispatchPlan, EncodeError> {
+    /// Exact admission for one request, including the implicit single pass of reference-only frames.
+    pub fn memory_plan_for_request(
+        &self,
+        source: &BufferImageSource,
+        request: &FrameEncodeRequest,
+    ) -> Result<VarDctMemoryPlan, EncodeError> {
+        Ok(self.prepare_frame(source, request)?.0.memory)
+    }
+
+    fn prepare_frame(
+        &self,
+        source: &BufferImageSource,
+        request: &FrameEncodeRequest,
+    ) -> Result<(VarDctDispatchPlan, FrameHeaderPlan, VarDctConfig), EncodeError> {
+        let extent = source.layout.extent;
+        let control =
+            validate_vardct_request(request, (extent.width, extent.height), &self.config)?;
+        let mut config = self.config.clone();
+        config.progressive = control.effective_progressive(&config.progressive);
+        let plan = self.dispatch_plan(source, &config.progressive)?;
+        Ok((plan, control, config))
+    }
+
+    fn dispatch_plan(
+        &self,
+        source: &BufferImageSource,
+        progressive: &ProgressivePlan,
+    ) -> Result<VarDctDispatchPlan, EncodeError> {
         let extent = source.layout.extent;
         let frame = match self.topology {
             VarDctTopology::SingleTransform(strategy) => {
@@ -443,7 +470,7 @@ impl VarDctBackend {
                     ArtifactLayout::for_tiled_grid(frame, &self.code, &self.hf_entropy)?
                 }
             }
-            .with_passes(self.config.progressive.passes().len())?;
+            .with_passes(progressive.passes().len())?;
             if self.config.group_order.requires_saliency() {
                 layout = layout.with_saliency(frame.ac_group_count()?)?;
             }
@@ -528,14 +555,10 @@ impl VarDctBackend {
                         ac_pass_count: layout.ac_pass_count,
                         ac_pass_words: layout.ac_fragment_words / layout.ac_pass_count,
                         progressive: std::array::from_fn(|index| {
-                            self.config
-                                .progressive
-                                .passes()
-                                .get(index)
-                                .map_or(0, |pass| {
-                                    u32::from(pass.coefficient_square.get())
-                                        | u32::from(pass.shift) << 8
-                                })
+                            progressive.passes().get(index).map_or(0, |pass| {
+                                u32::from(pass.coefficient_square.get())
+                                    | u32::from(pass.shift) << 8
+                            })
                         }),
                         saliency_offset: layout.saliency_offset,
                         saliency_groups: layout.saliency_groups,
@@ -659,7 +682,7 @@ fn validate_tiled_device_limits(limits: &wgpu::Limits) -> Result<(), EncodeError
 
 fn validate_vardct_request(
     request: &FrameEncodeRequest,
-    frame: VarDctFrameLayout,
+    source_extent: (u32, u32),
     config: &VarDctConfig,
 ) -> Result<FrameHeaderPlan, EncodeError> {
     if request.progressive != config.progressive {
@@ -681,7 +704,7 @@ fn validate_vardct_request(
             "the VarDCT encoder supports only post-color-transform references",
         ));
     }
-    FrameHeaderPlan::new(request, (frame.width, frame.height), false)
+    FrameHeaderPlan::new(request, source_extent, false)
 }
 
 impl GpuEncodeBackend for VarDctBackend {
@@ -695,7 +718,10 @@ impl GpuEncodeBackend for VarDctBackend {
         let GpuFrameSource::Buffer(source) = source else {
             return false;
         };
-        self.dispatch_plan(source).is_ok()
+        // Input support is independent of the requested pass count. Per-frame planning checks
+        // its actual resources; a reference-only frame can fit when a multipass frame cannot.
+        self.dispatch_plan(source, &ProgressivePlan::single())
+            .is_ok()
     }
 
     fn submit(
@@ -707,8 +733,7 @@ impl GpuEncodeBackend for VarDctBackend {
         let GpuFrameSource::Buffer(source) = source else {
             return Err(UnsupportedFeature::InputFormat.into());
         };
-        let plan = self.dispatch_plan(&source)?;
-        let control = validate_vardct_request(request, plan.frame, &self.config)?;
+        let (plan, control, config) = self.prepare_frame(&source, request)?;
         let memory_permit = context
             .memory_budget()
             .try_reserve(plan.memory.owned_bytes_per_job)?;
@@ -952,7 +977,7 @@ impl GpuEncodeBackend for VarDctBackend {
             completion,
             code: self.code.clone(),
             hf_entropy: self.hf_entropy.clone(),
-            config: self.config.clone(),
+            config,
             frame_layout: plan.frame,
             transform_plan: self.transform_plan.clone(),
             raw_matrix_plan: self.raw_matrix_plan.clone(),
@@ -1721,6 +1746,17 @@ impl VarDctEncoder {
         self.encoder.backend().memory_plan(source)
     }
 
+    /// Computes exact resources for the supplied physical-frame request.
+    pub fn memory_plan_for_request(
+        &self,
+        source: &BufferImageSource,
+        request: &FrameEncodeRequest,
+    ) -> Result<VarDctMemoryPlan, EncodeError> {
+        self.encoder
+            .backend()
+            .memory_plan_for_request(source, request)
+    }
+
     /// Begins an RGB8/XYB animation using this encoder's transform and quantization policy.
     /// Frame extents must match the selected transform/map, or the tiled backend's limits.
     pub fn begin_animation(
@@ -1848,6 +1884,17 @@ impl TiledVarDctEncoder {
 
     pub fn memory_plan(&self, source: &BufferImageSource) -> Result<VarDctMemoryPlan, EncodeError> {
         self.encoder.backend().memory_plan(source)
+    }
+
+    /// Computes exact resources for the supplied physical-frame request.
+    pub fn memory_plan_for_request(
+        &self,
+        source: &BufferImageSource,
+        request: &FrameEncodeRequest,
+    ) -> Result<VarDctMemoryPlan, EncodeError> {
+        self.encoder
+            .backend()
+            .memory_plan_for_request(source, request)
     }
 
     pub fn grid(&self, source: &BufferImageSource) -> Result<TiledVarDctGrid, EncodeError> {
