@@ -48,7 +48,7 @@ GPU image source -> GPU prediction/transform/quantization/tokenization
 
 The lossless Modular encoder's explicit ANS policy adds a frame histogram/codebook barrier and a
 GPU serialization pass per batch. Its first submission also profiles bounded hybrid configurations
-after tokenization, with no additional submit/map. The selected configuration and context map
+after tokenization, with no additional submit/map. The selected residual/distance/length configurations and context map
 belong to one immutable codebook. A checked plan reserves profile histograms, compressed output and tables
 inside the existing parameter/artifact/readback lease. One invocation owns a complete group's ANS
 state across its transformed channels; validated fragments alone reach packet assembly. Native and

@@ -1,7 +1,7 @@
 use super::super::super::types::ModularArtifactHeader;
 use super::*;
 
-fn maps() -> Vec<ContextMap> {
+pub(in super::super) fn maps() -> Vec<ContextMap> {
     // Independent Cartesian enumeration; canonical labels remove equivalent maps.
     (0..CONTEXTS.pow(CONTEXTS as u32))
         .map(|mut value| {
@@ -221,6 +221,7 @@ fn every_partition_and_reversed_cluster_label_decodes_actual_gpu_symbols() {
                         }
                     }),
                     mode,
+                    length: length::LengthCoding::canonical(),
                 }));
                 let (plan, words) =
                     gpu_fragment(&context, &pipeline, code.ans().unwrap(), &channels, None);
@@ -244,6 +245,7 @@ fn cluster(
         }],
         copies,
     )
+    .map(|clustered| (clustered.tables, clustered.map))
 }
 
 #[test]
@@ -323,7 +325,8 @@ fn joint_hybrid_partition_search_matches_exhaustive_f64_costs() {
                 }
                 cost
             };
-            let (tables, map) = super::cluster(&profiles, copies).unwrap();
+            let result = super::cluster(&profiles, copies).unwrap();
+            let (tables, map) = (result.tables, result.map);
             let minimum = maps()
                 .into_iter()
                 .map(|map| map_rate(map, None))
@@ -335,7 +338,8 @@ fn joint_hybrid_partition_search_matches_exhaustive_f64_costs() {
                 .unwrap() as f64
                 * 2f64.powi(-19);
             assert!(map_rate(map, Some(&tables)) - minimum <= allowance);
-            let (repeated, next_map) = super::cluster(&profiles, copies).unwrap();
+            let result = super::cluster(&profiles, copies).unwrap();
+            let (repeated, next_map) = (result.tables, result.map);
             assert_eq!(map, next_map);
             for (first, second) in tables.iter().zip(repeated) {
                 assert_eq!(first.config, second.config);

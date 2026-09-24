@@ -1107,7 +1107,7 @@ GPU ANS serialization is covered separately below.
 ## Lossless Modular GPU ANS encoding
 
 `lossless_layouts::ans` selects GPU ANS explicitly while retaining default Prefix fixture bytes.
-Its nine tests cover Gray/GrayAlpha/RGB/RGBA, all integer depths 1–31 and IEEE16/32 special words,
+Its ten tests cover Gray/GrayAlpha/RGB/RGBA, all integer depths 1–31 and IEEE16/32 special words,
 all 14 predictors with custom Weighted coefficients, all 42 global/local RCT types, all group sizes,
 both MA placements and both LZ77 policies. Packed/planar/split layouts with poisoned padding,
 unaligned pitches, reversed components and big-endian words must emit the same bytes as canonical
@@ -1180,8 +1180,26 @@ and rejects one-byte-short storage or insufficient workgroup limits before alloc
 uses adaptive residual/distance coding, with exactly 165,768 histogram bytes admitted per batch;
 its one/multiple-batch exact-budget, cancellation, reuse and late-failure checks remain in force.
 
+LZ77 length selection evaluates splits 0–4 jointly with residual/distance configurations and
+clustering. Every value in the full 20-bit length domain checks exact rebinned histograms and
+extra-bit totals, including weighted counts, empty channels and overflow rejection. The actual
+GPU matrix covers 5 length × 37 residual/distance configurations × 2 LZ77 policies (370 dispatches),
+short direct-value/exponent boundaries, maximum group-length copies and empty channels. Independent
+entropy decoding checks exact words, cursor and state at three width multipliers; malformed
+length tokens, widths and extra bits fail without fragment authority.
+
+Eight GPU-derived distributions/header-multiplicity cases compare global selection against
+independent F64 rates across all 5 length choices, 31 unions, 37 raw configurations and 52 maps.
+Sixteen public zero-run sources parse selected splits 0/2/3/4 directly, retain canonical versus
+poisoned-layout byte identity, and match native/original-word and whole/bounded GPU output with
+both tree placements and one/multiple groups. Split 1 has the same token mapping as split 0 with
+a longer header, but remains covered explicitly in the complete GPU configuration matrix.
+The previous all-depth, transform, animation, budget and cancellation checks also run with the
+selected length setting. Profiling and submission counts do not increase; only one parameter word
+is added to the admitted batch header.
+
 `ENT-E01` remains **Partial** for learned/wider contexts, clustering outside Modular ANS, adaptive
-length/alphabet configurations, cross-channel search and effort selection. This evidence makes no throughput
+alphabet configurations, cross-channel search and effort selection. This evidence makes no throughput
 or compression-ratio claim, and the rate estimate does not guarantee an always-smaller codestream.
 
 

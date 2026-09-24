@@ -211,12 +211,14 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   52 partitions by integer rate estimates plus serialized metadata, including repeated local
   headers. Each distribution jointly selects among 37 GPU-profiled split/MSB/LSB settings
   covering the full u32 range with tokens below LZ77 symbol 224; exact residual/distance extra-bit costs
-  participate in the estimate. Normalization to 4096, a 256-symbol alphabet and LZ77 length
-  configuration `4/0/0` remain deterministic. Host work builds
+  participate in the estimate. The same search selects one global LZ77 length configuration
+  from all five splits 0–4 covering the full 20-bit match domain in 32 reserved symbols,
+  including length extra bits and repeated headers. Normalization to 4096 and the 256-symbol
+  alphabet remain fixed. Canonical tokenization and default Prefix bytes are unchanged. Host work builds
   bounded histogram/alias metadata and copies already compressed fragments; every ANS symbol,
   renormalization and extra bit is emitted on GPU. There is no fallback to Prefix.
   The immutable codebook owns both the wire context map and GPU table selection. This is a
-  size estimate, without an always-smaller-stream guarantee; adaptive length/alphabet choices,
+  size estimate, without an always-smaller-stream guarantee; adaptive alphabet choices,
   learned contexts and effort policy remain open.
 - One GPU invocation handles each PassGroup/channel pair without Palette. With Palette, the
   group's first invocation builds its dictionary and encodes all its channels sequentially;
@@ -260,7 +262,7 @@ ANS output is part of the same artifact allocation, lease and budget. For `E` ma
 summed across a group's channels, it reserves a 16-byte completion record plus
 `4 * ceil((80 * E + 32) / 32)` compressed bytes. Each batch also reserves 165,768 artifact bytes
 for 37 × 5 × 224 hybrid histogram bins and two completion words. The five-table upper bound
-reserves 92,180 parameter bytes, including each table's selected hybrid setting, plus a 32-byte
+reserves 92,180 parameter bytes, including each table's selected hybrid setting, plus a 36-byte
 batch header, 16-byte group/channel descriptors and 37 candidate settings in an aligned suffix.
 Only the selected one to five tables are uploaded and bound. Admission retains the upper bound
 before the histogram pass, so selection never needs a late reservation or extra submission.

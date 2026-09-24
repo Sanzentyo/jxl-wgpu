@@ -13,7 +13,7 @@ fn config(lz77: LosslessModularLz77) -> LosslessModularConfig {
     }
 }
 
-fn read_global_entropy(bits: &mut jxl_bitstream::Bitstream<'_>) -> jxl_coding::Decoder {
+fn read_global_tree(bits: &mut jxl_bitstream::Bitstream<'_>) {
     assert!(bits.read_bool().unwrap()); // default LF dequantization
     assert!(bits.read_bool().unwrap()); // global Modular tree
     let mut tree = jxl_coding::Decoder::parse(bits, 6).unwrap();
@@ -31,7 +31,81 @@ fn read_global_entropy(bits: &mut jxl_bitstream::Bitstream<'_>) -> jxl_coding::D
         }
     }
     tree.finalize().unwrap();
+}
+
+fn read_global_entropy(bits: &mut jxl_bitstream::Bitstream<'_>) -> jxl_coding::Decoder {
+    read_global_tree(bits);
     jxl_coding::Decoder::parse(bits, 4).unwrap()
+}
+
+#[test]
+fn ans_adapts_length_headers_to_gpu_matches_without_changing_original_words() {
+    use jxl_wgpu_encode::{LosslessModularColorTransform, LosslessModularPredictor};
+    let rig = Rig::new();
+    let case = case(LosslessModularFormat::Gray, 8, SampleKind::Unsigned);
+    for tree_mode in TREES {
+        let encoder = LosslessModularEncoder::with_config(
+            rig.context.clone(),
+            LosslessModularConfig {
+                tree_mode,
+                predictor: LosslessModularPredictor::Zero,
+                color_transform: LosslessModularColorTransform::None,
+                ..config(LosslessModularLz77::ZeroRuns)
+            },
+        );
+        for extent in [Extent2d::new(128, 8), Extent2d::new(129, 8)] {
+            for (zeros, expected_split) in [(8, 0), (10, 2), (12, 3), (16, 4)] {
+                let expected: Vec<_> = (0..extent.area().unwrap())
+                    .map(|index| u32::from(index % extent.width as usize % 32 >= zeros))
+                    .collect();
+                let encoded = encoder
+                    .encode(upload(&rig.context, &case, extent, &expected, 4099))
+                    .unwrap();
+                assert_eq!(
+                    encoded,
+                    encoder
+                        .encode(upload(
+                            &rig.context,
+                            &case.canonical(),
+                            extent,
+                            &expected,
+                            0
+                        ))
+                        .unwrap()
+                );
+                let parsed = jxl_gpu_bitstream::parse(&encoded, Default::default()).unwrap();
+                let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+                let section = inventory.frames[0]
+                    .sections
+                    .iter()
+                    .find(|section| {
+                        matches!(
+                            section.kind,
+                            jxl_gpu_bitstream::FrameSectionKind::Single
+                                | jxl_gpu_bitstream::FrameSectionKind::LowFrequencyGlobal
+                        )
+                    })
+                    .unwrap();
+                let start = section.bytes.offset as usize;
+                let mut bits = jxl_bitstream::Bitstream::new(
+                    &encoded[start..start + section.bytes.length as usize],
+                );
+                read_global_tree(&mut bits);
+                assert!(bits.read_bool().unwrap());
+                assert_eq!(bits.read_bits(2).unwrap(), 0); // default min_symbol = 224
+                assert_eq!(bits.read_bits(4).unwrap(), 0b1010); // min_length = 7
+                let split = bits.read_bits(4).unwrap();
+                assert_eq!(split, expected_split, "zeros={zeros} extent={extent:?}");
+                let width = (32 - split.leading_zeros()) as usize;
+                assert_eq!(bits.read_bits(width).unwrap(), 0);
+                assert_eq!(bits.read_bits(width).unwrap(), 0);
+                let native = check_oracles(&encoded, &expected, &case);
+                rig.check_gpu(&encoded, &expected, &case, &native);
+            }
+        }
+        assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
+        assert_eq!(encoder.buffer_pool_stats().leased_buffer_sets, 0);
+    }
 }
 
 #[test]

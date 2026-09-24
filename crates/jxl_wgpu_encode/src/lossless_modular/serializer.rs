@@ -1711,12 +1711,7 @@ pub(super) fn write_ma_config(
         }
     }
 
-    output.write_bits(1, 1)?;
-    output.write_bits(0, 2)?;
-    output.write_bits(0b1010, 4)?;
-    output.write_bits(4, 4)?;
-    output.write_bits(0, 3)?;
-    output.write_bits(0, 3)?;
+    entropy.write_lz77_config(output)?;
     entropy.write_context_map(output)?;
     let EntropyCode::Prefix { codes, distance } = entropy else {
         return entropy

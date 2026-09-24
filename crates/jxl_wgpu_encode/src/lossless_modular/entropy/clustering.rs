@@ -16,10 +16,16 @@ struct Partition {
     cost: u128,
 }
 
+pub(super) struct ClusteredCode {
+    pub(super) tables: Vec<hybrid::HybridCode>,
+    pub(super) map: ContextMap,
+    pub(super) estimated_bits_q20: u128,
+}
+
 pub(super) fn cluster(
     profiles: &[hybrid::HybridCounts],
     header_copies: u64,
-) -> Result<(Vec<hybrid::HybridCode>, ContextMap), EncodeError> {
+) -> Result<ClusteredCode, EncodeError> {
     if header_copies == 0 {
         return Err(BackendError::Invariant("ANS codebook has no header").into());
     }
@@ -80,7 +86,11 @@ pub(super) fn cluster(
         .iter()
         .map(|&subset| candidates[subset as usize - 1].code.clone())
         .collect();
-    Ok((tables, best.map))
+    Ok(ClusteredCode {
+        tables,
+        map: best.map,
+        estimated_bits_q20: best.cost,
+    })
 }
 
 fn visit(
@@ -147,4 +157,4 @@ pub(super) fn write_context_map(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

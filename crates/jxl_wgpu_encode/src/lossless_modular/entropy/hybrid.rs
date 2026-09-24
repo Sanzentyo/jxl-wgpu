@@ -18,25 +18,46 @@ impl HybridConfig {
     pub(super) fn candidates() -> &'static [Self] {
         static CONFIGS: std::sync::OnceLock<Vec<HybridConfig>> = std::sync::OnceLock::new();
         CONFIGS.get_or_init(|| {
-            let mut configs = Vec::new();
-            for split in 0..8 {
-                for msb in 0..=split {
-                    for lsb in 0..=split - msb {
-                        let config = Self { split, msb, lsb };
-                        // Every u32 must fit below the reserved LZ77 alphabet.
-                        if config.max_token() < RAW_ALPHABET {
-                            configs.push(config);
-                        }
-                    }
-                }
-            }
+            let configs = Self::for_alphabet(32, RAW_ALPHABET);
             assert_eq!(configs.len(), PROFILES);
             configs
         })
     }
 
+    /// Configurations covering the entire declared value domain.
+    pub(super) fn for_alphabet(value_bits: u8, alphabet: usize) -> Vec<Self> {
+        (0..=8)
+            .flat_map(|split| {
+                (0..=split)
+                    .flat_map(move |msb| (0..=split - msb).map(move |lsb| Self { split, msb, lsb }))
+            })
+            .filter(|config| config.max_token_for(value_bits) < alphabet)
+            .collect()
+    }
+
+    pub(super) const fn canonical_length() -> Self {
+        Self {
+            split: 4,
+            msb: 0,
+            lsb: 0,
+        }
+    }
+
+    pub(super) fn split_only(self) -> Option<u8> {
+        (self.msb == 0 && self.lsb == 0).then_some(self.split)
+    }
+
     fn max_token(self) -> usize {
-        (1 << self.split) + ((32 - usize::from(self.split)) << (self.msb + self.lsb)) - 1
+        self.max_token_for(32)
+    }
+
+    fn max_token_for(self, value_bits: u8) -> usize {
+        if value_bits <= self.split {
+            (1 << value_bits) - 1
+        } else {
+            (1 << self.split) + ((usize::from(value_bits - self.split)) << (self.msb + self.lsb))
+                - 1
+        }
     }
 
     pub(super) fn packed(self) -> u32 {
@@ -230,17 +251,13 @@ impl FrameHistograms {
     pub(super) fn candidates(
         &self,
         mode: LosslessModularLz77,
+        length: &length::LengthHistograms,
     ) -> Result<Vec<HybridCounts>, EncodeError> {
         if self.profiles.len() != PROFILES {
             return Err(BackendError::InvalidArtifact(
                 "ANS requires validated GPU hybrid profiles",
             )
             .into());
-        }
-        if self.lz77.iter().any(|counts| counts[32] != 0) {
-            return Err(
-                BackendError::InvalidArtifact("ANS LZ77 alphabet exceeds 256 symbols").into(),
-            );
         }
         let canonical = self.canonical_raw(mode)?;
         Ok(HybridConfig::candidates()
@@ -251,13 +268,17 @@ impl FrameHistograms {
                 for (target, source) in counts.iter_mut().zip(profile) {
                     target[..RAW_ALPHABET].copy_from_slice(source);
                 }
-                for (target, source) in counts[1..].iter_mut().zip(&self.lz77) {
-                    target[RAW_ALPHABET..].copy_from_slice(&source[..32]);
+                for (target, source) in counts[1..].iter_mut().zip(&length.counts) {
+                    target[RAW_ALPHABET..].copy_from_slice(source);
+                }
+                let mut extra_bits = canonical.map(|counts| config.extra_bits(&counts));
+                for (extra, &length_extra) in extra_bits[1..].iter_mut().zip(&length.extra_bits) {
+                    *extra += length_extra;
                 }
                 HybridCounts {
                     config,
                     counts,
-                    extra_bits: canonical.map(|counts| config.extra_bits(&counts)),
+                    extra_bits,
                 }
             })
             .collect())
@@ -265,4 +286,4 @@ impl FrameHistograms {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

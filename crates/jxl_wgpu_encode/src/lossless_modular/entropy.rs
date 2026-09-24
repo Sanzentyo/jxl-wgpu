@@ -12,6 +12,7 @@ use crate::{BackendError, EncodeError, WgpuContext};
 
 mod clustering;
 mod hybrid;
+mod length;
 pub(super) use hybrid::{FrameHistograms, PROFILE_BYTES, PROFILES};
 
 /// Entropy coding after lossless GPU tokenization. This selection never changes source words.
@@ -85,6 +86,15 @@ impl EntropyCode {
         clustering::write_context_map(writer, map)
     }
 
+    pub(super) fn write_lz77_config(&self, writer: &mut BitWriter) -> Result<(), EncodeError> {
+        writer.write_bits(1, 1)?; // enabled
+        writer.write_bits(0, 2)?; // min_symbol = 224
+        writer.write_bits(0b1010, 4)?; // min_length = 7
+        self.ans()
+            .map_or(length::LengthCoding::canonical(), |code| code.length)
+            .write(writer)
+    }
+
     pub(super) fn write_empty_stream(&self, writer: &mut BitWriter) -> Result<(), EncodeError> {
         // Match libjxl WriteTokens: an empty ANS stream retains its 32-bit terminal state.
         if self.ans().is_some() {
@@ -133,6 +143,7 @@ pub(super) struct AnsCodebook {
     /// Distance, then channel 0/1/2/3+. Shared by wire metadata and GPU lowering.
     context_map: clustering::ContextMap,
     mode: LosslessModularLz77,
+    length: length::LengthCoding,
 }
 
 impl AnsCodebook {
@@ -141,12 +152,31 @@ impl AnsCodebook {
         histograms: &FrameHistograms,
         header_copies: u64,
     ) -> Result<Self, EncodeError> {
-        let profiles = histograms.candidates(mode)?;
-        let (tables, context_map) = clustering::cluster(&profiles, header_copies)?;
+        let mut best: Option<(u128, length::LengthCoding, clustering::ClusteredCode)> = None;
+        for length in length::LengthCoding::candidates() {
+            let lengths = length.histograms(&histograms.lz77)?;
+            let profiles = histograms.candidates(mode, &lengths)?;
+            let clustered = clustering::cluster(&profiles, header_copies)?;
+            let mut header = BitWriter::new();
+            length.write(&mut header)?;
+            let cost = clustered.estimated_bits_q20
+                + ((header.bit_len() as u128 * u128::from(header_copies)) << 20);
+            if best
+                .as_ref()
+                .is_none_or(|(previous_cost, previous_length, _)| {
+                    (cost, length) < (*previous_cost, *previous_length)
+                })
+            {
+                best = Some((cost, length, clustered));
+            }
+        }
+        let (_, length, clustered) =
+            best.ok_or(BackendError::Invariant("ANS length search is empty"))?;
         Ok(Self {
-            tables,
-            context_map,
+            tables: clustered.tables,
+            context_map: clustered.map,
             mode,
+            length,
         })
     }
 
@@ -204,7 +234,7 @@ pub(super) struct EntropyBatchPlan {
 
 impl EntropyBatchPlan {
     pub(super) fn bytes(self, channels: usize) -> u64 {
-        4 * (8
+        4 * (9
             + hybrid::PROFILES as u64
             + 4 * u64::from(self.group_count)
             + 4 * channels as u64
@@ -343,11 +373,11 @@ pub(super) fn record(
         "ANS batch has no metadata allocation",
     ))?;
     let groups = &plan.groups[batch.first_dispatch..batch.first_dispatch + batch.dispatch_count];
-    let channel_start = 8 + 4 * entropy.group_count as usize;
+    let channel_start = 9 + 4 * entropy.group_count as usize;
     let profiles_start = channel_start + 4 * groups.len();
     let tables_start = profiles_start + hybrid::PROFILES;
     let mut metadata = vec![0u32; tables_start];
-    metadata[..8].copy_from_slice(&[
+    metadata[..9].copy_from_slice(&[
         entropy.group_count,
         tables_start as u32,
         u32::from(plan.lz77 == LosslessModularLz77::Greedy),
@@ -356,6 +386,9 @@ pub(super) fn record(
         (entropy.profile_byte_offset / 4) as u32,
         profiles_start as u32,
         groups.len() as u32,
+        codebook
+            .map_or(length::LengthCoding::canonical(), |code| code.length)
+            .packed(),
     ]);
     for (target, &config) in metadata[profiles_start..tables_start]
         .iter_mut()
@@ -379,7 +412,7 @@ pub(super) fn record(
                 .iter()
                 .take_while(|next| next.group_index == group.group_index)
                 .count();
-            metadata[8 + job * 4..12 + job * 4].copy_from_slice(&[
+            metadata[9 + job * 4..13 + job * 4].copy_from_slice(&[
                 (channel_start + index * 4) as u32,
                 count as u32,
                 (base + output.byte_offset / 4) as u32,

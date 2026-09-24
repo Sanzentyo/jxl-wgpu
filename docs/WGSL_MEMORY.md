@@ -983,13 +983,14 @@ three ANS symbols, each requiring at most 16 renormalization bits, plus at most 
 capacities that exceed WGSL u32 bit addressing. The output range cannot overlap any event,
 Palette dictionary, prediction state or transform arena.
 
-`EntropyBatchPlan` appends a storage-offset-aligned parameter suffix: eight header words, four
+`EntropyBatchPlan` appends a storage-offset-aligned parameter suffix: nine header words, four
 words per group, four words per channel, 37 packed candidate configurations, then capacity for
 five 4609-word tables. Each table contains its packed split/MSB/LSB configuration, 256 frequencies,
 256 symbol rank offsets and a 4096-entry reverse alias map. Offsets are relative to the parameter
 suffix or the current artifact binding. Table capacity is 92,180 bytes per batch. Header words
 0–3 hold group count, table start, Greedy flag and distance table; words 4–7 hold channel-descriptor
-start, histogram arena offset, candidate start and channel count.
+start, histogram arena offset, candidate start and channel count. Word 8 contains the global
+LZ77 length configuration selected by the codebook; group descriptors begin at word 9.
 The clustered codebook uploads one to five tables and binds only the populated suffix. Batch word
 three selects the distance table; each channel descriptor contains its resolved cluster ID. Both
 come from the same immutable context map that writes the entropy header. Unused table capacity is
@@ -1001,7 +1002,8 @@ in artifact bytes; separate readback, when needed, copies that region with the r
 The first pass appends a 165,768-byte profile arena after every batch's complete channel ranges:
 two atomic completion/error words, then 37 × 5 × 224 atomic-u32 counters. One invocation per
 channel/configuration reads canonical events and increments residual/distance bins. ZeroRuns
-contributes literal zero and distance one; length symbols use the original fixed configuration.
+contributes literal zero and distance one. Length histograms retain their canonical configuration;
+the host derives all five full-range length candidates from those bounded counts.
 All profiles use the same hybrid function as the serializer. An admitted batch is at most u32
 bytes; each 16-byte event contributes at most two counts, so atomic counters cannot overflow.
 The host checks completed invocations, zero errors, all canonical event semantics, legal profile
@@ -1012,7 +1014,9 @@ pass shares the token submission and map. The second submission retains the same
 
 The second pass clears the artifact allocation, regenerates tokens, then dispatches the ANS
 kernel before mapping/copying. One invocation visits channels/events backwards, checks symbol
-availability and bit capacity, prepends the state and rebases bits forwards in place. Completion
+availability and bit capacity, recodes canonical length values with word 8, prepends the state
+and rebases bits forwards in place. Short lengths may gain extra bits under the selected split;
+the existing 80-bit-per-event bound already includes their maximum and remains unchanged. Completion
 is four words: status (`1` complete, `2` invalid or insufficient capacity), bit count, expanded
 symbol count and zero reserved word. Host validation first checks every token/histogram/channel,
 then these fields, exact capacity and zero tail padding; only its private validated fragment type

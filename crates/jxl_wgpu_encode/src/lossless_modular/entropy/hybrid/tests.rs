@@ -2,7 +2,7 @@ use super::super::super::types::{ModularArtifactHeader, ModularEvent};
 use super::super::tests::{dispatch_gpu, gpu_fragment, independent_decode, length, raw};
 use super::*;
 
-fn gpu_profiles(
+pub(in super::super) fn gpu_profiles(
     context: &WgpuContext,
     pipeline: &wgpu::ComputePipeline,
     mode: LosslessModularLz77,
@@ -133,7 +133,14 @@ fn all_hybrid_profiles_decode_gpu_words_and_reject_unvalidated_histograms() {
         histograms
             .read_profiles(mode, offset, channels.len(), bytes)
             .unwrap();
-        let candidates = histograms.candidates(mode).unwrap();
+        let candidates = histograms
+            .candidates(
+                mode,
+                &length::LengthCoding::canonical()
+                    .histograms(&histograms.lz77)
+                    .unwrap(),
+            )
+            .unwrap();
         let artifacts: Vec<_> = channels
             .iter()
             .map(|events| ValidatedModularArtifact {
@@ -160,6 +167,7 @@ fn all_hybrid_profiles_decode_gpu_words_and_reject_unvalidated_histograms() {
                 tables,
                 context_map: [0, 1, 2, 3, 4],
                 mode,
+                length: length::LengthCoding::canonical(),
             }));
             let (plan, result) = gpu_fragment(
                 &context,
@@ -225,7 +233,15 @@ fn adaptive_hybrid_selection_uses_mantissa_and_low_bits_with_exact_extra_costs()
         histograms
             .read_profiles(mode, offset, 1, bytemuck::cast_slice(&result))
             .unwrap();
-        for profile in histograms.candidates(mode).unwrap() {
+        for profile in histograms
+            .candidates(
+                mode,
+                &length::LengthCoding::canonical()
+                    .histograms(&histograms.lz77)
+                    .unwrap(),
+            )
+            .unwrap()
+        {
             let expected: u128 = values
                 .iter()
                 .map(|&value| {

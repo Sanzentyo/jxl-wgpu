@@ -113,7 +113,8 @@ ANS reuses the two-pass batch scheduler even for a single batch: GPU histograms 
 retokenization and ANS in the second submission. Four channel contexts (0/1/2/3+) and distance
 share one to five distributions. Their immutable codebook owns the context map consumed by
 both wire metadata and GPU descriptor lowering; neither consumer reinterprets the choice.
-The same codebook owns a hybrid-uint configuration for each shared distribution.
+The same codebook owns a hybrid-uint configuration for each shared distribution and one global
+LZ77 length configuration.
 Distributions are normalized to 4096 using exact integer largest-remainder allocation with symbol-order ties.
 Each observed symbol receives at least one slot. The host serializes small/general histogram
 metadata and builds alias reverse maps; it never codes ANS image symbols. Shared `ans.rs` owns
@@ -123,14 +124,22 @@ The first submission profiles 37 hybrid configurations on GPU after canonical to
 These are all split/MSB/LSB combinations representing every u32 with tokens below the reserved
 LZ77 threshold of 224 in the current 256-symbol alphabet. Canonical events retain split/MSB/LSB
 `0/0/0`; one shared WGSL helper recodes residuals and distances for profiling and final emission.
-LZ77 length coding retains `4/0/0`. A batch-wide atomic histogram arena has fixed capacity,
+Canonical LZ77 events retain `4/0/0`. A batch-wide atomic histogram arena has fixed capacity,
 independent of group count. Host code validates complete canonical events before accepting
 profile completion and coarsens each profile back to the canonical histograms for comparison.
 It aggregates only this bounded metadata, without host residual recoding.
 
-For each of the 31 nonempty context unions, clustering selects the best of 37 configurations,
-then examines all 52 partitions of the five contexts. It retains only one candidate per union.
-Its objective combines Q20 normalized cross-entropy, exact residual/distance extra-bit counts
+Length coding evaluates all five full-20-bit configurations fitting the reserved 32 symbols:
+split 0–4 with no MSB/LSB retention. A bounded histogram conversion maps the canonical direct
+bins 0–15 and exponent bins 16–31 to each candidate, with exact extra-bit totals and checked sums.
+No GPU re-profiling or host event recoding is required. `LengthCoding` owns the setting used by
+wire headers and the GPU; unsupported length counts cannot enter selection.
+
+For each length setting and each of the 31 nonempty context unions, clustering selects the best
+of 37 residual/distance configurations, then examines all 52 partitions of the five contexts.
+It retains only one candidate per union. The global choice also charges the length configuration
+header for every copy; length ties prefer the lower split.
+Its objective combines Q20 normalized cross-entropy, exact residual/distance/length extra-bit counts
 derived from canonical histograms, and the actual histogram, hybrid-configuration and simple-context-map bit lengths. Header cost is charged once for a shared
 tree or single group, and once plus every PassGroup for multi-group local trees. ZeroRuns contributes
 one distance symbol per run. Checked histogram sums reject overflow; fixed-point binary logarithms
@@ -146,7 +155,8 @@ lease. Profiling adds a compute pass within the first submission, without an ext
 Its storage participates in batch splitting; selection never requires a late allocation.
 
 One serial invocation per group visits all channels/events backwards, expands ZeroRuns into
-literal/length/distance symbols, and prepends renormalization words and hybrid extra bits. It then
+literal/length/distance symbols, recodes canonical lengths with the selected configuration, and
+prepends renormalization words and hybrid extra bits. It then
 prepends the 32-bit state and rebases the resulting fragment in place. Groups have disjoint output
 ranges; per-channel streams cannot be independently concatenated. Empty multi-group DC-global
 retains the zero-symbol ANS state emitted by libjxl's `WriteTokens`. The same codebook feeds global
@@ -161,7 +171,7 @@ and [independent evidence](CONFORMANCE_CORPUS.md#lossless-modular-gpu-ans-encodi
 The default Prefix path and private Gray8 acceleration index keep their previous byte contract;
 ANS containers omit that Prefix-specific index. This stage establishes correctness, with no
 measured throughput or compression-ratio claim. Learned contexts, clustering outside this bounded
-Modular ANS codebook, adaptive LZ77 length/alphabet choices, effort policy and parallelism within
+Modular ANS codebook, adaptive alphabet choices, effort policy and parallelism within
 a group remain future work.
 
 ### GPU artifact ABI

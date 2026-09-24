@@ -32,10 +32,22 @@ fn put_symbol(histogram: u32, symbol: u32) {
     symbols += 1u;
 }
 
+fn put_length(histogram: u32, token: u32, extra_count: u32, extra: u32) {
+    if token >= 32u || extra_count != select(0u, token - 12u, token >= 16u)
+        || (extra >> extra_count) != 0u {
+        failed = true; return;
+    }
+    let value = select(token, (1u << extra_count) | extra, token >= 16u);
+    let encoded = hybrid_uint(value, metadata[8u]);
+    if encoded.token >= 32u { failed = true; return; }
+    prepend(encoded.bits, encoded.count);
+    put_symbol(histogram, 224u + encoded.token);
+}
+
 @compute @workgroup_size(1)
 fn encode(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= metadata[0u] { return; }
-    let job = 8u + id.x * 4u;
+    let job = 9u + id.x * 4u;
     let channels = metadata[job];
     let count = metadata[job + 1u];
     let header = metadata[job + 2u];
@@ -63,12 +75,10 @@ fn encode(@builtin(global_invocation_id) id: vec3<u32>) {
             }
             if kind == 1u && metadata[2u] == 0u {
                 put_symbol(metadata[3u], 1u);
-                prepend(extra, extra_count);
-                put_symbol(histogram, 224u + token);
+                put_length(histogram, token, extra_count, extra);
                 put_symbol(histogram, 0u);
             } else if kind == 2u && metadata[2u] == 1u {
-                prepend(extra, extra_count);
-                put_symbol(histogram, 224u + token);
+                put_length(histogram, token, extra_count, extra);
             } else if kind == 0u || (kind == 3u && metadata[2u] == 1u) {
                 if !canonical_valid(token, extra_count, extra) { failed = true; break; }
                 let selected = select(histogram, metadata[3u], kind == 3u);
