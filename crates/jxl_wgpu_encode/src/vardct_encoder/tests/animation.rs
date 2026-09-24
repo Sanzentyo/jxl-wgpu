@@ -12,6 +12,7 @@ use jxl_test_support::oracles::progressive::native_updates;
 use jxl_wgpu_decode::WgpuDecodeEngine;
 
 mod layered_still;
+mod original_color;
 mod reference_only;
 
 fn timebase(numerator: u32, denominator: u32, loops: u32, timecodes: bool) -> AnimationHeader {
@@ -260,6 +261,26 @@ fn check_sequence_with_oracle(
     passes: usize,
     oracle: CompositionOracle,
 ) {
+    check_sequence_in_domain(
+        backend,
+        encoded,
+        descriptor,
+        layers,
+        samples,
+        passes,
+        (VarDctColorTransform::Xyb, oracle),
+    );
+}
+
+fn check_sequence_in_domain(
+    backend: &WgpuBackend,
+    encoded: &[u8],
+    descriptor: &VarDctAnimationDescriptor,
+    layers: &[Layer],
+    samples: &[Vec<f32>],
+    passes: usize,
+    (color, oracle): (VarDctColorTransform, CompositionOracle),
+) {
     let width = descriptor.canvas_width() as usize;
     let height = descriptor.canvas_height() as usize;
     let inventory = jxl_gpu_bitstream::parse(encoded, Default::default())
@@ -298,9 +319,21 @@ fn check_sequence_with_oracle(
             )
         }
     };
-    assert!(inventory.image_header.xyb_encoded);
+    assert_eq!(
+        inventory.image_header.xyb_encoded,
+        color == VarDctColorTransform::Xyb
+    );
     assert_eq!(inventory.frames.len(), layers.len());
     for (index, (frame, layer)) in inventory.frames.iter().zip(layers).enumerate() {
+        assert!(!frame.do_ycbcr);
+        assert_eq!(
+            (frame.x_qm_scale, frame.b_qm_scale),
+            if color == VarDctColorTransform::Xyb {
+                (3, 2)
+            } else {
+                (2, 2)
+            }
+        );
         let options = &layer.options;
         assert_eq!(
             (frame.width, frame.height),

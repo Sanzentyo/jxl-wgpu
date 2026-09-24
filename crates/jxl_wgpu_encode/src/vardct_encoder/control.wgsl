@@ -42,7 +42,8 @@ struct Params {
     progressive: array<u32, 11>,
     saliency_offset: u32,
     saliency_groups: u32,
-    padding: array<u32, 7>,
+    color_normalization: u32,
+    padding: array<u32, 6>,
 }
 
 @group(0) @binding(0)

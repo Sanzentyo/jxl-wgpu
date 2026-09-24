@@ -54,7 +54,19 @@ packet assembly all consume that configuration. `memory_plan_for_request` uses t
 path as submission; `memory_plan` retains the configured regular-frame estimate. No shader binding
 or ownership rules change, and regular frames retain their requested progression.
 
-`VarDctSequenceDescriptor` compiles bounded RGB8/XYB image metadata. Both VarDCT frontends create
+`VarDctSequenceDescriptor` compiles bounded image geometry and optional timebase fragments.
+Sequence creation binds them to the backend's immutable `VarDctColorPlan`, which lowers the
+typed XYB/original-RGB selection once. That same plan supplies image metadata, the presence
+of frame color/matrix-scale fields, GPU normalization and HF channel multipliers. Jobs retain
+it through packet assembly; neither the serializer nor either GPU path infers the domain
+from other configuration. Original RGB transforms normalized sRGB components with neutral HF
+channel multipliers; XYB retains linearization, opsin conversion and its standard X/B scales.
+LF/correlation and matrix/order policy remain explicit and independent of color selection.
+All source-dependent operations stay on the GPU, using the existing allocations and completion
+lease. This prepares a common image domain for mixed coding modes; a mixed-codec sequence API
+is still unimplemented. [Original-RGB evidence](CONFORMANCE_CORPUS.md#original-rgb-vardct-encoding).
+
+Both VarDCT frontends create
 `VarDctSequenceSession` around the existing generic `EncodeSession` and `CodestreamAssembler`.
 Modular uses the corresponding sequence descriptor/session, preserving its source format/precision/
 color contract and budgeted ICC header. Both descriptor kinds accept still or animated metadata.

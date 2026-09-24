@@ -6,7 +6,7 @@ struct TransformTask {
 }
 @group(0) @binding(3) var<storage, read> forward_coefficients: array<f32>;
 @group(0) @binding(4) var<storage, read> forward_lf: array<f32>;
-@group(0) @binding(5) var<storage, read_write> forward_xyb: array<f32>;
+@group(0) @binding(5) var<storage, read_write> forward_components: array<f32>;
 @group(0) @binding(6) var<storage, read_write> quantized_coefficients: array<i32>;
 @group(0) @binding(7) var<storage, read> quantization: array<QuantizationEntry>;
 @group(0) @binding(8) var<storage, read> tasks: array<TransformTask>;
@@ -24,13 +24,10 @@ fn normalize_image(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invoc
     let x = min(pixel % width, params.width - 1u);
     let y = min(pixel / width, params.height - 1u);
     let address = params.byte_offset + y * params.row_stride + x * 3u;
-    let linear = vec3<f32>(srgb_to_linear(f32(load_u8(address)) / 255.0),
-        srgb_to_linear(f32(load_u8(address + 1u)) / 255.0),
-        srgb_to_linear(f32(load_u8(address + 2u)) / 255.0));
-    let xyb = linear_rgb_to_xyb(linear);
-    forward_xyb[pixel] = xyb.x;
-    forward_xyb[area + pixel] = xyb.y;
-    forward_xyb[2u * area + pixel] = xyb.z;
+    let components = normalize_rgb8(address);
+    forward_components[pixel] = components.x;
+    forward_components[area + pixel] = components.y;
+    forward_components[2u * area + pixel] = components.z;
 }
 
 @compute @workgroup_size(wg_x)

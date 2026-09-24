@@ -1,9 +1,9 @@
-//! Checked stream metadata and ordered assembly for RGB8/XYB frame sequences.
+//! Checked stream metadata and ordered assembly for RGB8 frame sequences.
 
-use super::bitstream::image_header;
+use super::bitstream::ImageHeaderPlan;
 use super::{VarDctBackend, VarDctConfig, VarDctJob};
 use crate::{
-    AnimationHeader, BitFragment, BufferImageSource, CodestreamAssembler, Determinism, EncodeError,
+    AnimationHeader, BufferImageSource, CodestreamAssembler, Determinism, EncodeError,
     EncodeProfile, EncodeSession, FrameIndex, FrameOptions, FrameSubmission, GpuEncoder,
     GpuFrameArtifacts, GpuFrameSource, SessionDescriptor,
 };
@@ -16,7 +16,8 @@ pub type VarDctAnimationSession = VarDctSequenceSession;
 
 /// Stream-wide canvas and optional timebase for a VarDCT layered still or animation.
 ///
-/// Every frame uses RGB8 sRGB/D65 sources and the encoder's fixed configuration. Cropped
+/// Every frame uses RGB8 sRGB/D65 sources and the encoder's fixed configuration, including
+/// its XYB or original-RGB coding domain. Cropped
 /// sources may have different extents when using [`super::TiledVarDctEncoder`]; a single
 /// transform or strategy map keeps its own source extent on every frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,17 +25,17 @@ pub struct VarDctSequenceDescriptor {
     canvas_width: u32,
     canvas_height: u32,
     animation: AnimationHeader,
-    header: BitFragment,
+    header: ImageHeaderPlan,
 }
 
 impl VarDctSequenceDescriptor {
-    /// Checks the canvas/timebase and compiles the bounded stream header.
+    /// Checks the canvas/timebase. The encoder binds its color policy at `begin_sequence`.
     pub fn new(
         canvas_width: u32,
         canvas_height: u32,
         animation: AnimationHeader,
     ) -> Result<Self, EncodeError> {
-        let header = image_header(canvas_width, canvas_height, animation)?;
+        let header = ImageHeaderPlan::new(canvas_width, canvas_height, animation)?;
         Ok(Self {
             canvas_width,
             canvas_height,
@@ -88,7 +89,8 @@ impl VarDctSequenceSession {
             canvas_width: descriptor.canvas_width,
             canvas_height: descriptor.canvas_height,
         })?;
-        let assembler = CodestreamAssembler::new(descriptor.header.clone())?;
+        let assembler =
+            CodestreamAssembler::new(descriptor.header.encode(encoder.backend().color_plan)?)?;
         Ok(Self {
             descriptor,
             session,

@@ -6,6 +6,7 @@
 
 mod ac;
 mod bitstream;
+mod color;
 mod dispatch;
 mod entropy;
 mod group_order;
@@ -22,6 +23,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+pub use color::VarDctColorTransform;
 pub use dispatch::{TiledVarDctEncoder, VarDctBackend, VarDctEncoder, VarDctJob, VarDctSubmission};
 pub use group_order::VarDctGroupOrder;
 pub use matrices::{VarDctDequantMatrices, VarDctMatrixEncoding, VarDctRawMatrix};

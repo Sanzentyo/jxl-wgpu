@@ -15,8 +15,6 @@ use crate::{EncodeError, UnsupportedFeature};
 
 pub(super) const TILED_QUANTIZATION_BYTES: u64 = 64 * 6 * 4;
 
-pub(super) const HF_QUANTIZATION: [f32; 3] = [1.25, 1.0, 1.0];
-
 pub(super) const AC_GROUP_DIM_PIXELS: u32 = 256;
 pub(super) const LF_GROUP_DIM_PIXELS: u32 = 2_048;
 pub(super) const HEADER_WORDS: u32 = 68;
@@ -303,6 +301,7 @@ pub struct VarDctMemoryPlan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VarDctTransformMemoryPlan {
     pub forward: ForwardVarDctMemoryPlan,
+    /// Normalized three-plane storage (XYB or original RGB, according to the color policy).
     pub xyb_bytes: u64,
     pub coefficient_bytes: u64,
     pub lf_bytes: u64,
@@ -424,7 +423,8 @@ pub(super) struct VarDctKernelParams {
     pub(super) progressive: [u32; 11],
     pub(super) saliency_offset: u32,
     pub(super) saliency_groups: u32,
-    pub(super) padding: [u32; 7],
+    pub(super) color_normalization: u32,
+    pub(super) padding: [u32; 6],
 }
 
 #[repr(C)]

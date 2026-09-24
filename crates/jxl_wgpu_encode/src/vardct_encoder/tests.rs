@@ -3,6 +3,7 @@
 mod ac;
 mod animation;
 mod artifact;
+mod color;
 mod matrices;
 mod mixed;
 mod native;
@@ -38,7 +39,21 @@ use wgpu::util::DeviceExt;
 
 use super::entropy::VarDctPrefixCode;
 
-use super::bitstream::{build_frame_packet, image_header};
+use super::bitstream::build_frame_packet;
+use super::color::{VarDctColorPlan, VarDctColorTransform};
+
+fn image_header(
+    width: u32,
+    height: u32,
+    animation: crate::AnimationHeader,
+) -> Result<crate::BitFragment, EncodeError> {
+    super::bitstream::image_header(
+        width,
+        height,
+        animation,
+        VarDctColorPlan::new(VarDctColorTransform::Xyb),
+    )
+}
 use super::dispatch::{
     FORWARD_KERNEL_KEY, TILED_KERNEL_KEY, TILED_SHADER, TiledVarDctEncoder, VarDctEncoder,
     align_up, clamped_gradient_i32, gradient_residual_i32, shader_source, signed_token,
@@ -382,6 +397,7 @@ fn fixed_control_plane_decodes_as_standard_black_vardct() {
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
             &VarDctConfig::default(),
             &still_control(8, 8),
+            VarDctColorPlan::new(VarDctColorTransform::Xyb),
         )
         .unwrap(),
     )
@@ -410,6 +426,7 @@ fn fixed_control_plane_accepts_nonzero_quantized_xyb_dc() {
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
             &VarDctConfig::default(),
             &still_control(8, 8),
+            VarDctColorPlan::new(VarDctColorTransform::Xyb),
         )
         .unwrap(),
     )
@@ -441,6 +458,7 @@ fn custom_lf_metadata_roundtrips_through_the_standard_control_plane() {
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
             &config_with_lf(metadata),
             &still_control(8, 8),
+            VarDctColorPlan::new(VarDctColorTransform::Xyb),
         )
         .unwrap(),
     )
@@ -527,6 +545,7 @@ fn abi_records_are_pod_and_word_aligned() {
     params.progressive[10] = 0x124;
     params.saliency_offset = 0x125;
     params.saliency_groups = 0x126;
+    params.color_normalization = 0x127;
     let params = [params];
     let parameter_words = bytemuck::cast_slice::<VarDctKernelParams, u32>(&params);
     assert_eq!(&parameter_words[84..88], &[0x55, 0x56, 0x57, 0x58]);
@@ -536,7 +555,7 @@ fn abi_records_are_pod_and_word_aligned() {
     );
     assert_eq!(&parameter_words[170..172], &[0x113, 0x114]);
     assert_eq!(parameter_words[182], 0x124);
-    assert_eq!(&parameter_words[183..185], &[0x125, 0x126]);
+    assert_eq!(&parameter_words[183..186], &[0x125, 0x126, 0x127]);
 
     let mut header: VarDctArtifactHeader = bytemuck::Zeroable::zeroed();
     header.fragment_descriptor_offset = 0x41;
@@ -581,7 +600,11 @@ fn naga_validates_vardct_shaders() {
                     panic!("parameters must be a structure")
                 };
                 assert_eq!(*span, 768);
-                for (name, offset) in [("saliency_offset", 183 * 4), ("saliency_groups", 184 * 4)] {
+                for (name, offset) in [
+                    ("saliency_offset", 183 * 4),
+                    ("saliency_groups", 184 * 4),
+                    ("color_normalization", 185 * 4),
+                ] {
                     assert_eq!(
                         members
                             .iter()

@@ -12,6 +12,7 @@ use wgpu::util::DeviceExt;
 
 use super::ac::{AcFragments, validate_blocks, validate_transform_fragments};
 use super::bitstream::{build_frame_packet, image_header, pack_signed_control};
+use super::color::{VarDctColorPlan, VarDctColorTransform};
 use super::entropy::{
     HfEntropyPlan, fixed_prefix_code, prefix_entries, read_fragment_slice,
     validate_fragment_padding,
@@ -23,10 +24,9 @@ use super::sequence::{
 };
 use super::strategy_map::{TransformPlan, VarDctStrategyMap, VarDctTransform};
 use super::types::{
-    ARTIFACT_READY, ArtifactLayout, DcFragmentDescriptor, HEADER_WORDS, HF_QUANTIZATION,
-    TiledVarDctGrid, VarDctArtifactData, VarDctArtifactHeader, VarDctColorEncoding,
-    VarDctFrameLayout, VarDctKernelParams, VarDctLfMetadata, VarDctMemoryPlan, VarDctStrategy,
-    VarDctTopology,
+    ARTIFACT_READY, ArtifactLayout, DcFragmentDescriptor, HEADER_WORDS, TiledVarDctGrid,
+    VarDctArtifactData, VarDctArtifactHeader, VarDctColorEncoding, VarDctFrameLayout,
+    VarDctKernelParams, VarDctLfMetadata, VarDctMemoryPlan, VarDctStrategy, VarDctTopology,
 };
 use super::{raw_matrices, saliency, transforms};
 use crate::frame_header::FrameHeaderPlan;
@@ -91,6 +91,7 @@ pub struct VarDctBackend {
     raw_matrix_pipeline: Option<raw_matrices::Pipeline>,
     saliency_pipeline: Option<saliency::Pipeline>,
     config: VarDctConfig,
+    pub(super) color_plan: VarDctColorPlan,
     capabilities: EncoderCapabilities,
     max_storage_binding_size: u64,
     max_buffer_size: u64,
@@ -289,6 +290,7 @@ impl VarDctBackend {
             topology,
             transform_plan,
             tiled_metadata,
+            color_plan: VarDctColorPlan::new(config.color_transform),
             config: config.clone(),
             capabilities: EncoderCapabilities {
                 profiles: vec![ProfileCapability::VarDct {
@@ -546,7 +548,7 @@ impl VarDctBackend {
                         lf_correlation,
                         hf_prefix: self.hf_entropy.gpu_entries(),
                         hf_correlation,
-                        hf_quantization: HF_QUANTIZATION,
+                        hf_quantization: self.color_plan.hf_quantization(),
                         ac_descriptor_offset: layout.ac_descriptor_offset,
                         ac_descriptor_len: layout.ac_descriptor_len,
                         ac_fragment_offset: layout.ac_fragment_offset,
@@ -565,7 +567,8 @@ impl VarDctBackend {
                         }),
                         saliency_offset: layout.saliency_offset,
                         saliency_groups: layout.saliency_groups,
-                        padding: [0; 7],
+                        color_normalization: self.color_plan.normalization(),
+                        padding: [0; 6],
                     },
                     layout,
                 },
@@ -981,6 +984,7 @@ impl GpuEncodeBackend for VarDctBackend {
             code: self.code.clone(),
             hf_entropy: self.hf_entropy.clone(),
             config,
+            color_plan: self.color_plan,
             frame_layout: plan.frame,
             transform_plan: self.transform_plan.clone(),
             raw_matrix_plan: self.raw_matrix_plan.clone(),
@@ -1077,6 +1081,7 @@ pub struct VarDctJob {
     code: VarDctPrefixCode,
     hf_entropy: HfEntropyPlan,
     config: VarDctConfig,
+    color_plan: VarDctColorPlan,
     frame_layout: VarDctFrameLayout,
     transform_plan: Option<Arc<TransformPlan>>,
     artifact_layout: ArtifactLayout,
@@ -1203,6 +1208,7 @@ impl VarDctJob {
                     self.frame_layout,
                     &self.config,
                     &self.control,
+                    self.color_plan,
                 )?,
                 acceleration: None,
             })
@@ -1730,6 +1736,12 @@ impl VarDctEncoder {
         self.encoder.backend().lf_metadata()
     }
 
+    /// Selected coding domain; the accepted source remains RGB8 sRGB/D65.
+    #[must_use]
+    pub fn color_transform(&self) -> VarDctColorTransform {
+        self.encoder.backend().config.color_transform
+    }
+
     #[must_use]
     pub const fn color_encoding(&self) -> VarDctColorEncoding {
         VarDctColorEncoding::SrgbD65
@@ -1760,7 +1772,7 @@ impl VarDctEncoder {
             .memory_plan_for_request(source, request)
     }
 
-    /// Begins an RGB8/XYB animation using this encoder's transform and quantization policy.
+    /// Begins an RGB8 animation using this encoder's transform and quantization policy.
     /// Frame extents must match the selected transform/map, or the tiled backend's limits.
     pub fn begin_animation(
         &self,
@@ -1826,7 +1838,12 @@ impl VarDctEncoder {
             .submit_frame(GpuFrameSource::Buffer(source), request)?;
         Ok(VarDctSubmission {
             frame: Some(frame),
-            codestream_header: image_header(width, height, AnimationHeader::Still)?,
+            codestream_header: image_header(
+                width,
+                height,
+                AnimationHeader::Still,
+                self.encoder.backend().color_plan,
+            )?,
             container,
         })
     }
@@ -1883,6 +1900,12 @@ impl TiledVarDctEncoder {
         self.encoder.backend().lf_metadata()
     }
 
+    /// Selected coding domain; the accepted source remains RGB8 sRGB/D65.
+    #[must_use]
+    pub fn color_transform(&self) -> VarDctColorTransform {
+        self.encoder.backend().config.color_transform
+    }
+
     #[must_use]
     pub const fn color_encoding(&self) -> VarDctColorEncoding {
         VarDctColorEncoding::SrgbD65
@@ -1921,7 +1944,7 @@ impl TiledVarDctEncoder {
         })
     }
 
-    /// Begins an RGB8/XYB animation using this encoder's transform and quantization policy.
+    /// Begins an RGB8 animation using this encoder's transform and quantization policy.
     /// Frame extents must match the selected transform/map, or the tiled backend's limits.
     pub fn begin_animation(
         &self,
@@ -1988,7 +2011,12 @@ impl TiledVarDctEncoder {
             .submit_frame(GpuFrameSource::Buffer(source), request)?;
         Ok(VarDctSubmission {
             frame: Some(frame_submission),
-            codestream_header: image_header(frame.width, frame.height, AnimationHeader::Still)?,
+            codestream_header: image_header(
+                frame.width,
+                frame.height,
+                AnimationHeader::Still,
+                self.encoder.backend().color_plan,
+            )?,
             container,
         })
     }

@@ -484,6 +484,19 @@ The map is caller-selected metadata; content-adaptive strategy selection remains
 
 `VarDctEncoder::new_with_config`, `new_with_strategy_map`, and
 `TiledVarDctEncoder::new_with_config` accept a `VarDctConfig`. Its
+`color_transform` selects `VarDctColorTransform::Xyb` (default) or `Original`. Both accept
+the same RGB8 sRGB/D65 source layout. XYB linearizes sRGB before the opsin transform;
+Original directly transforms the normalized sRGB components. It does not linearize them
+or add support for other source encodings. `color_transform()` reports the selected policy;
+`color_encoding()` continues to describe the source. One immutable color plan controls the
+image's XYB flag, frame syntax, GPU normalization and HF channel multipliers. Original RGB
+omits the XYB-only matrix-scale fields and uses their implicit neutral multipliers.
+LF metadata, matrices, orders and quantizers retain their explicit values in either domain;
+switching the domain does not imply equivalent bitrate or perceptual quality.
+The [original-RGB corpus](../../docs/CONFORMANCE_CORPUS.md#original-rgb-vardct-encoding)
+covers all three backends, sequences, progressive passes and independent pixel/coefficient checks.
+
+The config's
 `lf_metadata` field holds validated `VarDctLfMetadata`. Its LF dequantization and base-correlation fields retain exact finite
 binary16 values, while the colour factor and signed LF factors use their normative integer
 domains. Construction rejects dequantized coefficients below libjxl's `1e-8` threshold, colour
@@ -494,7 +507,7 @@ dequantization multipliers. Generated explicit-metadata streams are parsed back 
 frontend and agree across Rust `jxl`, the stock GPU decoder, and optional `djxl` within one RGB8
 code; blocking and runtime-neutral Future assembly are identical.
 
-The GPU executes sRGB linearization, XYB conversion, forward transforms, LF/AC quantization, the per-8×8
+The GPU executes the selected color normalization, forward transforms, LF/AC quantization, the per-8×8
 clamped-Gradient DC predictor, signed tokenization, prefix packing, histogramming, and the
 standard strategy map. All 27 strategies and `TiledVarDctEncoder` use default or caller-selected
 parametric/raw dequantization matrices and natural or caller-selected coefficient orders, with one prefix distribution
@@ -620,7 +633,7 @@ the standard fused packet, including tiny and odd images; larger images carry ev
 `ceil(width / 256) * ceil(height / 256)` AC group and
 `ceil(width / 2048) * ceil(height / 2048)` LF group. Each block is an independent DCT8 transform.
 The first pass dispatches a two-dimensional block grid, with 64 lanes by default. Each workgroup
-uses 2,048 bytes for 64 XYB pixels and 64 quantized AC vectors, plus a four-byte quantization error flag. Coefficients stay in shared
+uses 2,048 bytes for 64 normalized color vectors and 64 quantized AC vectors, plus a four-byte quantization error flag. Coefficients stay in shared
 memory and are immediately packed into one word-aligned block fragment per AC pass; adjacent workgroups never
 write the same storage word. The second pass predicts and packs DC, resetting Gradient at LF-group
 boundaries and writing a checked descriptor per LF group. Ending the first compute pass is the
@@ -637,13 +650,14 @@ policy; future contextual or ANS encoders must maintain their state on GPU.
 768-byte parameters and a runtime-sized artifact with a 272-byte header. The former carries
 the pass count, per-pass word stride and eleven spectral/shift descriptors; the latter records
 the pass count. Both record sizes remain unchanged. LF descriptors
-follow the header; the subsequent strategy, sample and entropy sections align to 256 bytes. Single-transform plans additionally report exact XYB, raw coefficient,
+follow the header; the subsequent strategy, sample and entropy sections align to 256 bytes. Single-transform plans additionally report exact normalized-color, raw coefficient,
 LF, quantized coefficient, matrix/order, transform-task and forward scratch allocations in `transform`.
 Mapped plans report their aggregate allocation sizes: basis/uniform storage is shared per strategy,
-while all transforms share image-wide XYB/coefficient/LF/quantized arenas. Each strategy batch
+while all transforms share image-wide color/coefficient/LF/quantized arenas. `xyb_bytes` retains
+its public name and accounts for either normalized color domain. Each strategy batch
 owns one horizontal scratch allocation and a 20-byte forward task per transform; encoder tasks
 occupy 44 bytes per transform. No GPU allocation is created per individual transform.
-Sources use channel origins within one complete XYB binding, so small maps also work on devices
+Sources use channel origins within one complete color binding, so small maps also work on devices
 requiring 1024-byte storage offsets without padding each channel allocation.
 Each general-transform matrix/order entry contains three F32 scales and three U32 indices in
 24 bytes. An 8×8 DCT submission owns 12,180 bytes: 768 parameters, 3,072 artifact, 3,072 readback
@@ -821,7 +835,8 @@ its requirement for an animation timebase and delegates to the same sequence imp
 Existing `encode`/`submit` still APIs retain their single full-canvas output and bytes.
 
 `VarDctEncoder::begin_sequence` and `TiledVarDctEncoder::begin_sequence` share the same descriptor
-and session. The descriptor fixes canvas and optional timebase; the encoder fixes RGB8 sRGB/D65 input, XYB coding, transform policy,
+and session. The descriptor fixes canvas and optional timebase; the encoder fixes RGB8 sRGB/D65 input,
+XYB or original-RGB coding, transform policy,
 quantization, matrices/orders and AC passes. Single transforms and maps retain their source
 extent on each frame; tiled DCT8 accepts separately checked crop extents through its 16K axis
 bound. Both support Replace/Add/Multiply, signed crops, hidden zero-duration regular frames and

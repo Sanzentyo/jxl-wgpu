@@ -59,6 +59,20 @@ fn linear_rgb_to_xyb(rgb: vec3<f32>) -> vec3<f32> {
     );
 }
 
+// The checked color plan selects the same domain for image/frame headers and quantization.
+// 0 = XYB, 1 = original sRGB. No source samples cross the host boundary.
+fn normalize_rgb8(address: u32) -> vec3<f32> {
+    let encoded = vec3<f32>(
+        f32(load_u8(address)) / 255.0,
+        f32(load_u8(address + 1u)) / 255.0,
+        f32(load_u8(address + 2u)) / 255.0,
+    );
+    if params.color_normalization == 1u { return encoded; }
+    return linear_rgb_to_xyb(vec3<f32>(
+        srgb_to_linear(encoded.x), srgb_to_linear(encoded.y), srgb_to_linear(encoded.z),
+    ));
+}
+
 fn dct_basis(frequency: u32, position: u32, size: u32) -> f32 {
     if frequency == 0u {
         return 1.0;

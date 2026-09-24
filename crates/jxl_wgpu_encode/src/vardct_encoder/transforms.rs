@@ -92,7 +92,7 @@ impl Pipeline {
                 mapped_at_creation: false,
             })
         };
-        let xyb = buffer("resident encoder XYB", memory.xyb_bytes);
+        let components = buffer("resident encoder color components", memory.xyb_bytes);
         let coefficients = buffer(
             "resident encoder forward coefficients",
             memory.coefficient_bytes,
@@ -151,13 +151,13 @@ impl Pipeline {
                     resource: wgpu::BindingResource::Buffer(inputs.source),
                 },
                 entry(1, inputs.parameters),
-                entry(5, &xyb),
+                entry(5, &components),
             ],
             area,
             false,
         );
-        let xyb_storage =
-            ResidentStorageBinding::entire(&xyb).map_err(jxl_wgpu::ForwardVarDctError::from)?;
+        let component_storage = ResidentStorageBinding::entire(&components)
+            .map_err(jxl_wgpu::ForwardVarDctError::from)?;
         let mut forward = Vec::with_capacity(inputs.plan.batches.len());
         for batch in &inputs.plan.batches {
             forward.push(
@@ -167,7 +167,7 @@ impl Pipeline {
                     ForwardVarDctBatchInputs {
                         transform: batch.strategy,
                         sources: std::array::from_fn(|_| ResidentF32Plane {
-                            storage: xyb_storage,
+                            storage: component_storage,
                             width,
                             height,
                             stride: 0,
@@ -228,7 +228,14 @@ impl Pipeline {
             true,
         );
         Ok(Scratch {
-            _buffers: [xyb, coefficients, low_frequency, quantized, metadata, tasks],
+            _buffers: [
+                components,
+                coefficients,
+                low_frequency,
+                quantized,
+                metadata,
+                tasks,
+            ],
             _forward: forward,
         })
     }

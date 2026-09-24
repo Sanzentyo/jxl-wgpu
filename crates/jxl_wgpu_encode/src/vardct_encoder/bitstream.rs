@@ -2,6 +2,7 @@
 
 use jxl_gpu_bitstream::BitWriter;
 
+use super::color::VarDctColorPlan;
 use super::entropy::VarDctPrefixCode;
 use super::entropy::{HfEntropyPlan, write_prefix_config};
 use super::types::{DcFragmentDescriptor, VarDctArtifactData, VarDctFrameLayout};
@@ -40,48 +41,99 @@ pub(super) fn image_header(
     width: u32,
     height: u32,
     animation: AnimationHeader,
+    color: VarDctColorPlan,
 ) -> Result<BitFragment, EncodeError> {
-    let mut output = BitWriter::new();
-    output.write_bits(0x0aff, 16)?;
-    output.write_bits(0, 1)?; // dimensions are not encoded as multiples of eight
-    write_size(&mut output, height, true)?;
-    write_size(&mut output, width, false)?;
-    if animation.is_animation() {
-        output.write_bits(0, 1)?; // explicit image metadata
-        output.write_bits(1, 1)?; // extra fields contain the animation timebase
-        output.write_bits(0, 3)?; // identity orientation
-        output.write_bits(0, 1)?; // no intrinsic size
-        output.write_bits(0, 1)?; // no preview
-        output.write_bits(1, 1)?; // animation present
-        write_animation_header(&mut output, animation)?;
-        output.write_bits(0, 1)?; // integer samples
-        output.write_bits(0, 2)?; // eight bits per sample
-        output.write_bits(1, 1)?; // 16-bit Modular buffers are sufficient
-        output.write_bits(0, 2)?; // no extra channels
-        output.write_bits(1, 1)?; // XYB encoded
-        output.write_bits(1, 1)?; // default sRGB presentation
-        output.write_bits(1, 1)?; // default tone mapping
-        output.write_bits(0, 2)?; // no image extensions
-    } else {
-        output.write_bits(1, 1)?; // all-default image metadata: 8-bit, XYB, sRGB presentation
+    ImageHeaderPlan::new(width, height, animation)?.encode(color)
+}
+
+/// Checked geometry/timebase, bound to the backend's color plan when a sequence begins.
+/// Retaining these fragments avoids interpreting color policy in the public descriptor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ImageHeaderPlan {
+    prefix: BitFragment,
+    animation: Option<BitFragment>,
+}
+
+impl ImageHeaderPlan {
+    pub(super) fn new(
+        width: u32,
+        height: u32,
+        animation: AnimationHeader,
+    ) -> Result<Self, EncodeError> {
+        let fragment = |writer: BitWriter| {
+            let bits = writer.bit_len();
+            BitFragment::new(writer.into_bytes(), bits).map_err(EncodeError::from)
+        };
+        let mut prefix = BitWriter::new();
+        prefix.write_bits(0x0aff, 16)?;
+        prefix.write_bits(0, 1)?; // dimensions are not multiples of eight
+        write_size(&mut prefix, height, true)?;
+        write_size(&mut prefix, width, false)?;
+        let animation = if animation.is_animation() {
+            let mut writer = BitWriter::new();
+            write_animation_header(&mut writer, animation)?;
+            Some(fragment(writer)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            prefix: fragment(prefix)?,
+            animation,
+        })
     }
-    output.write_bits(1, 1)?; // default opsin inverse matrix and upsampling weights
-    output.align_to_byte()?;
-    Ok(BitFragment::byte_aligned(output.into_bytes())?)
+
+    pub(super) fn encode(&self, color: VarDctColorPlan) -> Result<BitFragment, EncodeError> {
+        let mut output = BitWriter::new();
+        crate::packet::append_fragment(&mut output, &self.prefix)?;
+        let has_animation = self.animation.is_some();
+        if has_animation || !color.xyb_encoded() {
+            output.write_bits(0, 1)?; // explicit image metadata
+            output.write_bits(u64::from(has_animation), 1)?;
+            if let Some(animation) = &self.animation {
+                output.write_bits(0, 3)?; // identity orientation
+                output.write_bits(0, 1)?; // no intrinsic size
+                output.write_bits(0, 1)?; // no preview
+                output.write_bits(1, 1)?; // animation present
+                crate::packet::append_fragment(&mut output, animation)?;
+            }
+            output.write_bits(0, 1)?; // integer samples
+            output.write_bits(0, 2)?; // eight bits per sample
+            output.write_bits(1, 1)?; // 16-bit Modular buffers are sufficient
+            output.write_bits(0, 2)?; // no extra channels
+            output.write_bits(u64::from(color.xyb_encoded()), 1)?;
+            output.write_bits(1, 1)?; // default sRGB presentation
+            if has_animation {
+                output.write_bits(1, 1)?; // default tone mapping (present only with extra fields)
+            }
+            output.write_bits(0, 2)?; // no image extensions
+        } else {
+            output.write_bits(1, 1)?; // all-default image metadata: 8-bit, XYB, sRGB presentation
+        }
+        output.write_bits(1, 1)?; // default opsin inverse matrix and upsampling weights
+        output.align_to_byte()?;
+        Ok(BitFragment::byte_aligned(output.into_bytes())?)
+    }
 }
 
 fn frame_header(
     progressive: &crate::ProgressivePlan,
     control: &FrameHeaderPlan,
+    color: VarDctColorPlan,
 ) -> Result<BitFragment, EncodeError> {
     let mut output = BitWriter::new();
     output.write_bits(0, 1)?; // non-default so restoration can be disabled
     control.write_kind(&mut output)?;
     output.write_bits(0, 1)?; // VarDCT
     output.write_bits(0, 2)?; // no frame flags
+    if !color.xyb_encoded() {
+        output.write_bits(0, 1)?; // original RGB, not YCbCr
+    }
     output.write_bits(0, 2)?; // no upsampling
-    output.write_bits(3, 3)?; // default X quant-matrix scale
-    output.write_bits(2, 3)?; // default B quant-matrix scale
+    if let Some(scales) = color.qm_scales() {
+        for scale in scales {
+            output.write_bits(u64::from(scale), 3)?;
+        }
+    }
     if control.has_passes() {
         let passes = progressive.passes();
         write_u32(
@@ -378,6 +430,7 @@ pub(super) fn build_frame_packet(
     frame: VarDctFrameLayout,
     config: &VarDctConfig,
     control: &FrameHeaderPlan,
+    color: VarDctColorPlan,
 ) -> Result<FramePacketSet, EncodeError> {
     config.group_order.validate(frame)?;
     config
@@ -404,7 +457,7 @@ pub(super) fn build_frame_packet(
         artifact.ac.append_group(&mut group, frame, 0, 0)?;
         group.align_to_byte()?;
         return Ok(FramePacketSet::new(
-            frame_header(&config.progressive, control)?,
+            frame_header(&config.progressive, control, color)?,
             FrameGroupLayout::new(1, 1, 1)?,
             [GroupPacket::new(
                 GroupPacketKind::Single,
@@ -483,7 +536,7 @@ pub(super) fn build_frame_packet(
     }
     config.group_order.apply(
         FramePacketSet::new(
-            frame_header(&config.progressive, control)?,
+            frame_header(&config.progressive, control, color)?,
             FrameGroupLayout::new(lf_groups, ac_groups, passes)?,
             packets,
         )?,

@@ -97,9 +97,11 @@ impl Default for VarDctQuantization {
     }
 }
 
-/// Quantizers, matrices, LF metadata, coefficient orders and AC passes for all VarDCT encoders.
+/// Coding domain, quantizers, matrices, LF metadata, coefficient orders and AC passes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct VarDctConfig {
+    /// Stream-wide coding domain for RGB8 sRGB sources; defaults to XYB.
+    pub color_transform: super::VarDctColorTransform,
     /// Spectral/quantized AC progression; defaults to one complete pass.
     pub progressive: crate::ProgressivePlan,
     /// Physical AC group order, repeated per pass; defaults to raster order.

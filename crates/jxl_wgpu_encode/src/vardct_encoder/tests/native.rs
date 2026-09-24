@@ -97,12 +97,23 @@ pub(super) fn forward(
         .iter()
         .map(|&pixel| reference::xyb(pixel))
         .collect::<Vec<_>>();
+    forward_samples(&xyb, width, height, oracle)
+}
+
+pub(super) fn forward_samples(
+    components: &[[f64; 3]],
+    width: usize,
+    height: usize,
+    oracle: &Oracle,
+) -> Vec<[f64; 3]> {
     let area = width * height;
+    assert_eq!(components.len(), area);
     if !oracle.basis.is_empty() {
         return (0..area)
             .map(|coefficient| {
                 std::array::from_fn(|channel| {
-                    xyb.iter()
+                    components
+                        .iter()
                         .enumerate()
                         .map(|(pixel, value)| {
                             value[channel] * oracle.basis[coefficient * 64 + pixel]
@@ -136,7 +147,7 @@ pub(super) fn forward(
         for fx in 0..width {
             horizontal[y * width + fx] = std::array::from_fn(|channel| {
                 (0..width)
-                    .map(|x| xyb[y * width + x][channel] * horizontal_basis[fx * width + x])
+                    .map(|x| components[y * width + x][channel] * horizontal_basis[fx * width + x])
                     .sum()
             });
         }
@@ -206,7 +217,10 @@ pub(super) fn check_ac(
                 * (f64::from(config.quantization.global_scale())
                     * f64::from(config.quantization.hf_multiplier().get())
                     / 65536.0)
-                * [1.25, 1.0, 1.0][channel]
+                * match config.color_transform {
+                    VarDctColorTransform::Xyb => [1.25, 1.0, 1.0][channel],
+                    VarDctColorTransform::Original => 1.0,
+                }
                 / oracle.dequant[channel][index])
                 .round() as i32;
             // Fixed f64/native oracle regression bound: at most one quantizer

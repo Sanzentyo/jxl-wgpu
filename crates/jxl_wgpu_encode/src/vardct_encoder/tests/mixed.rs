@@ -194,6 +194,7 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
             &oracles
         };
         let config = VarDctConfig {
+            color_transform: VarDctColorTransform::Xyb,
             progressive: Default::default(),
             group_order: Default::default(),
             dequant_matrices: if case >= 12 {

@@ -1676,6 +1676,46 @@ window without touching its host-parsed descriptor and must return typed
 quant-matrix scales; a lower-level actual-GPU artifact test observes non-default scale multipliers
 for all three channels directly in the resident resource vectors.
 
+## Original RGB VarDCT encoding
+
+`vardct_encoder/tests/color.rs` checks the explicit `VarDctColorTransform::Original` policy
+on Apple M5/Metal (2026-09-25). Inputs remain interleaved RGB8 sRGB/D65, with a five-byte
+prefix and row padding; normalized sRGB components enter the forward transform directly.
+The checked color plan also owns the non-XYB image flag, original-RGB frame selector and
+implicit neutral matrix scales. The existing XYB policy remains the default.
+
+All 27 single-transform strategies use independently normalized F64 samples, cosine sums or
+the pinned native impulse bases, native matrix/order data, custom correlation and custom
+coefficient orders. Every compressed AC value remains within one integer quantizer step of
+that independent calculation. Public still assembly must equal direct backend packet assembly.
+Native libjxl 0.12.0 and Rust `jxl` supply independent F32 output; whole and fragmented GPU
+decode through 256-byte windows must agree within `2e-4 * (1 + abs(reference))` per finite
+component and one rounded RGB8 code. Whole/windowed GPU outputs are identical, and every
+decoder/input reservation returns to zero. Source PSNR exceeds 30 dB at the explicitly tested
+`(global_scale, quant_lf, hf_multiplier) = (35252, 16, 12)`; this is a corpus bound, not a
+general quality guarantee.
+
+Thirty mapped/tiled cases cross 1×1, 25×17 and 259×19 with Scalar/32/64/128/256 lanes,
+five coefficient passes, custom orders, parametric or raw matrices and GPU local-contrast
+group ordering. They retain the same native/Rust/GPU bounds, including replicated edges
+and AC-group boundaries. A separate 13×21 tiled case also checks native/Rust/GPU RGB8 output
+through 40-byte windows. Both backend layouts retain exact memory-plan equality with XYB,
+one-byte-deficient rejection, overlapping-admission rejection, abandoned-completion release
+and successful reuse. Gray and undefined-color sources fail before memory admission.
+
+`tests/animation/original_color.rs` adds six three-frame sequences: layered still and animation
+for single-transform, mixed-map and tiled backends. Reference-only producers use one complete
+pass, regular frames use five; signed crops, Add/Multiply, reference slots and indexed containers
+retain the selected original color domain. Native and jxl-oxide whole-stream presentations,
+explicit composition of independently Rust-decoded stills, and whole/bounded GPU F32 output
+retain the same bounds and output leases. Binding one descriptor to either color policy also
+requires one-frame sequence bytes to equal the corresponding still API.
+
+Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib original_rgb -- --test-threads=2`.
+Native tools and an actual GPU are required. No fixture or reference is replaced. Mixed
+Modular/VarDCT sequence selection, other VarDCT source colors/precisions, extra channels,
+pre-transform reference encoding and adaptive quality selection remain outside this evidence.
+
 ## VarDCT animation encoding
 
 `jxl_wgpu_encode::vardct_encoder::tests::animation` covers eight RGB8/XYB sequences with

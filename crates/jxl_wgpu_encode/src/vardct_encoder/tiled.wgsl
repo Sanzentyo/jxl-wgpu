@@ -3,7 +3,7 @@
 
 // Both vec3 arrays have a 16-byte stride: exactly 2,048 workgroup bytes.
 // AC coefficients live only here, never in storage or mapped readback buffers.
-var<workgroup> block_xyb: array<vec3<f32>, 64>;
+var<workgroup> block_components: array<vec3<f32>, 64>;
 var<workgroup> block_ac: array<vec3<i32>, 64>;
 
 fn serialize_block_ac(block: u32) {
@@ -58,17 +58,7 @@ fn quantize_blocks(
         let pixel_x = min(block_x * 8u + local_x, params.width - 1u);
         let pixel_y = min(block_y * 8u + local_y, params.height - 1u);
         let pixel_address = params.byte_offset + pixel_y * params.row_stride + pixel_x * 3u;
-        let encoded = vec3<f32>(
-            f32(load_u8(pixel_address)) / 255.0,
-            f32(load_u8(pixel_address + 1u)) / 255.0,
-            f32(load_u8(pixel_address + 2u)) / 255.0,
-        );
-        let linear = vec3<f32>(
-            srgb_to_linear(encoded.x),
-            srgb_to_linear(encoded.y),
-            srgb_to_linear(encoded.z),
-        );
-        block_xyb[sample] = linear_rgb_to_xyb(linear);
+        block_components[sample] = normalize_rgb8(pixel_address);
     }
     workgroupBarrier();
 
@@ -82,7 +72,7 @@ fn quantize_blocks(
         for (var pixel = 0u; pixel < 64u; pixel += 1u) {
             let basis = dct_basis(fx, pixel & 7u, 8u)
                 * dct_basis(fy, pixel >> 3u, 8u) / 64.0;
-            coefficient += block_xyb[pixel] * basis;
+            coefficient += block_components[pixel] * basis;
         }
         // ComputeScaledDCT's wire layout is transposed (row = horizontal
         // frequency). DC belongs to the separate LF stream.
@@ -93,7 +83,7 @@ fn quantize_blocks(
     if local_index == 0u {
         var sum = vec3<f32>(0.0);
         for (var index = 0u; index < 64u; index += 1u) {
-            sum += block_xyb[index];
+            sum += block_components[index];
         }
         let mean = sum / 64.0;
         let dc_scale = f32(params.global_scale) * f32(params.quant_lf);
