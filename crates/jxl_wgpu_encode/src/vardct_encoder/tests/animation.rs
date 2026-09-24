@@ -210,7 +210,7 @@ fn encode_layers(
         session.insert(artifacts).unwrap();
     }
     let encoded = if container {
-        session.finish_container()
+        session.finish_indexed_container(Default::default(), Default::default())
     } else {
         session.finish_raw()
     }
@@ -419,6 +419,66 @@ fn check_animation(
             );
         }
         drop(held);
+        let parsed = jxl_gpu_bitstream::parse(encoded, Default::default()).unwrap();
+        if let Some(index) =
+            jxl_gpu_bitstream::FrameIndex::from_container(&parsed, Default::default()).unwrap()
+        {
+            assert_eq!(index.tick_numerator(), ticks_per_second_denominator.get());
+            assert_eq!(index.tick_denominator(), ticks_per_second_numerator);
+            assert_eq!(
+                index
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.frames)
+                    .sum::<u64>(),
+                timings.len() as u64
+            );
+            assert_eq!(
+                index
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.duration_ticks)
+                    .sum::<u64>(),
+                ticks
+            );
+            for target in (0..actual.len()).rev() {
+                let mut seek = decoder
+                    .open_seek(
+                        encoded,
+                        GpuOutputRequest::color(format.clone()).unwrap(),
+                        target,
+                        Default::default(),
+                        Default::default(),
+                    )
+                    .unwrap();
+                let frame = pollster::block_on(seek.next_frame_async())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(frame.metadata.index, target);
+                assert_eq!(
+                    frame.metadata.duration.ticks,
+                    timings[target].duration_ticks
+                );
+                assert_eq!(frame.metadata.timecode, timings[target].timecode);
+                assert!(seek.next_frame().unwrap().is_none());
+                drop(seek);
+                // The retained target remains readable after all seek state is released.
+                let pixels = &readback
+                    .submit(frame.output())
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .frame
+                    .outputs[0]
+                    .bytes;
+                assert_eq!(pixels, &actual[target]);
+                compare(
+                    "indexed GPU/native target",
+                    &floats(pixels),
+                    &floats(&native[target].pixels),
+                );
+            }
+        }
         assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
         assert_eq!(
             decoder.incremental_input_budget().snapshot().reserved_bytes,
@@ -430,6 +490,73 @@ fn check_animation(
             assert_eq!(actual, whole);
         }
     }
+}
+
+#[test]
+fn indexed_animation_restores_an_old_reference_across_a_new_independent_frame() {
+    let backend = backend();
+    let context = WgpuContext::from_backend(&backend);
+    let encoder = TiledVarDctEncoder::new_with_config(context.clone(), configuration()).unwrap();
+    let desc = descriptor(9, 7, timebase(60_000, 1001, 2, true));
+    let layers: Vec<_> = [
+        (0, BlendMode::Replace, 0, 0),
+        (3, BlendMode::Add, 0, 1),
+        (5, BlendMode::Replace, 0, 0),
+        (7, BlendMode::Add, 1, 0),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, (duration, mode, source, save))| Layer {
+        width: 9,
+        height: 7,
+        options: options(duration, Some(100 + i as u32), mode, source, save),
+    })
+    .collect();
+    let (encoded, samples) = encode_layers(
+        &context,
+        encoder.begin_animation(desc.clone()).unwrap(),
+        &layers,
+        |source| encoder.encode(source).unwrap(),
+        true,
+    );
+    let parsed = jxl_gpu_bitstream::parse(&encoded, Default::default()).unwrap();
+    let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+    let index = jxl_gpu_bitstream::FrameIndex::from_container(&parsed, Default::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        index.entries(),
+        [
+            jxl_gpu_bitstream::FrameIndexEntry {
+                codestream_offset: inventory.frames[0].header_bits.offset / 8,
+                duration_ticks: 3,
+                frames: 1
+            },
+            jxl_gpu_bitstream::FrameIndexEntry {
+                codestream_offset: inventory.frames[2].header_bits.offset / 8,
+                duration_ticks: 12,
+                frames: 2
+            },
+        ]
+    );
+    let bound =
+        jxl_wgpu_decode::BoundFrameIndex::new(Arc::new(inventory), Some(index), Default::default())
+            .unwrap();
+    assert_eq!(
+        bound
+            .seek(1, Default::default())
+            .unwrap()
+            .restart_presentation(),
+        1
+    );
+    assert_eq!(
+        bound
+            .seek(2, Default::default())
+            .unwrap()
+            .restart_presentation(),
+        0
+    );
+    check_animation(&backend, &encoded, &desc, &layers, &samples, 1);
 }
 
 #[test]

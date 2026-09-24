@@ -519,6 +519,19 @@ impl LosslessModularAnimationSession {
         self.assembler.finish_container()
     }
 
+    /// Finishes with a header-validated `jxli` index. See
+    /// [`CodestreamAssembler::finish_indexed_container`] for limits and restart semantics.
+    pub fn finish_indexed_container(
+        self,
+        inventory_limits: jxl_gpu_bitstream::InventoryLimits,
+        index_limits: jxl_gpu_bitstream::FrameIndexLimits,
+    ) -> Result<Vec<u8>, EncodeError> {
+        let _metadata_permit = self.metadata_permit;
+        self.session.ensure_closed()?;
+        self.assembler
+            .finish_indexed_container(inventory_limits, index_limits)
+    }
+
     fn validate_source(&self, source: &crate::BufferImageSource) -> Result<(), EncodeError> {
         let spec = lossless_modular_source_spec(&source.layout.format)?;
         if spec.format != self.descriptor.format

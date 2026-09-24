@@ -998,7 +998,9 @@ overwritten reference chains and LF patch/resampling/noise combinations. The spl
 checks ordered patch/spline/resampling/noise execution. Broader LF restoration cross-products and
 the remaining ISO precision coverage remain open.
 
-`FrameExecutionPlan` separates physical decode nodes from coalesced presentations. Nodes retain
+`FrameExecutionPlan` adds output orientation and presentation metadata to the bitstream crate's
+checked `FrameSequencePlan`, also used for encoder index emission and decoder index binding.
+Physical decode nodes remain separate from coalesced presentations. Nodes retain
 exact earlier LF producers and their last consumers, the four reference-slot versions before each frame, save-before/after
 color-transform metadata, and whether the frame needs canvas composition. Presentation metadata
 retains orientation-normalized extent, rational timebase, loop count (including zero for infinite

@@ -502,6 +502,140 @@ mod native_tests {
         assert!(inventory.frames[1].is_last);
     }
 
+    // Synthetic section bytes exercise only assembly/header authority, never pixel validity.
+    fn index_probe(actual_last: bool) -> CodestreamAssembler {
+        let animation = if actual_last {
+            AnimationHeader::Still
+        } else {
+            AnimationHeader::Animation {
+                ticks_per_second_numerator: NonZeroU32::new(100).unwrap(),
+                ticks_per_second_denominator: NonZeroU32::new(1).unwrap(),
+                num_loops: 0,
+                have_timecodes: false,
+            }
+        };
+        let header = image_header(
+            3,
+            2,
+            LosslessModularFormat::Gray,
+            8,
+            0,
+            animation,
+            Default::default(),
+        )
+        .unwrap();
+        let budget = jxl_wgpu::MemoryBudget::new(NonZeroU64::new(1024).unwrap());
+        let mut assembler = CodestreamAssembler::new(header.finish(&budget).unwrap().0).unwrap();
+        let request = crate::FrameEncodeRequest {
+            frame_index: FrameIndex::new(0),
+            is_last: actual_last,
+            profile: crate::EncodeProfile::ModularLossless {
+                sample_bit_depth: jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample: 8 },
+            },
+            progressive: crate::ProgressivePlan::single(),
+            minimum_determinism: crate::Determinism::CrossDevice,
+            animation,
+            canvas_width: 3,
+            canvas_height: 2,
+            options: FrameOptions::default(),
+        };
+        let control = FrameHeaderPlan::new(&request, (3, 2), false).unwrap();
+        assembler
+            .insert(GpuFrameArtifacts {
+                frame_index: FrameIndex::new(0),
+                is_last: true,
+                packets: FramePacketSet::new(
+                    frame_header(LosslessModularFormat::Gray, &control, Default::default())
+                        .unwrap(),
+                    FrameGroupLayout::new(1, 1, 1).unwrap(),
+                    [GroupPacket::new(GroupPacketKind::Single, vec![0])],
+                )
+                .unwrap(),
+                acceleration: None,
+            })
+            .unwrap();
+        assembler
+    }
+
+    #[test]
+    fn indexed_assembly_preserves_raw_bytes_and_checks_actual_headers_and_limits() {
+        use jxl_gpu_bitstream::{
+            FrameIndexError, FrameIndexLimits, InventoryError, InventoryLimits,
+        };
+        let raw = index_probe(true).finish_raw().unwrap();
+        let plain = index_probe(true).finish_container().unwrap();
+        let encoded = index_probe(true)
+            .finish_indexed_container(Default::default(), Default::default())
+            .unwrap();
+        let parsed = jxl_gpu_bitstream::parse(&encoded, Default::default()).unwrap();
+        assert_eq!(parsed.codestream(), raw);
+        assert_eq!(
+            jxl_gpu_bitstream::parse(&plain, Default::default())
+                .unwrap()
+                .codestream(),
+            raw
+        );
+        let index = jxl_gpu_bitstream::FrameIndex::from_container(&parsed, Default::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (index.tick_numerator(), index.tick_denominator().get()),
+            (1, 1)
+        );
+        assert_eq!(index.entries().len(), 1);
+        assert_eq!(
+            (index.entries()[0].frames, index.entries()[0].duration_ticks),
+            (1, 0)
+        );
+        assert!(matches!(
+            index_probe(false).finish_indexed_container(Default::default(), Default::default()),
+            Err(EncodeError::Inventory(_))
+        ));
+        for limits in [
+            InventoryLimits {
+                max_frames: 0,
+                ..Default::default()
+            },
+            InventoryLimits {
+                max_total_section_bytes: 0,
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                index_probe(true).finish_indexed_container(limits, Default::default()),
+                Err(EncodeError::Inventory(InventoryError::ResourceLimit(_)))
+            ));
+        }
+        for (limits, expected) in [
+            (
+                FrameIndexLimits {
+                    max_entries: 0,
+                    ..Default::default()
+                },
+                FrameIndexError::EntryLimit,
+            ),
+            (
+                FrameIndexLimits {
+                    max_frames: 0,
+                    ..Default::default()
+                },
+                FrameIndexError::FrameLimit,
+            ),
+            (
+                FrameIndexLimits {
+                    max_payload_bytes: 8,
+                    ..Default::default()
+                },
+                FrameIndexError::PayloadLimit,
+            ),
+        ] {
+            let error = index_probe(true)
+                .finish_indexed_container(Default::default(), limits)
+                .unwrap_err();
+            assert!(matches!(error, EncodeError::FrameIndex(actual) if actual == expected));
+        }
+    }
+
     #[test]
     fn group_grid_is_row_major_and_covers_edge_tiles_exactly() {
         let grid = LosslessModularGroupGrid::for_extent(513, 257, Default::default()).unwrap();
@@ -2320,7 +2454,9 @@ mod native_tests {
         session.insert(last).unwrap();
         session.insert(second).unwrap();
         session.insert(first).unwrap();
-        let container = session.finish_container().unwrap();
+        let container = session
+            .finish_indexed_container(Default::default(), Default::default())
+            .unwrap();
 
         let parsed =
             jxl_gpu_bitstream::parse(&container, jxl_gpu_bitstream::ParseLimits::default())
@@ -2344,6 +2480,27 @@ mod native_tests {
         assert_eq!(inventory.frames[1].color_blend.source, 1);
         assert_eq!(inventory.frames[1].save_as_reference, 2);
         assert!(inventory.frames[2].is_last);
+
+        let index = jxl_gpu_bitstream::FrameIndex::from_container(&parsed, Default::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(index.tick_numerator(), 1);
+        assert_eq!(index.tick_denominator().get(), 100);
+        assert_eq!(
+            index.entries(),
+            [
+                jxl_gpu_bitstream::FrameIndexEntry {
+                    codestream_offset: inventory.frames[0].header_bits.offset / 8,
+                    duration_ticks: 5,
+                    frames: 2,
+                },
+                jxl_gpu_bitstream::FrameIndexEntry {
+                    codestream_offset: inventory.frames[2].header_bits.offset / 8,
+                    duration_ticks: 4,
+                    frames: 1,
+                },
+            ]
+        );
 
         let (decoded_animation, decoded_frames) =
             decode_animation8(&container, LosslessModularFormat::Gray)

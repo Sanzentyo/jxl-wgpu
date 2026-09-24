@@ -15,6 +15,7 @@ use thiserror::Error;
 mod acceleration;
 mod colour_encoding;
 mod frame_index;
+mod frame_sequence;
 pub mod gain_map;
 pub mod icc_profile;
 mod inventory;
@@ -26,6 +27,10 @@ mod stream;
 pub use frame_index::{
     FRAME_INDEX_BOX_TYPE, FrameIndex, FrameIndexCollector, FrameIndexCollectorStats,
     FrameIndexEntry, FrameIndexError, FrameIndexLimits,
+};
+pub use frame_sequence::{
+    FrameExecutionNode, FramePlanError, FrameReference, FrameSequenceEnd, FrameSequencePlan,
+    FrameSequencePresentation,
 };
 
 #[cfg(test)]

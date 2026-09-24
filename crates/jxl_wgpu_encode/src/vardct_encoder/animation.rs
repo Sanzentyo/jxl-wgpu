@@ -138,4 +138,16 @@ impl VarDctAnimationSession {
         self.session.ensure_closed()?;
         self.assembler.finish_container()
     }
+
+    /// Finishes with a header-validated `jxli` index. See
+    /// [`CodestreamAssembler::finish_indexed_container`] for limits and restart semantics.
+    pub fn finish_indexed_container(
+        self,
+        inventory_limits: jxl_gpu_bitstream::InventoryLimits,
+        index_limits: jxl_gpu_bitstream::FrameIndexLimits,
+    ) -> Result<Vec<u8>, EncodeError> {
+        self.session.ensure_closed()?;
+        self.assembler
+            .finish_indexed_container(inventory_limits, index_limits)
+    }
 }

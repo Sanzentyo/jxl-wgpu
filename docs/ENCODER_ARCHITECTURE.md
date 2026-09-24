@@ -49,6 +49,15 @@ blends and extra-channel contracts. Fixed frame metadata does not change GPU ABI
 submission/map counts or the existing completion/cancellation ownership. Syntax and conformance
 scope remain in the [animation corpus](CONFORMANCE_CORPUS.md#vardct-animation-encoding).
 
+Indexed container assembly has a separate authority boundary after frame ordering.
+`CodestreamAssembler::finish_indexed_container` inventories the actual output headers under
+caller limits, then constructs the bitstream crate's immutable `FrameSequencePlan`. This common
+plan owns frame order/finality, timing, reference-slot versions, LF producers and transitive
+dependencies; decoder execution and index binding use it too. `FrameIndex::from_sequence`
+compiles independent presentation intervals into `jxli` without consulting codec configuration
+or trusting public artifact labels as header evidence. This is bounded host metadata work;
+GPU pixels, entropy, submission ownership and the unindexed assembly APIs are unchanged.
+
 ## Implemented profile
 
 `LosslessModularBackend` advertises exactly:

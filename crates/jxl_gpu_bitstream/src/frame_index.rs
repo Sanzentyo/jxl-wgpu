@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::ParsedJxl;
 
 mod collector;
+mod sequence;
 pub use collector::{FrameIndexCollector, FrameIndexCollectorStats};
 
 pub const FRAME_INDEX_BOX_TYPE: [u8; 4] = *b"jxli";
@@ -47,6 +48,18 @@ pub struct FrameIndex {
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FrameIndexError {
+    #[error("jxli entry {entry} does not identify the expected presentation boundary")]
+    Offset { entry: usize },
+    #[error("jxli entry {entry} depends on an earlier reference or LF producer")]
+    DependentAnchor { entry: usize },
+    #[error("jxli displayed-frame intervals do not match the codestream")]
+    FrameCount,
+    #[error("jxli entry {entry} has a duration inconsistent with the image timebase")]
+    Duration { entry: usize },
+    #[error("jxli requires byte-aligned frame headers")]
+    UnalignedHeader,
+    #[error("jxli generation/binding requires a complete image sequence")]
+    IncompleteSequence,
     #[error("jxli payload exceeds its byte limit")]
     PayloadLimit,
     #[error("jxli entry count exceeds its limit")]

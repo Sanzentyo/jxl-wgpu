@@ -458,6 +458,40 @@ impl CodestreamAssembler {
         let codestream = self.finish_raw()?;
         Ok(jxl_gpu_bitstream::write_container(&codestream)?)
     }
+
+    /// Emits a plain `jxli` plus `jxlc`, using all independently restartable presentations.
+    /// Inventories the actual assembled headers under explicit limits; artifact labels and
+    /// requested controls do not authorize offsets, timing or reference independence.
+    /// This metadata pass does not validate frame entropy or reconstruct pixels.
+    pub fn finish_indexed_container(
+        self,
+        inventory_limits: jxl_gpu_bitstream::InventoryLimits,
+        index_limits: jxl_gpu_bitstream::FrameIndexLimits,
+    ) -> Result<Vec<u8>, EncodeError> {
+        use jxl_gpu_bitstream::{ContainerBox, FRAME_INDEX_BOX_TYPE, FrameSequencePlan};
+        let codestream = self.finish_raw()?;
+        // The assembler already owns and bounds the raw allocation. Header/TOC and index
+        // limits independently bound all additional metadata retained by this operation.
+        let parsed = jxl_gpu_bitstream::parse(
+            &codestream,
+            jxl_gpu_bitstream::ParseLimits {
+                max_input_bytes: codestream.len() as u64,
+                max_codestream_bytes: codestream.len() as u64,
+                ..Default::default()
+            },
+        )?;
+        let inventory = parsed.codestream_inventory(inventory_limits)?;
+        let sequence = FrameSequencePlan::negotiate(&inventory)?;
+        let index = jxl_gpu_bitstream::FrameIndex::from_sequence(&sequence, index_limits)?;
+        let payload = index.encode(index_limits)?;
+        Ok(jxl_gpu_bitstream::write_container_with_boxes(
+            &codestream,
+            &[ContainerBox {
+                box_type: FRAME_INDEX_BOX_TYPE,
+                payload: &payload,
+            }],
+        )?)
+    }
 }
 
 #[cfg(test)]

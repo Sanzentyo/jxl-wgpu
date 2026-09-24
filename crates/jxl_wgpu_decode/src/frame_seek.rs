@@ -1,11 +1,8 @@
 //! Bind optional container indexes to real headers and retain the complete restart dependency span.
-use std::num::NonZeroU32;
 use std::ops::Range;
 use std::sync::Arc;
 
-use jxl_gpu_bitstream::{
-    CodestreamInventory, FrameBlendMode, FrameIndex, FrameIndexEntry, FrameIndexLimits, FrameType,
-};
+use jxl_gpu_bitstream::{CodestreamInventory, FrameIndex, FrameIndexLimits, FrameSequencePlan};
 
 use crate::{FrameExecutionPlan, FrameMetadata, ImageSelection, SelectedImageInventory};
 
@@ -29,7 +26,7 @@ impl Default for FrameSeekLimits {
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FrameSeekError {
     #[error(transparent)]
-    Index(#[from] jxl_gpu_bitstream::FrameIndexError),
+    Index(jxl_gpu_bitstream::FrameIndexError),
     #[error(transparent)]
     Image(#[from] crate::ImageSelectionError),
     #[error(transparent)]
@@ -74,93 +71,18 @@ impl BoundFrameIndex {
     ) -> Result<Self, FrameSeekError> {
         let selection = SelectedImageInventory::new(inventory, ImageSelection::Main)?;
         let inventory = selection.reconstruction_inventory();
-        let execution = FrameExecutionPlan::negotiate(inventory)?;
-        if execution.presentations.len() as u64 > limits.max_frames {
-            return Err(jxl_gpu_bitstream::FrameIndexError::FrameLimit.into());
-        }
-        let earliest = dependencies(inventory, &execution)?;
-        let independent = |presentation: usize| {
-            let span = &execution.presentations[presentation].physical_frames;
-            earliest[span.clone()]
-                .iter()
-                .all(|&source| source >= span.start)
-        };
+        let sequence = FrameSequencePlan::negotiate(inventory)?;
         let index = match index {
-            Some(index) => {
-                // Reapply caller limits, even when the parsed object had looser limits.
-                index.encode(limits)?;
-                index
-            }
-            None => {
-                let anchors: Vec<_> = (0..execution.presentations.len())
-                    .filter(|&i| independent(i))
-                    .collect();
-                if anchors.first() != Some(&0) {
-                    return Err(FrameSeekError::DependentAnchor { entry: 0 });
-                }
-                let entries = anchors
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &start)| {
-                        let end = anchors
-                            .get(i + 1)
-                            .copied()
-                            .unwrap_or(execution.presentations.len());
-                        Ok(FrameIndexEntry {
-                            codestream_offset: offset(inventory, &execution, start)?,
-                            duration_ticks: duration(&execution, start..end),
-                            frames: (end - start) as u64,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, FrameSeekError>>()?;
-                let (numerator, denominator) = execution.metadata.timebase.map_or(
-                    (1, NonZeroU32::new(1).expect("one is nonzero")),
-                    |time| {
-                        (
-                            time.ticks_per_second_denominator.get(),
-                            time.ticks_per_second_numerator,
-                        )
-                    },
-                );
-                FrameIndex::new(numerator, denominator, entries, limits)?
-            }
+            Some(index) => index,
+            None => FrameIndex::from_sequence(&sequence, limits)?,
         };
-        let mut anchors = Vec::with_capacity(index.entries().len());
-        let mut presentation = 0_usize;
-        for (entry, record) in index.entries().iter().enumerate() {
-            let next = usize::try_from(record.frames)
-                .ok()
-                .and_then(|count| presentation.checked_add(count))
-                .filter(|&end| end <= execution.presentations.len())
-                .ok_or(FrameSeekError::FrameCount)?;
-            if offset(inventory, &execution, presentation)? != record.codestream_offset {
-                return Err(FrameSeekError::Offset { entry });
-            }
-            if !independent(presentation) {
-                return Err(FrameSeekError::DependentAnchor { entry });
-            }
-            let ticks = duration(&execution, presentation..next);
-            let (tps_num, tps_den) = execution.metadata.timebase.map_or((1, 1), |t| {
-                (
-                    t.ticks_per_second_numerator.get(),
-                    t.ticks_per_second_denominator.get(),
-                )
-            });
-            if u128::from(record.duration_ticks)
-                * u128::from(index.tick_numerator())
-                * u128::from(tps_num)
-                != u128::from(ticks)
-                    * u128::from(tps_den)
-                    * u128::from(index.tick_denominator().get())
-            {
-                return Err(FrameSeekError::Duration { entry });
-            }
-            anchors.push(presentation);
-            presentation = next;
-        }
-        if presentation != execution.presentations.len() {
-            return Err(FrameSeekError::FrameCount);
-        }
+        let anchors = index.bind_sequence(&sequence, limits)?;
+        let earliest = sequence.earliest_dependencies().to_vec();
+        let execution = FrameExecutionPlan::from_sequence(
+            inventory,
+            crate::OrientationPolicy::Apply,
+            sequence,
+        )?;
         Ok(Self {
             selection,
             execution,
@@ -274,88 +196,17 @@ impl FrameSeekPlan {
     }
 }
 
-fn offset(
-    inventory: &CodestreamInventory,
-    plan: &FrameExecutionPlan,
-    presentation: usize,
-) -> Result<u64, FrameSeekError> {
-    let span = &plan
-        .presentations
-        .get(presentation)
-        .ok_or(FrameSeekError::FrameCount)?
-        .physical_frames;
-    let bits = inventory.frames[span.start].header_bits.offset;
-    if !bits.is_multiple_of(8) {
-        return Err(FrameSeekError::Inventory("unaligned frame header"));
+// Preserve decoder-facing typed errors while sharing their validation with the writer.
+impl From<jxl_gpu_bitstream::FrameIndexError> for FrameSeekError {
+    fn from(error: jxl_gpu_bitstream::FrameIndexError) -> Self {
+        use jxl_gpu_bitstream::FrameIndexError;
+        match error {
+            FrameIndexError::Offset { entry } => Self::Offset { entry },
+            FrameIndexError::DependentAnchor { entry } => Self::DependentAnchor { entry },
+            FrameIndexError::FrameCount => Self::FrameCount,
+            FrameIndexError::Duration { entry } => Self::Duration { entry },
+            FrameIndexError::UnalignedHeader => Self::Inventory("unaligned frame header"),
+            error => Self::Index(error),
+        }
     }
-    Ok(bits / 8)
-}
-
-fn duration(plan: &FrameExecutionPlan, range: Range<usize>) -> u64 {
-    // The full execution plan has already checked the cumulative u64 presentation clock.
-    plan.presentations[range]
-        .iter()
-        .map(|p| u64::from(p.metadata.duration.ticks))
-        .sum()
-}
-
-fn dependencies(
-    inventory: &CodestreamInventory,
-    plan: &FrameExecutionPlan,
-) -> Result<Vec<usize>, FrameSeekError> {
-    let mut earliest = Vec::with_capacity(plan.nodes.len());
-    for (position, (frame, node)) in inventory.frames.iter().zip(&plan.nodes).enumerate() {
-        let mut first = position;
-        let mut use_source = |source: u32| -> Result<(), FrameSeekError> {
-            let source = inventory
-                .frame_position(source)
-                .filter(|&index| index < position)
-                .ok_or(FrameSeekError::Inventory(
-                    "reference is not an earlier physical frame",
-                ))?;
-            first = first.min(earliest[source]);
-            Ok(())
-        };
-        if let Some(source) = node.lf_source_frame {
-            use_source(source)?;
-        }
-        if frame.flags & 2 != 0 {
-            // Patch selectors are GPU entropy. All live slot versions are conservative dependencies.
-            for reference in node.references.iter().flatten() {
-                use_source(reference.frame_index)?;
-            }
-        }
-        if matches!(
-            frame.frame_type,
-            FrameType::Regular | FrameType::SkipProgressive
-        ) {
-            let covers = i64::from(frame.x0) <= 0
-                && i64::from(frame.y0) <= 0
-                && i64::from(frame.x0) + i64::from(frame.width)
-                    >= i64::from(inventory.image_header.width)
-                && i64::from(frame.y0) + i64::from(frame.height)
-                    >= i64::from(inventory.image_header.height);
-            for blend in std::iter::once(&frame.color_blend).chain(&frame.extra_channel_blends) {
-                if (!covers || blend.mode != FrameBlendMode::Replace)
-                    && let Some(reference) = node.references[blend.source as usize]
-                {
-                    use_source(reference.frame_index)?;
-                }
-                // Unassociated source-over and the selected alpha's output read that alpha's
-                // own background slot, even when its declared extra-channel mode is Replace.
-                if matches!(
-                    blend.mode,
-                    FrameBlendMode::Blend | FrameBlendMode::MultiplyAdd
-                ) && let Some(alpha) = frame
-                    .extra_channel_blends
-                    .get(blend.alpha_channel.unwrap_or(0) as usize)
-                    && let Some(reference) = node.references[alpha.source as usize]
-                {
-                    use_source(reference.frame_index)?;
-                }
-            }
-        }
-        earliest.push(first);
-    }
-    Ok(earliest)
 }

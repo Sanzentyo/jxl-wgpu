@@ -58,7 +58,14 @@ container headers and `jxlp` indexes. Its nonzero tick denominator defines secon
 numerator/denominator. The final entry's interval includes its own presentation through stream end.
 Emission is canonical; accepted nonminimal integer encodings are normalized.
 
-`BoundFrameIndex::new` binds an optional index to the authoritative main-image header inventory.
+`FrameSequencePlan` in the bitstream crate owns physical ordering, reference-slot versions,
+LF producers, presentation timing and transitive dependencies. Decoder execution adds output
+orientation and public presentation metadata to that checked plan; index generation and binding
+use its immutable original offsets and clock. Partial reconstruction intervals cannot produce
+or bind a full-image index.
+
+`BoundFrameIndex::new` selects the main image, builds this plan, and calls
+`FrameIndex::bind_sequence` to bind an optional index to the authoritative header inventory.
 Every entry must identify the expected presentation's first physical header, including any
 leading hidden or recursive-DC producers. Counts must cover the complete presentation sequence.
 Durations are compared to original image ticks using exact u128 rational products. Wrong offsets,
@@ -70,6 +77,27 @@ When no index is supplied, binding generates all conservatively independent pres
 `index().encode(...)` can be placed in a `ContainerBox` with `FRAME_INDEX_BOX_TYPE`, then written
 using the existing `jxlc` or `jxlp` container writer. Container edits do not change logical offsets,
 but editing codestream headers or frame data requires rebuilding the index.
+
+## Encoder index emission
+
+`CodestreamAssembler`, `LosslessModularAnimationSession` and `VarDctAnimationSession` expose
+`finish_indexed_container(inventory_limits, index_limits)`. They emit a plain `jxli` and ordinary
+`jxlc` after all completed GPU frame artifacts are ordered. Existing `finish_raw` and
+`finish_container` remain unindexed. Indexed assembly inventories the actual serialized headers,
+constructs `FrameSequencePlan`, and generates entries with `FrameIndex::from_sequence`; it does
+not derive offsets or independence from requested options or artifact labels.
+
+Every independently restartable presentation receives an entry. Leading hidden frames are part
+of its physical span, dependent presentations extend the prior entry, and a final zero-duration
+frame still counts as a presentation. Durations retain the original tick unit, with no rounding
+or subtraction of the first duration. Still images use a zero-duration interval with tick unit
+1/1. Only container framing changes; the raw codestream is preserved byte for byte.
+
+Inventory limits bound all retained header/ICC/TOC metadata and physical frames; index limits
+independently bound displayed frames, entry count and payload bytes. Failure returns a typed
+error with no container. This host operation does not check frame entropy or reconstruct pixels.
+The encoder currently emits regular main-image frames; preview emission, caller-selected sparse
+index policies and compressed indexes are outside this API's current scope.
 
 ## Dependency and ownership bounds
 

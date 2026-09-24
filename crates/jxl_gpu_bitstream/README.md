@@ -16,8 +16,12 @@ streams are joined.
 
 `FrameIndex` parses and emits bounded plain `jxli` payloads and rejects duplicate boxes or
 unsupported compressed indexes. It retains logical offsets, rational tick units and displayed
-frame intervals without authorizing a restart. Header/dependency binding and GPU seeking belong
-to `jxl_wgpu_decode`. `FrameIndexCollector` observes borrowed transport events, retains only bounded
+frame intervals without authorizing a restart. `FrameSequencePlan` owns checked physical ordering,
+reference versions, presentation timing and conservative transitive dependencies for a selected
+image. `FrameIndex::from_sequence` generates independent anchors, and `bind_sequence` checks
+actual boundaries, spans and exact rational durations under caller limits. Partial reconstruction
+intervals cannot generate or bind indexes. GPU seeking belongs to `jxl_wgpu_decode`.
+`FrameIndexCollector` observes borrowed transport events, retains only bounded
 index metadata, and requires authoritative End before handoff. Known payload limits apply before
 allocation; byte-drip growth is geometric. Failures drop encoded and parsed storage, and unrelated
 boxes never retain their payload or caller allocation.

@@ -191,6 +191,12 @@ pub enum EncodeError {
     #[error(transparent)]
     Bitstream(#[from] jxl_gpu_bitstream::Error),
     #[error(transparent)]
+    Inventory(#[from] jxl_gpu_bitstream::InventoryError),
+    #[error(transparent)]
+    FramePlan(#[from] jxl_gpu_bitstream::FramePlanError),
+    #[error(transparent)]
+    FrameIndex(#[from] jxl_gpu_bitstream::FrameIndexError),
+    #[error(transparent)]
     AccelerationIndex(#[from] jxl_gpu_bitstream::AccelerationIndexError),
     #[error("GPU encoder kernel policy failed: {0}")]
     KernelPolicy(#[from] jxl_wgpu::Error),

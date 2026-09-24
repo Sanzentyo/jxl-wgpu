@@ -793,7 +793,7 @@ extent on each frame; tiled DCT8 accepts separately checked crop extents through
 bound. Both support Replace/Add/Multiply, signed crops, hidden zero-duration regular frames and
 four post-color-transform references. Alpha-weighted modes, extra-channel contracts and
 pre-color-transform reference storage are rejected. Mixed Modular/VarDCT sessions, reference-only
-frame types, frame names, previews and frame-index emission remain unimplemented.
+frame types, frame names and previews remain unimplemented.
 
 Both codecs lower frame options once into a checked, immutable `FrameHeaderPlan` before GPU
 admission. Resident, native-streamed and browser-streamed Modular jobs and VarDCT jobs append
@@ -821,6 +821,17 @@ multiple frames in flight, complete each with blocking `wait` or await the same 
 `Future`, and insert completed artifacts in any order. Final assembly restores normative frame
 order and rejects duplicates, gaps, or an invalid final-frame flag. All live frame jobs share the
 same byte-weighted `MemoryBudget` as still encoding; Modular also uses its existing buffer pool.
+
+Both animation sessions and the generic `CodestreamAssembler` expose
+`finish_indexed_container(inventory_limits, index_limits)` for opt-in plain `jxli` plus `jxlc`
+output. After ordering artifacts, this bounded metadata pass inventories the actual assembled
+headers and uses the shared `FrameSequencePlan` to generate every independent presentation anchor.
+Hidden frames belong to their presentation; dependent intervals sum original ticks exactly.
+Logical offsets exclude container boxes. Inventory limits bound physical frames, headers, ICC and
+TOCs; index limits bound displayed frames, entries and payload. Failures remain typed, and no
+partially indexed container is returned. Existing raw/unindexed methods keep their behavior.
+The metadata pass does not validate image entropy or decode pixels. See the
+[index contract](../../docs/FRAME_SEEKING.md#encoder-index-emission).
 
 ```rust,no_run
 # use std::num::NonZeroU32;
@@ -868,7 +879,7 @@ let crop = animation.submit_last_frame(
 )?;
 animation.insert(first.wait()?)?;
 animation.insert(crop.wait()?)?;
-animation.finish_container()
+animation.finish_indexed_container(Default::default(), Default::default())
 # }
 ```
 

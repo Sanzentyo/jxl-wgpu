@@ -51,6 +51,25 @@ all truncated prefixes, nonminimal/overflowing varints, offset/count/time overfl
 denominator, duplicate offsets/boxes, forbidden compressed indexes, exact caps and canonical
 emission. Default and fragmented containers preserve logical offsets.
 
+`frame_index::sequence::tests` checks generation from the shared immutable frame plan: seven
+physical headers starting at ID 23 form five presentations with hidden layers, persistent and
+overwritten references, and a zero-duration final frame. Explicit expected offsets/spans and
+60,000/1001 timing require four entries with durations 3/12/11/0. Entry/frame/payload caps,
+unaligned headers and partial reconstruction intervals reject before index authority.
+Encoder assembly tests preserve raw bytes, reject an artifact whose final label disagrees with
+the serialized header, and exercise physical/section and index caps. Synthetic section bytes in
+that host test establish metadata behavior only; pixel evidence uses actual GPU artifacts below.
+
+The Gray GPU animation now emits an index with intervals `(2 presentations, 5 ticks)` and
+`(1 presentation, 4 ticks)`, retaining exact native/Rust pixels and timecodes. Four indexed VarDCT
+sequences cover hidden/cropped/reference and five-pass single/mixed transforms. Whole and
+256-byte-window seeks to every target match sequential GPU bytes and independent native F32
+samples within the unchanged animation bound. Targets remain readable after seek destruction.
+A four-layer sequence includes a new independent frame followed by a consumer of an older
+slot: the index includes that independent anchor, but the later target correctly restarts before
+it. The existing decoder index, corruption, cancellation, input-admission and retained-output
+matrices exercise the same shared planning implementation.
+
 The incremental collector adds every two-chunk split and one-byte delivery for compact, extended
 and to-end `jxli`, including indexes between ordered or version-1 reordered fragments. Exact and
 one-short payload/entry/frame caps, malformed prefixes, duplicate/compressed indexes, event order,
@@ -1659,8 +1678,8 @@ for all three channels directly in the resident resource vectors.
 
 ## VarDCT animation encoding
 
-`jxl_wgpu_encode::vardct_encoder::tests::animation` covers seven RGB8/XYB sequences with
-24 physical frames and 20 presentations. Two six-frame tiled sequences at 17×9 differ only in
+`jxl_wgpu_encode::vardct_encoder::tests::animation` covers eight RGB8/XYB sequences with
+28 physical frames and 23 presentations. Two six-frame tiled sequences at 17×9 differ only in
 timecode presence and raw/container transport. They combine Replace, signed 9×7 and 5×6 crops,
 Add, clamped/unclamped Multiply, hidden zero-duration regular frames and every reference slot.
 Durations include 0, 1, 257, 65,536 and `u32::MAX`; timebase is 60,000/1001. Three two-frame,
@@ -1669,7 +1688,8 @@ extents and a zero-duration final presentation. Single DCT8 and a mixed map add 
 five-pass sequences with overhanging crops and smaller canvases. Other timebases exercise
 1024/256 and 1000/1024, with loop counts through `u32::MAX`. Metadata checks retain exact canvas,
 crop, mode, reference, pass count, timing and finality; futures complete in reverse insertion
-order and raw/container assembly restores physical order.
+order and raw/container assembly restores physical order. A four-layer 9×7 indexed sequence
+checks old-reference restoration across a newer independent frame, as described above.
 
 Each physical source is independently encoded as a still and decoded by native libjxl 0.12.0.
 A separate signal-domain composition calculation uses these samples, the declared crop and
@@ -1701,8 +1721,10 @@ old Modular control serializer in resident, native-streamed and browser-streamed
 Modular still, animation, precision and lifetime tests remain unchanged in scope.
 
 This extends `FRAME-05`. It does not provide mixed Modular/VarDCT streams, VarDCT pre-transform
-reference storage or extra-channel blending, reference-only frame types, names, previews or
-frame-index writing. GPU image/entropy work and its memory plan are unchanged.
+reference storage or extra-channel blending, reference-only frame types, names or previews.
+Plain frame-index writing uses the shared metadata plan described in the
+[index checkpoint](#frame-index-and-seek-checkpoint). GPU image/entropy work and its memory plan
+are unchanged.
 
 ## Progressive VarDCT encoding
 
