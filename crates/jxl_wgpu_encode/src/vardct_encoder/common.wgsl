@@ -29,25 +29,9 @@ fn quantize_checked(value: f32, error: u32) -> i32 {
     return i32(rounded);
 }
 
-fn load_u8(byte_address: u32) -> u32 {
-    let word = source_words[byte_address >> 2u];
-    return (word >> ((byte_address & 3u) * 8u)) & 255u;
-}
-
-// Byte loads preserve arbitrary validated source offsets/strides, including words
-// crossing a storage-buffer u32 boundary. Padding bits never enter normalization.
-fn load_source_sample(address: u32) -> u32 {
-    var value = load_u8(address);
-    for (var byte = 1u; byte < params.source_word_bytes; byte += 1u) {
-        value |= load_u8(address + byte) << (8u * byte);
-    }
-    return value & params.source_sample_mask;
-}
-
 // All admitted floating precisions fit binary32 exactly. Rebase their fields instead
 // of evaluating an exponential, preserving subnormal/sign bits before GPU arithmetic.
-fn normalize_source_sample(address: u32) -> f32 {
-    let word = load_source_sample(address);
+fn normalize_source_sample(word: u32) -> f32 {
     let exponent_bits = params.source_exponent_bits;
     if exponent_bits == 0u { return f32(word) / f32(params.source_sample_mask); }
     let bits = 32u - countLeadingZeros(params.source_sample_mask);
@@ -103,14 +87,17 @@ fn linear_rgb_to_xyb(rgb: vec3<f32>) -> vec3<f32> {
     );
 }
 
+fn source_sample(x: u32, y: u32, component: u32) -> u32 {
+    return load_source_component(params.sources[component], x, y, params.source_big_endian, params.source_sample_mask);
+}
+
 // The checked color plan selects the same domain for image/frame headers and quantization.
 // 0 = XYB, 1 = original sRGB. No source samples cross the host boundary.
-fn normalize_rgb(address: u32) -> vec3<f32> {
-    let stride = params.source_word_bytes;
+fn normalize_rgb(x: u32, y: u32) -> vec3<f32> {
     let encoded = vec3<f32>(
-        normalize_source_sample(address),
-        normalize_source_sample(address + stride),
-        normalize_source_sample(address + 2u * stride),
+        normalize_source_sample(source_sample(x, y, 0u)),
+        normalize_source_sample(source_sample(x, y, 1u)),
+        normalize_source_sample(source_sample(x, y, 2u)),
     );
     if params.color_normalization == 1u { return encoded; }
     return linear_rgb_to_xyb(vec3<f32>(

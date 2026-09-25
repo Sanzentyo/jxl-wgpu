@@ -38,11 +38,14 @@ use crate::{
     VarDctQuantization, WgpuContext, assemble_frame,
 };
 
+pub(super) const SOURCE_BINDINGS: [u32; 4] = [0, 12, 13, 14];
+
 pub(super) const TILED_SHADER: &str = include_str!("tiled.wgsl");
 
 pub(super) fn shader_source(entry_points: &str) -> String {
     format!(
-        "{}\n{}\n{entry_points}",
+        "{}\n{}\n{}\n{entry_points}",
+        crate::source::SHADER,
         include_str!("common.wgsl"),
         include_str!("control.wgsl")
     )
@@ -53,8 +56,7 @@ pub(super) const TILED_WORKGROUP_STORAGE_BYTES: u32 = 2 * 64 * 16 + 4;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct VarDctDispatchPlan {
-    source_binding_offset: u64,
-    source_binding_size: NonZeroU64,
+    source_windows: crate::source::SourceWindows,
     kernel: VarDctKernelPlan,
     memory: VarDctMemoryPlan,
     frame: VarDctFrameLayout,
@@ -155,6 +157,7 @@ impl VarDctBackend {
         let code = fixed_prefix_code()?;
         let hf_entropy = HfEntropyPlan::single_cluster_prefix()?;
         let limits = context.device().limits();
+        validate_vardct_device_limits(&limits)?;
         let raw_matrix_plan =
             raw_matrices::Plan::new(&config.dequant_matrices, &code)?.map(Arc::new);
         if let Some(plan) = &raw_matrix_plan {
@@ -210,7 +213,6 @@ impl VarDctBackend {
                 workgroup_variant,
             )?)
         } else {
-            validate_tiled_device_limits(&limits)?;
             let module = context
                 .device()
                 .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -398,77 +400,23 @@ impl VarDctBackend {
         };
         self.config.group_order.validate(frame)?;
         if !self.sample_format().matches_format(&source.layout.format)
-            || source.layout.planes.len() != 1
             || !source.buffer.usage().contains(wgpu::BufferUsages::STORAGE)
         {
             return Err(UnsupportedFeature::InputFormat.into());
         }
-        let plane = source
-            .layout
-            .plane(0)
-            .ok_or(EncodeError::InvalidSource("missing VarDCT RGB plane"))?;
-        let row_bytes = u64::from(extent.width) * 3 * u64::from(self.sample_format().word_bytes());
-        if plane.row_bytes != row_bytes || plane.row_stride < row_bytes {
-            return Err(EncodeError::InvalidSource(
-                "the VarDCT RGB plane has an invalid row layout",
-            ));
-        }
-        let row_stride = u32::try_from(plane.row_stride)
-            .map_err(|_| EncodeError::InvalidSource("VarDCT row stride exceeds WGSL u32"))?;
-        let sample_end = plane
-            .row_stride
-            .checked_mul(u64::from(extent.height - 1))
-            .and_then(|rows| plane.offset.checked_add(rows))
-            .and_then(|offset| offset.checked_add(row_bytes))
-            .ok_or(EncodeError::InvalidSource(
-                "VarDCT source address arithmetic overflow",
-            ))?;
-        let binding_end = align_up(sample_end, 4).ok_or(EncodeError::InvalidSource(
-            "VarDCT source binding size overflow",
-        ))?;
-        if binding_end > source.buffer.size() {
-            return Err(EncodeError::InvalidSource(
-                "VarDCT source binding does not contain the final sample word",
-            ));
-        }
-        let alignment = self.storage_offset_alignment.max(4);
-        let source_binding_offset = plane.offset - plane.offset % alignment;
-        let source_binding_bytes =
-            binding_end
-                .checked_sub(source_binding_offset)
-                .ok_or(EncodeError::InvalidSource(
-                    "VarDCT source binding range underflow",
-                ))?;
-        if source_binding_bytes > self.max_storage_binding_size {
-            return Err(UnsupportedFeature::DeviceLimit {
-                name: "max_storage_buffer_binding_size",
-                required: source_binding_bytes,
-                available: self.max_storage_binding_size,
-            }
-            .into());
-        }
-        let source_binding_size = NonZeroU64::new(source_binding_bytes).ok_or(
-            EncodeError::InvalidSource("VarDCT source binding must not be empty"),
+        let source_layout = crate::source::SourceLayout::new(
+            &source.layout,
+            source.buffer.size(),
+            self.storage_offset_alignment,
         )?;
-        let relative_offset =
-            plane
-                .offset
-                .checked_sub(source_binding_offset)
-                .ok_or(EncodeError::InvalidSource(
-                    "VarDCT source address arithmetic underflow",
-                ))?;
-        let shader_last_byte = sample_end
-            .checked_sub(source_binding_offset)
-            .and_then(|end| end.checked_sub(1))
-            .ok_or(EncodeError::InvalidSource(
-                "VarDCT source address arithmetic underflow",
-            ))?;
-        u32::try_from(shader_last_byte).map_err(|_| {
-            EncodeError::InvalidSource("VarDCT source address exceeds the WGSL u32 space")
-        })?;
-        let byte_offset = u32::try_from(relative_offset).map_err(|_| {
-            EncodeError::InvalidSource("VarDCT source offset exceeds the WGSL u32 space")
-        })?;
+        let source_windows = source_layout.full_windows;
+        source_windows.validate(self.max_storage_binding_size)?;
+        let source_binding_bytes = source_windows.addressed_bytes()?;
+        let region = source_layout.region(0, 0, extent.width, extent.height)?;
+        let mut sources: [crate::source::SourceParams; 3] = region.components[..3]
+            .try_into()
+            .expect("RGB source has three checked components");
+        source_windows.rebase(&mut sources, region.offsets)?;
         let blocks_x = frame.blocks_x;
         let blocks_y = frame.blocks_y;
         let (lf_quantization, lf_correlation) = self.config.lf_metadata.forward_quantization();
@@ -541,8 +489,6 @@ impl VarDctBackend {
             (
                 VarDctKernelPlan {
                     params: VarDctKernelParams {
-                        row_stride,
-                        byte_offset,
                         width: extent.width,
                         height: extent.height,
                         blocks_x,
@@ -588,12 +534,12 @@ impl VarDctBackend {
                         saliency_offset: layout.saliency_offset,
                         saliency_groups: layout.saliency_groups,
                         color_normalization: self.color_plan.normalization(),
-                        source_word_bytes: u32::from(self.sample_format().word_bytes()),
                         source_sample_mask: self.sample_format().sample_mask(),
                         source_exponent_bits: u32::from(self.sample_format().exponent_bits()),
                         source_validation_offset: layout.source_validation_offset,
                         source_validation_groups: layout.source_validation_groups,
-                        padding: [0; 1],
+                        source_big_endian: u32::from(source_layout.spec.big_endian),
+                        sources,
                     },
                     layout,
                 },
@@ -683,8 +629,7 @@ impl VarDctBackend {
             }
         }
         Ok(VarDctDispatchPlan {
-            source_binding_offset,
-            source_binding_size,
+            source_windows,
             kernel,
             memory,
             frame,
@@ -692,18 +637,10 @@ impl VarDctBackend {
     }
 }
 
-pub(super) fn align_up(value: u64, alignment: u64) -> Option<u64> {
-    let adjustment = alignment.checked_sub(1)?;
-    value
-        .checked_add(adjustment)?
-        .checked_div(alignment)?
-        .checked_mul(alignment)
-}
-
-fn validate_tiled_device_limits(limits: &wgpu::Limits) -> Result<(), EncodeError> {
+fn validate_vardct_device_limits(limits: &wgpu::Limits) -> Result<(), EncodeError> {
     let checks = [(
         "max_storage_buffers_per_shader_stage",
-        4,
+        7,
         u64::from(limits.max_storage_buffers_per_shader_stage),
     )];
     if let Some((name, required, available)) = checks
@@ -812,11 +749,7 @@ impl GpuEncodeBackend for VarDctBackend {
                 })
         });
 
-        let source_binding = wgpu::BufferBinding {
-            buffer: &source.buffer,
-            offset: plan.source_binding_offset,
-            size: Some(plan.source_binding_size),
-        };
+        let source_entries = plan.source_windows.entries(&source.buffer, SOURCE_BINDINGS);
         let params_binding_size = NonZeroU64::new(plan.memory.parameter_storage_bytes)
             .expect("the VarDCT parameter ABI is non-empty");
         let artifact_binding_size = NonZeroU64::new(plan.memory.artifact_storage_bytes)
@@ -828,10 +761,10 @@ impl GpuEncodeBackend for VarDctBackend {
                     label: Some(label),
                     layout: &pipeline.get_bind_group_layout(0),
                     entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Buffer(source_binding.clone()),
-                        },
+                        source_entries[0].clone(),
+                        source_entries[1].clone(),
+                        source_entries[2].clone(),
+                        source_entries[3].clone(),
                         wgpu::BindGroupEntry {
                             binding: 1,
                             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -877,7 +810,7 @@ impl GpuEncodeBackend for VarDctBackend {
                                 .transform_plan
                                 .as_ref()
                                 .expect("general transform plan"),
-                            source: source_binding.clone(),
+                            sources: source_entries.clone(),
                             parameters: &parameters,
                             artifact: &artifact,
                         },
@@ -950,7 +883,7 @@ impl GpuEncodeBackend for VarDctBackend {
             pipeline.encode(
                 context.device(),
                 &mut commands,
-                source_binding,
+                source_entries,
                 &parameters,
                 &artifact,
                 plan.frame,
@@ -2148,5 +2081,28 @@ impl Future for VarDctSubmission {
                 Poll::Ready(result.and_then(|frame| submission.assemble(frame)))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod limits_tests {
+    use super::*;
+
+    #[test]
+    fn source_binding_count_is_rejected_before_pipeline_creation() {
+        let mut limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 6,
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_vardct_device_limits(&limits),
+            Err(EncodeError::Unsupported(UnsupportedFeature::DeviceLimit {
+                name: "max_storage_buffers_per_shader_stage",
+                required: 7,
+                available: 6
+            }))
+        ));
+        limits.max_storage_buffers_per_shader_stage = 7;
+        validate_vardct_device_limits(&limits).unwrap();
     }
 }

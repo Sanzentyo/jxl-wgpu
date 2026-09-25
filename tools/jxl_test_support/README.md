@@ -123,6 +123,11 @@ their codestream order without reaching into another test target or example's pr
 case declares its family, source noise operation, oracle, comparison controls and precision metric.
 Filename prefixes and suffixes do not select test behavior or oracle exceptions.
 
+`fixtures::source_layout` independently packs raw logical words into adversarial physical layouts
+for Modular and VarDCT tests. It returns bytes and image metadata without calling production
+source parsing, GPU normalization or either encoder. Channel order, sample shifts, endianness,
+poisoned gaps and unaligned pitches therefore remain fixture choices shared across targets.
+
 Each decoder integration target has a `tests/<target>/main.rs` entry point. Its private modules
 live below that directory and use ordinary `mod` declarations. Examples with private helpers
 follow the same `examples/<target>/main.rs` layout. Shared helpers are imported from this crate;

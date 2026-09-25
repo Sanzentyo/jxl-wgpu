@@ -467,7 +467,7 @@ entries, animation, invalid ranges, overflow and resident/streamed lifetime.
 
 
 
-`VarDctEncoder::new` takes an explicit `VarDctStrategy` and accepts one padded, interleaved sRGB8
+`VarDctEncoder::new` takes an explicit `VarDctStrategy` and accepts one packed/planar/split sRGB8
 image whose extent equals that transform. All 27 standard strategies are executable end to end,
 from the 8×8-footprint strategies through the regular 16/32/64/128/256 square and rectangular
 families. `VarDctStrategy` re-exports the shared protocol `TransformKind`; `ALL` enumerates the
@@ -488,7 +488,7 @@ The map is caller-selected metadata; content-adaptive strategy selection remains
 the configured integer or floating RGB sRGB/D65 source layout. XYB linearizes sRGB before the opsin transform;
 Original directly transforms the normalized sRGB components. It does not linearize them
 or add support for other source encodings. `color_transform()` reports the selected policy;
-`color_encoding()` reports sRGB/D65; `sample_format().pixel_format()` describes storage. One immutable color plan controls the
+`color_encoding()` reports sRGB/D65; `sample_format().pixel_format()` constructs canonical storage. One immutable color plan controls the
 image's XYB flag, frame syntax, GPU normalization and HF channel multipliers. Original RGB
 omits the XYB-only matrix-scale fields and uses their implicit neutral multipliers.
 LF metadata, matrices, orders and quantizers retain their explicit values in either domain;
@@ -499,11 +499,19 @@ covers all three backends, sequences, progressive passes and independent pixel/c
 `VarDctConfig::sample_format` uses checked `RgbSampleFormat::integer(bits)` for all
 1–31-bit unsigned sources or `RgbSampleFormat::float(bits, exponent_bits)` for all 154
 legal floating precisions (2–8 exponent and 2–23 fraction bits). The default remains RGB8.
-Components occupy separate native-endian words of 1 byte (up to 8 bits), 2 bytes (up to 16),
-or 4 bytes (up to 32), with valid bits right aligned. High padding bits are ignored;
-byte offsets and row pitches may be unaligned. IEEE binary16/binary32 accept either
-`SampleKind::Float` or the equivalent `CustomFloat` spelling. The same immutable plan
-supplies admission, GPU loading/normalization and image bit-depth/exponent metadata.
+The source may be packed, planar or split across full-resolution planes in one buffer, with
+bijective RGB component swizzles, shared or separate 8/16/24/32-bit words, arbitrary valid
+sample bit positions and Native/Little/Big byte order. Component word widths may differ;
+logical sample and exponent widths must agree. Byte offsets and independent row pitches may
+be unaligned, and physical planes may appear in any nonoverlapping order. Padding bits are
+ignored. `sample_format.pixel_format()` remains a canonical native-endian interleaved format
+with separate 1/2/4-byte component words and right-aligned samples.
+
+The shared checked source plan owns physical addressing and per-plane binding windows for
+both Modular and VarDCT; the immutable color/sample plan owns logical normalization and image
+metadata. Neither dispatch path nor the serializer independently reconstructs the layout.
+The same GPU byte/word loader feeds Modular, general/tiled VarDCT and local-contrast ordering.
+IEEE binary16/binary32 accept `SampleKind::Float` or equivalent `CustomFloat` spelling.
 Integers divide by `2^bits - 1`; floats rebase their fields into F32 on GPU.
 
 VarDCT checks raw floating exponent fields on GPU, returning typed
@@ -515,8 +523,8 @@ no arbitrary extended-range reconstruction or general quality guarantee is impli
 Subnormals enter the lossy F32 arithmetic contract; VarDCT is not a bit-preserving float codec.
 General transforms budget per-workgroup completion/error records inside the artifact/readback;
 tiled DCT8 carries errors in its existing block records. Missing or malformed validation
-records cannot publish an artifact. Gray, alpha, ICC, other source colors and other packing
-layouts remain outside the VarDCT contract.
+records cannot publish an artifact. Gray, alpha, ICC, other source colors, subsampling and
+texture inputs remain outside the VarDCT contract.
 
 VarDCT and mixed sequences declare 32-bit Modular working buffers, independently of input
 depth: their quantized LF coefficients are checked i32 values. This corrects the earlier
@@ -526,7 +534,9 @@ and codec working precision are separate; existing quantization-overflow rejecti
 The [integer-input corpus](../../docs/CONFORMANCE_CORPUS.md#integer-rgb-vardct-input) records
 independent coefficient/pixel, source-layout, sequence and ownership evidence; the
 [floating-input corpus](../../docs/CONFORMANCE_CORPUS.md#floating-rgb-vardct-input) adds
-all floating precisions, nonfinite rejection and completion ownership.
+all floating precisions, nonfinite rejection and completion ownership. The
+[source-layout corpus](../../docs/CONFORMANCE_CORPUS.md#shared-encoder-source-layouts) covers
+physical layout variants and per-frame layout changes.
 
 See the compiled configuration example on [`RgbSampleFormat`](src/sample_format.rs).
 
@@ -683,9 +693,10 @@ fallback. The independently concatenable block format relies on the single-distr
 policy; future contextual or ANS encoders must maintain their state on GPU.
 
 `VarDctMemoryPlan::kernel_layout` distinguishes `SingleTransform`, `StrategyMap` and `TiledDct8`. All use
-768-byte parameters and a runtime-sized artifact with a 272-byte header. The former carries
+828-byte parameters and a runtime-sized artifact with a 272-byte header. The former carries
 the pass count, per-pass word stride and eleven spectral/shift descriptors; the latter records
-the pass count. Both record sizes remain unchanged. LF descriptors
+the pass count. The source layout replaces three old geometry/width words with three 24-byte
+component records, increasing parameters by 60 bytes; the artifact header is unchanged. LF descriptors
 follow the header; the subsequent strategy, sample and entropy sections align to 256 bytes. Single-transform plans additionally report exact normalized-color, raw coefficient,
 LF, quantized coefficient, matrix/order, transform-task and forward scratch allocations in `transform`.
 Mapped plans report their aggregate allocation sizes: basis/uniform storage is shared per strategy,
@@ -693,14 +704,16 @@ while all transforms share image-wide color/coefficient/LF/quantized arenas. `xy
 its public name and accounts for either normalized color domain. Each strategy batch
 owns one horizontal scratch allocation and a 20-byte forward task per transform; encoder tasks
 occupy 44 bytes per transform. No GPU allocation is created per individual transform.
-Sources use channel origins within one complete color binding, so small maps also work on devices
-requiring 1024-byte storage offsets without padding each channel allocation.
+Forward transforms use channel origins within one complete normalized-color binding, so small maps
+also work on devices requiring 1024-byte storage offsets without padding each channel allocation.
+Raw input instead uses four aligned plane bindings (unused entries alias the first); the reported
+`source_binding_bytes` is their union, with overlap counted once and gaps between windows excluded.
 Each general-transform matrix/order entry contains three F32 scales and three U32 indices in
-24 bytes. An 8×8 DCT submission owns 12,180 bytes: 768 parameters, 3,072 artifact, 3,072 readback
+24 bytes. An 8×8 DCT submission owns 12,240 bytes: 828 parameters, 3,072 artifact, 3,072 readback
 and 5,268 resident transform bytes. Tiled DCT8 retains the same 24-byte entry layout in a
 1,536-byte matrix/order table at read-only storage binding 3, reported by
 `quantization_metadata_bytes` and included in the
-job's owned bytes. It requires four storage bindings and retains the table through completion
+job's owned bytes. It requires seven storage bindings and retains the table through completion
 or cancellation. No coefficient readback is added.
 Mode-7 selections add `raw_matrix_input_bytes` for immutable sample/descriptor/prefix storage
 and `raw_matrix_artifact_bytes` for compressed fragments and status. `readback_bytes` includes
@@ -840,9 +853,9 @@ encoder.encode(source_13_by_21)
 `MixedModeEncoder::new(context, MixedModeConfig)` accepts explicit per-frame choices through
 `MixedModeFrameEncoding::{Modular, VarDct}`. `begin_sequence(RgbSequenceDescriptor)` creates
 one layered still or animation with a shared integer/floating RGB sRGB/D65 image contract. Both codecs
-use the precision in `config.vardct.sample_format` (1–31 integer bits or a legal floating precision, default RGB8) and the interleaved
-format returned by `encoder.sample_format().pixel_format()`;
-unaligned offsets and padded pitches remain supported. The default config uses original-RGB
+use the precision in `config.vardct.sample_format` (1–31 integer bits or a legal floating precision, default RGB8) and the
+logical RGB/default-sRGB contract. Each physical frame may independently select any supported
+packed, planar or split layout, swizzle, bit position and word byte order; precision and color stay fixed. The default config uses original-RGB
 VarDCT, tiled DCT8 and default lossless Modular. An explicit XYB configuration is rejected.
 
 `MixedModeConfig` fixes each codec's policy. `vardct_transform` selects `TiledDct8`,

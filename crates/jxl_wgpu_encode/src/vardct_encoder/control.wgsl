@@ -1,10 +1,8 @@
 // Shared checked artifact ABI and deterministic entropy/control writers.
 
-// Exactly 768 bytes. All artifact offsets and lengths are expressed in u32
+// Exactly 828 bytes. All artifact offsets and lengths are expressed in u32
 // words and are independently checked by the host before dispatch.
 struct Params {
-    row_stride: u32,
-    byte_offset: u32,
     width: u32,
     height: u32,
     blocks_x: u32,
@@ -43,16 +41,19 @@ struct Params {
     saliency_offset: u32,
     saliency_groups: u32,
     color_normalization: u32,
-    source_word_bytes: u32,
     source_sample_mask: u32,
     source_exponent_bits: u32,
     source_validation_offset: u32,
     source_validation_groups: u32,
-    padding: array<u32, 1>,
+    source_big_endian: u32,
+    sources: array<Source, 3>,
 }
 
 @group(0) @binding(0)
 var<storage, read> source_words: array<u32>;
+@group(0) @binding(12) var<storage, read> source_words_1: array<u32>;
+@group(0) @binding(13) var<storage, read> source_words_2: array<u32>;
+@group(0) @binding(14) var<storage, read> source_words_3: array<u32>;
 
 @group(0) @binding(1)
 var<storage, read> params: Params;

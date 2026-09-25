@@ -75,7 +75,7 @@ impl Pipeline {
         &self,
         device: &wgpu::Device,
         commands: &mut wgpu::CommandEncoder,
-        source: wgpu::BufferBinding<'_>,
+        sources: [wgpu::BindGroupEntry<'_>; 4],
         parameters: &wgpu::Buffer,
         artifact: &wgpu::Buffer,
         frame: VarDctFrameLayout,
@@ -84,10 +84,10 @@ impl Pipeline {
             label: Some("VarDCT saliency bindings"),
             layout: &self.0.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(source),
-                },
+                sources[0].clone(),
+                sources[1].clone(),
+                sources[2].clone(),
+                sources[3].clone(),
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: parameters.as_entire_binding(),

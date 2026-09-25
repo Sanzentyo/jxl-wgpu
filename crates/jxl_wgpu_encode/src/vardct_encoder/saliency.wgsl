@@ -4,11 +4,11 @@
 // Integer arithmetic preserves exact RGB8 behavior and workgroup-independent sums.
 var<workgroup> contrast_sums: array<u32, 256>;
 
-fn saliency_sample(address: u32) -> i32 {
+fn saliency_sample(x: u32, y: u32, component: u32) -> i32 {
+    let value = source_sample(x, y, component);
     if params.source_exponent_bits != 0u {
-        return i32(round(clamp(normalize_source_sample(address), 0.0, 1.0) * 255.0));
+        return i32(round(clamp(normalize_source_sample(value), 0.0, 1.0) * 255.0));
     }
-    let value = load_source_sample(address);
     let mask = params.source_sample_mask;
     if mask < 255u { return i32((value * 255u + mask / 2u) / mask); }
     return i32(value >> (24u - countLeadingZeros(mask)));
@@ -24,13 +24,10 @@ fn group_saliency(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invoca
     for (var pixel = lane; pixel < width * height; pixel += wg_x) {
         let x = left + pixel % width;
         let y = top + pixel / width;
-        let pixel_stride = 3u * params.source_word_bytes;
-        let address = params.byte_offset + y * params.row_stride + x * pixel_stride;
         for (var channel = 0u; channel < 3u; channel += 1u) {
-            let component = address + channel * params.source_word_bytes;
-            let value = saliency_sample(component);
-            if x > 0u { sum += u32(abs(value - saliency_sample(component - pixel_stride))); }
-            if y > 0u { sum += u32(abs(value - saliency_sample(component - params.row_stride))); }
+            let value = saliency_sample(x, y, channel);
+            if x > 0u { sum += u32(abs(value - saliency_sample(x - 1u, y, channel))); }
+            if y > 0u { sum += u32(abs(value - saliency_sample(x, y - 1u, channel))); }
         }
     }
     // A group has at most 131072 directed edges, each contributing at most 765.

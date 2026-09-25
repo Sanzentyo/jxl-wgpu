@@ -15,5 +15,6 @@ pub mod patches;
 pub mod preview;
 pub mod progressive_layers;
 pub mod resampling;
+pub mod source_layout;
 pub mod splines;
 pub mod tone_mapping;

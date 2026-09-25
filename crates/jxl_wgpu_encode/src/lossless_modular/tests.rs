@@ -174,8 +174,10 @@ mod native_tests {
 
     #[test]
     fn naga_validates_the_streaming_modular_shader() {
-        let module = naga::front::wgsl::parse_str(&jxl_wgpu::modular_prediction_shader(SHADER))
-            .expect("Modular WGSL parses");
+        let module = naga::front::wgsl::parse_str(&jxl_wgpu::modular_prediction_shader(
+            &crate::source::shader(SHADER),
+        ))
+        .expect("Modular WGSL parses");
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::empty(),
@@ -303,14 +305,14 @@ mod native_tests {
             for bits_per_sample in 1..=31 {
                 let pixel_format = format.pixel_format(bits_per_sample).unwrap();
                 let spec = lossless_modular_source_spec(&pixel_format).unwrap();
-                assert_eq!(spec.format, format);
-                assert_eq!(spec.bits_per_sample, bits_per_sample);
+                assert_eq!(spec.packing.format, format);
+                assert_eq!(spec.packing.bits_per_sample, bits_per_sample);
                 assert_eq!(
-                    spec.bytes_per_sample,
+                    spec.packing.bytes_per_sample,
                     bits_per_sample.next_power_of_two().max(8) / 8
                 );
                 let word = &pixel_format.planes[0].words[0];
-                assert_eq!(word.bits(), u32::from(spec.bytes_per_sample) * 8);
+                assert_eq!(word.bits(), u32::from(spec.packing.bytes_per_sample) * 8);
                 assert!(matches!(
                     word.fields.last().map(|field| field.kind),
                     Some(PackingFieldKind::Channel(Channel::X))
@@ -319,10 +321,10 @@ mod native_tests {
             for (bits, exponent) in [(16, 5), (32, 8)] {
                 let pixel_format = format.float_pixel_format(bits).unwrap();
                 let spec = lossless_modular_source_spec(&pixel_format).unwrap();
-                assert_eq!(spec.format, format);
-                assert_eq!(spec.bits_per_sample, bits);
-                assert_eq!(spec.bytes_per_sample, bits / 8);
-                assert_eq!(spec.exponent_bits_per_sample, exponent);
+                assert_eq!(spec.packing.format, format);
+                assert_eq!(spec.packing.bits_per_sample, bits);
+                assert_eq!(spec.packing.bytes_per_sample, bits / 8);
+                assert_eq!(spec.packing.exponent_bits_per_sample, exponent);
             }
             for bits in [0, 8, 24, 64] {
                 assert!(matches!(

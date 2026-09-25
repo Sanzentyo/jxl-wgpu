@@ -262,8 +262,9 @@ pub enum VarDctKernelLayout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VarDctMemoryPlan {
     pub kernel_layout: VarDctKernelLayout,
-    /// Source bytes made addressable by the storage binding. The caller owns
-    /// this allocation, so it is not charged to `owned_bytes_per_job`.
+    /// Union of bytes made addressable by the source plane bindings, counting alignment
+    /// overlap once and excluding gaps between windows. The caller owns the allocation;
+    /// these bytes are not charged to `owned_bytes_per_job`.
     pub source_binding_bytes: u64,
     pub parameter_storage_bytes: u64,
     pub artifact_storage_bytes: u64,
@@ -372,8 +373,6 @@ pub(super) struct GpuPrefixEntry {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub(super) struct VarDctKernelParams {
-    pub(super) row_stride: u32,
-    pub(super) byte_offset: u32,
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) blocks_x: u32,
@@ -412,12 +411,12 @@ pub(super) struct VarDctKernelParams {
     pub(super) saliency_offset: u32,
     pub(super) saliency_groups: u32,
     pub(super) color_normalization: u32,
-    pub(super) source_word_bytes: u32,
     pub(super) source_sample_mask: u32,
     pub(super) source_exponent_bits: u32,
     pub(super) source_validation_offset: u32,
     pub(super) source_validation_groups: u32,
-    pub(super) padding: [u32; 1],
+    pub(super) source_big_endian: u32,
+    pub(super) sources: [crate::source::SourceParams; 3],
 }
 
 #[repr(C)]
@@ -471,7 +470,7 @@ pub(super) struct DcFragmentDescriptor {
 const _: () = {
     assert!(std::mem::size_of::<GpuPrefixEntry>() == 8);
     assert!(std::mem::align_of::<GpuPrefixEntry>() == 4);
-    assert!(std::mem::size_of::<VarDctKernelParams>() == 768);
+    assert!(std::mem::size_of::<VarDctKernelParams>() == 828);
     assert!(std::mem::align_of::<VarDctKernelParams>() == 4);
     assert!(std::mem::size_of::<VarDctArtifactHeader>() == 272);
     assert!(std::mem::align_of::<VarDctArtifactHeader>() == 4);

@@ -22,7 +22,7 @@ pub(super) struct Pipeline {
 
 pub(super) struct Inputs<'a> {
     pub(super) plan: &'a TransformPlan,
-    pub(super) source: wgpu::BufferBinding<'a>,
+    pub(super) sources: [wgpu::BindGroupEntry<'a>; 4],
     pub(super) parameters: &'a wgpu::Buffer,
     pub(super) artifact: &'a wgpu::Buffer,
 }
@@ -146,10 +146,10 @@ impl Pipeline {
             commands,
             &self.normalize,
             &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(inputs.source),
-                },
+                inputs.sources[0].clone(),
+                inputs.sources[1].clone(),
+                inputs.sources[2].clone(),
+                inputs.sources[3].clone(),
                 entry(1, inputs.parameters),
                 entry(2, inputs.artifact),
                 entry(5, &components),

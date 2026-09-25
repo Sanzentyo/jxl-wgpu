@@ -1,8 +1,3 @@
-use jxl_gpu_formats::{
-    ByteOrder, Channel, ChromaSubsampling, ColorModel, ColorSpecification, PackingField,
-    PackingWord, PixelFormat, PlaneFormat, PlaneSampling, SampleKind, Swizzle,
-};
-
 use crate::EncodeError;
 use crate::prefix::{LZ77_SYMBOLS, RAW_SYMBOLS};
 
@@ -11,16 +6,7 @@ pub const LOSSLESS_MODULAR_GROUP_DIMENSION: u32 = LosslessModularGroupSize::Pixe
 pub(super) const SHADER: &str = include_str!("../lossless_modular.wgsl");
 pub(super) const MAX_DISPATCHES_PER_ARTIFACT_BINDING: usize = 64;
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub(super) struct ModularSourceParams {
-    pub(super) row_stride: u32,
-    pub(super) byte_offset: u32,
-    pub(super) pixel_stride: u32,
-    pub(super) word_bytes: u32,
-    pub(super) bit_shift: u32,
-    pub(super) plane: u32,
-}
+pub(super) use crate::source::SourceParams as ModularSourceParams;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -95,14 +81,7 @@ const _: () = {
     assert!(std::mem::align_of::<ModularEvent>() == 4);
 };
 
-/// Standard lossless Modular input profile selected from a pitch-linear source descriptor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LosslessModularFormat {
-    Gray,
-    GrayAlpha,
-    Rgb,
-    Rgba,
-}
+pub use crate::source::SourceChannels as LosslessModularFormat;
 
 /// Interpretation of caller-supplied color samples relative to the alpha plane.
 /// Encoding preserves the source words, including color at zero alpha; it never multiplies,
@@ -210,133 +189,6 @@ pub struct LosslessModularConfig {
     pub local_transforms: super::local_transforms::LosslessModularLocalTransforms,
     /// Optional exact local palette built on GPU after source RCT and before local transforms.
     pub palette: Option<super::palette::LosslessModularPalette>,
-}
-
-impl LosslessModularFormat {
-    #[must_use]
-    pub const fn channel_count(self) -> u32 {
-        match self {
-            Self::Gray => 1,
-            Self::GrayAlpha => 2,
-            Self::Rgb => 3,
-            Self::Rgba => 4,
-        }
-    }
-
-    #[must_use]
-    pub const fn has_alpha(self) -> bool {
-        matches!(self, Self::GrayAlpha | Self::Rgba)
-    }
-
-    #[must_use]
-    pub const fn color_channel_count(self) -> u32 {
-        match self {
-            Self::Gray | Self::GrayAlpha => 1,
-            Self::Rgb | Self::Rgba => 3,
-        }
-    }
-
-    /// Constructs the canonical pitch-linear source format for an unsigned integer depth.
-    ///
-    /// Depths `1..=8` use one native-endian `u8` word per component. Depths `9..=16` use one
-    /// native-endian `u16` word per component, and `17..=31` use `u32`. Samples occupy the low bits;
-    /// the high padding bits are outside the valid sample and are ignored by the encoder.
-    pub fn pixel_format(self, bits_per_sample: u8) -> Result<PixelFormat, EncodeError> {
-        if !(1..=31).contains(&bits_per_sample) {
-            return Err(EncodeError::InvalidConfiguration(
-                "lossless Modular integer depth must be in 1..=31",
-            ));
-        }
-        Ok(self.packed_pixel_format(bits_per_sample, SampleKind::Unsigned))
-    }
-
-    /// Constructs native IEEE binary16 or binary32 storage, preserving every source bit.
-    ///
-    /// Components remain in the declared sRGB/gray domain. No floating-point arithmetic,
-    /// normalization or alpha association is performed by the lossless encoder.
-    pub fn float_pixel_format(self, bits_per_sample: u8) -> Result<PixelFormat, EncodeError> {
-        if !matches!(bits_per_sample, 16 | 32) {
-            return Err(EncodeError::InvalidConfiguration(
-                "lossless Modular floating storage must be binary16 or binary32",
-            ));
-        }
-        Ok(self.packed_pixel_format(bits_per_sample, SampleKind::Float))
-    }
-
-    /// Constructs raw binary floating storage with explicitly checked sample/exponent widths.
-    /// Like integer input, each component occupies the low bits of an 8/16/32-bit word.
-    /// All components, including alpha, share this precision. No F32 conversion occurs.
-    ///
-    /// ```
-    /// use jxl_gpu_formats::{FloatPrecision, SampleKind};
-    /// use jxl_wgpu_encode::LosslessModularFormat;
-    /// let precision = FloatPrecision::new(24, 7).unwrap();
-    /// let format = LosslessModularFormat::Rgba.custom_float_pixel_format(precision);
-    /// assert_eq!(format.sample_kind, SampleKind::CustomFloat(precision));
-    /// format.validate().unwrap();
-    /// ```
-    #[must_use]
-    pub fn custom_float_pixel_format(
-        self,
-        precision: jxl_gpu_formats::FloatPrecision,
-    ) -> PixelFormat {
-        self.packed_pixel_format(precision.bits(), SampleKind::CustomFloat(precision))
-    }
-
-    fn packed_pixel_format(self, bits_per_sample: u8, sample_kind: SampleKind) -> PixelFormat {
-        let storage_bits = bits_per_sample.next_power_of_two().max(8);
-        let (model, color_spec, swizzle, channels): (_, _, _, &[Channel]) = match self {
-            Self::Gray => (
-                ColorModel::NonColor,
-                ColorSpecification::Undefined,
-                Swizzle::X000,
-                &[Channel::X],
-            ),
-            Self::GrayAlpha => (
-                ColorModel::Gray,
-                ColorSpecification::Default,
-                Swizzle::X00W,
-                &[Channel::X, Channel::W],
-            ),
-            Self::Rgb => (
-                ColorModel::Rgb,
-                ColorSpecification::Default,
-                Swizzle::XYZ1,
-                &[Channel::X, Channel::Y, Channel::Z],
-            ),
-            Self::Rgba => (
-                ColorModel::Rgb,
-                ColorSpecification::Default,
-                Swizzle::XYZW,
-                &[Channel::X, Channel::Y, Channel::Z, Channel::W],
-            ),
-        };
-        let words = channels
-            .iter()
-            .copied()
-            .map(|channel| {
-                let mut fields = Vec::with_capacity(2);
-                if bits_per_sample < storage_bits {
-                    fields.push(PackingField::padding(storage_bits - bits_per_sample));
-                }
-                fields.push(PackingField::channel(channel, bits_per_sample));
-                PackingWord { fields }
-            })
-            .collect();
-        PixelFormat {
-            model,
-            color_spec,
-            chroma_subsampling: ChromaSubsampling::None,
-            sample_kind,
-            byte_order: ByteOrder::Native,
-            swizzle,
-            planes: vec![PlaneFormat {
-                sampling: PlaneSampling::FULL,
-                pixels_per_element: 1,
-                words,
-            }],
-        }
-    }
 }
 
 pub(super) const fn modular_sample_depth(

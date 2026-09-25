@@ -2,14 +2,7 @@ override squeeze_enabled: bool = false;
 override palette_enabled: bool = false;
 override transform_program_enabled: bool = false;
 
-struct Source {
-    row_stride: u32,
-    byte_offset: u32,
-    pixel_stride: u32,
-    word_bytes: u32,
-    bit_shift: u32,
-    plane: u32,
-}
+/*__JXL_SOURCE__*/
 
 struct Params {
     width: u32,
@@ -100,27 +93,8 @@ fn wp_store_row(index: u32, true_error: i32, errors: array<u32, 4>) {
 }
 fn predictor_error() { output_words[active_params.output_word_offset] = EVENT_OVERFLOW; }
 
-fn source_byte(plane: u32, byte_index: u32) -> u32 {
-    var word: u32;
-    switch plane {
-        case 0u: { word = source_words[byte_index >> 2u]; }
-        case 1u: { word = source_words_1[byte_index >> 2u]; }
-        case 2u: { word = source_words_2[byte_index >> 2u]; }
-        default: { word = source_words_3[byte_index >> 2u]; }
-    }
-    let shift = (byte_index & 3u) * 8u;
-    return (word >> shift) & 255u;
-}
-
 fn source_component(params: Params, x: u32, y: u32, component: u32) -> i32 {
-    let source = params.sources[component];
-    let byte_index = source.byte_offset + y * source.row_stride + x * source.pixel_stride;
-    var value = 0u;
-    for (var byte = 0u; byte < source.word_bytes; byte += 1u) {
-        let shift = select(byte, source.word_bytes - 1u - byte, params.big_endian != 0u) * 8u;
-        value |= source_byte(source.plane, byte_index + byte) << shift;
-    }
-    return bitcast<i32>((value >> source.bit_shift) & params.sample_mask);
+    return bitcast<i32>(load_source_component(params.sources[component], x, y, params.big_endian, params.sample_mask));
 }
 
 fn add_wrap(a: i32, b: i32) -> i32 {

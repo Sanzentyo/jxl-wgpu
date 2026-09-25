@@ -1747,7 +1747,7 @@ output. Source normalization precision and validated i32 LF working precision ar
 Forty saliency runs cover 1/9/17/31 bits, both GPU paths and Scalar/32/64/128/256 lanes.
 An independent U64 pixel-edge traversal checks exact sums for the bounded 8-bit proxy;
 forward transforms retain full source precision. Six precision boundaries exercise both
-paths' source admission, wrong precision/endianness/kind, malformed row/binding arithmetic,
+paths' source admission, wrong precision/color/kind, malformed row/binding arithmetic,
 exact and one-byte-deficient budgets, competing jobs, cancellation, release and reuse.
 
 Twelve three-frame fixed-codec sequences cover 9/16/31 bits, both coding domains, stills
@@ -1769,7 +1769,7 @@ whole-stream comparisons.
 Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib integer_precision -- --test-threads=2`,
 with both required scalar/word oracle paths from the development procedure. No fixtures,
 reference data or existing numerical bounds are replaced. Gray/alpha,
-ICC/other colors and arbitrary packing remain outside this capability.
+ICC/other colors remain outside this capability; physical packing is covered separately below.
 
 ## Floating RGB VarDCT input
 
@@ -1809,7 +1809,7 @@ pixels, rotating channels, through mapped XYB and tiled original RGB (1,232 jobs
 returns `VarDctNonFiniteSource` before artifacts and immediately releases its entire budget.
 The map callback now releases its lifetime reference before notifying completion, eliminating
 a race exposed by fast rejection. Four precision boundaries on both paths test mismatched
-exponents/kind/endianness, malformed source arithmetic, exact and one-byte-short budgets,
+exponents/kind/color, malformed source arithmetic, exact and one-byte-short budgets,
 competing admission, cancellation and reuse. CPU artifact tests reject missing/corrupt
 normalization stamps and padding under single/eleven passes with optional saliency.
 
@@ -1832,8 +1832,61 @@ Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib floating_precision -
 with required scalar/word oracle paths from the development procedure. No fixtures, native
 oracles or existing numerical bounds are replaced. VarDCT accepts only finite source samples;
 selected Modular frames retain their separate raw-word contract. Gray/alpha, ICC, other source
-colors/packing, general extended-range XYB quality and adaptive quantization remain outside
+colors, general extended-range XYB quality and adaptive quantization remain outside
 this evidence.
+
+## Shared encoder source layouts
+
+`vardct_encoder/tests/layouts.rs` and `tests/animation/sample_precision.rs` exercise the
+shared checked source plan and GPU word loader on Apple M5/Metal (2026-09-25). Existing
+Modular packed/planar/split, RCT/Palette/Squeeze, streaming and raw floating-word corpora
+consume the same implementation. Their independent references and case matrices are retained.
+The adversarial byte packer is shared test support in `fixtures::source_layout`; it neither
+calls the production source planner nor normalizes samples.
+
+All 31 integer and 154 floating precisions cross both XYB and original sRGB. Each of the
+370 canonical DCT8 images is independently checked against native/Rust/GPU pixels with the
+existing `2e-4 * (1 + abs(reference))` F32 bound, at most one rounded RGB8 code, identical
+whole/256-byte-window GPU output and source PSNR above 30 dB at `(35252, 256, 48)` quantizers.
+Three additional packed/planar/split sources per case must emit exactly the same codestream:
+1,480 encodes total. Layouts reverse RGB components, shift sample fields, change byte order,
+reverse physical plane order and poison unaligned prefixes, row padding and inter-plane gaps.
+This is byte equivalence to independently verified output, not a codec self-roundtrip.
+
+Another 44 canonical images cross seven integer and four floating precisions with both
+color domains, a 25×17 strategy map and 259×3 tiled DCT8. Five-pass progression and GPU saliency
+ordering are enabled. Their 408 layout variants include shared words, mixed component word
+widths, 24-bit words, planar/split storage, shifts and both little/big endian; every output
+matches its independently checked canonical image byte for byte. An additional 36 comparisons
+cover all six RGB permutations across packed/planar/split layouts at integer7 and binary16.
+Forty runs cross four precision boundaries, both GPU paths and all five workgroup variants;
+independent U64 pixel-edge sums verify saliency over logical samples from planar big-endian input.
+
+Twenty-six three-frame sequences vary layout and byte order per physical frame: 18 mixed
+integer7/binary16 streams across all three VarDCT backends, and eight fixed-VarDCT integer16/
+float24 streams across both color domains. Stills and animation, reference-only/cropped
+Add/Multiply and the existing floating full-canvas Replace cases, reverse completion insertion,
+five regular passes, native exact Modular words and indexed presentation checks are retained.
+Each physical still additionally matches its canonical input's bytes. The external floating
+whole-stream oracle limitations and independent composition checks documented above remain
+unchanged.
+
+A separate 216-job matrix puts infinity and NaN in every logical component's final sample,
+across four precisions, three layouts and both GPU paths. All must return typed nonfinite
+errors before publication and release their reservation. Integer31/float24 planar and split
+sources test mismatched public layout fields, overlap, stride/offset overflow, invalid swizzles
+and color before admission, exact/one-byte-deficient budgets, competing jobs, cancellation and
+completion/reuse. Completed host packets no longer retain GPU storage. Host tests check every
+integer field position, rebasing of plane offsets beyond u32 without binding gaps, aligned-window
+union accounting, region bounds, final-word padding and typed seven-binding device admission.
+Rust ABI checks and Naga reflection cover the 828-byte VarDCT parameters and 24-byte shared
+component records; Modular's 256-byte parameter and both artifact formats remain unchanged.
+
+Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib source_layouts -- --test-threads=2`,
+with the existing required native oracle paths. Full workspace gates include the unchanged
+Modular layout/transform/streaming targets. Gray/alpha and non-default color remain outside
+VarDCT's source contract; subsampling, CMYK/arbitrary extras and textures still need broader
+plans. No fixtures, reference data, tolerances or native oracles are replaced.
 
 ## Mixed-codec sequence encoding
 

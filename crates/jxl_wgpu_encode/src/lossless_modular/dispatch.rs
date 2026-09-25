@@ -9,7 +9,6 @@ use super::memory::{
     LosslessModularMemoryLimits, LosslessModularMemoryPlan, align_up, event_capacity,
 };
 use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
-use super::source::{ModularSourceLayout, ModularSourceWindows};
 use super::streaming::{
     EncodeJobLifetime, LosslessModularJob, LosslessModularJobState, MapCompletion,
     ResidentLosslessModularJob,
@@ -22,6 +21,7 @@ use super::types::{
 };
 use crate::buffer_pool::EncoderBufferPool;
 use crate::frame_header::FrameHeaderPlan;
+use crate::source::{SourceLayout, SourceWindows};
 use crate::{
     BackendError, DEFAULT_ENCODER_BUFFER_POOL_BYTES, Determinism, EncodeError, EncodeProfile,
     EncoderBufferPoolStats, EncoderCapabilities, FrameEncodeRequest, GpuEncodeBackend,
@@ -89,7 +89,7 @@ pub(super) struct ModularDispatchBatch {
     pub(super) dispatch_count: usize,
     pub(super) artifact_byte_offset: u64,
     pub(super) artifact_binding_size: NonZeroU64,
-    pub(super) source_windows: ModularSourceWindows,
+    pub(super) source_windows: SourceWindows,
     pub(super) parameter_bytes: u64,
     pub(super) entropy: Option<EntropyBatchPlan>,
 }
@@ -159,18 +159,19 @@ impl LosslessModularBackend {
     #[must_use]
     pub fn with_config(context: &WgpuContext, config: LosslessModularConfig) -> Self {
         let limits = context.device().limits();
-        let pipeline =
-            (limits.max_storage_buffers_per_shader_stage >= 6).then(|| {
-                let module = context
+        let pipeline = (limits.max_storage_buffers_per_shader_stage >= 6).then(|| {
+            let module = context
+                .device()
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("jxl-wgpu lossless modular token kernel"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        jxl_wgpu::modular_prediction_shader(&crate::source::shader(SHADER)).into(),
+                    ),
+                });
+            Arc::new(
+                context
                     .device()
-                    .create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some("jxl-wgpu lossless modular token kernel"),
-                        source: wgpu::ShaderSource::Wgsl(
-                            jxl_wgpu::modular_prediction_shader(SHADER).into(),
-                        ),
-                    });
-                Arc::new(context.device().create_compute_pipeline(
-                    &wgpu::ComputePipelineDescriptor {
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                         label: Some("jxl-wgpu lossless modular token pipeline"),
                         layout: None,
                         module: &module,
@@ -193,9 +194,9 @@ impl LosslessModularBackend {
                             ..Default::default()
                         },
                         cache: None,
-                    },
-                ))
-            });
+                    }),
+            )
+        });
         Self {
             ans_pipeline: (pipeline.is_some()
                 && config.entropy == LosslessModularEntropyCoding::Ans)
@@ -340,7 +341,8 @@ impl LosslessModularBackend {
             extent.height,
             self.config.group_size,
         )?;
-        let source_layout = ModularSourceLayout::new(
+        let source_color = super::color::ModularColorEncoding::from_format(&source.layout.format)?;
+        let source_layout = SourceLayout::new(
             &source.layout,
             source.buffer.size(),
             self.storage_offset_alignment,
@@ -399,7 +401,7 @@ impl LosslessModularBackend {
         let mut output_size = 0u64;
         let mut batch_first_dispatch = 0usize;
         let mut batch_artifact_offset = 0u64;
-        let mut batch_source_windows = ModularSourceWindows::default();
+        let mut batch_source_windows = SourceWindows::default();
         for group in group_grid.ordered_groups() {
             let topology = transforms.group(group)?;
             let channels = topology.channels.len() as u32;
@@ -410,7 +412,7 @@ impl LosslessModularBackend {
                 .transform_program
                 .as_ref()
                 .map_or(0, |program| program.scratch_bytes());
-            let group_source = source_layout.group(group)?;
+            let group_source = source_layout.region(group.x, group.y, group.width, group.height)?;
             group_source
                 .windows
                 .validate(self.max_storage_binding_size)?;
@@ -492,7 +494,7 @@ impl LosslessModularBackend {
                     },
                 )?);
                 batch_first_dispatch = parameters.len();
-                batch_source_windows = ModularSourceWindows::default();
+                batch_source_windows = SourceWindows::default();
                 output_size =
                     output_size
                         .checked_add(profile_bytes)
@@ -829,8 +831,7 @@ impl LosslessModularBackend {
             .checked_add(readback_bytes)
             .and_then(|value| value.checked_add(parameter_storage_bytes))
             .ok_or(EncodeError::InvalidSource("per-job memory size overflow"))?;
-        let icc_profile_bytes = source_spec
-            .color
+        let icc_profile_bytes = source_color
             .icc_profile()
             .map_or(0, |profile| profile.bytes().len() as u64);
         let addressed_bytes_per_job = owned_bytes_per_job
@@ -916,7 +917,7 @@ impl LosslessModularBackend {
     }
 }
 struct ModularBatchFinalizeContext<'a> {
-    source_windows: ModularSourceWindows,
+    source_windows: SourceWindows,
     absolute_source_offsets: &'a [[u64; 4]],
     parameters: &'a mut [ModularParams],
     max_storage_binding_size: u64,
@@ -972,7 +973,7 @@ fn modular_dispatch_batch(
         .validate(context.max_storage_binding_size)?;
     for index in dispatches {
         context.source_windows.rebase(
-            &mut context.parameters[index],
+            &mut context.parameters[index].sources[..context.parameters[index].channels as usize],
             context.absolute_source_offsets[index],
         )?;
     }
@@ -1064,7 +1065,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
                         "artifact batch parameter size overflow",
                     ))?;
                 let [source0, source1, source2, source3] =
-                    batch.source_windows.entries(&source.buffer);
+                    batch.source_windows.entries(&source.buffer, [0, 3, 4, 5]);
                 Ok((
                     context
                         .device()

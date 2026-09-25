@@ -32,7 +32,7 @@ fn layers(width: usize, height: usize, animated: bool) -> Vec<Layer> {
     .collect()
 }
 
-fn check_mixed_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>) {
+fn check_mixed_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>, vary_layout: bool) {
     let backend = backend();
     let context = WgpuContext::from_backend(&backend);
     let pixels = color::PixelOracles::new(&backend);
@@ -101,6 +101,19 @@ fn check_mixed_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>) {
                                 );
                             }
                         }
+                        let source = if vary_layout {
+                            let alternate = layouts::sequence_source(
+                                &context,
+                                Extent2d::new(w as u32, h as u32),
+                                sample,
+                                &input,
+                                i,
+                            );
+                            assert_eq!(stills.encode(alternate.clone(), mode), baseline);
+                            alternate
+                        } else {
+                            source
+                        };
                         inputs.push((source, mode));
                     }
                     for (i, ((source, mode), layer)) in inputs.into_iter().zip(&layers).enumerate()
@@ -170,7 +183,7 @@ fn check_mixed_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>) {
     assert_eq!(context.memory_stats().reserved_bytes, 0);
 }
 
-fn check_vardct_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>) {
+fn check_vardct_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>, vary_layout: bool) {
     let backend = backend();
     let context = WgpuContext::from_backend(&backend);
     let pixels = color::PixelOracles::new(&backend);
@@ -195,6 +208,19 @@ fn check_vardct_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>) {
                     let source = input_source(&context, w, h, sample, &input);
                     let baseline = encoder.encode(source.clone()).unwrap();
                     samples.push(check_pixels(&pixels, &baseline, &input, sample));
+                    let source = if vary_layout {
+                        let alternate = layouts::sequence_source(
+                            &context,
+                            Extent2d::new(w as u32, h as u32),
+                            sample,
+                            &input,
+                            i,
+                        );
+                        assert_eq!(encoder.encode(alternate.clone()).unwrap(), baseline);
+                        alternate
+                    } else {
+                        source
+                    };
                     inputs.push(source);
                 }
                 for (i, (source, layer)) in inputs.into_iter().zip(&layers).enumerate() {
@@ -290,20 +316,42 @@ fn check_pixels(
 fn integer_precision_mixed_sequences_share_depth_across_codecs_and_reference_frames() {
     check_mixed_sequences(
         [1, 9, 16, 17, 24, 31].map(|bits| RgbSampleFormat::integer(bits).unwrap()),
+        false,
     );
 }
 
 #[test]
 fn integer_precision_vardct_sequences_bind_precision_with_both_color_domains() {
-    check_vardct_sequences([9, 16, 31].map(|bits| RgbSampleFormat::integer(bits).unwrap()));
+    check_vardct_sequences(
+        [9, 16, 31].map(|bits| RgbSampleFormat::integer(bits).unwrap()),
+        false,
+    );
 }
 
 #[test]
 fn floating_precision_mixed_sequences_share_precision_across_codecs_and_reference_frames() {
-    check_mixed_sequences(float_formats());
+    check_mixed_sequences(float_formats(), false);
 }
 
 #[test]
 fn floating_precision_vardct_sequences_bind_precision_with_both_color_domains() {
-    check_vardct_sequences(float_formats());
+    check_vardct_sequences(float_formats(), false);
+}
+
+#[test]
+fn source_layouts_vary_per_frame_in_mixed_and_vardct_sequences() {
+    check_mixed_sequences(
+        [
+            RgbSampleFormat::integer(7).unwrap(),
+            RgbSampleFormat::float(16, 5).unwrap(),
+        ],
+        true,
+    );
+    check_vardct_sequences(
+        [
+            RgbSampleFormat::integer(16).unwrap(),
+            RgbSampleFormat::float(24, 7).unwrap(),
+        ],
+        true,
+    );
 }

@@ -464,7 +464,7 @@ fn integer_precision_rejects_mismatches_before_admission_and_releases_canceled_j
                 .pixel_format();
             invalid.push(wrong);
             let mut wrong = source.clone();
-            wrong.layout.format.byte_order = ByteOrder::Big;
+            wrong.layout.format.color_spec = ColorSpecification::Undefined;
             invalid.push(wrong);
             let mut wrong = source.clone();
             wrong.layout.format.sample_kind = SampleKind::Signed;

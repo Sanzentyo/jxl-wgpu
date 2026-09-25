@@ -8,14 +8,16 @@ use jxl_gpu_formats::{
 
 use crate::EncodeError;
 
-/// Stream-wide precision and canonical storage for sRGB/D65 components.
+/// Stream-wide precision for sRGB/D65 components, independent of physical source layout.
 ///
-/// Each component occupies a native-endian word: one byte for 1–8 bits, two for
-/// 9–16, and four for 17–32. Integers support 1–31 bits; floating samples support
-/// all checked [`FloatPrecision`] combinations. Valid bits are right aligned; unused
-/// high bits are ignored. RGB components are interleaved, with independently checked
-/// row padding and byte offsets. VarDCT converts finite floating samples on GPU and
-/// rejects NaN/infinity before publishing a frame; Modular preserves raw words.
+/// Integers support 1–31 bits; floating samples support all checked [`FloatPrecision`]
+/// combinations. Sources may be packed, planar or split, with bijective RGB swizzles,
+/// shared or separate 8/16/24/32-bit words, declared byte order and sample bit positions.
+/// Every plane's extent, byte offset, row pitch and bounded GPU binding is checked.
+/// [`Self::pixel_format`] constructs canonical native-endian interleaved RGB with one
+/// 1/2/4-byte word per component and valid bits right aligned. Other valid layouts retain
+/// the same logical precision. VarDCT converts finite floating samples on GPU and rejects
+/// NaN/infinity before publishing a frame; Modular preserves raw words.
 ///
 /// ```rust
 /// use jxl_wgpu_encode::{RgbSampleFormat, VarDctConfig};
@@ -88,6 +90,7 @@ impl RgbSampleFormat {
         }
     }
 
+    /// Component word width in the canonical layout returned by `pixel_format`.
     #[must_use]
     pub const fn word_bytes(self) -> u8 {
         match self.bits_per_sample() {
@@ -110,6 +113,7 @@ impl RgbSampleFormat {
         }
     }
 
+    /// Construct canonical native-endian interleaved storage for this logical precision.
     #[must_use]
     pub fn pixel_format(self) -> PixelFormat {
         PixelFormat {
@@ -146,13 +150,14 @@ impl RgbSampleFormat {
     }
 
     pub(crate) fn matches_format(self, format: &PixelFormat) -> bool {
-        let mut expected = self.pixel_format();
-        if let SampleKind::CustomFloat(p) = format.sample_kind
-            && self.float_precision() == Some(p)
-        {
-            expected.sample_kind = format.sample_kind;
-        }
-        expected == *format
+        let Ok(spec) = crate::source::source_spec(format) else {
+            return false;
+        };
+        format.model == ColorModel::Rgb
+            && format.color_spec == ColorSpecification::Default
+            && spec.format == crate::source::SourceChannels::Rgb
+            && spec.bits_per_sample == self.bits_per_sample()
+            && spec.exponent_bits_per_sample == self.exponent_bits()
     }
 
     pub(crate) const fn sample_mask(self) -> u32 {

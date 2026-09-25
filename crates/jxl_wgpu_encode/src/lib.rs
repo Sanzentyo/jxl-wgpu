@@ -29,13 +29,14 @@
 //! explicit global/LF controls and per-transform HF multipliers; content-adaptive strategy search,
 //! distance control and progressive encoding
 //! remain incomplete. [`TiledVarDctEncoder`] provides an optimized DCT8 workgroup path.
-//! Both frontends expose [`VarDctAnimationSession`] for integer RGB timed crops in XYB or original sRGB, Replace/Add/Multiply,
+//! Both frontends expose [`VarDctAnimationSession`] for integer/floating RGB timed crops in XYB or original sRGB, Replace/Add/Multiply,
 //! hidden frames and four post-color-transform references, using the same checked frame control
 //! as Modular. Each frame retains the encoder's quantization and progressive AC configuration.
 //! [`MixedModeEncoder`] selects Modular or VarDCT explicitly for each physical frame under one
 //! checked [`RgbSequenceDescriptor`]. Its shared original-sRGB contract supports layered stills,
 //! animations and post-color-transform references across both codecs. Automatic mode selection
-//! and common floating-point, alpha and other source color contracts remain unimplemented.
+//! and common alpha and other source color contracts remain unimplemented. Both codecs use the
+//! same checked packed/planar/split RGB source plan and GPU byte/word loader.
 //! [`VarDctCoefficientOrders`] selects independent X/Y/B permutations for every standard size class;
 //! GPU serializers consume them without exposing image coefficients to the host.
 //!
@@ -67,6 +68,7 @@ mod prefix;
 mod rgb;
 mod sample_format;
 mod session;
+mod source;
 mod vardct_encoder;
 
 pub use buffer_pool::{

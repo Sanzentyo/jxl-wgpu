@@ -148,9 +148,9 @@ impl LosslessModularEncoder {
         let header = image_header(
             source.layout.extent.width,
             source.layout.extent.height,
-            spec.format,
-            spec.bits_per_sample,
-            spec.exponent_bits_per_sample,
+            spec.packing.format,
+            spec.packing.bits_per_sample,
+            spec.packing.exponent_bits_per_sample,
             AnimationHeader::Still,
             spec.color.metadata(
                 self.color_options,
@@ -289,7 +289,7 @@ impl LosslessModularEncoder {
         let width = source.layout.extent.width;
         let height = source.layout.extent.height;
         let source_spec = lossless_modular_source_spec(&source.layout.format)?;
-        let format = source_spec.format;
+        let format = source_spec.packing.format;
         let group_grid =
             LosslessModularGroupGrid::for_extent(width, height, self.config().group_size)?;
         let request = FrameEncodeRequest {
@@ -297,8 +297,8 @@ impl LosslessModularEncoder {
             is_last: true,
             profile: EncodeProfile::ModularLossless {
                 sample_bit_depth: modular_sample_depth(
-                    source_spec.bits_per_sample,
-                    source_spec.exponent_bits_per_sample,
+                    source_spec.packing.bits_per_sample,
+                    source_spec.packing.exponent_bits_per_sample,
                 ),
             },
             progressive: ProgressivePlan::single(),
@@ -313,8 +313,8 @@ impl LosslessModularEncoder {
             width,
             height,
             format,
-            source_spec.bits_per_sample,
-            source_spec.exponent_bits_per_sample,
+            source_spec.packing.bits_per_sample,
+            source_spec.packing.exponent_bits_per_sample,
             AnimationHeader::Still,
             source_spec.color.metadata(
                 self.color_options,
@@ -335,8 +335,8 @@ impl LosslessModularEncoder {
             container,
             group_grid,
             format,
-            bits_per_sample: source_spec.bits_per_sample,
-            exponent_bits_per_sample: source_spec.exponent_bits_per_sample,
+            bits_per_sample: source_spec.packing.bits_per_sample,
+            exponent_bits_per_sample: source_spec.packing.exponent_bits_per_sample,
         })
     }
 }
@@ -376,9 +376,9 @@ impl LosslessModularSequenceDescriptor {
         let mut descriptor = Self::with_precision(
             canvas_width,
             canvas_height,
-            spec.format,
-            spec.bits_per_sample,
-            spec.exponent_bits_per_sample,
+            spec.packing.format,
+            spec.packing.bits_per_sample,
+            spec.packing.exponent_bits_per_sample,
             animation,
         )?;
         descriptor.color = spec.color;
@@ -550,9 +550,9 @@ impl LosslessModularSequenceSession {
 
     fn validate_source(&self, source: &crate::BufferImageSource) -> Result<(), EncodeError> {
         let spec = lossless_modular_source_spec(&source.layout.format)?;
-        if spec.format != self.descriptor.format
-            || spec.bits_per_sample != self.descriptor.bits_per_sample
-            || spec.exponent_bits_per_sample != self.descriptor.exponent_bits_per_sample
+        if spec.packing.format != self.descriptor.format
+            || spec.packing.bits_per_sample != self.descriptor.bits_per_sample
+            || spec.packing.exponent_bits_per_sample != self.descriptor.exponent_bits_per_sample
             || spec.color != self.descriptor.color
         {
             return Err(EncodeError::InvalidConfiguration(

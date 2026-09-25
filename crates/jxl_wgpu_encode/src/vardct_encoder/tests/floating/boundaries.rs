@@ -1,6 +1,5 @@
 use super::*;
 use crate::VarDctGroupOrder;
-use jxl_gpu_formats::ByteOrder;
 
 #[test]
 fn floating_precision_saliency_proxy_is_bounded_and_exact_in_every_workgroup_variant() {
@@ -121,7 +120,7 @@ fn floating_precision_rejects_mismatches_before_admission_and_releases_canceled_
                     .pixel_format();
             invalid.push(wrong);
             let mut wrong = source.clone();
-            wrong.layout.format.byte_order = ByteOrder::Big;
+            wrong.layout.format.color_spec = jxl_gpu_formats::ColorSpecification::Undefined;
             invalid.push(wrong);
             let mut wrong = source.clone();
             wrong.layout.format.sample_kind = SampleKind::Signed;
@@ -200,7 +199,7 @@ fn floating_precision_conversion_preserves_finite_binary32_bits() {
             @compute @workgroup_size(64)
             fn check_float_fields(@builtin(local_invocation_index) i: u32) {
                 if i < arrayLength(&source_words) {
-                    artifact_words[i] = bitcast<u32>(normalize_source_sample(i * 4u));
+                    artifact_words[i] = bitcast<u32>(normalize_source_sample(source_words[i]));
                 }
             }
         ",
@@ -230,7 +229,6 @@ fn floating_precision_conversion_preserves_finite_binary32_bits() {
             .collect();
         let mut params: super::super::super::types::VarDctKernelParams =
             bytemuck::Zeroable::zeroed();
-        params.source_word_bytes = 4;
         params.source_sample_mask = format(p).sample_mask();
         params.source_exponent_bits = u32::from(p.exponent_bits());
         let input = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

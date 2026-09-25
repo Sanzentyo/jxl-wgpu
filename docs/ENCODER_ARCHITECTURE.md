@@ -66,10 +66,22 @@ LF/correlation and matrix/order policy remain explicit and independent of color 
 All source-dependent operations stay on the GPU, using the existing allocations and completion
 lease. [Original-RGB evidence](CONFORMANCE_CORPUS.md#original-rgb-vardct-encoding).
 
-`RgbSampleFormat` owns 1–31-bit integer or checked `FloatPrecision` source precision, canonical word width and right-aligned
-packing. Admission, row/binding geometry, the shared GPU sample loader and image metadata
-consume this checked value. Unused high bits are masked before normalization; the same GPU
-loader feeds the bounded saliency proxy without quantizing the forward-transform input.
+`RgbSampleFormat` owns 1–31-bit integer or checked `FloatPrecision` logical precision and a
+canonical format constructor. The shared `source` module owns physical packing, swizzle and
+plane-window validation. Its checked `SourceLayout` reconstructs the public image layout,
+rejects inconsistent extents/strides/overlap, and resolves each logical component to a plane,
+word width, bit shift, pixel stride and absolute origin. Regions retain u64 absolute offsets
+until dispatch windows rebase them into checked WGSL-u32 addresses. Modular groups/streaming
+and whole-image VarDCT use the same plan and window-union accounting; color serialization
+remains codec-specific. Gaps between aligned windows are neither bound nor charged as addressed
+bytes; alignment overlap is counted once. No host sample scan, repacking or extra image allocation
+is introduced.
+
+Both shaders include the same `source.wgsl` byte/word loader. It selects the checked plane,
+loads an unaligned declared-endian word and masks the sample field. Modular consumes raw
+words; VarDCT applies its independent normalization policy, and saliency builds its bounded
+proxy from those same logical samples without quantizing forward-transform inputs. Policy,
+resource bounds and validated GPU completion remain distinct representations.
 Source precision does not bound VarDCT's LF integers. RGB sequence headers conservatively
 declare 32-bit Modular buffers because the GPU validates coefficients over the full i32 range,
 including low-bit-depth sources with fine quantizers. No content-dependent CPU scan or second
@@ -92,8 +104,8 @@ caller selects one for each physical frame. The generic `EncodeSession` retains 
 frame counter, finality, canvas and timebase, validates before admission, and advances only
 after successful submission. Fixed-codec sessions use this same submission path. Geometry
 belongs to the selected backend: a fixed VarDCT transform/map does not constrain Modular sources.
-Both codecs accept the exact common interleaved integer/floating RGB/default-sRGB format at the selected precision and post-transform
-references. XYB configuration and incompatible source/reference contracts fail before admission.
+Both codecs accept the same logical integer/floating RGB/default-sRGB precision and post-transform
+references. Physical frames may independently change their supported layout, swizzle and word byte order. XYB configuration and incompatible source/reference contracts fail before admission.
 
 Memory queries and submissions share each backend's frame preparation, including reference-only
 VarDCT pass lowering. The selected job keeps its existing completion/cancellation ownership;
@@ -321,7 +333,7 @@ The GPU only loads and transforms raw words, so custom precision adds no shader 
 allocation or submission. A custom descriptor does not grant generic F32 display/output support.
 
 The parameter ABI is one `#[repr(C)]`, `bytemuck::Pod` Rust value and the matching WGSL structure.
-`ModularSourceParams` / `Source` is 24 bytes and `ModularParams` / `Params` is 256 bytes, both
+`SourceParams` (aliased as `ModularSourceParams`) / `Source` is 24 bytes and `ModularParams` / `Params` is 256 bytes, both
 with four-byte alignment. The [WGSL memory table](WGSL_MEMORY.md#uniform-and-structured-storage-table)
 owns the complete field layout, including the resolved sample source and Squeeze band.
 

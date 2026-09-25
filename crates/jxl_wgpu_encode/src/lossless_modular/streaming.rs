@@ -258,7 +258,8 @@ fn submit_streaming_batch(
     );
     let buffers = buffer_lease.buffers();
     let uploads = plan.upload_parameters(context.queue(), &buffers.parameters, *batch)?;
-    let [source0, source1, source2, source3] = batch.source_windows.entries(&source.buffer);
+    let [source0, source1, source2, source3] =
+        batch.source_windows.entries(&source.buffer, [0, 3, 4, 5]);
     let bind_group = context
         .device()
         .create_bind_group(&wgpu::BindGroupDescriptor {

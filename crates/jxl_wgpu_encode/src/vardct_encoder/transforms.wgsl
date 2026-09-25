@@ -23,8 +23,7 @@ fn normalize_image(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invoc
     if pixel < area {
         let x = min(pixel % width, params.width - 1u);
         let y = min(pixel / width, params.height - 1u);
-        let address = params.byte_offset + y * params.row_stride + x * (3u * params.source_word_bytes);
-        let components = normalize_rgb(address);
+        let components = normalize_rgb(x, y);
         forward_components[pixel] = components.x;
         forward_components[area + pixel] = components.y;
         forward_components[2u * area + pixel] = components.z;
