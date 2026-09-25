@@ -1879,7 +1879,7 @@ and color before admission, exact/one-byte-deficient budgets, competing jobs, ca
 completion/reuse. Completed host packets no longer retain GPU storage. Host tests check every
 integer field position, rebasing of plane offsets beyond u32 without binding gaps, aligned-window
 union accounting, region bounds, final-word padding and typed seven-binding device admission.
-Rust ABI checks and Naga reflection cover the 828-byte VarDCT parameters and 24-byte shared
+Rust ABI checks and Naga reflection cover the 892-byte VarDCT parameters and 24-byte shared
 component records; Modular's 256-byte parameter and both artifact formats remain unchanged.
 
 Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib source_layouts -- --test-threads=2`,
@@ -1945,8 +1945,70 @@ comparison. This separates external oracle limits
 from the unchanged numeric bounds; no input cases are skipped.
 
 Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib gray_input -- --test-threads=2`,
-with the required native Modular word oracle set to an absolute path. Alpha, other source
-colors/ICC, subsampling and textures remain outside this VarDCT/mixed contract.
+with the required native Modular word oracle set to an absolute path. The subsequent
+[enumerated-color slice](#enumerated-vardct-and-mixed-input) extends the color contract; alpha,
+ICC, subsampling and textures remain open.
+
+## Enumerated VarDCT and mixed input
+
+`vardct_encoder/tests/enumerated.rs` and its `oracle`, `boundaries` and `sequence` modules
+exercise the checked color plan on Apple M5/Metal (2026-09-25). The common source-color writer
+owns serialized primaries/white/transfer; GPU normalization consumes those same quantized
+values and the shared transfer shader. `ImageColorOptions` supplies both codecs' intent and
+positive exact binary16 image white. The 64-byte color parameter tail is included in exact
+admission; original components bypass conversion, and no image-sized allocation is added.
+
+The 196 DCT8 images cross seven source geometries, seven wire transfers, Gray/RGB and
+XYB/original coding. Geometry includes BT.709, BT.2020, Display-P3, D65/E/DCI/custom whites and
+custom primaries whose coordinates require wire rounding. Transfers are Linear, sRGB, BT.709,
+PQ, HLG, DCI and Gamma. Four intents and 255/1000/4000-nit image whites vary across the cases.
+Input uses 12-bit integers. Native libjxl 0.12.0 original ICC export must match an independently
+native-encoded declaration byte for byte; image precision, color domain and intensity are
+checked. Independent F64 normalization plus committed native transform bases checks AC within
+one quantizer step; source PSNR exceeds 30 dB at `(35252, 256, 48)`.
+
+Another 54 images cover all 27 strategies in both domains with binary32, custom coefficient
+orders and LF metadata. Fifty-six progressive mapped/tiled images cross the transfers,
+Gray/RGB and both domains at 25×17 and 259×3. Their 56 additional big-endian shifted/split
+layouts must emit exactly the same bytes; saliency ordering and five passes stay active.
+Original-profile native, independent Rust and whole/256-byte-window GPU output retain
+`2e-4 * (1 + abs(reference))` per F32 component and at most one rounded RGB8 code. Whole and
+bounded GPU output agree exactly, and all context/input reservations return to zero.
+
+The independent reference follows the actual decoder output domain. Rust `jxl` 0.6.0 selects
+linear-sRGB F32 for non-D65 XYB Gray; the helper retains and checks that profile before applying
+independent F64 Gray transfer/OOTF. Its output must not be labeled original encoded Gray
+(the first unconverted sRGB/DCI-white sample was 0.0511961 versus native 0.25079793).
+Rust `jxl` also skips HLG OOTF for `abs(exponent) < 0.1`, whereas the native/common contract uses
+0.01; a 255-nit Gray sample was 0.26364362 versus native 0.2512811. Those stills instead use
+jxl-oxide raw XYB, its independently parsed inverse-opsin metadata and F64 colorimetry.
+An exploratory raw-XYB jxl-oxide reference differed on one 256×128 custom-LF/E-white/sRGB case
+(0.103297085 versus native 0.25112417); its cause is not established. That case keeps native,
+profile-checked Rust `jxl` and independent forward-coefficient evidence at the original bounds.
+These external limitations are not passes, and no input case is skipped.
+
+Direct GPU normalization also checks 2,156 signed/zero/subnormal/transfer-boundary vectors
+against independent F64. BT.709's discontinuity at decimal 0.081 is evaluated on both limiting
+branches at its nearest F32 representation; the arithmetic tolerance remains `2e-4` normalized.
+Metadata negatives include undefined/limited/YUV/ICC declarations, unsupported transfers,
+invalid image white and differing frame color; custom wire-equivalent and sRGB/Sycc aliases
+remain admitted. Shared color tests retain singular/rounded geometry and gamma-range checks.
+The relocated image-options test covers every finite binary16 word's positivity. Exact and
+one-byte-short mapped/tiled budgets, cancellation/retry and nonfinite-source rejection verify
+ownership for the additional parameter bytes.
+
+Forty-two three-frame indexed animations cross all seven transfer/geometry pairs, Gray/RGB,
+12-bit/binary32, single/map/tiled VarDCT, both fixed coding domains and original mixed-codec
+Modular→VarDCT→Modular. RGB frames use cross-codec Multiply references; Gray uses Replace.
+Each frame changes packing, invalid color cannot advance the frame index or acquire memory,
+and reverse completion insertion preserves the stream. Native whole-stream output, Rust with
+its checked output profile, and whole/bounded GPU output retain the same component/code bounds.
+These add 126 physical frames without claiming new Gray-reference oracle coverage.
+
+Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib enumerated_ -- --test-threads=2`.
+Existing RGB/Gray/Modular corpora, native fixtures and thresholds remain in the full gate.
+Alpha/ICC VarDCT input, CMYK/arbitrary extras, YUV/textures, perceptual quality policy and full
+ISO conformance remain open.
 
 ## Mixed-codec sequence encoding
 

@@ -88,16 +88,15 @@ pub use image_sequence::ImageSequenceDescriptor;
 pub use jxl_gpu_bitstream::FiniteF16;
 pub use lossless_modular::{
     AlphaAssociation, LOSSLESS_MODULAR_GROUP_DIMENSION, LosslessModularAnimationDescriptor,
-    LosslessModularAnimationSession, LosslessModularBackend, LosslessModularColorOptions,
-    LosslessModularColorTransform, LosslessModularConfig, LosslessModularEncoder,
-    LosslessModularEntropyCoding, LosslessModularFormat, LosslessModularGroup,
-    LosslessModularGroupGrid, LosslessModularGroupSize, LosslessModularInFlightMemory,
-    LosslessModularJob, LosslessModularLocalTransforms, LosslessModularLz77,
-    LosslessModularMemoryLimits, LosslessModularMemoryPlan, LosslessModularPalette,
-    LosslessModularPredictor, LosslessModularRctType, LosslessModularSequenceDescriptor,
-    LosslessModularSequenceSession, LosslessModularSqueeze, LosslessModularSqueezeStep,
-    LosslessModularSubmission, LosslessModularTransform, LosslessModularTreeMode,
-    LosslessModularWeightedPredictor,
+    LosslessModularAnimationSession, LosslessModularBackend, LosslessModularColorTransform,
+    LosslessModularConfig, LosslessModularEncoder, LosslessModularEntropyCoding,
+    LosslessModularFormat, LosslessModularGroup, LosslessModularGroupGrid,
+    LosslessModularGroupSize, LosslessModularInFlightMemory, LosslessModularJob,
+    LosslessModularLocalTransforms, LosslessModularLz77, LosslessModularMemoryLimits,
+    LosslessModularMemoryPlan, LosslessModularPalette, LosslessModularPredictor,
+    LosslessModularRctType, LosslessModularSequenceDescriptor, LosslessModularSequenceSession,
+    LosslessModularSqueeze, LosslessModularSqueezeStep, LosslessModularSubmission,
+    LosslessModularTransform, LosslessModularTreeMode, LosslessModularWeightedPredictor,
 };
 pub use mixed_encoder::{
     MixedModeConfig, MixedModeEncoder, MixedModeFrameEncoding, MixedModeJob, MixedModeMemoryPlan,
@@ -113,11 +112,12 @@ pub use session::{
     FrameEncodeRequest, FrameIndex, FrameKind, FrameOptions, FrameSubmission, FrameTiming,
     GpuAccelerationArtifact, GpuFrameArtifacts, ReferenceSlot, SessionDescriptor,
 };
+pub use source_color::ImageColorOptions;
 pub use vardct_encoder::{
     TiledVarDctEncoder, TiledVarDctGrid, VarDctAnimationDescriptor, VarDctAnimationSession,
-    VarDctBackend, VarDctCoefficientOrders, VarDctColorEncoding, VarDctColorTransform,
-    VarDctConfig, VarDctDequantMatrices, VarDctEncoder, VarDctGroupOrder, VarDctHfMultiplier,
-    VarDctJob, VarDctKernelLayout, VarDctLfMetadata, VarDctMatrixEncoding, VarDctMemoryPlan,
+    VarDctBackend, VarDctCoefficientOrders, VarDctColorTransform, VarDctConfig,
+    VarDctDequantMatrices, VarDctEncoder, VarDctGroupOrder, VarDctHfMultiplier, VarDctJob,
+    VarDctKernelLayout, VarDctLfMetadata, VarDctMatrixEncoding, VarDctMemoryPlan,
     VarDctQuantization, VarDctRawMatrix, VarDctSequenceDescriptor, VarDctSequenceSession,
     VarDctStrategy, VarDctStrategyMap, VarDctSubmission, VarDctTransform,
     VarDctTransformMemoryPlan,

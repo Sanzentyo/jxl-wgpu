@@ -13,7 +13,7 @@ fn color_declarations_keep_exact_admission_and_cancelled_source_release() {
         shifted: true,
     };
     let color = spec(ColorSpace::Bt2020, TransferFunction::Pq);
-    let options = LosslessModularColorOptions {
+    let options = ImageColorOptions {
         rendering_intent: IccRenderingIntent::Absolute,
         intensity_target: FiniteF16::from_bits(0x63d0).unwrap(),
     };
@@ -126,7 +126,7 @@ fn unsupported_source_metadata_never_allocates_a_gpu_job() {
     }
     for bits in [0, 0x8000, 0xbc00] {
         let result = LosslessModularEncoder::new(rig.context.clone()).with_color_options(
-            LosslessModularColorOptions {
+            ImageColorOptions {
                 intensity_target: FiniteF16::from_bits(bits).unwrap(),
                 ..Default::default()
             },

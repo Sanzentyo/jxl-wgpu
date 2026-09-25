@@ -231,6 +231,11 @@ fn xyz(space: ColorSpace) -> Matrix {
     matrix.map(|row| std::array::from_fn(|c| row[c] * scale[c]))
 }
 
+/// Unit-white luminance from the independent CIE solve, including custom chromaticities.
+pub fn luminance(space: ColorSpace) -> [f64; 3] {
+    xyz(space)[1]
+}
+
 fn white(space: ColorSpace) -> [f64; 2] {
     if let ColorSpace::CustomRgb(color) = space {
         [color.white.x(), color.white.y()]

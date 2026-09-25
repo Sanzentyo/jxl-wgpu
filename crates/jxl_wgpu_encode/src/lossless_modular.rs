@@ -23,7 +23,6 @@ mod transform;
 mod types;
 mod upload;
 
-pub use color::LosslessModularColorOptions;
 pub use dispatch::LosslessModularBackend;
 pub use entropy::LosslessModularEntropyCoding;
 pub use grid::{LosslessModularGroup, LosslessModularGroupGrid};

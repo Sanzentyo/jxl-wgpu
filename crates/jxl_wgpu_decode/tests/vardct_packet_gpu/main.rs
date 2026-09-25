@@ -9,7 +9,7 @@ use jxl_wgpu_decode::vardct::packet::{
     vardct_packet_shader_source,
 };
 use jxl_wgpu_encode::{
-    BufferImageSource, VarDctColorEncoding, VarDctEncoder, VarDctStrategy, WgpuContext,
+    BufferImageSource, ColorSampleFormat, VarDctEncoder, VarDctStrategy, WgpuContext,
 };
 use wgpu::util::DeviceExt;
 
@@ -40,7 +40,7 @@ fn black_source(context: &WgpuContext) -> BufferImageSource {
     let bytes = vec![0u8; 8 * 8 * 3];
     let layout = ImageLayout::from_planes(
         extent,
-        VarDctColorEncoding::SrgbD65.pixel_format(),
+        ColorSampleFormat::RGB8.pixel_format(),
         vec![PitchLinearPlaneLayout {
             plane_index: 0,
             offset: 0,

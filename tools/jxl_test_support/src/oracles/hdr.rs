@@ -7,6 +7,7 @@ pub fn luminance(space: ColorSpace) -> [f64; 3] {
         ColorSpace::Bt709 => [0.212639005871510, 0.715168678767756, 0.072192315360734],
         ColorSpace::Bt2020 => [0.262700212011267, 0.677998071518871, 0.059301716469862],
         ColorSpace::DisplayP3 => [0.228974564069749, 0.691738521836506, 0.079286914093745],
+        ColorSpace::CustomRgb(_) => color::luminance(space),
         _ => panic!("HDR reference primaries"),
     }
 }

@@ -25,8 +25,8 @@ use super::sequence::{
 use super::strategy_map::{TransformPlan, VarDctStrategyMap, VarDctTransform};
 use super::types::{
     ARTIFACT_READY, ArtifactLayout, DcFragmentDescriptor, HEADER_WORDS, TiledVarDctGrid,
-    VarDctArtifactData, VarDctArtifactHeader, VarDctColorEncoding, VarDctFrameLayout,
-    VarDctKernelParams, VarDctLfMetadata, VarDctMemoryPlan, VarDctStrategy, VarDctTopology,
+    VarDctArtifactData, VarDctArtifactHeader, VarDctFrameLayout, VarDctKernelParams,
+    VarDctLfMetadata, VarDctMemoryPlan, VarDctStrategy, VarDctTopology,
 };
 use super::{raw_matrices, saliency, transforms};
 use crate::frame_header::FrameHeaderPlan;
@@ -44,8 +44,9 @@ pub(super) const TILED_SHADER: &str = include_str!("tiled.wgsl");
 
 pub(super) fn shader_source(entry_points: &str) -> String {
     format!(
-        "{}\n{}\n{}\n{entry_points}",
+        "{}\n{}\n{}\n{}\n{entry_points}",
         crate::source::SHADER,
+        jxl_wgpu::IMAGE_TRANSFER_SHADER,
         include_str!("common.wgsl"),
         include_str!("control.wgsl")
     )
@@ -154,6 +155,7 @@ impl VarDctBackend {
         topology: VarDctTopology,
         config: VarDctConfig,
     ) -> Result<Self, EncodeError> {
+        let color_plan = VarDctColorPlan::new(&config)?;
         let code = fixed_prefix_code()?;
         let hf_entropy = HfEntropyPlan::single_cluster_prefix()?;
         let limits = context.device().limits();
@@ -292,7 +294,7 @@ impl VarDctBackend {
             topology,
             transform_plan,
             tiled_metadata,
-            color_plan: VarDctColorPlan::new(config.color_transform, config.sample_format),
+            color_plan,
             config: config.clone(),
             capabilities: EncoderCapabilities {
                 profiles: vec![ProfileCapability::VarDct {
@@ -334,7 +336,11 @@ impl VarDctBackend {
         &self,
         descriptor: &crate::ImageSequenceDescriptor,
     ) -> Result<BitFragment, EncodeError> {
-        descriptor.image_header(self.color_plan.xyb_encoded(), self.sample_format())
+        self.color_plan.image_header(descriptor)
+    }
+
+    pub(crate) fn matches_source_format(&self, format: &jxl_gpu_formats::PixelFormat) -> bool {
+        self.color_plan.matches_format(format)
     }
 
     /// Computes memory admission and source binding with the configured regular-frame passes.
@@ -399,7 +405,7 @@ impl VarDctBackend {
             }
         };
         self.config.group_order.validate(frame)?;
-        if !self.sample_format().matches_format(&source.layout.format)
+        if !self.matches_source_format(&source.layout.format)
             || !source.buffer.usage().contains(wgpu::BufferUsages::STORAGE)
         {
             return Err(UnsupportedFeature::InputFormat.into());
@@ -538,6 +544,7 @@ impl VarDctBackend {
                         source_validation_groups: layout.source_validation_groups,
                         source_big_endian: u32::from(source_layout.spec.big_endian),
                         sources,
+                        source_color: self.color_plan.gpu,
                     },
                     layout,
                 },
@@ -1736,7 +1743,7 @@ impl VarDctEncoder {
         self.encoder.backend().lf_metadata()
     }
 
-    /// Selected coding domain; the accepted source remains integer or floating Gray/RGB sRGB/D65.
+    /// Selected coding domain; source color is checked independently of integer or floating Gray/RGB storage.
     #[must_use]
     pub fn color_transform(&self) -> VarDctColorTransform {
         self.encoder.backend().config.color_transform
@@ -1749,8 +1756,8 @@ impl VarDctEncoder {
 
     /// Declared presentation color encoding.
     #[must_use]
-    pub const fn color_encoding(&self) -> VarDctColorEncoding {
-        VarDctColorEncoding::SrgbD65
+    pub fn source_color(&self) -> &jxl_gpu_formats::ColorSpecification {
+        &self.encoder.backend().config.source_color
     }
 
     #[must_use]
@@ -1906,7 +1913,7 @@ impl TiledVarDctEncoder {
         self.encoder.backend().lf_metadata()
     }
 
-    /// Selected coding domain; the accepted source remains integer or floating Gray/RGB sRGB/D65.
+    /// Selected coding domain; source color is checked independently of integer or floating Gray/RGB storage.
     #[must_use]
     pub fn color_transform(&self) -> VarDctColorTransform {
         self.encoder.backend().config.color_transform
@@ -1919,8 +1926,8 @@ impl TiledVarDctEncoder {
 
     /// Declared presentation color encoding.
     #[must_use]
-    pub const fn color_encoding(&self) -> VarDctColorEncoding {
-        VarDctColorEncoding::SrgbD65
+    pub fn source_color(&self) -> &jxl_gpu_formats::ColorSpecification {
+        &self.encoder.backend().config.source_color
     }
 
     #[must_use]

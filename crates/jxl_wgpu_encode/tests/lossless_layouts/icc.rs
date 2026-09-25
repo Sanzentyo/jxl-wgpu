@@ -2,7 +2,7 @@ use super::*;
 use jxl_gpu_formats::{Channel, ColorModel, ColorSpecification, PackingFieldKind, Swizzle};
 use jxl_gpu_protocol::icc::IccProfile;
 use jxl_test_support::oracles::icc_profile::IccProfileOracle;
-use jxl_wgpu_encode::{AlphaAssociation, LosslessModularColorOptions};
+use jxl_wgpu_encode::{AlphaAssociation, ImageColorOptions};
 
 mod animation;
 mod lifetime;
@@ -26,7 +26,7 @@ fn encoder(
     tree: LosslessModularTreeMode,
 ) -> LosslessModularEncoder {
     LosslessModularEncoder::with_tree_mode(rig.context.clone(), tree)
-        .with_color_options(LosslessModularColorOptions {
+        .with_color_options(ImageColorOptions {
             rendering_intent: profile.header().rendering_intent,
             ..Default::default()
         })

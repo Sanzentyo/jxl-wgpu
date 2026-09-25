@@ -10,7 +10,7 @@ use jxl_gpu_bitstream::{
     write_container_with_boxes,
 };
 
-use super::color::{LosslessModularColorOptions, ModularImageMetadata};
+use super::color::ModularImageMetadata;
 use super::dispatch::{LosslessModularBackend, ModularGroupPlan};
 use super::entropy::{EncodedGroup, EntropyCode};
 use super::grid::{LosslessModularGroup, LosslessModularGroupGrid};
@@ -27,6 +27,7 @@ use super::types::{
     AlphaAssociation, LosslessModularFormat, LosslessModularTreeMode, ModularArtifactHeader,
     ModularEvent, modular_sample_depth,
 };
+use crate::ImageColorOptions;
 use crate::frame_header::{FrameHeaderPlan, write_animation_header};
 use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS, RawPrefixCode};
 use crate::source_color::SourceColorEncoding;
@@ -42,7 +43,7 @@ use crate::{
 /// `jxlc` container from a GPU-resident Gray, GrayAlpha, RGB, or RGBA integer/IEEE floating buffer.
 pub struct LosslessModularEncoder {
     encoder: GpuEncoder<LosslessModularBackend>,
-    color_options: LosslessModularColorOptions,
+    color_options: ImageColorOptions,
     alpha_association: AlphaAssociation,
     max_icc_profile_bytes: u64,
 }
@@ -59,7 +60,7 @@ impl LosslessModularEncoder {
         let backend = LosslessModularBackend::with_config(&context, config);
         Self {
             encoder: GpuEncoder::new(context, backend),
-            color_options: LosslessModularColorOptions::default(),
+            color_options: ImageColorOptions::default(),
             alpha_association: AlphaAssociation::default(),
             max_icc_profile_bytes: DEFAULT_PROFILE_LIMIT,
         }
@@ -87,7 +88,7 @@ impl LosslessModularEncoder {
         backend.set_buffer_pool_limit(limit_bytes);
         Self {
             encoder: GpuEncoder::new(context, backend),
-            color_options: LosslessModularColorOptions::default(),
+            color_options: ImageColorOptions::default(),
             alpha_association: AlphaAssociation::default(),
             max_icc_profile_bytes: DEFAULT_PROFILE_LIMIT,
         }
@@ -96,10 +97,7 @@ impl LosslessModularEncoder {
     /// Selects the declaration shared by subsequent stills and animations.
     /// Source primaries/white/transfer or ICC bytes continue to come from each source format.
     /// ICC input requires the selected intent to match the profile header.
-    pub fn with_color_options(
-        mut self,
-        options: LosslessModularColorOptions,
-    ) -> Result<Self, EncodeError> {
+    pub fn with_color_options(mut self, options: ImageColorOptions) -> Result<Self, EncodeError> {
         options.validate()?;
         self.color_options = options;
         Ok(self)
@@ -335,7 +333,7 @@ impl LosslessModularEncoder {
             codestream_header: Some(codestream_header),
             metadata_permit,
             default_color: source_spec.color == SourceColorEncoding::default()
-                && self.color_options == LosslessModularColorOptions::default(),
+                && self.color_options == ImageColorOptions::default(),
             container,
             group_grid,
             format,
@@ -369,7 +367,7 @@ impl LosslessModularSequenceDescriptor {
     /// Frame storage may differ, but every submitted frame must have the same encoded color
     /// declaration (custom xy rounded to 1e-6 and gamma to 1e-7, or identical original ICC
     /// bytes). Image white and rendering intent come from the encoder's
-    /// [`LosslessModularColorOptions`]; the intent must agree with an embedded profile.
+    /// [`ImageColorOptions`]; the intent must agree with an embedded profile.
     pub fn from_pixel_format(
         canvas_width: u32,
         canvas_height: u32,

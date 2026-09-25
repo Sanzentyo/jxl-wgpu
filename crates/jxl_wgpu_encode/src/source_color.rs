@@ -15,6 +15,9 @@ use jxl_gpu_protocol::{
 use crate::ColorChannels;
 use crate::{EncodeError, UnsupportedFeature};
 
+mod options;
+pub use options::ImageColorOptions;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EnumeratedColorEncoding {
     white: WhitePointInventory,
@@ -156,7 +159,53 @@ impl SourceColorEncoding {
 }
 
 impl EnumeratedColorEncoding {
-    fn write(
+    /// Expand the serialized declaration, including rounded custom xy/gamma values.
+    /// GPU conversion must use these values rather than the caller's unrounded metadata.
+    pub(crate) fn rgb_encoding(self) -> jxl_gpu_protocol::RgbColorEncoding {
+        use jxl_gpu_protocol::{GammaExponent, RgbColorEncoding, TransferFunction as Transfer};
+        let mut coordinates = match self.primaries {
+            PrimariesInventory::Srgb => RgbChromaticities::BT709,
+            PrimariesInventory::Bt2100 => RgbChromaticities::BT2020,
+            PrimariesInventory::P3 => RgbChromaticities::DISPLAY_P3,
+            PrimariesInventory::Custom { red, green, blue } => RgbChromaticities {
+                red: expand_xy(red),
+                green: expand_xy(green),
+                blue: expand_xy(blue),
+                white: Chromaticity::D65,
+            },
+        };
+        coordinates.white = match self.white {
+            WhitePointInventory::D65 => Chromaticity::D65,
+            WhitePointInventory::E => Chromaticity::E,
+            WhitePointInventory::Dci => Chromaticity::DCI,
+            WhitePointInventory::Custom(value) => expand_xy(value),
+        };
+        let space = match coordinates {
+            RgbChromaticities::BT709 => RgbColorSpace::Bt709,
+            RgbChromaticities::BT2020 => RgbColorSpace::Bt2020,
+            RgbChromaticities::DISPLAY_P3 => RgbColorSpace::DisplayP3,
+            value => RgbColorSpace::Custom(value),
+        };
+        let transfer = match self.transfer {
+            TransferFunctionInventory::Linear => Transfer::Linear,
+            TransferFunctionInventory::Srgb => Transfer::Srgb,
+            TransferFunctionInventory::Bt709 => Transfer::Bt709,
+            TransferFunctionInventory::Pq => Transfer::Pq,
+            TransferFunctionInventory::Hlg => Transfer::Hlg,
+            TransferFunctionInventory::Dci => Transfer::Dci,
+            TransferFunctionInventory::Gamma {
+                scaled_gamma,
+                inverted: true,
+            } => Transfer::Gamma(
+                GammaExponent::new(scaled_gamma as f32 / 10_000_000.0)
+                    .expect("checked positive wire gamma"),
+            ),
+            _ => unreachable!("source color only constructs supported wire transfers"),
+        };
+        RgbColorEncoding { space, transfer }
+    }
+
+    pub(crate) fn write(
         self,
         output: &mut BitWriter,
         channels: ColorChannels,

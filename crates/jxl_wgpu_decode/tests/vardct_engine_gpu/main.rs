@@ -28,7 +28,7 @@ use jxl_wgpu_decode::{
     WgpuDecodeEngine, WgpuDecodeSubmissionSession,
 };
 use jxl_wgpu_encode::{
-    BufferImageSource, TiledVarDctEncoder, VarDctColorEncoding, VarDctEncoder, VarDctStrategy,
+    BufferImageSource, ColorSampleFormat, TiledVarDctEncoder, VarDctEncoder, VarDctStrategy,
     WgpuContext,
 };
 use wgpu::util::DeviceExt;
@@ -111,7 +111,7 @@ fn solid_source(
     let bytes = rgb.repeat(pixels);
     let layout = ImageLayout::from_planes(
         extent,
-        VarDctColorEncoding::SrgbD65.pixel_format(),
+        ColorSampleFormat::RGB8.pixel_format(),
         vec![PitchLinearPlaneLayout {
             plane_index: 0,
             offset: 0,
@@ -146,7 +146,7 @@ fn tiled_source(context: &WgpuContext, extent: Extent2d) -> BufferImageSource {
     }
     let layout = ImageLayout::from_planes(
         extent,
-        VarDctColorEncoding::SrgbD65.pixel_format(),
+        ColorSampleFormat::RGB8.pixel_format(),
         vec![PitchLinearPlaneLayout {
             plane_index: 0,
             offset: 0,

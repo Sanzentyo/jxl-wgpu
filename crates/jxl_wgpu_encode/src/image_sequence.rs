@@ -3,12 +3,13 @@
 use crate::frame_header::write_animation_header;
 use crate::sample_format::write_sample_bit_depth;
 use crate::{AnimationHeader, BitFragment, ColorSampleFormat, EncodeError};
+use crate::{ImageColorOptions, source_color::EnumeratedColorEncoding};
 use jxl_gpu_bitstream::BitWriter;
 
-/// Stream-wide canvas and optional timebase for a Gray/RGB sRGB/D65 layered still or animation.
+/// Stream-wide canvas and optional timebase for a Gray/RGB layered still or animation.
 ///
 /// Every frame uses the encoder's configured Gray/RGB channels, integer or floating precision
-/// and sRGB/D65 sources. The encoder binds the image's coding domain:
+/// and source color. The encoder binds the image's coding domain:
 /// XYB or original components for VarDCT sequences, original components for mixed-codec sequences.
 /// Modular and tiled DCT8 sources may vary in extent; a single VarDCT transform or checked
 /// strategy map constrains the source extent of that codec's frames only.
@@ -40,8 +41,10 @@ impl ImageSequenceDescriptor {
         &self,
         xyb_encoded: bool,
         samples: ColorSampleFormat,
+        encoding: EnumeratedColorEncoding,
+        options: ImageColorOptions,
     ) -> Result<crate::BitFragment, EncodeError> {
-        self.header.encode(xyb_encoded, samples)
+        self.header.encode(xyb_encoded, samples, encoding, options)
     }
 
     #[must_use]
@@ -120,18 +123,23 @@ impl ImageHeaderPlan {
         &self,
         xyb_encoded: bool,
         samples: ColorSampleFormat,
+        encoding: EnumeratedColorEncoding,
+        options: ImageColorOptions,
     ) -> Result<BitFragment, EncodeError> {
         let mut output = BitWriter::new();
         crate::packet::append_fragment(&mut output, &self.prefix)?;
         let has_animation = self.animation.is_some();
+        let extra_fields = has_animation || options.extra_fields();
         output.write_bits(0, 1)?; // explicit image metadata
-        output.write_bits(u64::from(has_animation), 1)?;
-        if let Some(animation) = &self.animation {
+        output.write_bits(u64::from(extra_fields), 1)?;
+        if extra_fields {
             output.write_bits(0, 3)?; // identity orientation
             output.write_bits(0, 1)?; // no intrinsic size
             output.write_bits(0, 1)?; // no preview
-            output.write_bits(1, 1)?; // animation present
-            crate::packet::append_fragment(&mut output, animation)?;
+            output.write_bits(u64::from(has_animation), 1)?;
+            if let Some(animation) = &self.animation {
+                crate::packet::append_fragment(&mut output, animation)?;
+            }
         }
         write_sample_bit_depth(
             &mut output,
@@ -143,13 +151,9 @@ impl ImageHeaderPlan {
         output.write_bits(0, 1)?; // 32-bit Modular buffers
         output.write_bits(0, 2)?; // no extra channels
         output.write_bits(u64::from(xyb_encoded), 1)?;
-        crate::source_color::SourceColorEncoding::default().write(
-            &mut output,
-            samples.channels(),
-            jxl_gpu_protocol::icc::IccRenderingIntent::Relative,
-        )?;
-        if has_animation {
-            output.write_bits(1, 1)?; // default tone mapping (present only with extra fields)
+        encoding.write(&mut output, samples.channels(), options.rendering_intent)?;
+        if extra_fields {
+            options.write_tone(&mut output)?;
         }
         output.write_bits(0, 2)?; // no image extensions
         output.write_bits(1, 1)?; // default opsin inverse matrix and upsampling weights

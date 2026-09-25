@@ -39,7 +39,7 @@ impl ColorChannels {
     }
 }
 
-/// Stream-wide Gray/RGB channels and precision for sRGB/D65 components, independent of physical source layout.
+/// Stream-wide Gray/RGB channels and precision, independent of color and physical source layout.
 ///
 /// Integers support 1–31 bits; floating samples support all checked [`FloatPrecision`]
 /// combinations. Gray selects one stored component; RGB may be packed, planar or split,
@@ -223,7 +223,6 @@ impl ColorSampleFormat {
                 ColorChannels::Gray => ColorModel::Gray,
                 ColorChannels::Rgb => ColorModel::Rgb,
             }
-            && format.color_spec == ColorSpecification::Default
             && spec.format == self.channels.source_channels()
             && spec.bits_per_sample == self.bits_per_sample()
             && spec.exponent_bits_per_sample == self.exponent_bits()

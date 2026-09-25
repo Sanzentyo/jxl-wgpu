@@ -97,6 +97,14 @@ pub fn rust_planes(encoded: &[u8]) -> FloatPlanes {
 }
 
 pub fn rust_frame_planes(encoded: &[u8]) -> Vec<FloatPlanes> {
+    rust_frame_planes_with_profile(encoded).0
+}
+
+/// Retain the decoder's actual output declaration; unsupported original encodings may
+/// select linear sRGB. Callers must not interpret those samples as the embedded profile.
+pub fn rust_frame_planes_with_profile(
+    encoded: &[u8],
+) -> (Vec<FloatPlanes>, jxl::api::JxlColorProfile) {
     let mut input = encoded;
     let mut options = JxlDecoderOptions::default();
     options.render_spot_colors = false;
@@ -122,6 +130,7 @@ pub fn rust_frame_planes(encoded: &[u8]) -> Vec<FloatPlanes> {
             count
         ],
     });
+    let profile = decoder.output_color_profile().clone();
     let mut frames = Vec::new();
     loop {
         let ProcessingResult::Complete { result: frame } =
@@ -149,5 +158,5 @@ pub fn rust_frame_planes(encoded: &[u8]) -> Vec<FloatPlanes> {
             break;
         }
     }
-    frames
+    (frames, profile)
 }

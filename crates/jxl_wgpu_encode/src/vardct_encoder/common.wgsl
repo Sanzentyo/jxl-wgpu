@@ -59,13 +59,6 @@ fn normalize_source_sample(word: u32) -> f32 {
     return bitcast<f32>(sign | (rebased_exponent << 23u) | rebased_fraction);
 }
 
-fn srgb_to_linear(encoded: f32) -> f32 {
-    if abs(encoded) <= 0.04045 {
-        return encoded / 12.92;
-    }
-    return sign(encoded) * pow((abs(encoded) + 0.055) / 1.055, 2.4);
-}
-
 fn linear_rgb_to_xyb(rgb: vec3<f32>) -> vec3<f32> {
     let mixed = max(
         vec3<f32>(
@@ -92,7 +85,7 @@ fn source_sample(x: u32, y: u32, component: u32) -> u32 {
 }
 
 // The checked color plan selects the same domain for image/frame headers and quantization.
-// 0 = XYB, 1 = original sRGB. No source samples cross the host boundary.
+// 0 = XYB, 1 = original components. No source samples cross the host boundary.
 fn normalize_rgb(x: u32, y: u32) -> vec3<f32> {
     let encoded = vec3<f32>(
         normalize_source_sample(source_sample(x, y, 0u)),
@@ -100,9 +93,16 @@ fn normalize_rgb(x: u32, y: u32) -> vec3<f32> {
         normalize_source_sample(source_sample(x, y, 2u)),
     );
     if params.color_normalization == 1u { return encoded; }
-    return linear_rgb_to_xyb(vec3<f32>(
-        srgb_to_linear(encoded.x), srgb_to_linear(encoded.y), srgb_to_linear(encoded.z),
-    ));
+    let color = params.source_color;
+    let linear = display_to_linear(encoded, color.transfer, color.gamma, color.intensity,
+        vec4<f32>(color.luminance[0], color.luminance[1], color.luminance[2], color.luminance[3]));
+    let matrix = color.matrix;
+    let rgb = vec3<f32>(
+        dot(vec3<f32>(matrix[0][0], matrix[0][1], matrix[0][2]), linear),
+        dot(vec3<f32>(matrix[1][0], matrix[1][1], matrix[1][2]), linear),
+        dot(vec3<f32>(matrix[2][0], matrix[2][1], matrix[2][2]), linear),
+    );
+    return linear_rgb_to_xyb(rgb * (color.intensity / 255.0));
 }
 
 fn dct_basis(frequency: u32, position: u32, size: u32) -> f32 {

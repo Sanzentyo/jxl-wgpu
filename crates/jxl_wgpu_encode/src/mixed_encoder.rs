@@ -32,8 +32,8 @@ pub enum VarDctTransformSelection {
     Map(VarDctStrategyMap),
 }
 
-/// Fixed policies for both frame codecs. Both use `vardct.sample_format` for source
-/// precision/storage and sRGB/D65 presentation.
+/// Fixed policies for both frame codecs. Both use `vardct`'s stream-wide source
+/// channels/precision, source color and image color options.
 ///
 /// The default VarDCT domain is `Original`. An explicit XYB configuration is rejected:
 /// the image-wide XYB flag cannot change between physical frames, and the Modular backend
@@ -156,11 +156,7 @@ impl MixedModeBackend {
         source: &BufferImageSource,
         request: &FrameEncodeRequest,
     ) -> Result<(), EncodeError> {
-        if !self
-            .vardct
-            .sample_format()
-            .matches_format(&source.layout.format)
-        {
+        if !self.vardct.matches_source_format(&source.layout.format) {
             return Err(UnsupportedFeature::InputFormat.into());
         }
         if request.options.save_before_color_transform {
@@ -208,9 +204,7 @@ impl GpuEncodeBackend for MixedModeBackend {
         let GpuFrameSource::Buffer(buffer) = source else {
             return false;
         };
-        self.vardct
-            .sample_format()
-            .matches_format(&buffer.layout.format)
+        self.vardct.matches_source_format(&buffer.layout.format)
             && (self.modular.supports_input(source) || self.vardct.supports_input(source))
     }
 

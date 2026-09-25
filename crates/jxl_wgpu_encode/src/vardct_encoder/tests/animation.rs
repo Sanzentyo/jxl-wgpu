@@ -90,7 +90,7 @@ fn pixels(width: usize, height: usize, frame: usize) -> Vec<[u8; 3]> {
         .collect()
 }
 
-fn compare(label: &str, actual: &[f32], expected: &[f32]) {
+pub(super) fn compare(label: &str, actual: &[f32], expected: &[f32]) {
     assert_eq!(actual.len(), expected.len());
     for (index, (&a, &b)) in actual.iter().zip(expected).enumerate() {
         assert!(a.is_finite() && b.is_finite());

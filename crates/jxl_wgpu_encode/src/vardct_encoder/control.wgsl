@@ -1,6 +1,14 @@
 // Shared checked artifact ABI and deterministic entropy/control writers.
 
-// Exactly 828 bytes. All artifact offsets and lengths are expressed in u32
+struct SourceColor {
+    transfer: u32,
+    gamma: f32,
+    intensity: f32,
+    luminance: array<f32, 4>,
+    matrix: array<array<f32, 3>, 3>,
+}
+
+// Exactly 892 bytes. All artifact offsets and lengths are expressed in u32
 // words and are independently checked by the host before dispatch.
 struct Params {
     width: u32,
@@ -47,6 +55,7 @@ struct Params {
     source_validation_groups: u32,
     source_big_endian: u32,
     sources: array<Source, 3>,
+    source_color: SourceColor,
 }
 
 @group(0) @binding(0)

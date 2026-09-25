@@ -35,6 +35,6 @@ pub use sequence::{
 };
 pub use strategy_map::{VarDctStrategyMap, VarDctTransform};
 pub use types::{
-    TiledVarDctGrid, VarDctColorEncoding, VarDctKernelLayout, VarDctLfMetadata, VarDctMemoryPlan,
-    VarDctStrategy, VarDctTransformMemoryPlan,
+    TiledVarDctGrid, VarDctKernelLayout, VarDctLfMetadata, VarDctMemoryPlan, VarDctStrategy,
+    VarDctTransformMemoryPlan,
 };

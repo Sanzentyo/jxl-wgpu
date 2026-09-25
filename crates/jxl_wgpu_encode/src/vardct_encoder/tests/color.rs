@@ -128,16 +128,30 @@ impl PixelOracles {
     }
 
     pub(super) fn check_decoders_with_rust(&self, encoded: &[u8]) -> (Vec<f32>, Vec<f32>) {
-        let native =
-            libjxl_output(encoded, &["--original"]).expect("required pinned native RGB oracle");
+        self.check_declared_color(encoded, vardct_rgb8_format().color_spec)
+    }
+
+    pub(super) fn check_declared_color(
+        &self,
+        encoded: &[u8],
+        color: jxl_gpu_formats::ColorSpecification,
+    ) -> (Vec<f32>, Vec<f32>) {
         let (rust, extras) = rust_planes(encoded);
         assert!(extras.is_empty());
-        compare(&rust, &native);
-        let format = PixelFormat::rgb_f32(
-            RgbChannelOrder::Rgba,
-            false,
-            vardct_rgb8_format().color_spec,
-        );
+        let native = self.check_with_reference(encoded, color, &rust);
+        (native, rust)
+    }
+
+    pub(super) fn check_with_reference(
+        &self,
+        encoded: &[u8],
+        color: jxl_gpu_formats::ColorSpecification,
+        reference: &[f32],
+    ) -> Vec<f32> {
+        let native =
+            libjxl_output(encoded, &["--original"]).expect("required pinned native RGB oracle");
+        compare(reference, &native);
+        let format = PixelFormat::rgb_f32(RgbChannelOrder::Rgba, false, color);
         let mut whole = Vec::new();
         for (decoder, fragmented) in [(&self.whole, false), (&self.windowed, true)] {
             let request = GpuOutputRequest::color(format.clone()).unwrap();
@@ -155,7 +169,7 @@ impl PixelOracles {
                 .unwrap();
             let gpu = floats(&read.frame.outputs[0].bytes);
             compare(&gpu, &native);
-            compare(&gpu, &rust);
+            compare(&gpu, reference);
             if fragmented {
                 assert_eq!(gpu, whole);
             } else {
@@ -171,7 +185,7 @@ impl PixelOracles {
                 0
             );
         }
-        (native, rust)
+        native
     }
 }
 

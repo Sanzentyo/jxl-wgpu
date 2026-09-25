@@ -17,6 +17,10 @@ callbacks; the shared fragments introduce no bindings or host pixel arithmetic.
 The same expansion includes the pure implicit Palette entry fragment for encoder matching and
 decoder inversion, retaining wide cube arithmetic and the 24-bit signed-delta scale cap.
 
+`IMAGE_TRANSFER_SHADER` and `transfer_parameters` share the transfer-selector/gamma ABI across
+packing, ICC RGB connections and encoder normalization. `display_luminance` lowers declared
+primaries and image white for PQ scaling and HLG's coupled OOTF; no host image samples enter it.
+
 Host code validates plans and packets, records command buffers, and resolves completion. Supported
 pixel, coefficient, restoration, color, packing, and display work executes in WGSL. Unsupported
 operations, layouts, precision contracts, and device limits return typed errors before an output

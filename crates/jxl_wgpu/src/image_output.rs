@@ -672,8 +672,9 @@ pub(crate) struct ImageColorTransform {
     pub(crate) primaries: [[f32; 4]; 3],
 }
 
-/// Shared selector and gamma ABI for image packing and ordered ICC RGB stages.
-pub(crate) fn transfer_parameters(transfer: SourceTransferFunction) -> (u32, f32) {
+/// Selector and gamma for [`IMAGE_TRANSFER_SHADER`], shared by image packing,
+/// ordered ICC RGB stages and encoder source normalization.
+pub fn transfer_parameters(transfer: SourceTransferFunction) -> (u32, f32) {
     let code = match transfer {
         SourceTransferFunction::Linear => 0,
         SourceTransferFunction::Srgb => 1,

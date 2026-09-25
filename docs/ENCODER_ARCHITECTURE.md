@@ -57,14 +57,26 @@ or ownership rules change, and regular frames retain their requested progression
 `ImageSequenceDescriptor` compiles bounded image geometry and optional timebase fragments;
 `VarDctSequenceDescriptor` remains an alias.
 Sequence creation binds them to the backend's immutable `VarDctColorPlan`, which lowers the
-typed XYB/original-component selection and checked `ColorSampleFormat` once. That same plan supplies image metadata, the presence
+typed XYB/original-component selection, checked `ColorSampleFormat`, enumerated source color and image options once. That same plan supplies image metadata, the presence
 of frame color/matrix-scale fields, GPU normalization and HF channel multipliers. Jobs retain
 it through packet assembly; neither the serializer nor either GPU path infers the domain
-from other configuration. Original RGB transforms normalized sRGB components with neutral HF
+from other configuration. Original coding transforms normalized source components with neutral HF
 channel multipliers; XYB retains linearization, opsin conversion and its standard X/B scales.
 LF/correlation and matrix/order policy remain explicit and independent of color selection.
 All source-dependent operations stay on the GPU, using the existing allocations and completion
 lease. [Original-RGB evidence](CONFORMANCE_CORPUS.md#original-rgb-vardct-encoding).
+
+`VarDctConfig::source_color` is lowered to the same checked enumerated encoding that writes
+Modular metadata. Custom xy and gamma are quantized once to wire precision, then expanded for
+GPU transfer/Bradford matrix/luminance lowering. The plan rejects undefined/ICC/limited-range
+or unsupported color before creating pipelines and compares each source's wire encoding before
+budget admission. `ImageColorOptions` owns the common intent/positive exact-F16 image-white
+contract; the image writer emits tone metadata for either stills or animations when needed.
+XYB includes the existing `IMAGE_TRANSFER_SHADER` and its shared selector ABI, preserving PQ
+absolute scaling and HLG's coupled OOTF before primary conversion and intensity/255 opsin scaling.
+Original coding bypasses those conversions. A bounded 64-byte parameter tail adds no image
+buffer or submission; GPU results still establish validity separately from metadata policy.
+[Enumerated input evidence](CONFORMANCE_CORPUS.md#enumerated-vardct-and-mixed-input).
 
 `ColorSampleFormat` owns `ColorChannels::Gray` or `Rgb`, 1–31-bit integer or checked
 `FloatPrecision` logical precision, and a
@@ -74,8 +86,8 @@ rejects inconsistent extents/strides/overlap, and resolves each logical componen
 word width, bit shift, pixel stride and absolute origin. Regions retain u64 absolute offsets
 until dispatch windows rebase them into checked WGSL-u32 addresses. Modular groups/streaming
 and whole-image VarDCT use the same plan and window-union accounting. Shared `source_color`
-lowering writes Gray/RGB color syntax; Modular image options and ICC ownership stay in its
-metadata plan. Gaps between aligned windows are neither bound nor charged as addressed
+lowering writes Gray/RGB color syntax and owns shared `ImageColorOptions`; variable ICC ownership
+stays in the Modular metadata plan. Gaps between aligned windows are neither bound nor charged as addressed
 bytes; alignment overlap is counted once. No host sample scan, repacking or extra image allocation
 is introduced.
 
@@ -114,7 +126,7 @@ caller selects one for each physical frame. The generic `EncodeSession` retains 
 frame counter, finality, canvas and timebase, validates before admission, and advances only
 after successful submission. Fixed-codec sessions use this same submission path. Geometry
 belongs to the selected backend: a fixed VarDCT transform/map does not constrain Modular sources.
-Both codecs accept the same logical Gray/RGB channels and integer/floating default-sRGB precision and post-transform
+Both codecs accept the same logical Gray/RGB channels, integer/floating precision, enumerated color and post-transform
 references. Physical frames may independently change their supported layout, swizzle and word byte order. XYB configuration and incompatible source/reference contracts fail before admission.
 
 Memory queries and submissions share each backend's frame preparation, including reference-only

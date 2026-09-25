@@ -349,7 +349,7 @@ fn nonzero_ac_admission_includes_every_fragment_and_readback_byte() {
     let plan = provisional.memory_plan(&source).unwrap();
     assert_eq!(
         plan.owned_bytes_per_job,
-        828 + 2 * plan.artifact_storage_bytes + plan.quantization_metadata_bytes
+        892 + 2 * plan.artifact_storage_bytes + plan.quantization_metadata_bytes
     );
     let limited = WgpuContext::with_memory_budget(
         Arc::new(base.device().clone()),

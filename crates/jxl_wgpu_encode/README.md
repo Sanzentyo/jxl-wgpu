@@ -73,7 +73,7 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   profile streams must also fit JPEG XL's 256 MiB limits. Limit failures use `EncodeError::IccLimit`
   before variable-sized header allocation or GPU admission. CMYK and other device spaces remain
   unsupported.
-- `with_color_options(LosslessModularColorOptions)` selects all four ICC rendering intents and
+- `with_color_options(ImageColorOptions)` selects all four ICC rendering intents and
   a positive exact `FiniteF16` image white in cd/m². Defaults are Relative and 255 cd/m², also for
   HDR; the caller explicitly selects another known source white. This declares metadata and
   performs no tone mapping, primary conversion or alpha-association change. For ICC input, select
@@ -485,12 +485,22 @@ The map is caller-selected metadata; content-adaptive strategy selection remains
 `VarDctEncoder::new_with_config`, `new_with_strategy_map`, and
 `TiledVarDctEncoder::new_with_config` accept a `VarDctConfig`. Its
 `color_transform` selects `VarDctColorTransform::Xyb` (default) or `Original`. Both accept
-the configured integer or floating Gray/RGB sRGB/D65 source layout. XYB linearizes sRGB before the opsin transform;
-Original directly transforms the normalized sRGB components. It does not linearize them
-or add support for other source encodings. `color_transform()` reports the selected policy;
-`color_encoding()` reports sRGB/D65; `sample_format().pixel_format()` constructs canonical storage. One immutable color plan controls the
-image's XYB flag, logical-to-working component mapping, frame syntax, GPU normalization and HF channel multipliers. Original components
-omits the XYB-only matrix-scale fields and uses their implicit neutral multipliers.
+the configured integer or floating Gray/RGB source layout. `source_color` declares full-range
+enumerated BT.709, BT.2020, Display-P3 or custom primaries with D65, E, DCI or custom white;
+Linear, sRGB/Sycc, BT.709, PQ, HLG, DCI and checked Gamma transfers are supported.
+The default remains sRGB/D65. `color_options: ImageColorOptions` binds all four rendering
+intents and positive exact binary16 image white (default 255 cd/m²), shared with Modular.
+XYB applies the shared GPU EOTF, PQ/HLG display luminance, Bradford-adapted primary matrix,
+image-white scaling and opsin transform. Original directly transforms normalized components.
+`color_transform()` and `source_color()` report the configured policy;
+`VarDctConfig::pixel_format()` constructs canonical storage including its color declaration.
+One checked color plan owns image/frame syntax, logical-to-working component mapping, GPU
+normalization and HF multipliers. It expands serialized custom xy/gamma values before GPU
+lowering, so metadata and arithmetic use the same rounding. Every admitted frame must have
+wire-equivalent color, channels and precision; explicit sRGB/Sycc aliases may match defaults.
+Undefined color, unsupported transfers, ICC, limited-range RGB/YUV and unrepresentable geometry
+are rejected before job admission. Original components omit XYB-only matrix-scale fields and
+use their implicit neutral multipliers.
 LF metadata, matrices, orders and quantizers retain their explicit values in either domain;
 switching the domain does not imply equivalent bitrate or perceptual quality.
 The [original-RGB corpus](../../docs/CONFORMANCE_CORPUS.md#original-rgb-vardct-encoding)
@@ -508,7 +518,7 @@ be unaligned, and physical planes may appear in any nonoverlapping order. Paddin
 ignored. `sample_format.pixel_format()` remains a canonical native-endian interleaved format
 with separate 1/2/4-byte component words and right-aligned samples.
 
-Gray uses `ColorModel::Gray`, default sRGB/D65 and a single stored channel selected by
+Gray uses `ColorModel::Gray`, the configured white/transfer and a single stored channel selected by
 the gray swizzle (X, Y, Z or W; no alpha). Its checked source record is bound to each of
 the three standard VarDCT working components. The GPU reads the same source sample for
 each, while the header declares Gray and omits RGB primaries. Source windows count those
@@ -517,7 +527,7 @@ same word sizes, bit positions, byte order and unaligned row/offset support as R
 
 The logical input API is `ColorSampleFormat` and `ImageSequenceDescriptor`; these replace
 the former RGB-only names. A sequence fixes channels and precision together, even when
-its physical frames change layout or codec.
+its physical frames change layout or codec. The color plan independently binds the declared color and image-white options.
 
 The shared checked source plan owns physical addressing and per-plane binding windows for
 both Modular and VarDCT; the immutable color/sample plan owns logical normalization and image
@@ -530,12 +540,12 @@ VarDCT checks raw floating exponent fields on GPU, returning typed
 `BackendError::VarDctNonFiniteSource` for NaN or either infinity before exposing any frame.
 Finite values that overflow quantized i32 coefficients retain the distinct quantization error.
 Original components retain finite negative/greater-than-one values within that quantizer range.
-XYB uses signed sRGB linearization and its existing nonnegative opsin-absorbance clamp;
+XYB uses each declared transfer's extension and its existing nonnegative opsin-absorbance clamp;
 no arbitrary extended-range reconstruction or general quality guarantee is implied.
 Subnormals enter the lossy F32 arithmetic contract; VarDCT is not a bit-preserving float codec.
 General transforms budget per-workgroup completion/error records inside the artifact/readback;
 tiled DCT8 carries errors in its existing block records. Missing or malformed validation
-records cannot publish an artifact. Alpha, ICC, other source colors, subsampling and
+records cannot publish an artifact. Alpha, ICC, subsampling and
 texture inputs remain outside the VarDCT contract.
 
 VarDCT and mixed sequences declare 32-bit Modular working buffers, independently of input
@@ -708,7 +718,7 @@ fallback. The independently concatenable block format relies on the single-distr
 policy; future contextual or ANS encoders must maintain their state on GPU.
 
 `VarDctMemoryPlan::kernel_layout` distinguishes `SingleTransform`, `StrategyMap` and `TiledDct8`. All use
-828-byte parameters and a runtime-sized artifact with a 272-byte header. The former carries
+892-byte parameters and a runtime-sized artifact with a 272-byte header. The former carries
 the pass count, per-pass word stride and eleven spectral/shift descriptors; the latter records
 the pass count. The source layout replaces three old geometry/width words with three 24-byte
 component records, increasing parameters by 60 bytes; the artifact header is unchanged. LF descriptors
@@ -724,7 +734,7 @@ also work on devices requiring 1024-byte storage offsets without padding each ch
 Raw input instead uses four aligned plane bindings (unused entries alias the first); the reported
 `source_binding_bytes` is their union, with overlap counted once and gaps between windows excluded.
 Each general-transform matrix/order entry contains three F32 scales and three U32 indices in
-24 bytes. An 8×8 DCT submission owns 12,240 bytes: 828 parameters, 3,072 artifact, 3,072 readback
+24 bytes. An 8×8 DCT submission owns 12,304 bytes: 892 parameters, 3,072 artifact, 3,072 readback
 and 5,268 resident transform bytes. Tiled DCT8 retains the same 24-byte entry layout in a
 1,536-byte matrix/order table at read-only storage binding 3, reported by
 `quantization_metadata_bytes` and included in the
@@ -867,9 +877,9 @@ encoder.encode(source_13_by_21)
 
 `MixedModeEncoder::new(context, MixedModeConfig)` accepts explicit per-frame choices through
 `MixedModeFrameEncoding::{Modular, VarDct}`. `begin_sequence(ImageSequenceDescriptor)` creates
-one layered still or animation with a shared integer/floating Gray/RGB sRGB/D65 image contract. Both codecs
+one layered still or animation with a shared integer/floating Gray/RGB enumerated-color image contract. Both codecs
 use the precision in `config.vardct.sample_format` (1–31 integer bits or a legal floating precision, default RGB8) and the
-logical Gray/RGB/default-sRGB contract. Each physical frame may independently select any supported
+`source_color` and `color_options` in that same VarDCT configuration. Each physical frame may independently select any supported
 packed, planar or split layout, swizzle, bit position and word byte order; channels, precision and color stay fixed. The default config uses original-component
 VarDCT, tiled DCT8 and default lossless Modular. An explicit XYB configuration is rejected.
 
@@ -879,7 +889,7 @@ only; Modular and tiled sources can vary per frame. Modular retains its configur
 predictor and transform policies. Regular VarDCT frames retain configured AC progression;
 reference-only VarDCT frames use one implicit complete pass. The common contract supports
 Replace/Add/Multiply, signed crops, hidden layers, timecodes and four post-transform reference
-slots across codec boundaries. Alpha, ICC, other color and pre-transform
+slots across codec boundaries. Alpha, ICC and pre-transform
 references and automatic mode selection require broader contracts and remain unsupported.
 Modular preserves its physical source words, including nonfinite float payloads; selected VarDCT frames require finite samples.
 Modular/VarDCT mode selection preserves these distinct contracts; including VarDCT does not make the presentation lossless.
@@ -935,7 +945,7 @@ working-buffer declaration changes its image header; mixed all-Modular frames re
 frame payloads and metadata apart from that image-wide working-buffer flag.
 
 `VarDctEncoder::begin_sequence` and `TiledVarDctEncoder::begin_sequence` share the same descriptor
-and session. The descriptor fixes canvas and optional timebase; the encoder binds the selected Gray/RGB channels, integer or floating precision and sRGB/D65 input,
+and session. The descriptor fixes canvas and optional timebase; the encoder binds the selected Gray/RGB channels, integer or floating precision and enumerated input color,
 XYB or original-component coding, transform policy,
 quantization, matrices/orders and AC passes. Single transforms and maps retain their source
 extent on each frame; tiled DCT8 accepts separately checked crop extents through its 16K axis

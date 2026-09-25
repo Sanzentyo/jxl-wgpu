@@ -1,7 +1,6 @@
 //! VarDCT contracts, ABI records, and frame geometry.
 
 use jxl_gpu_bitstream::FiniteF16;
-use jxl_gpu_formats::PixelFormat;
 use jxl_gpu_protocol::Extent2d;
 
 pub use jxl_gpu_protocol::TransformKind as VarDctStrategy;
@@ -20,12 +19,6 @@ pub(super) const SOURCE_VALIDATED: u32 = 0x0052_4345;
 pub(super) const ARTIFACT_READY: u32 = 0x5644_4354;
 pub(super) const SINGLE_TRANSFORM_TOPOLOGY: u32 = 0;
 pub(super) const TILED_DCT8_TOPOLOGY: u32 = 1;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum VarDctColorEncoding {
-    #[default]
-    SrgbD65,
-}
 
 /// Exact LF dequantization and chroma-from-luma metadata serialized in a VarDCT frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -136,17 +129,6 @@ impl Default for VarDctLfMetadata {
             base_correlation: [0x0000, 0x3c00]
                 .map(|bits| FiniteF16::from_bits(bits).expect("default correlation F16 is finite")),
             lf_factors: [0, 0],
-        }
-    }
-}
-
-impl VarDctColorEncoding {
-    /// Canonical RGB8 convenience format with checked byte offsets and row padding.
-    /// For other precisions, use the encoder's `sample_format().pixel_format()`.
-    #[must_use]
-    pub fn pixel_format(self) -> PixelFormat {
-        match self {
-            Self::SrgbD65 => crate::ColorSampleFormat::RGB8.pixel_format(),
         }
     }
 }
@@ -417,6 +399,7 @@ pub(super) struct VarDctKernelParams {
     pub(super) source_validation_groups: u32,
     pub(super) source_big_endian: u32,
     pub(super) sources: [crate::source::SourceParams; 3],
+    pub(super) source_color: super::color::SourceColorParams,
 }
 
 #[repr(C)]
@@ -470,7 +453,8 @@ pub(super) struct DcFragmentDescriptor {
 const _: () = {
     assert!(std::mem::size_of::<GpuPrefixEntry>() == 8);
     assert!(std::mem::align_of::<GpuPrefixEntry>() == 4);
-    assert!(std::mem::size_of::<VarDctKernelParams>() == 828);
+    assert!(std::mem::size_of::<VarDctKernelParams>() == 892);
+    assert!(std::mem::offset_of!(VarDctKernelParams, source_color) == 828);
     assert!(std::mem::align_of::<VarDctKernelParams>() == 4);
     assert!(std::mem::size_of::<VarDctArtifactHeader>() == 272);
     assert!(std::mem::align_of::<VarDctArtifactHeader>() == 4);

@@ -97,12 +97,16 @@ impl Default for VarDctQuantization {
     }
 }
 
-/// Coding domain, quantizers, matrices, LF metadata, coefficient orders and AC passes.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+/// Source color, coding domain, quantizers, matrices, LF metadata, coefficient orders and AC passes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct VarDctConfig {
     /// Stream-wide Gray/RGB source channels and precision; defaults to interleaved RGB8.
     pub sample_format: crate::ColorSampleFormat,
-    /// Stream-wide coding domain for integer or floating Gray/RGB sRGB sources; defaults to XYB.
+    /// Stream-wide enumerated source color; defaults to sRGB/D65. ICC is not yet supported.
+    pub source_color: jxl_gpu_formats::ColorSpecification,
+    /// Rendering intent and positive exact binary16 image white (default 255 cd/m²).
+    pub color_options: crate::ImageColorOptions,
+    /// Stream-wide coding domain for integer or floating Gray/RGB sources; defaults to XYB.
     pub color_transform: super::VarDctColorTransform,
     /// Spectral/quantized AC progression; defaults to one complete pass.
     pub progressive: crate::ProgressivePlan,
@@ -114,4 +118,32 @@ pub struct VarDctConfig {
     pub coefficient_orders: VarDctCoefficientOrders,
     /// Validated parametric/raw HF matrices; defaults to the standard matrices for all 17 families.
     pub dequant_matrices: VarDctDequantMatrices,
+}
+
+impl Default for VarDctConfig {
+    fn default() -> Self {
+        Self {
+            sample_format: Default::default(),
+            source_color: jxl_gpu_formats::ColorSpecification::Default,
+            color_options: Default::default(),
+            color_transform: Default::default(),
+            progressive: Default::default(),
+            group_order: Default::default(),
+            quantization: Default::default(),
+            lf_metadata: Default::default(),
+            coefficient_orders: Default::default(),
+            dequant_matrices: Default::default(),
+        }
+    }
+}
+
+impl VarDctConfig {
+    /// Canonical source storage with this configuration's channels, precision and color.
+    #[must_use]
+    pub fn pixel_format(&self) -> jxl_gpu_formats::PixelFormat {
+        jxl_gpu_formats::PixelFormat {
+            color_spec: self.source_color.clone(),
+            ..self.sample_format.pixel_format()
+        }
+    }
 }
