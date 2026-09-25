@@ -1,7 +1,7 @@
 use super::*;
-use crate::RgbSampleFormat;
+use crate::{ColorChannels, ColorSampleFormat};
 use crate::{
-    FrameKind, MixedModeConfig, MixedModeEncoder, MixedModeFrameEncoding, RgbSequenceDescriptor,
+    FrameKind, ImageSequenceDescriptor, MixedModeConfig, MixedModeEncoder, MixedModeFrameEncoding,
     VarDctTransformSelection,
 };
 use jxl_gpu_formats::SampleKind;
@@ -32,7 +32,7 @@ fn layers(width: usize, height: usize, animated: bool) -> Vec<Layer> {
     .collect()
 }
 
-fn check_mixed_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>, vary_layout: bool) {
+fn check_mixed_sequences(formats: impl IntoIterator<Item = ColorSampleFormat>, vary_layout: bool) {
     let backend = backend();
     let context = WgpuContext::from_backend(&backend);
     let pixels = color::PixelOracles::new(&backend);
@@ -59,7 +59,8 @@ fn check_mixed_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>, var
             let stills = mixed_mode::Stills::new(&context, &config);
             assert_eq!(encoder.sample_format(), config.vardct.sample_format);
             for animation in [AnimationHeader::Still, timebase(60_000, 1001, 2, false)] {
-                for &reference_only in if sample == RgbSampleFormat::integer(31).unwrap()
+                for &reference_only in if sample.channels() == ColorChannels::Gray
+                    || sample.bits_per_sample() == 31
                     || sample.float_precision().is_some()
                 {
                     &[true, false][..]
@@ -67,7 +68,7 @@ fn check_mixed_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>, var
                     &[true][..]
                 } {
                     eprintln!("{sample:?}/{w}x{h}/{animation:?}");
-                    let desc = RgbSequenceDescriptor::new(w as u32, h as u32, animation).unwrap();
+                    let desc = ImageSequenceDescriptor::new(w as u32, h as u32, animation).unwrap();
                     let mut session = encoder.begin_sequence(desc.clone()).unwrap();
                     let mut layers = layers(w, h, animation.is_animation());
                     if !reference_only {
@@ -94,6 +95,7 @@ fn check_mixed_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>, var
                         if mode == MixedModeFrameEncoding::Modular {
                             let words = original_frames(&baseline);
                             assert_eq!(words.len(), 1);
+                            assert_eq!(words[0].planes.len(), sample.channels().count() as usize);
                             for (c, plane) in words[0].planes.iter().enumerate() {
                                 assert_eq!(
                                     *plane,
@@ -102,7 +104,7 @@ fn check_mixed_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>, var
                             }
                         }
                         let source = if vary_layout {
-                            let alternate = layouts::sequence_source(
+                            let alternate = alternate_source(
                                 &context,
                                 Extent2d::new(w as u32, h as u32),
                                 sample,
@@ -120,7 +122,7 @@ fn check_mixed_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>, var
                     {
                         // The checked common precision applies before either codec acquires memory.
                         let mut wrong = source.clone();
-                        wrong.layout.format = crate::RgbSampleFormat::RGB8.pixel_format();
+                        wrong.layout.format = crate::ColorSampleFormat::RGB8.pixel_format();
                         assert!(
                             session
                                 .memory_plan(&wrong, mode, layer.options.clone(), i == 2)
@@ -151,7 +153,15 @@ fn check_mixed_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>, var
                         &[1, 5, 1],
                         (
                             VarDctColorTransform::Original,
-                            if sample.float_precision().is_some() && reference_only {
+                            if sample.channels() == ColorChannels::Gray && reference_only {
+                                // Oxide's mixed Gray reference grids disagree on one versus three
+                                // components; Rust jxl disagrees with native reference composition.
+                                // Keep native/GPU whole streams and independent physical-still
+                                // composition, plus Rust jxl whole-stream Replace cases below.
+                                CompositionOracle::IndependentStills
+                            } else if sample.channels() == ColorChannels::Gray {
+                                CompositionOracle::RustJxl
+                            } else if sample.float_precision().is_some() && reference_only {
                                 // Whole-stream oxide and Rust jxl disagree with native floating
                                 // mixed blending. Preserve these cases with native/GPU output and
                                 // independent Rust-decoded physical-still composition. Extra
@@ -159,15 +169,13 @@ fn check_mixed_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>, var
                                 CompositionOracle::IndependentStills
                             } else if sample.float_precision().is_some() {
                                 CompositionOracle::RustJxl
-                            } else if sample == RgbSampleFormat::integer(31).unwrap()
-                                && reference_only
-                            {
+                            } else if sample.bits_per_sample() == 31 && reference_only {
                                 // Both external whole-stream Rust decoders have 31-bit mixed blending
                                 // limitations: oxide overflows its i32 divisor; jxl disagrees with native
                                 // composition. Retain native/GPU whole-stream checks and independent
                                 // composition of Rust-decoded physical stills for this combination.
                                 CompositionOracle::IndependentStills
-                            } else if sample == RgbSampleFormat::integer(31).unwrap() {
+                            } else if sample.bits_per_sample() == 31 {
                                 // jxl-oxide 0.13 overflows (1i32 << 31) - 1 while normalizing Modular.
                                 // Rust jxl independently verifies the additional full-canvas Replace streams.
                                 CompositionOracle::RustJxl
@@ -183,7 +191,7 @@ fn check_mixed_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>, var
     assert_eq!(context.memory_stats().reserved_bytes, 0);
 }
 
-fn check_vardct_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>, vary_layout: bool) {
+fn check_vardct_sequences(formats: impl IntoIterator<Item = ColorSampleFormat>, vary_layout: bool) {
     let backend = backend();
     let context = WgpuContext::from_backend(&backend);
     let pixels = color::PixelOracles::new(&backend);
@@ -197,72 +205,106 @@ fn check_vardct_sequences(formats: impl IntoIterator<Item = RgbSampleFormat>, va
             };
             let encoder = TiledVarDctEncoder::new_with_config(context.clone(), config).unwrap();
             for animation in [AnimationHeader::Still, timebase(60, 1, 0, false)] {
-                let desc = RgbSequenceDescriptor::new(w as u32, h as u32, animation).unwrap();
-                let layers = layers(w, h, animation.is_animation());
-                let mut session = encoder.begin_sequence(desc.clone()).unwrap();
-                let mut samples = Vec::new();
-                let mut jobs = Vec::new();
-                let mut inputs = Vec::new();
-                for i in 0..layers.len() {
-                    let input = source_samples(w, h, sample, i as u32 * 31);
-                    let source = input_source(&context, w, h, sample, &input);
-                    let baseline = encoder.encode(source.clone()).unwrap();
-                    samples.push(check_pixels(&pixels, &baseline, &input, sample));
-                    let source = if vary_layout {
-                        let alternate = layouts::sequence_source(
-                            &context,
-                            Extent2d::new(w as u32, h as u32),
-                            sample,
-                            &input,
-                            i,
-                        );
-                        assert_eq!(encoder.encode(alternate.clone()).unwrap(), baseline);
-                        alternate
-                    } else {
-                        source
-                    };
-                    inputs.push(source);
-                }
-                for (i, (source, layer)) in inputs.into_iter().zip(&layers).enumerate() {
-                    jobs.push(
-                        if i == 2 {
-                            session.submit_last_frame(source, layer.options.clone())
-                        } else {
-                            session.submit_frame(source, layer.options.clone())
+                for &reference_only in if sample.channels() == ColorChannels::Gray {
+                    &[true, false][..]
+                } else {
+                    &[true][..]
+                } {
+                    eprintln!(
+                        "fixed {sample:?}/{color:?}/{animation:?}/references={reference_only}"
+                    );
+                    let desc = ImageSequenceDescriptor::new(w as u32, h as u32, animation).unwrap();
+                    let mut layers = layers(w, h, animation.is_animation());
+                    if !reference_only {
+                        for layer in &mut layers {
+                            layer.options.kind = FrameKind::Regular;
+                            layer.options.crop = None;
+                            layer.options.color_blend = FrameBlend::default();
                         }
-                        .unwrap(),
+                    }
+                    let mut session = encoder.begin_sequence(desc.clone()).unwrap();
+                    let mut samples = Vec::new();
+                    let mut jobs = Vec::new();
+                    let mut inputs = Vec::new();
+                    for i in 0..layers.len() {
+                        let input = source_samples(w, h, sample, i as u32 * 31);
+                        let source = input_source(&context, w, h, sample, &input);
+                        let baseline = encoder.encode(source.clone()).unwrap();
+                        samples.push(check_pixels(&pixels, &baseline, &input, sample));
+                        let source = if vary_layout {
+                            let alternate = alternate_source(
+                                &context,
+                                Extent2d::new(w as u32, h as u32),
+                                sample,
+                                &input,
+                                i,
+                            );
+                            assert_eq!(encoder.encode(alternate.clone()).unwrap(), baseline);
+                            alternate
+                        } else {
+                            source
+                        };
+                        inputs.push(source);
+                    }
+                    for (i, (source, layer)) in inputs.into_iter().zip(&layers).enumerate() {
+                        jobs.push(
+                            if i == 2 {
+                                session.submit_last_frame(source, layer.options.clone())
+                            } else {
+                                session.submit_frame(source, layer.options.clone())
+                            }
+                            .unwrap(),
+                        );
+                    }
+                    for job in jobs.into_iter().rev() {
+                        session.insert(job.wait().unwrap()).unwrap();
+                    }
+                    let encoded = session
+                        .finish_indexed_container(Default::default(), Default::default())
+                        .unwrap();
+                    assert_header(&encoded, sample, color);
+                    check_sequence_with_passes(
+                        &backend,
+                        &encoded,
+                        &desc,
+                        &layers,
+                        &samples,
+                        if reference_only {
+                            &[1, 5, 5]
+                        } else {
+                            &[5, 5, 5]
+                        },
+                        (
+                            color,
+                            if sample.channels() == ColorChannels::Gray && reference_only {
+                                // External Rust decoders differ from native Gray reference
+                                // composition. Keep the same independent-still/native/GPU contract
+                                // as mixed Gray, with additional whole-stream Replace comparisons.
+                                CompositionOracle::IndependentStills
+                            } else if sample.channels() == ColorChannels::Gray {
+                                CompositionOracle::RustJxl
+                            } else {
+                                CompositionOracle::JxlOxide
+                            },
+                        ),
                     );
                 }
-                for job in jobs.into_iter().rev() {
-                    session.insert(job.wait().unwrap()).unwrap();
-                }
-                let encoded = session
-                    .finish_indexed_container(Default::default(), Default::default())
-                    .unwrap();
-                assert_header(&encoded, sample, color);
-                check_sequence_with_passes(
-                    &backend,
-                    &encoded,
-                    &desc,
-                    &layers,
-                    &samples,
-                    &[1, 5, 5],
-                    (color, CompositionOracle::JxlOxide),
-                );
             }
         }
     }
     assert_eq!(context.memory_stats().reserved_bytes, 0);
 }
 
-fn float_formats() -> Vec<RgbSampleFormat> {
+fn float_formats() -> Vec<ColorSampleFormat> {
     [(5, 2), (16, 5), (24, 7), (32, 8)]
-        .map(|(bits, exponent)| RgbSampleFormat::float(bits, exponent).unwrap())
+        .map(|(bits, exponent)| {
+            ColorSampleFormat::float(crate::ColorChannels::Rgb, bits, exponent).unwrap()
+        })
         .to_vec()
 }
 
-fn source_samples(w: usize, h: usize, format: RgbSampleFormat, seed: u32) -> Vec<[u32; 3]> {
-    match format.float_precision() {
+fn source_samples(w: usize, h: usize, format: ColorSampleFormat, seed: u32) -> Vec<[u32; 3]> {
+    let mut pixels = match format.float_precision() {
         None => precision::pixels(w, h, format.bits_per_sample(), seed),
         Some(p) => {
             let mut pixels = floating::pixels(w, h, p);
@@ -270,16 +312,31 @@ fn source_samples(w: usize, h: usize, format: RgbSampleFormat, seed: u32) -> Vec
             pixels.rotate_left(offset);
             pixels
         }
+    };
+    if format.channels() == ColorChannels::Gray {
+        for pixel in &mut pixels {
+            *pixel = [pixel[0]; 3];
+        }
     }
+    pixels
 }
 
 fn input_source(
     context: &WgpuContext,
     w: usize,
     h: usize,
-    format: RgbSampleFormat,
+    format: ColorSampleFormat,
     words: &[[u32; 3]],
 ) -> BufferImageSource {
+    if format.channels() == ColorChannels::Gray {
+        return gray::upload(
+            context,
+            Extent2d::new(w as u32, h as u32),
+            format,
+            &words.iter().map(|p| p[0]).collect::<Vec<_>>(),
+            false,
+        );
+    }
     precision::source_with_kind(
         context,
         w,
@@ -293,7 +350,34 @@ fn input_source(
     )
 }
 
-fn assert_header(encoded: &[u8], format: RgbSampleFormat, color: VarDctColorTransform) {
+fn alternate_source(
+    context: &WgpuContext,
+    extent: Extent2d,
+    format: ColorSampleFormat,
+    words: &[[u32; 3]],
+    index: usize,
+) -> BufferImageSource {
+    match format.channels() {
+        ColorChannels::Gray => gray::upload(
+            context,
+            extent,
+            format,
+            &words.iter().map(|p| p[0]).collect::<Vec<_>>(),
+            index.is_multiple_of(2),
+        ),
+        ColorChannels::Rgb => layouts::sequence_source(context, extent, format, words, index),
+    }
+}
+
+fn assert_header(encoded: &[u8], format: ColorSampleFormat, color: VarDctColorTransform) {
+    let inventory = jxl_gpu_bitstream::parse(encoded, Default::default())
+        .unwrap()
+        .codestream_inventory(Default::default())
+        .unwrap();
+    assert_eq!(
+        inventory.image_header.grayscale,
+        format.channels() == ColorChannels::Gray
+    );
     match format.float_precision() {
         None => precision::check_header(encoded, format.bits_per_sample(), color),
         Some(p) => floating::check_header(encoded, p),
@@ -304,7 +388,7 @@ fn check_pixels(
     oracles: &color::PixelOracles,
     encoded: &[u8],
     words: &[[u32; 3]],
-    format: RgbSampleFormat,
+    format: ColorSampleFormat,
 ) -> Vec<f32> {
     match format.float_precision() {
         None => precision::check_pixels(oracles, encoded, words, format.bits_per_sample()),
@@ -315,7 +399,8 @@ fn check_pixels(
 #[test]
 fn integer_precision_mixed_sequences_share_depth_across_codecs_and_reference_frames() {
     check_mixed_sequences(
-        [1, 9, 16, 17, 24, 31].map(|bits| RgbSampleFormat::integer(bits).unwrap()),
+        [1, 9, 16, 17, 24, 31]
+            .map(|bits| ColorSampleFormat::integer(crate::ColorChannels::Rgb, bits).unwrap()),
         false,
     );
 }
@@ -323,7 +408,8 @@ fn integer_precision_mixed_sequences_share_depth_across_codecs_and_reference_fra
 #[test]
 fn integer_precision_vardct_sequences_bind_precision_with_both_color_domains() {
     check_vardct_sequences(
-        [9, 16, 31].map(|bits| RgbSampleFormat::integer(bits).unwrap()),
+        [9, 16, 31]
+            .map(|bits| ColorSampleFormat::integer(crate::ColorChannels::Rgb, bits).unwrap()),
         false,
     );
 }
@@ -342,16 +428,29 @@ fn floating_precision_vardct_sequences_bind_precision_with_both_color_domains() 
 fn source_layouts_vary_per_frame_in_mixed_and_vardct_sequences() {
     check_mixed_sequences(
         [
-            RgbSampleFormat::integer(7).unwrap(),
-            RgbSampleFormat::float(16, 5).unwrap(),
+            ColorSampleFormat::integer(crate::ColorChannels::Rgb, 7).unwrap(),
+            ColorSampleFormat::float(crate::ColorChannels::Rgb, 16, 5).unwrap(),
         ],
         true,
     );
     check_vardct_sequences(
         [
-            RgbSampleFormat::integer(16).unwrap(),
-            RgbSampleFormat::float(24, 7).unwrap(),
+            ColorSampleFormat::integer(crate::ColorChannels::Rgb, 16).unwrap(),
+            ColorSampleFormat::float(crate::ColorChannels::Rgb, 24, 7).unwrap(),
         ],
         true,
     );
+}
+
+#[test]
+fn gray_input_sequences_bind_logical_channels_across_codecs_and_source_layouts() {
+    let formats: Vec<_> = [1, 9, 16, 31]
+        .map(|bits| ColorSampleFormat::integer(ColorChannels::Gray, bits).unwrap())
+        .into_iter()
+        .chain([(5, 2), (16, 5), (24, 7), (32, 8)].map(|(bits, exponent)| {
+            ColorSampleFormat::float(ColorChannels::Gray, bits, exponent).unwrap()
+        }))
+        .collect();
+    check_mixed_sequences(formats.iter().copied(), true);
+    check_vardct_sequences(formats, true);
 }

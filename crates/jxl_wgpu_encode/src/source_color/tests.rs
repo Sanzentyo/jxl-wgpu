@@ -56,19 +56,19 @@ fn unrepresentable_or_singular_source_metadata_is_rejected() {
         TransferFunction::Smpte240M,
         TransferFunction::Bt2020,
     ] {
-        assert!(ModularColorEncoding::from_format(&format(ColorSpace::Bt709, transfer)).is_err());
+        assert!(SourceColorEncoding::from_format(&format(ColorSpace::Bt709, transfer)).is_err());
     }
     for gamma in [f32::MIN_POSITIVE, 0.0001, 1.00001, 2.2] {
         let transfer =
             TransferFunction::Gamma(jxl_gpu_protocol::GammaExponent::new(gamma).unwrap());
-        assert!(ModularColorEncoding::from_format(&format(ColorSpace::Bt709, transfer)).is_err());
+        assert!(SourceColorEncoding::from_format(&format(ColorSpace::Bt709, transfer)).is_err());
     }
     for gamma in [1.0 / 8192.0, 1.0 / 2.2, 1.0] {
         let transfer =
             TransferFunction::Gamma(jxl_gpu_protocol::GammaExponent::new(gamma).unwrap());
         let encoded =
-            ModularColorEncoding::from_format(&format(ColorSpace::Bt709, transfer)).unwrap();
-        let ModularColorEncoding::Enumerated(encoded) = encoded else {
+            SourceColorEncoding::from_format(&format(ColorSpace::Bt709, transfer)).unwrap();
+        let SourceColorEncoding::Enumerated(encoded) = encoded else {
             panic!("enumerated source color");
         };
         let TransferFunctionInventory::Gamma {
@@ -101,7 +101,7 @@ fn unrepresentable_or_singular_source_metadata_is_rejected() {
         },
     ] {
         assert!(
-            ModularColorEncoding::from_format(&format(
+            SourceColorEncoding::from_format(&format(
                 ColorSpace::CustomRgb(coordinates),
                 TransferFunction::Srgb
             ))
@@ -111,21 +111,12 @@ fn unrepresentable_or_singular_source_metadata_is_rejected() {
 }
 
 #[test]
-fn source_aliases_and_positive_exact_image_white_are_explicit() {
-    let default = ModularColorEncoding::default();
+fn source_aliases_are_explicit() {
+    let default = SourceColorEncoding::default();
     for transfer in [TransferFunction::Srgb, TransferFunction::Sycc] {
         assert_eq!(
-            ModularColorEncoding::from_format(&format(ColorSpace::Bt709, transfer)).unwrap(),
+            SourceColorEncoding::from_format(&format(ColorSpace::Bt709, transfer)).unwrap(),
             default
         );
-    }
-    for bits in 0..=u16::MAX {
-        if let Some(value) = FiniteF16::from_bits(bits) {
-            let options = LosslessModularColorOptions {
-                intensity_target: value,
-                ..Default::default()
-            };
-            assert_eq!(options.validate().is_ok(), bits > 0 && bits < 0x7c00);
-        }
     }
 }

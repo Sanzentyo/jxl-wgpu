@@ -10,7 +10,7 @@ use jxl_gpu_bitstream::{
     write_container_with_boxes,
 };
 
-use super::color::{LosslessModularColorOptions, ModularColorEncoding, ModularImageMetadata};
+use super::color::{LosslessModularColorOptions, ModularImageMetadata};
 use super::dispatch::{LosslessModularBackend, ModularGroupPlan};
 use super::entropy::{EncodedGroup, EntropyCode};
 use super::grid::{LosslessModularGroup, LosslessModularGroupGrid};
@@ -29,6 +29,7 @@ use super::types::{
 };
 use crate::frame_header::{FrameHeaderPlan, write_animation_header};
 use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS, RawPrefixCode};
+use crate::source_color::SourceColorEncoding;
 use crate::{
     AnimationHeader, BackendError, BitFragment, CodestreamAssembler, Determinism, EncodeError,
     EncodeProfile, EncodeSession, EncoderBufferPoolStats, EncoderCapabilities, FrameEncodeRequest,
@@ -152,7 +153,8 @@ impl LosslessModularEncoder {
             spec.packing.bits_per_sample,
             spec.packing.exponent_bits_per_sample,
             AnimationHeader::Still,
-            spec.color.metadata(
+            ModularImageMetadata::new(
+                spec.color.clone(),
                 self.color_options,
                 self.alpha_association,
                 self.max_icc_profile_bytes,
@@ -253,7 +255,8 @@ impl LosslessModularEncoder {
             descriptor.bits_per_sample,
             descriptor.exponent_bits_per_sample,
             descriptor.animation,
-            descriptor.color.metadata(
+            ModularImageMetadata::new(
+                descriptor.color.clone(),
                 self.color_options,
                 self.alpha_association,
                 self.max_icc_profile_bytes,
@@ -316,7 +319,8 @@ impl LosslessModularEncoder {
             source_spec.packing.bits_per_sample,
             source_spec.packing.exponent_bits_per_sample,
             AnimationHeader::Still,
-            source_spec.color.metadata(
+            ModularImageMetadata::new(
+                source_spec.color.clone(),
                 self.color_options,
                 self.alpha_association,
                 self.max_icc_profile_bytes,
@@ -330,7 +334,7 @@ impl LosslessModularEncoder {
             frame: Some(frame),
             codestream_header: Some(codestream_header),
             metadata_permit,
-            default_color: source_spec.color == ModularColorEncoding::default()
+            default_color: source_spec.color == SourceColorEncoding::default()
                 && self.color_options == LosslessModularColorOptions::default(),
             container,
             group_grid,
@@ -356,7 +360,7 @@ pub struct LosslessModularSequenceDescriptor {
     bits_per_sample: u8,
     exponent_bits_per_sample: u8,
     animation: AnimationHeader,
-    color: ModularColorEncoding,
+    color: SourceColorEncoding,
 }
 
 impl LosslessModularSequenceDescriptor {
@@ -443,7 +447,7 @@ impl LosslessModularSequenceDescriptor {
             bits_per_sample,
             exponent_bits_per_sample,
             animation,
-            color: ModularColorEncoding::default(),
+            color: SourceColorEncoding::default(),
         })
     }
 
@@ -1817,9 +1821,11 @@ pub(super) fn image_header(
         output.write_bits(0, 2)?;
     }
     output.write_bits(0, 1)?;
-    color
-        .encoding
-        .write(&mut output, format, color.options.rendering_intent)?;
+    color.encoding.write(
+        &mut output,
+        format.color_channels(),
+        color.options.rendering_intent,
+    )?;
     if extra_fields {
         color.options.write_tone(&mut output)?;
     }

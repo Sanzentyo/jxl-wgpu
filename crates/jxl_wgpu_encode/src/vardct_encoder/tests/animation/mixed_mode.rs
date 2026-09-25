@@ -1,9 +1,9 @@
 use super::*;
 use crate::{
-    FrameKind, LosslessModularColorTransform, LosslessModularConfig, LosslessModularEncoder,
-    LosslessModularEntropyCoding, LosslessModularGroupSize, LosslessModularPredictor,
-    LosslessModularRctType, LosslessModularSqueeze, MixedModeConfig, MixedModeEncoder,
-    MixedModeFrameEncoding, MixedModeMemoryPlan, Rgb8SequenceDescriptor, VarDctTransformSelection,
+    FrameKind, ImageSequenceDescriptor, LosslessModularColorTransform, LosslessModularConfig,
+    LosslessModularEncoder, LosslessModularEntropyCoding, LosslessModularGroupSize,
+    LosslessModularPredictor, LosslessModularRctType, LosslessModularSqueeze, MixedModeConfig,
+    MixedModeEncoder, MixedModeFrameEncoding, MixedModeMemoryPlan, VarDctTransformSelection,
 };
 use jxl_test_support::oracles::modular_words::original_frames;
 
@@ -471,7 +471,7 @@ fn mixed_mode_rejects_incompatible_contracts_before_advancing() {
         },
     )
     .unwrap();
-    let desc = Rgb8SequenceDescriptor::new(8, 8, AnimationHeader::Still).unwrap();
+    let desc = ImageSequenceDescriptor::new(8, 8, AnimationHeader::Still).unwrap();
     let source = padded_rgb_source_sized(&context, 8, 8, &pixels(8, 8, 0));
     for mode in [MODULAR, VARDCT] {
         let mut sequence = encoder.begin_sequence(desc.clone()).unwrap();

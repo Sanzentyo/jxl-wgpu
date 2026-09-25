@@ -324,15 +324,15 @@ impl VarDctBackend {
         self.config.lf_metadata
     }
 
-    /// Stream-wide precision used for source admission, GPU normalization and image metadata.
+    /// Stream-wide channels and precision used for source admission, GPU normalization and image metadata.
     #[must_use]
-    pub const fn sample_format(&self) -> crate::RgbSampleFormat {
+    pub const fn sample_format(&self) -> crate::ColorSampleFormat {
         self.color_plan.samples()
     }
 
     pub(crate) fn sequence_header(
         &self,
-        descriptor: &crate::RgbSequenceDescriptor,
+        descriptor: &crate::ImageSequenceDescriptor,
     ) -> Result<BitFragment, EncodeError> {
         descriptor.image_header(self.color_plan.xyb_encoded(), self.sample_format())
     }
@@ -413,10 +413,8 @@ impl VarDctBackend {
         source_windows.validate(self.max_storage_binding_size)?;
         let source_binding_bytes = source_windows.addressed_bytes()?;
         let region = source_layout.region(0, 0, extent.width, extent.height)?;
-        let mut sources: [crate::source::SourceParams; 3] = region.components[..3]
-            .try_into()
-            .expect("RGB source has three checked components");
-        source_windows.rebase(&mut sources, region.offsets)?;
+        let (mut sources, offsets) = self.color_plan.bind_sources(&region);
+        source_windows.rebase(&mut sources, offsets)?;
         let blocks_x = frame.blocks_x;
         let blocks_y = frame.blocks_y;
         let (lf_quantization, lf_correlation) = self.config.lf_metadata.forward_quantization();
@@ -1738,14 +1736,14 @@ impl VarDctEncoder {
         self.encoder.backend().lf_metadata()
     }
 
-    /// Selected coding domain; the accepted source remains integer or floating RGB sRGB/D65.
+    /// Selected coding domain; the accepted source remains integer or floating Gray/RGB sRGB/D65.
     #[must_use]
     pub fn color_transform(&self) -> VarDctColorTransform {
         self.encoder.backend().config.color_transform
     }
 
     #[must_use]
-    pub fn sample_format(&self) -> crate::RgbSampleFormat {
+    pub fn sample_format(&self) -> crate::ColorSampleFormat {
         self.encoder.backend().sample_format()
     }
 
@@ -1780,7 +1778,7 @@ impl VarDctEncoder {
             .memory_plan_for_request(source, request)
     }
 
-    /// Begins an integer or floating RGB animation using this encoder's transform and quantization policy.
+    /// Begins an integer or floating Gray/RGB animation using this encoder's transform and quantization policy.
     /// Frame extents must match the selected transform/map, or the tiled backend's limits.
     pub fn begin_animation(
         &self,
@@ -1860,7 +1858,7 @@ impl VarDctEncoder {
 /// GPU-only JPEG XL VarDCT encoder for a rectangular grid of independent
 /// regular DCT8 transforms.
 ///
-/// Accepts nonzero RGB dimensions through 16,384 pixels on each axis, with
+/// Accepts nonzero Gray/RGB dimensions through 16,384 pixels on each axis, with
 /// partial edge blocks replicated on the GPU. Every block carries quantized
 /// DC and AC, using default matrices, configurable coefficient orders and one prefix distribution.
 /// The frame has every 2,048-pixel LF group and 256-pixel AC group; a single
@@ -1908,14 +1906,14 @@ impl TiledVarDctEncoder {
         self.encoder.backend().lf_metadata()
     }
 
-    /// Selected coding domain; the accepted source remains integer or floating RGB sRGB/D65.
+    /// Selected coding domain; the accepted source remains integer or floating Gray/RGB sRGB/D65.
     #[must_use]
     pub fn color_transform(&self) -> VarDctColorTransform {
         self.encoder.backend().config.color_transform
     }
 
     #[must_use]
-    pub fn sample_format(&self) -> crate::RgbSampleFormat {
+    pub fn sample_format(&self) -> crate::ColorSampleFormat {
         self.encoder.backend().sample_format()
     }
 
@@ -1958,7 +1956,7 @@ impl TiledVarDctEncoder {
         })
     }
 
-    /// Begins an integer or floating RGB animation using this encoder's transform and quantization policy.
+    /// Begins an integer or floating Gray/RGB animation using this encoder's transform and quantization policy.
     /// Frame extents must match the selected transform/map, or the tiled backend's limits.
     pub fn begin_animation(
         &self,

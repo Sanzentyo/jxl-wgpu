@@ -48,11 +48,16 @@ impl SourceChannels {
     }
 
     #[must_use]
-    pub const fn color_channel_count(self) -> u32 {
+    pub const fn color_channels(self) -> crate::ColorChannels {
         match self {
-            Self::Gray | Self::GrayAlpha => 1,
-            Self::Rgb | Self::Rgba => 3,
+            Self::Gray | Self::GrayAlpha => crate::ColorChannels::Gray,
+            Self::Rgb | Self::Rgba => crate::ColorChannels::Rgb,
         }
+    }
+
+    #[must_use]
+    pub const fn color_channel_count(self) -> u32 {
+        self.color_channels().count()
     }
 
     /// Constructs the canonical pitch-linear source format for an unsigned integer depth.

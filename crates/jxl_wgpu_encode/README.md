@@ -485,27 +485,39 @@ The map is caller-selected metadata; content-adaptive strategy selection remains
 `VarDctEncoder::new_with_config`, `new_with_strategy_map`, and
 `TiledVarDctEncoder::new_with_config` accept a `VarDctConfig`. Its
 `color_transform` selects `VarDctColorTransform::Xyb` (default) or `Original`. Both accept
-the configured integer or floating RGB sRGB/D65 source layout. XYB linearizes sRGB before the opsin transform;
+the configured integer or floating Gray/RGB sRGB/D65 source layout. XYB linearizes sRGB before the opsin transform;
 Original directly transforms the normalized sRGB components. It does not linearize them
 or add support for other source encodings. `color_transform()` reports the selected policy;
 `color_encoding()` reports sRGB/D65; `sample_format().pixel_format()` constructs canonical storage. One immutable color plan controls the
-image's XYB flag, frame syntax, GPU normalization and HF channel multipliers. Original RGB
+image's XYB flag, logical-to-working component mapping, frame syntax, GPU normalization and HF channel multipliers. Original components
 omits the XYB-only matrix-scale fields and uses their implicit neutral multipliers.
 LF metadata, matrices, orders and quantizers retain their explicit values in either domain;
 switching the domain does not imply equivalent bitrate or perceptual quality.
 The [original-RGB corpus](../../docs/CONFORMANCE_CORPUS.md#original-rgb-vardct-encoding)
 covers all three backends, sequences, progressive passes and independent pixel/coefficient checks.
 
-`VarDctConfig::sample_format` uses checked `RgbSampleFormat::integer(bits)` for all
-1–31-bit unsigned sources or `RgbSampleFormat::float(bits, exponent_bits)` for all 154
-legal floating precisions (2–8 exponent and 2–23 fraction bits). The default remains RGB8.
-The source may be packed, planar or split across full-resolution planes in one buffer, with
+`VarDctConfig::sample_format` uses checked `ColorSampleFormat::integer(channels, bits)` for all
+1–31-bit unsigned sources or `ColorSampleFormat::float(channels, bits, exponent_bits)` for all 154
+legal floating precisions (2–8 exponent and 2–23 fraction bits). `ColorChannels::Gray` selects
+one logical component; `ColorChannels::Rgb` selects three. The default remains RGB8.
+RGB may be packed, planar or split across full-resolution planes in one buffer, with
 bijective RGB component swizzles, shared or separate 8/16/24/32-bit words, arbitrary valid
 sample bit positions and Native/Little/Big byte order. Component word widths may differ;
 logical sample and exponent widths must agree. Byte offsets and independent row pitches may
 be unaligned, and physical planes may appear in any nonoverlapping order. Padding bits are
 ignored. `sample_format.pixel_format()` remains a canonical native-endian interleaved format
 with separate 1/2/4-byte component words and right-aligned samples.
+
+Gray uses `ColorModel::Gray`, default sRGB/D65 and a single stored channel selected by
+the gray swizzle (X, Y, Z or W; no alpha). Its checked source record is bound to each of
+the three standard VarDCT working components. The GPU reads the same source sample for
+each, while the header declares Gray and omits RGB primaries. Source windows count those
+bytes once; there is no expanded input buffer or host pixel conversion. Gray keeps the
+same word sizes, bit positions, byte order and unaligned row/offset support as RGB.
+
+The logical input API is `ColorSampleFormat` and `ImageSequenceDescriptor`; these replace
+the former RGB-only names. A sequence fixes channels and precision together, even when
+its physical frames change layout or codec.
 
 The shared checked source plan owns physical addressing and per-plane binding windows for
 both Modular and VarDCT; the immutable color/sample plan owns logical normalization and image
@@ -517,13 +529,13 @@ Integers divide by `2^bits - 1`; floats rebase their fields into F32 on GPU.
 VarDCT checks raw floating exponent fields on GPU, returning typed
 `BackendError::VarDctNonFiniteSource` for NaN or either infinity before exposing any frame.
 Finite values that overflow quantized i32 coefficients retain the distinct quantization error.
-Original RGB retains finite negative/greater-than-one values within that quantizer range.
+Original components retain finite negative/greater-than-one values within that quantizer range.
 XYB uses signed sRGB linearization and its existing nonnegative opsin-absorbance clamp;
 no arbitrary extended-range reconstruction or general quality guarantee is implied.
 Subnormals enter the lossy F32 arithmetic contract; VarDCT is not a bit-preserving float codec.
 General transforms budget per-workgroup completion/error records inside the artifact/readback;
 tiled DCT8 carries errors in its existing block records. Missing or malformed validation
-records cannot publish an artifact. Gray, alpha, ICC, other source colors, subsampling and
+records cannot publish an artifact. Alpha, ICC, other source colors, subsampling and
 texture inputs remain outside the VarDCT contract.
 
 VarDCT and mixed sequences declare 32-bit Modular working buffers, independently of input
@@ -536,9 +548,12 @@ independent coefficient/pixel, source-layout, sequence and ownership evidence; t
 [floating-input corpus](../../docs/CONFORMANCE_CORPUS.md#floating-rgb-vardct-input) adds
 all floating precisions, nonfinite rejection and completion ownership. The
 [source-layout corpus](../../docs/CONFORMANCE_CORPUS.md#shared-encoder-source-layouts) covers
-physical layout variants and per-frame layout changes.
+physical layout variants and per-frame layout changes. The
+[Gray-input corpus](../../docs/CONFORMANCE_CORPUS.md#gray-vardct-and-mixed-input) adds all precisions,
+all 27 strategies, cross-codec references and per-frame Gray layouts, retaining independent
+coefficient/pixel bounds and documenting external whole-stream oracle limitations.
 
-See the compiled configuration example on [`RgbSampleFormat`](src/sample_format.rs).
+See the compiled configuration example on [`ColorSampleFormat`](src/sample_format.rs).
 
 The config's
 `lf_metadata` field holds validated `VarDctLfMetadata`. Its LF dequantization and base-correlation fields retain exact finite
@@ -673,7 +688,7 @@ The decoder's direct dependencies on `jxl-vardct`, `jxl-threadpool` and `jxl-oxi
 serve development oracles. Production defaults no longer instantiate a CPU decoder's matrix
 parser; common metadata dependencies may still use the latter two transitively.
 
-`TiledVarDctEncoder` accepts nonzero RGB dimensions through the checked 16,384-pixel per-axis
+`TiledVarDctEncoder` accepts nonzero Gray/RGB dimensions through the checked 16,384-pixel per-axis
 bound. Partial edge blocks replicate the final source row/column on GPU. A single AC group with one pass uses
 the standard fused packet, including tiny and odd images; larger images carry every
 `ceil(width / 256) * ceil(height / 256)` AC group and
@@ -851,11 +866,11 @@ encoder.encode(source_13_by_21)
 ### Mixed Modular and VarDCT frames
 
 `MixedModeEncoder::new(context, MixedModeConfig)` accepts explicit per-frame choices through
-`MixedModeFrameEncoding::{Modular, VarDct}`. `begin_sequence(RgbSequenceDescriptor)` creates
-one layered still or animation with a shared integer/floating RGB sRGB/D65 image contract. Both codecs
+`MixedModeFrameEncoding::{Modular, VarDct}`. `begin_sequence(ImageSequenceDescriptor)` creates
+one layered still or animation with a shared integer/floating Gray/RGB sRGB/D65 image contract. Both codecs
 use the precision in `config.vardct.sample_format` (1–31 integer bits or a legal floating precision, default RGB8) and the
-logical RGB/default-sRGB contract. Each physical frame may independently select any supported
-packed, planar or split layout, swizzle, bit position and word byte order; precision and color stay fixed. The default config uses original-RGB
+logical Gray/RGB/default-sRGB contract. Each physical frame may independently select any supported
+packed, planar or split layout, swizzle, bit position and word byte order; channels, precision and color stay fixed. The default config uses original-component
 VarDCT, tiled DCT8 and default lossless Modular. An explicit XYB configuration is rejected.
 
 `MixedModeConfig` fixes each codec's policy. `vardct_transform` selects `TiledDct8`,
@@ -882,7 +897,7 @@ and validation boundaries. See the compiled usage example on
 ### Fixed-codec sequences
 
 `begin_sequence` on either codec accepts a `LosslessModularSequenceDescriptor` or
-`VarDctSequenceDescriptor` (an alias of `RgbSequenceDescriptor`) and returns its corresponding
+`VarDctSequenceDescriptor` (an alias of `ImageSequenceDescriptor`) and returns its corresponding
 `SequenceSession`. Descriptors select
 `AnimationHeader::Still` for a layered still or `AnimationHeader::Animation` for a timed sequence.
 The former omits animation metadata and requires zero duration and no timecode on every frame.
@@ -920,8 +935,8 @@ working-buffer declaration changes its image header; mixed all-Modular frames re
 frame payloads and metadata apart from that image-wide working-buffer flag.
 
 `VarDctEncoder::begin_sequence` and `TiledVarDctEncoder::begin_sequence` share the same descriptor
-and session. The descriptor fixes canvas and optional timebase; the encoder binds the selected integer or floating RGB precision and sRGB/D65 input,
-XYB or original-RGB coding, transform policy,
+and session. The descriptor fixes canvas and optional timebase; the encoder binds the selected Gray/RGB channels, integer or floating precision and sRGB/D65 input,
+XYB or original-component coding, transform policy,
 quantization, matrices/orders and AC passes. Single transforms and maps retain their source
 extent on each frame; tiled DCT8 accepts separately checked crop extents through its 16K axis
 bound. Both support Replace/Add/Multiply, signed crops, hidden zero-duration regular frames and

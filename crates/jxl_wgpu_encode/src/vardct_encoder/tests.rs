@@ -5,6 +5,7 @@ mod animation;
 mod artifact;
 mod color;
 mod floating;
+mod gray;
 mod layouts;
 mod matrices;
 mod mixed;
@@ -55,7 +56,7 @@ fn image_header(
         width,
         height,
         animation,
-        VarDctColorPlan::new(VarDctColorTransform::Xyb, crate::RgbSampleFormat::RGB8),
+        VarDctColorPlan::new(VarDctColorTransform::Xyb, crate::ColorSampleFormat::RGB8),
     )
 }
 use super::dispatch::{
@@ -401,7 +402,7 @@ fn fixed_control_plane_decodes_as_standard_black_vardct() {
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
             &VarDctConfig::default(),
             &still_control(8, 8),
-            VarDctColorPlan::new(VarDctColorTransform::Xyb, crate::RgbSampleFormat::RGB8),
+            VarDctColorPlan::new(VarDctColorTransform::Xyb, crate::ColorSampleFormat::RGB8),
         )
         .unwrap(),
     )
@@ -430,7 +431,7 @@ fn fixed_control_plane_accepts_nonzero_quantized_xyb_dc() {
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
             &VarDctConfig::default(),
             &still_control(8, 8),
-            VarDctColorPlan::new(VarDctColorTransform::Xyb, crate::RgbSampleFormat::RGB8),
+            VarDctColorPlan::new(VarDctColorTransform::Xyb, crate::ColorSampleFormat::RGB8),
         )
         .unwrap(),
     )
@@ -462,7 +463,7 @@ fn custom_lf_metadata_roundtrips_through_the_standard_control_plane() {
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
             &config_with_lf(metadata),
             &still_control(8, 8),
-            VarDctColorPlan::new(VarDctColorTransform::Xyb, crate::RgbSampleFormat::RGB8),
+            VarDctColorPlan::new(VarDctColorTransform::Xyb, crate::ColorSampleFormat::RGB8),
         )
         .unwrap(),
     )

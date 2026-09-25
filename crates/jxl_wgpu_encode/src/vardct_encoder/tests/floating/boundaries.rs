@@ -74,7 +74,7 @@ fn floating_precision_rejects_mismatches_before_admission_and_releases_canceled_
     for bits in 0..=u8::MAX {
         for exponent in 0..=u8::MAX {
             assert_eq!(
-                RgbSampleFormat::float(bits, exponent).is_ok(),
+                ColorSampleFormat::float(crate::ColorChannels::Rgb, bits, exponent).is_ok(),
                 FloatPrecision::new(bits, exponent).is_ok()
             );
         }
@@ -114,10 +114,13 @@ fn floating_precision_rejects_mismatches_before_admission_and_releases_canceled_
             let request = request(w, h, &config);
             let mut invalid = Vec::new();
             let mut wrong = source.clone();
-            wrong.layout.format =
-                RgbSampleFormat::float(16, if p == FloatPrecision::BINARY16 { 4 } else { 5 })
-                    .unwrap()
-                    .pixel_format();
+            wrong.layout.format = ColorSampleFormat::float(
+                crate::ColorChannels::Rgb,
+                16,
+                if p == FloatPrecision::BINARY16 { 4 } else { 5 },
+            )
+            .unwrap()
+            .pixel_format();
             invalid.push(wrong);
             let mut wrong = source.clone();
             wrong.layout.format.color_spec = jxl_gpu_formats::ColorSpecification::Undefined;

@@ -1,4 +1,4 @@
-//! Caller-selected Modular/VarDCT frames under one checked original-RGB image contract.
+//! Caller-selected Modular/VarDCT frames under one checked original Gray/RGB image contract.
 
 use std::task::{Context, Poll};
 
@@ -7,8 +7,8 @@ use crate::{
     BufferImageSource, CodestreamAssembler, Determinism, EncodeError, EncodeProfile, EncodeSession,
     EncoderBufferPoolStats, EncoderCapabilities, FrameEncodeRequest, FrameIndex, FrameOptions,
     FrameSubmission, GpuEncodeBackend, GpuEncodeJob, GpuEncoder, GpuFrameArtifacts, GpuFrameSource,
-    LosslessModularBackend, LosslessModularConfig, LosslessModularJob, LosslessModularMemoryPlan,
-    ProfileCapability, ProgressivePlan, RgbSequenceDescriptor, SessionDescriptor,
+    ImageSequenceDescriptor, LosslessModularBackend, LosslessModularConfig, LosslessModularJob,
+    LosslessModularMemoryPlan, ProfileCapability, ProgressivePlan, SessionDescriptor,
     UnsupportedFeature, VarDctBackend, VarDctColorTransform, VarDctConfig, VarDctJob,
     VarDctMemoryPlan, VarDctStrategy, VarDctStrategyMap, WgpuContext,
 };
@@ -91,7 +91,7 @@ impl MixedModeBackend {
     fn new(context: &WgpuContext, config: MixedModeConfig) -> Result<Self, EncodeError> {
         if config.vardct.color_transform != VarDctColorTransform::Original {
             return Err(EncodeError::InvalidConfiguration(
-                "mixed Modular/VarDCT sequences require original-RGB coding",
+                "mixed Modular/VarDCT sequences require original-component coding",
             ));
         }
         let samples = config.vardct.sample_format;
@@ -274,11 +274,11 @@ impl GpuEncodeJob for MixedModeJob {
 /// ```no_run
 /// # use jxl_wgpu_encode::{AnimationHeader, BufferImageSource, EncodeError, FrameCrop,
 /// #     FrameOptions, MixedModeConfig, MixedModeEncoder, MixedModeFrameEncoding,
-/// #     RgbSequenceDescriptor, WgpuContext};
+/// #     ImageSequenceDescriptor, WgpuContext};
 /// # fn layers(context: WgpuContext, background: BufferImageSource,
 /// #     patch: BufferImageSource) -> Result<Vec<u8>, EncodeError> {
 /// let encoder = MixedModeEncoder::new(context, MixedModeConfig::default())?;
-/// let mut sequence = encoder.begin_sequence(RgbSequenceDescriptor::new(
+/// let mut sequence = encoder.begin_sequence(ImageSequenceDescriptor::new(
 ///     640, 480, AnimationHeader::Still,
 /// )?)?;
 /// let base = sequence.submit_frame(
@@ -332,15 +332,15 @@ impl MixedModeEncoder {
         self.encoder.backend().modular.clear_buffer_pool();
     }
 
-    /// Common source precision for both frame codecs.
+    /// Common source channels and precision for both frame codecs.
     #[must_use]
-    pub fn sample_format(&self) -> crate::RgbSampleFormat {
+    pub fn sample_format(&self) -> crate::ColorSampleFormat {
         self.encoder.backend().vardct.sample_format()
     }
 
     pub fn begin_sequence(
         &self,
-        descriptor: RgbSequenceDescriptor,
+        descriptor: ImageSequenceDescriptor,
     ) -> Result<MixedModeSequenceSession, EncodeError> {
         let backend = self.encoder.backend();
         let assembler = CodestreamAssembler::new(backend.vardct.sequence_header(&descriptor)?)?;
@@ -364,12 +364,12 @@ impl MixedModeEncoder {
 pub struct MixedModeSequenceSession {
     session: EncodeSession<MixedModeBackend>,
     assembler: CodestreamAssembler,
-    descriptor: RgbSequenceDescriptor,
+    descriptor: ImageSequenceDescriptor,
 }
 
 impl MixedModeSequenceSession {
     #[must_use]
-    pub fn descriptor(&self) -> &RgbSequenceDescriptor {
+    pub fn descriptor(&self) -> &ImageSequenceDescriptor {
         &self.descriptor
     }
 

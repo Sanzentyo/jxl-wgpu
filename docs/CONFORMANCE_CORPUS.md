@@ -1719,7 +1719,7 @@ pre-transform reference encoding and adaptive quality selection remain outside t
 ## Integer RGB VarDCT input
 
 `vardct_encoder/tests/precision.rs` and `tests/animation/sample_precision.rs` exercise
-the checked `RgbSampleFormat` on Apple M5/Metal (2026-09-25). All 31 integer depths cross
+the checked `ColorSampleFormat` on Apple M5/Metal (2026-09-25). All 31 integer depths cross
 XYB/original sRGB and single DCT8, a 25×17 strategy map and 259×3 tiled DCT8: 186 physical
 images, including five-pass progression, replicated edges and saliency order. Independently
 packed sources use 1/2/4-byte words, unaligned prefixes and rows, full-range endpoints,
@@ -1884,9 +1884,69 @@ component records; Modular's 256-byte parameter and both artifact formats remain
 
 Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib source_layouts -- --test-threads=2`,
 with the existing required native oracle paths. Full workspace gates include the unchanged
-Modular layout/transform/streaming targets. Gray/alpha and non-default color remain outside
+Modular layout/transform/streaming targets. [Gray coverage](#gray-vardct-and-mixed-input) follows below; alpha and non-default color remain outside
 VarDCT's source contract; subsampling, CMYK/arbitrary extras and textures still need broader
 plans. No fixtures, reference data, tolerances or native oracles are replaced.
+
+## Gray VarDCT and mixed input
+
+`vardct_encoder/tests/gray.rs`, `gray/boundaries.rs` and `animation/sample_precision.rs`
+exercise the logical Gray contract on Apple M5/Metal (2026-09-25). `ColorSampleFormat` binds
+Gray/RGB channels independently of sample precision and physical packing. Shared color syntax
+declares Gray; the checked VarDCT color plan aliases the one source component into its three
+working records. Modular retains one encoded color channel. Existing RGB and Modular corpora,
+native tools, fixtures and tolerances remain unchanged.
+
+All 31 integer and 154 floating precisions cross XYB/original components and single DCT8,
+25×17 mixed maps and 259×3 tiled DCT8: 1,110 independently checked images, each with a second
+layout-equivalent encode. Big-endian shifted fields and a W gray swizzle must preserve exact
+codestream bytes. Single-transform cases compare AC with independent F64 calculations and
+pinned native bases within one quantizer step. Native libjxl, Rust `jxl` and whole/256-byte-window
+GPU output retain `2e-4 * (1 + abs(reference))` per finite F32 component and at most one rounded
+RGB8 code. Whole/bounded GPU bytes match exactly; source PSNR exceeds 30 dB with explicit
+`(35252, 256, 48)` quantizers. Mapped/tiled cases include five passes and saliency ordering.
+
+Eighty-one images cross every strategy with integer31/original, binary16/XYB and
+binary32/original, custom coefficient orders and LF metadata at `(65536, 256, 256)` quantizers.
+They retain the same independent AC, native/Rust/GPU original-domain F32, RGB8 and source-quality
+bounds. The RGB corpus's scalar linear helper is not used here: requesting Gray linear output
+from native CMS selects/replicates its Gray component, whereas independently linearizing the
+three original-domain VarDCT outputs is a different operation (the initial integer31 DCT8
+comparison differed at sample 46: 0.60145605 versus 0.60101587). Original-domain comparisons
+agree without changing bounds; this corpus makes no new cross-profile conversion claim.
+
+Twenty-four progressive images cover 1×1, 1×257, 255×1, 256×1, 2049×1 and 1×2049 under both
+color domains and both mapped/tiled paths. Forty saliency baselines cross integer7/integer31/
+float5/binary32, both paths and all five workgroup variants. Their 160 shifted layout variants
+exercise each X/Y/Z/W gray selector, little/big endian and 24-bit words where representable;
+codestream bytes agree and U64 edge/contrast arithmetic independently checks every score.
+Another 1,232 jobs cover signed infinity and NaN at first/last samples for all 154 floating
+precisions, with typed rejection before publication and immediate reservation release.
+Logical-channel/color/kind/swizzle and malformed-layout rejection, exact/one-byte-short budgets,
+competing admission, abandoned completion, reuse and retained validated packets cover both paths.
+
+Eight precision boundaries (integer1/9/16/31 and float5/16/24/32) form 96 mixed-codec and 64
+fixed-VarDCT three-frame sequences. They cross still/animation, both VarDCT color domains for
+fixed streams, all three backends for mixed streams, and reference-only/cropped Add/Multiply
+versus full-canvas Replace. Each frame changes its physical layout under the same logical Gray
+contract. Native Modular words and channel counts remain exact. Reverse completion insertion,
+five regular passes, indexed seeking, retained outputs after session destruction, bounded input
+and complete budget release keep the existing checks.
+
+External whole-stream failures remain recorded, not counted as passes. Mixed Gray references
+make jxl-oxide assert one versus three color channels; Rust `jxl` disagrees with native composition
+(integer1 sample 36: 1 versus 2.0000243). Gray XYB reference composition also differs in both Rust
+decoders (oxide sample 112: 1.000897 versus 1.0014629; Rust sample 4: -0.00027330843 versus 0).
+Fixed original-component references also differ in Rust `jxl` (integer1 sample 13:
+-0.00024408587 versus native/independent 0).
+Those cases retain native whole-stream and GPU output against independent composition of
+Rust-decoded physical stills. The additional Replace streams retain whole-stream Rust `jxl`
+comparison. This separates external oracle limits
+from the unchanged numeric bounds; no input cases are skipped.
+
+Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib gray_input -- --test-threads=2`,
+with the required native Modular word oracle set to an absolute path. Alpha, other source
+colors/ICC, subsampling and textures remain outside this VarDCT/mixed contract.
 
 ## Mixed-codec sequence encoding
 

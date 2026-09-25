@@ -4,9 +4,8 @@ pub(super) mod linear;
 
 use super::*;
 use crate::{
-    AnimationHeader, Determinism, EncodeProfile, FrameEncodeRequest, FrameIndex, FrameOptions,
-    GpuEncodeBackend, GpuEncodeJob, GpuFrameSource, RgbSampleFormat, VarDctBackend,
-    VarDctGroupOrder,
+    AnimationHeader, ColorSampleFormat, Determinism, EncodeProfile, FrameEncodeRequest, FrameIndex,
+    FrameOptions, GpuEncodeBackend, GpuEncodeJob, GpuFrameSource, VarDctBackend, VarDctGroupOrder,
 };
 use jxl_gpu_bitstream::SampleBitDepth;
 use jxl_gpu_formats::{
@@ -16,7 +15,7 @@ use jxl_gpu_formats::{
 
 pub(super) fn configuration(bits: u8, color_transform: VarDctColorTransform) -> VarDctConfig {
     VarDctConfig {
-        sample_format: RgbSampleFormat::integer(bits).unwrap(),
+        sample_format: ColorSampleFormat::integer(crate::ColorChannels::Rgb, bits).unwrap(),
         color_transform,
         quantization: VarDctQuantization::new(
             35_252,
@@ -73,7 +72,9 @@ pub(super) fn source(
         poison,
     );
     assert_eq!(
-        RgbSampleFormat::integer(bits).unwrap().pixel_format(),
+        ColorSampleFormat::integer(crate::ColorChannels::Rgb, bits)
+            .unwrap()
+            .pixel_format(),
         source.layout.format
     );
     source
@@ -432,7 +433,7 @@ fn integer_precision_saliency_proxy_is_bounded_and_exact_in_every_workgroup_vari
 #[test]
 fn integer_precision_rejects_mismatches_before_admission_and_releases_canceled_jobs() {
     for bits in [0, 32, 64, 255] {
-        assert!(RgbSampleFormat::integer(bits).is_err());
+        assert!(ColorSampleFormat::integer(crate::ColorChannels::Rgb, bits).is_err());
     }
     let context = test_context().expect("actual GPU required");
     let (w, h) = (25, 17);
@@ -459,9 +460,12 @@ fn integer_precision_rejects_mismatches_before_admission_and_releases_canceled_j
             let request = request(w, h, &config);
             let mut invalid = Vec::new();
             let mut wrong = source.clone();
-            wrong.layout.format = RgbSampleFormat::integer(if bits == 8 { 7 } else { 8 })
-                .unwrap()
-                .pixel_format();
+            wrong.layout.format = ColorSampleFormat::integer(
+                crate::ColorChannels::Rgb,
+                if bits == 8 { 7 } else { 8 },
+            )
+            .unwrap()
+            .pixel_format();
             invalid.push(wrong);
             let mut wrong = source.clone();
             wrong.layout.format.color_spec = ColorSpecification::Undefined;

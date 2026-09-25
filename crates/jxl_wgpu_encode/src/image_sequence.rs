@@ -1,25 +1,26 @@
-//! Checked RGB image contract shared by VarDCT and mixed-codec sequences.
+//! Checked image geometry and timebase shared by VarDCT and mixed-codec sequences.
 
 use crate::frame_header::write_animation_header;
 use crate::sample_format::write_sample_bit_depth;
-use crate::{AnimationHeader, BitFragment, EncodeError, RgbSampleFormat};
+use crate::{AnimationHeader, BitFragment, ColorSampleFormat, EncodeError};
 use jxl_gpu_bitstream::BitWriter;
 
-/// Stream-wide canvas and optional timebase for an RGB sRGB/D65 layered still or animation.
+/// Stream-wide canvas and optional timebase for a Gray/RGB sRGB/D65 layered still or animation.
 ///
-/// Every frame uses the encoder's configured integer or floating RGB precision and sRGB/D65 sources. The encoder binds the image's coding domain:
-/// XYB or original RGB for VarDCT sequences, original RGB for mixed-codec sequences.
+/// Every frame uses the encoder's configured Gray/RGB channels, integer or floating precision
+/// and sRGB/D65 sources. The encoder binds the image's coding domain:
+/// XYB or original components for VarDCT sequences, original components for mixed-codec sequences.
 /// Modular and tiled DCT8 sources may vary in extent; a single VarDCT transform or checked
 /// strategy map constrains the source extent of that codec's frames only.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RgbSequenceDescriptor {
+pub struct ImageSequenceDescriptor {
     canvas_width: u32,
     canvas_height: u32,
     animation: AnimationHeader,
     header: ImageHeaderPlan,
 }
 
-impl RgbSequenceDescriptor {
+impl ImageSequenceDescriptor {
     /// Checks the canvas/timebase. The encoder binds its color policy at `begin_sequence`.
     pub fn new(
         canvas_width: u32,
@@ -38,7 +39,7 @@ impl RgbSequenceDescriptor {
     pub(crate) fn image_header(
         &self,
         xyb_encoded: bool,
-        samples: RgbSampleFormat,
+        samples: ColorSampleFormat,
     ) -> Result<crate::BitFragment, EncodeError> {
         self.header.encode(xyb_encoded, samples)
     }
@@ -62,7 +63,7 @@ impl RgbSequenceDescriptor {
 fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), EncodeError> {
     if !(1..(1 << 30)).contains(&size) {
         return Err(EncodeError::InvalidConfiguration(
-            "RGB image dimensions must be in 1..2^30",
+            "image dimensions must be in 1..2^30",
         ));
     }
     let value = size - 1;
@@ -118,7 +119,7 @@ impl ImageHeaderPlan {
     fn encode(
         &self,
         xyb_encoded: bool,
-        samples: RgbSampleFormat,
+        samples: ColorSampleFormat,
     ) -> Result<BitFragment, EncodeError> {
         let mut output = BitWriter::new();
         crate::packet::append_fragment(&mut output, &self.prefix)?;
@@ -142,7 +143,11 @@ impl ImageHeaderPlan {
         output.write_bits(0, 1)?; // 32-bit Modular buffers
         output.write_bits(0, 2)?; // no extra channels
         output.write_bits(u64::from(xyb_encoded), 1)?;
-        output.write_bits(1, 1)?; // default sRGB presentation
+        crate::source_color::SourceColorEncoding::default().write(
+            &mut output,
+            samples.channels(),
+            jxl_gpu_protocol::icc::IccRenderingIntent::Relative,
+        )?;
         if has_animation {
             output.write_bits(1, 1)?; // default tone mapping (present only with extra fields)
         }
@@ -152,6 +157,3 @@ impl ImageHeaderPlan {
         Ok(BitFragment::byte_aligned(output.into_bytes())?)
     }
 }
-
-/// Compatibility name for [`RgbSequenceDescriptor`]; precision is bound by the encoder.
-pub type Rgb8SequenceDescriptor = RgbSequenceDescriptor;

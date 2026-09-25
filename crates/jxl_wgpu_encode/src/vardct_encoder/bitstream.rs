@@ -19,7 +19,7 @@ pub(super) fn image_header(
     animation: AnimationHeader,
     color: VarDctColorPlan,
 ) -> Result<BitFragment, EncodeError> {
-    crate::RgbSequenceDescriptor::new(width, height, animation)?
+    crate::ImageSequenceDescriptor::new(width, height, animation)?
         .image_header(color.xyb_encoded(), color.samples())
 }
 

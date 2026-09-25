@@ -146,7 +146,7 @@ impl VarDctColorEncoding {
     #[must_use]
     pub fn pixel_format(self) -> PixelFormat {
         match self {
-            Self::SrgbD65 => crate::RgbSampleFormat::RGB8.pixel_format(),
+            Self::SrgbD65 => crate::ColorSampleFormat::RGB8.pixel_format(),
         }
     }
 }

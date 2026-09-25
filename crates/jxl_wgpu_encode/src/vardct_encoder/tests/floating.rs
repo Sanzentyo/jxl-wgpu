@@ -4,8 +4,9 @@ mod boundaries;
 
 use super::*;
 use crate::{
-    AnimationHeader, BackendError, Determinism, EncodeProfile, FrameEncodeRequest, FrameIndex,
-    FrameOptions, GpuEncodeBackend, GpuEncodeJob, GpuFrameSource, RgbSampleFormat, VarDctBackend,
+    AnimationHeader, BackendError, ColorSampleFormat, Determinism, EncodeProfile,
+    FrameEncodeRequest, FrameIndex, FrameOptions, GpuEncodeBackend, GpuEncodeJob, GpuFrameSource,
+    VarDctBackend,
 };
 
 use jxl_gpu_formats::{FloatPrecision, SampleKind};
@@ -22,8 +23,13 @@ pub(super) fn all_precisions() -> Vec<FloatPrecision> {
     result
 }
 
-pub(super) fn format(precision: FloatPrecision) -> RgbSampleFormat {
-    RgbSampleFormat::float(precision.bits(), precision.exponent_bits()).unwrap()
+pub(super) fn format(precision: FloatPrecision) -> ColorSampleFormat {
+    ColorSampleFormat::float(
+        crate::ColorChannels::Rgb,
+        precision.bits(),
+        precision.exponent_bits(),
+    )
+    .unwrap()
 }
 
 /// Arithmetic decoding in F64, independent of the shader's binary32 field rebasing.

@@ -1,4 +1,4 @@
-//! Checked stream metadata and ordered assembly for RGB frame sequences.
+//! Checked stream metadata and ordered assembly for Gray/RGB frame sequences.
 
 use super::{VarDctBackend, VarDctConfig, VarDctJob};
 use crate::{
@@ -13,15 +13,15 @@ pub type VarDctAnimationDescriptor = VarDctSequenceDescriptor;
 /// Compatibility name for [`VarDctSequenceSession`].
 pub type VarDctAnimationSession = VarDctSequenceSession;
 
-/// Compatibility name for the common RGB sequence descriptor.
-pub type VarDctSequenceDescriptor = crate::RgbSequenceDescriptor;
+/// Compatibility name for the common image sequence descriptor.
+pub type VarDctSequenceDescriptor = crate::ImageSequenceDescriptor;
 
 /// Independent GPU frame submissions and deterministic sequence assembly.
 ///
 /// Supports Replace, Add and Multiply, signed crops, hidden zero-duration frames,
 /// timecodes and four post-color-transform reference slots. Pre-color-transform storage is
 /// rejected until the profile supports its consumers. Alpha-weighted modes require an alpha source and
-/// are rejected by this RGB-only profile. Frame controls are checked before GPU admission;
+/// are rejected by this color-only profile. Frame controls are checked before GPU admission;
 /// failure leaves the frame index and final-frame state available for retry.
 pub struct VarDctSequenceSession {
     descriptor: VarDctSequenceDescriptor,

@@ -341,7 +341,8 @@ impl LosslessModularBackend {
             extent.height,
             self.config.group_size,
         )?;
-        let source_color = super::color::ModularColorEncoding::from_format(&source.layout.format)?;
+        let source_color =
+            crate::source_color::SourceColorEncoding::from_format(&source.layout.format)?;
         let source_layout = SourceLayout::new(
             &source.layout,
             source.buffer.size(),

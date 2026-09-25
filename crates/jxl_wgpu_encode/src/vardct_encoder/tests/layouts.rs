@@ -1,22 +1,22 @@
 //! Physical storage is independent of RGB precision, color and transform topology.
 use super::*;
 use crate::{
-    AnimationHeader, BackendError, Determinism, EncodeProfile, FrameEncodeRequest, FrameIndex,
-    FrameOptions, GpuEncodeBackend, GpuEncodeJob, GpuFrameSource, RgbSampleFormat, VarDctBackend,
-    VarDctGroupOrder,
+    AnimationHeader, BackendError, ColorSampleFormat, Determinism, EncodeProfile,
+    FrameEncodeRequest, FrameIndex, FrameOptions, GpuEncodeBackend, GpuEncodeJob, GpuFrameSource,
+    VarDctBackend, VarDctGroupOrder,
 };
 use jxl_gpu_formats::{ByteOrder, ColorSpecification, FloatPrecision, Swizzle, SwizzleComponent};
 use jxl_test_support::fixtures::source_layout::{Packing, Storage};
 
 #[derive(Clone, Copy, Debug)]
-enum Topology {
+pub(super) enum Topology {
     Single,
     Map,
     Tiled,
 }
 
 impl Topology {
-    fn backend(
+    pub(super) fn backend(
         self,
         context: &WgpuContext,
         extent: Extent2d,
@@ -37,14 +37,14 @@ impl Topology {
     }
 }
 
-fn configuration(format: RgbSampleFormat, color: VarDctColorTransform) -> VarDctConfig {
+fn configuration(format: ColorSampleFormat, color: VarDctColorTransform) -> VarDctConfig {
     VarDctConfig {
         sample_format: format,
         ..precision::configuration(8, color)
     }
 }
 
-fn pixels(extent: Extent2d, format: RgbSampleFormat) -> Vec<[u32; 3]> {
+fn pixels(extent: Extent2d, format: ColorSampleFormat) -> Vec<[u32; 3]> {
     let (w, h) = (extent.width as usize, extent.height as usize);
     match format.float_precision() {
         Some(p) => floating::pixels(w, h, p),
@@ -56,7 +56,7 @@ fn check_pixels(
     oracles: &color::PixelOracles,
     bytes: &[u8],
     input: &[[u32; 3]],
-    format: RgbSampleFormat,
+    format: ColorSampleFormat,
 ) {
     match format.float_precision() {
         Some(p) => {
@@ -71,7 +71,7 @@ fn check_pixels(
 fn canonical(
     context: &WgpuContext,
     extent: Extent2d,
-    format: RgbSampleFormat,
+    format: ColorSampleFormat,
     input: &[[u32; 3]],
 ) -> BufferImageSource {
     precision::source_with_kind(
@@ -88,7 +88,7 @@ fn canonical(
 pub(super) fn upload(
     context: &WgpuContext,
     extent: Extent2d,
-    format: RgbSampleFormat,
+    format: ColorSampleFormat,
     input: &[[u32; 3]],
     packing: Packing,
     order: ByteOrder,
@@ -109,7 +109,7 @@ pub(super) fn upload(
 pub(super) fn sequence_source(
     context: &WgpuContext,
     extent: Extent2d,
-    format: RgbSampleFormat,
+    format: ColorSampleFormat,
     input: &[[u32; 3]],
     index: usize,
 ) -> BufferImageSource {
@@ -127,7 +127,7 @@ pub(super) fn sequence_source(
     )
 }
 
-fn request(extent: Extent2d, config: &VarDctConfig) -> FrameEncodeRequest {
+pub(super) fn request(extent: Extent2d, config: &VarDctConfig) -> FrameEncodeRequest {
     FrameEncodeRequest {
         frame_index: FrameIndex::new(0),
         is_last: true,
@@ -143,7 +143,7 @@ fn request(extent: Extent2d, config: &VarDctConfig) -> FrameEncodeRequest {
     }
 }
 
-fn encode(
+pub(super) fn encode(
     context: &WgpuContext,
     backend: &VarDctBackend,
     config: &VarDctConfig,
@@ -178,7 +178,7 @@ fn source_layouts_all_precisions_preserve_independently_checked_codestreams() {
     let context = WgpuContext::from_backend(&gpu);
     let oracles = color::PixelOracles::new(&gpu);
     let formats = (1..=31)
-        .map(|b| RgbSampleFormat::integer(b).unwrap())
+        .map(|b| ColorSampleFormat::integer(crate::ColorChannels::Rgb, b).unwrap())
         .chain(floating::all_precisions().into_iter().map(floating::format));
     let extent = Extent2d::new(8, 8);
     for format in formats {
@@ -212,10 +212,11 @@ fn source_layouts_shared_mixed_and_three_byte_words_preserve_mapped_and_tiled_fr
     let context = WgpuContext::from_backend(&gpu);
     let oracles = color::PixelOracles::new(&gpu);
     for format in [1, 7, 8, 10, 16, 24, 31]
-        .map(|b| RgbSampleFormat::integer(b).unwrap())
+        .map(|b| ColorSampleFormat::integer(crate::ColorChannels::Rgb, b).unwrap())
         .into_iter()
         .chain(
-            [(5, 2), (16, 5), (24, 7), (32, 8)].map(|(b, e)| RgbSampleFormat::float(b, e).unwrap()),
+            [(5, 2), (16, 5), (24, 7), (32, 8)]
+                .map(|(b, e)| ColorSampleFormat::float(crate::ColorChannels::Rgb, b, e).unwrap()),
         )
     {
         for (topology, extent) in [
@@ -281,8 +282,8 @@ fn source_layouts_all_rgb_permutations_select_logical_components() {
     let context = test_context().expect("actual GPU required");
     let extent = Extent2d::new(17, 9);
     for format in [
-        RgbSampleFormat::integer(7).unwrap(),
-        RgbSampleFormat::float(16, 5).unwrap(),
+        ColorSampleFormat::integer(crate::ColorChannels::Rgb, 7).unwrap(),
+        ColorSampleFormat::float(crate::ColorChannels::Rgb, 16, 5).unwrap(),
     ] {
         let input = pixels(extent, format);
         let config = configuration(format, VarDctColorTransform::Xyb);
@@ -393,8 +394,8 @@ fn source_layouts_admission_cancellation_and_completion_obey_exact_budget() {
     let context = test_context().expect("actual GPU required");
     let extent = Extent2d::new(25, 17);
     for format in [
-        RgbSampleFormat::integer(31).unwrap(),
-        RgbSampleFormat::float(24, 7).unwrap(),
+        ColorSampleFormat::integer(crate::ColorChannels::Rgb, 31).unwrap(),
+        ColorSampleFormat::float(crate::ColorChannels::Rgb, 24, 7).unwrap(),
     ] {
         let input = pixels(extent, format);
         let config = configuration(format, VarDctColorTransform::Original);
@@ -510,10 +511,10 @@ fn source_layouts_saliency_uses_logical_samples_in_every_workgroup_variant() {
     let (device, queue, info) = test_device().expect("actual GPU required");
     let extent = Extent2d::new(259, 3);
     let formats = [
-        RgbSampleFormat::integer(7).unwrap(),
-        RgbSampleFormat::integer(31).unwrap(),
-        RgbSampleFormat::float(5, 2).unwrap(),
-        RgbSampleFormat::float(32, 8).unwrap(),
+        ColorSampleFormat::integer(crate::ColorChannels::Rgb, 7).unwrap(),
+        ColorSampleFormat::integer(crate::ColorChannels::Rgb, 31).unwrap(),
+        ColorSampleFormat::float(crate::ColorChannels::Rgb, 5, 2).unwrap(),
+        ColorSampleFormat::float(crate::ColorChannels::Rgb, 32, 8).unwrap(),
     ];
     for variant in [
         KernelVariant::Scalar,

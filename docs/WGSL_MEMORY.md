@@ -299,7 +299,7 @@ The table below states the default workgroup configuration for each entry point:
 | `vardct_encoder/tiled::quantize_blocks` | four source planes/params/matrix table RO, artifact RW | 64x1 | Tier C (`KernelVariant` linear) | one 2-D workgroup per 8x8 block; checked block-grid/source/artifact ranges; 2,052 shared bytes including the error flag; tiled DCT8 emits DC plus disjoint word-aligned AC fragments |
 | `vardct_encoder/control::serialize_control` | params RO, artifact RW | 1x1 | Tier B (fixed) | one bounded scalar dispatch serializes LF groups row-major, resets prediction at each 256x256-block boundary, and writes checked contiguous fragment descriptors |
 | `vardct_encoder/raw_matrices::encode` | matrix samples/descriptors/prefix RO, raw artifact RW | 1x1 | Tier B (fixed) | one invocation per raw family (at most 17); each owns one word-aligned fragment and status, with bounded Gradient prediction and two-word prefix/extra writes |
-| `vardct_encoder/saliency::group_saliency` | four source planes/params RO, artifact RW | 64x1 | Tier A (`KernelVariant` linear) | one workgroup per visible AC group; checked RGB source offset/stride, left/up neighbors and disjoint four-word records; 1,024 shared bytes for exact integer reduction |
+| `vardct_encoder/saliency::group_saliency` | four source planes/params RO, artifact RW | 64x1 | Tier A (`KernelVariant` linear) | one workgroup per visible AC group; checked Gray/RGB source offset/stride, left/up neighbors and disjoint four-word records; 1,024 shared bytes for exact integer reduction |
 | `color_output` (decoder) | X/Y/B, Cb/Y/Cr or R/G/B planes and opacity RO, output RW, 2 U | 256x1 | Tier A (`KernelVariant` 1-D) | shared 304-byte output uniform plus 160-byte codec-source uniform; checked word count is linearized across 2-D workgroups; each invocation writes one packed u32 after full-precision inverse opsin or encoded BT.601 reconstruction, requested color conversion and packing; normative JPEG 2× component interpolation is fused when restoration did not already expand the planes |
 | `vardct_chroma_upsample` (decoder, `chroma_upsample`/`chroma_2d`) | compact component RO, distinct full-resolution component RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | one-axis or fused two-axis quarter/three-quarter interpolation before restoration; checked logical extents, padded strides, storage usage/alignment/binding limits, dispatch counts, and replicated odd borders; the decoder allocates distinct destinations |
 | `vardct_gaborish` (decoder, `gaborish_rgb`) | resident X/Y/B RO, distinct resident X/Y/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked actual image extent, padded per-plane stride/range, storage usage/alignment/binding limits, finite normalized weights and dispatch counts |
@@ -913,8 +913,15 @@ All-family exact-budget, cancellation, independent entropy and corruption tests 
 
 ## Progressive VarDCT encoding
 
+Gray input retains the 828-byte parameter record and all existing bindings. The immutable
+color plan aliases the single checked source component into its three working-component
+records before rebasing; the WGSL loader expands it on GPU. Unused plane bindings alias the
+first window, and window-union accounting charges caller-owned source bytes once. RGB keeps
+three distinct logical records. No expansion allocation, submission or readback is added;
+nonfinite validation and cancellation use the same artifact status and completion leases.
+
 Mixed Modular/VarDCT sequence selection adds no shader ABI or image allocation. The common
-RGB descriptor fixes image geometry/timebase; the backend binds integer/floating precision and original-sRGB metadata; per-frame coding
+image descriptor fixes geometry/timebase; the backend binds Gray/RGB channels and integer/floating precision and original-sRGB metadata; per-frame coding
 chooses an existing backend's checked dispatch plan. `MixedModeMemoryPlan` exposes that plan's
 exact resources, including reference-only VarDCT lowering to one complete pass. Both codecs
 reserve from the same context budget. Resident completion retains its permit through artifact
@@ -931,7 +938,7 @@ stride; words 170–180 hold eleven `coefficient_square | (shift << 8)` descript
 Words 181–182 contain saliency offset/count; word 183 selects XYB (0) or original sRGB (1).
 Words 184–185 are sample mask and exponent width (zero for integers); 186–187 hold general
 floating-source validation offset/count. Word 188 is the big-endian flag. Words 189–206 are
-three logical RGB `Source` records: `row_stride, byte_offset, pixel_stride, word_bytes,
+three VarDCT working-component `Source` records: `row_stride, byte_offset, pixel_stride, word_bytes,
 bit_shift, plane`, each with 24-byte stride and four-byte alignment. Unused pass descriptors
 are zero. Rust POD/offset checks and Naga reflection verify the layout.
 
@@ -946,7 +953,7 @@ limit checks run before pipeline creation. No extra source copy, allocation or s
 
 The independent color/sample plan supplies normalization, image precision and HF multipliers.
 Float conversion rejects raw nonfinite exponents and rebases finite fields into F32; integers
-divide by their mask. Original RGB skips color conversion. `xyb_bytes` still accounts for
+divide by their mask. Original components skip color conversion. `xyb_bytes` still accounts for
 normalized three-plane storage in either domain.
 
 General floating normalization uses artifact binding 2 alongside the source/parameter/
