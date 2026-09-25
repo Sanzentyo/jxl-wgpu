@@ -66,7 +66,7 @@ LF/correlation and matrix/order policy remain explicit and independent of color 
 All source-dependent operations stay on the GPU, using the existing allocations and completion
 lease. [Original-RGB evidence](CONFORMANCE_CORPUS.md#original-rgb-vardct-encoding).
 
-`RgbSampleFormat` owns 1–31-bit source precision, canonical word width and right-aligned
+`RgbSampleFormat` owns 1–31-bit integer or checked `FloatPrecision` source precision, canonical word width and right-aligned
 packing. Admission, row/binding geometry, the shared GPU sample loader and image metadata
 consume this checked value. Unused high bits are masked before normalization; the same GPU
 loader feeds the bounded saliency proxy without quantizing the forward-transform input.
@@ -76,13 +76,23 @@ including low-bit-depth sources with fine quantizers. No content-dependent CPU s
 header interpretation is needed. The common bit-depth writer is also used by Modular headers.
 [Integer-input evidence](CONFORMANCE_CORPUS.md#integer-rgb-vardct-input).
 
+Floating VarDCT loading uses the same plan's exponent width and masks. Raw exponent checks
+reject nonfinite input before publication; field rebasing produces F32 without a host image scan.
+The general normalization stage writes one checked completion/error word per workgroup to
+an aligned artifact section; tiled DCT8 folds errors into its existing block descriptors.
+The immutable artifact layout, memory admission, serializer and host validator share that
+section's bounds. Validation results remain separate from precision policy and allocation
+bounds. The map callback drops its lifetime reference before waking completion, so rejected
+artifacts synchronously return their reservation; abandoned jobs still retain it until GPU
+completion. [Floating-input evidence](CONFORMANCE_CORPUS.md#floating-rgb-vardct-input).
+
 `MixedModeEncoder` binds this same image plan to original RGB and hosts both existing codec
 backends. Its immutable per-codec `FrameCoding` values contain profile and progression; the
 caller selects one for each physical frame. The generic `EncodeSession` retains the sole
 frame counter, finality, canvas and timebase, validates before admission, and advances only
 after successful submission. Fixed-codec sessions use this same submission path. Geometry
 belongs to the selected backend: a fixed VarDCT transform/map does not constrain Modular sources.
-Both codecs accept the exact common interleaved integer RGB/default-sRGB format at the selected precision and post-transform
+Both codecs accept the exact common interleaved integer/floating RGB/default-sRGB format at the selected precision and post-transform
 references. XYB configuration and incompatible source/reference contracts fail before admission.
 
 Memory queries and submissions share each backend's frame preparation, including reference-only

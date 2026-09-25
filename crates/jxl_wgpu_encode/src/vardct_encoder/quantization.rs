@@ -102,7 +102,7 @@ impl Default for VarDctQuantization {
 pub struct VarDctConfig {
     /// Stream-wide source precision and storage; defaults to interleaved RGB8.
     pub sample_format: crate::RgbSampleFormat,
-    /// Stream-wide coding domain for integer RGB sRGB sources; defaults to XYB.
+    /// Stream-wide coding domain for integer or floating RGB sRGB sources; defaults to XYB.
     pub color_transform: super::VarDctColorTransform,
     /// Spectral/quantized AC progression; defaults to one complete pass.
     pub progressive: crate::ProgressivePlan,

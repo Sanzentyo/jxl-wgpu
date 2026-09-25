@@ -151,6 +151,7 @@ impl Pipeline {
                     resource: wgpu::BindingResource::Buffer(inputs.source),
                 },
                 entry(1, inputs.parameters),
+                entry(2, inputs.artifact),
                 entry(5, &components),
             ],
             area,

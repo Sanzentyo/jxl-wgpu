@@ -1,6 +1,6 @@
 //! Integer precision crosses source storage, normalization, metadata and frame codecs.
 
-mod linear;
+pub(super) mod linear;
 
 use super::*;
 use crate::{
@@ -63,6 +63,31 @@ pub(super) fn source(
     pixels: &[[u32; 3]],
     poison: bool,
 ) -> BufferImageSource {
+    let source = source_with_kind(
+        context,
+        width,
+        height,
+        bits,
+        SampleKind::Unsigned,
+        pixels,
+        poison,
+    );
+    assert_eq!(
+        RgbSampleFormat::integer(bits).unwrap().pixel_format(),
+        source.layout.format
+    );
+    source
+}
+
+pub(super) fn source_with_kind(
+    context: &WgpuContext,
+    width: usize,
+    height: usize,
+    bits: u8,
+    kind: SampleKind,
+    pixels: &[[u32; 3]],
+    poison: bool,
+) -> BufferImageSource {
     assert_eq!(pixels.len(), width * height);
     let bytes = match bits {
         1..=8 => 1,
@@ -77,7 +102,12 @@ pub(super) fn source(
     for (i, pixel) in pixels.iter().enumerate() {
         let start = offset + i / width * row_stride + i % width * 3 * bytes;
         for (channel, &value) in pixel.iter().enumerate() {
-            let word = value | if poison { u32::MAX << bits } else { 0 };
+            let word = value
+                | if poison {
+                    u32::MAX.checked_shl(u32::from(bits)).unwrap_or(0)
+                } else {
+                    0
+                };
             allocation[start + channel * bytes..start + (channel + 1) * bytes]
                 .copy_from_slice(&word.to_le_bytes()[..bytes]);
         }
@@ -86,7 +116,7 @@ pub(super) fn source(
         model: ColorModel::Rgb,
         color_spec: ColorSpecification::Default,
         chroma_subsampling: ChromaSubsampling::None,
-        sample_kind: SampleKind::Unsigned,
+        sample_kind: kind,
         byte_order: ByteOrder::Native,
         swizzle: Swizzle::XYZ1,
         planes: vec![PlaneFormat {
@@ -103,10 +133,6 @@ pub(super) fn source(
                 .into(),
         }],
     };
-    assert_eq!(
-        RgbSampleFormat::integer(bits).unwrap().pixel_format(),
-        format
-    );
     let extent = Extent2d::new(width as u32, height as u32);
     let layout = ImageLayout::from_planes(
         extent,
@@ -186,18 +212,22 @@ pub(super) fn check_pixels(
 
 fn check_quality(actual: &[f32], input: &[[u32; 3]], bits: u8) {
     let expected = normalized(input, bits);
+    check_normalized_quality(actual, &expected);
+}
+
+pub(super) fn check_normalized_quality(actual: &[f32], expected: &[[f64; 3]]) {
     assert_eq!(actual.len(), expected.len() * 4);
     let error = actual
         .as_chunks::<4>()
         .0
         .iter()
-        .zip(&expected)
+        .zip(expected)
         .flat_map(|(a, b)| (0..3).map(move |c| (f64::from(a[c]) - b[c]).powi(2)))
         .sum::<f64>()
         / (3 * expected.len()) as f64;
     assert!(
         -10.0 * error.log10() > 30.0,
-        "{bits}-bit source PSNR {}",
+        "source PSNR {}",
         -10.0 * error.log10()
     );
 }

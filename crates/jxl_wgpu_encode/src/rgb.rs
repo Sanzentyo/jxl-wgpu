@@ -7,7 +7,7 @@ use jxl_gpu_bitstream::BitWriter;
 
 /// Stream-wide canvas and optional timebase for an RGB sRGB/D65 layered still or animation.
 ///
-/// Every frame uses the encoder's configured integer RGB precision and sRGB/D65 sources. The encoder binds the image's coding domain:
+/// Every frame uses the encoder's configured integer or floating RGB precision and sRGB/D65 sources. The encoder binds the image's coding domain:
 /// XYB or original RGB for VarDCT sequences, original RGB for mixed-codec sequences.
 /// Modular and tiled DCT8 sources may vary in extent; a single VarDCT transform or checked
 /// strategy map constrains the source extent of that codec's frames only.
@@ -132,7 +132,11 @@ impl ImageHeaderPlan {
             output.write_bits(1, 1)?; // animation present
             crate::packet::append_fragment(&mut output, animation)?;
         }
-        write_sample_bit_depth(&mut output, samples.bits_per_sample(), 0)?;
+        write_sample_bit_depth(
+            &mut output,
+            samples.bits_per_sample(),
+            samples.exponent_bits(),
+        )?;
         // VarDCT LF coefficients are checked i32 values independently of input depth.
         // Mixed sequences must retain that same image-wide working-buffer contract.
         output.write_bits(0, 1)?; // 32-bit Modular buffers

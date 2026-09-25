@@ -25,6 +25,8 @@ pub enum BackendError {
         low_frequency: bool,
         high_frequency: bool,
     },
+    #[error("VarDCT source contains a non-finite floating sample")]
+    VarDctNonFiniteSource,
     #[error("GPU artifact mapping failed")]
     ArtifactMapping(#[source] wgpu::BufferAsyncError),
     #[error("the mapped GPU artifact range is invalid")]

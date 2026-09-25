@@ -45,7 +45,10 @@ struct Params {
     color_normalization: u32,
     source_word_bytes: u32,
     source_sample_mask: u32,
-    padding: array<u32, 4>,
+    source_exponent_bits: u32,
+    source_validation_offset: u32,
+    source_validation_groups: u32,
+    padding: array<u32, 1>,
 }
 
 @group(0) @binding(0)
@@ -129,7 +132,14 @@ fn serialize_control() {
     var error = 0u;
     for (var index = 0u; index < params.ac_descriptor_len; index += 1u) {
         error |= artifact_words[params.ac_descriptor_offset + index]
-            & (LF_QUANTIZATION_OVERFLOW | HF_QUANTIZATION_OVERFLOW);
+            & (LF_QUANTIZATION_OVERFLOW | HF_QUANTIZATION_OVERFLOW | NON_FINITE_SOURCE);
+    }
+    for (var group = 0u; group < params.source_validation_groups; group += 1u) {
+        let status = artifact_words[params.source_validation_offset + group];
+        if status != SOURCE_VALIDATED && status != (SOURCE_VALIDATED | NON_FINITE_SOURCE) {
+            error |= SOURCE_VALIDATION_INCOMPLETE;
+        }
+        error |= status & NON_FINITE_SOURCE;
     }
     if error != 0u {
         artifact_words[0] = error;

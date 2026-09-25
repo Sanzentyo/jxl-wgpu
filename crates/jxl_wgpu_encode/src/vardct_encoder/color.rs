@@ -1,6 +1,6 @@
 //! One lowering of the source-to-codestream color contract, shared by headers and GPU work.
 
-/// Coding-domain selection for integer RGB sRGB/D65 sources.
+/// Coding-domain selection for integer or floating RGB sRGB/D65 sources.
 ///
 /// This is independent of source storage and the declared presentation encoding.
 /// Every physical frame in a sequence uses the encoder's selected domain.

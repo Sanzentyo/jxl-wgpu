@@ -16,6 +16,7 @@ pub(super) const AC_GROUP_DIM_PIXELS: u32 = 256;
 pub(super) const LF_GROUP_DIM_PIXELS: u32 = 2_048;
 pub(super) const HEADER_WORDS: u32 = 68;
 pub(super) const SECTION_ALIGNMENT_WORDS: u32 = 64;
+pub(super) const SOURCE_VALIDATED: u32 = 0x0052_4345;
 pub(super) const ARTIFACT_READY: u32 = 0x5644_4354;
 pub(super) const SINGLE_TRANSFORM_TOPOLOGY: u32 = 0;
 pub(super) const TILED_DCT8_TOPOLOGY: u32 = 1;
@@ -141,7 +142,7 @@ impl Default for VarDctLfMetadata {
 
 impl VarDctColorEncoding {
     /// Canonical RGB8 convenience format with checked byte offsets and row padding.
-    /// For other integer precisions, use the encoder's `sample_format().pixel_format()`.
+    /// For other precisions, use the encoder's `sample_format().pixel_format()`.
     #[must_use]
     pub fn pixel_format(self) -> PixelFormat {
         match self {
@@ -269,6 +270,8 @@ pub struct VarDctMemoryPlan {
     pub readback_bytes: u64,
     /// Local-contrast records and alignment, already included in artifact/readback bytes.
     pub saliency_metadata_bytes: u64,
+    /// General floating-source validation records/alignment, included in artifact/readback.
+    pub source_validation_bytes: u64,
     /// Tiled DCT8's X/Y/B dequantization and order table; general transforms include it in `transform`.
     pub quantization_metadata_bytes: u64,
     /// Raw-matrix GPU sample/descriptor/prefix input, zero when all matrices are parametric.
@@ -348,6 +351,7 @@ impl VarDctMemoryPlan {
             artifact_storage_bytes,
             readback_bytes,
             saliency_metadata_bytes: 0,
+            source_validation_bytes: 0,
             quantization_metadata_bytes,
             transform: None,
             raw_matrix_input_bytes: 0,
@@ -410,7 +414,10 @@ pub(super) struct VarDctKernelParams {
     pub(super) color_normalization: u32,
     pub(super) source_word_bytes: u32,
     pub(super) source_sample_mask: u32,
-    pub(super) padding: [u32; 4],
+    pub(super) source_exponent_bits: u32,
+    pub(super) source_validation_offset: u32,
+    pub(super) source_validation_groups: u32,
+    pub(super) padding: [u32; 1],
 }
 
 #[repr(C)]
@@ -474,6 +481,8 @@ const _: () = {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ArtifactLayout {
+    pub(super) source_validation_offset: u32,
+    pub(super) source_validation_groups: u32,
     pub(super) saliency_offset: u32,
     pub(super) saliency_groups: u32,
     pub(super) ac_pass_count: u32,
@@ -499,6 +508,19 @@ pub(super) struct ArtifactLayout {
 }
 
 impl ArtifactLayout {
+    pub(super) fn with_source_validation(mut self, groups: u32) -> Result<Self, EncodeError> {
+        if groups == 0 || self.source_validation_groups != 0 || self.saliency_groups != 0 {
+            return Err(EncodeError::InvalidConfiguration(
+                "invalid VarDCT source validation count",
+            ));
+        }
+        self.source_validation_offset = self.artifact_words;
+        self.source_validation_groups = groups;
+        self.artifact_words = align_words(self.artifact_words.checked_add(groups).ok_or(
+            EncodeError::InvalidConfiguration("VarDCT source validation arena overflow"),
+        )?)?;
+        Ok(self)
+    }
     pub(super) fn with_saliency(mut self, groups: u32) -> Result<Self, EncodeError> {
         if self.saliency_groups != 0 || !(1..=4096).contains(&groups) {
             return Err(EncodeError::InvalidConfiguration(
@@ -518,6 +540,7 @@ impl ArtifactLayout {
         if !(1..=crate::ProgressivePlan::MAX_PASSES).contains(&count)
             || self.ac_pass_count != 1
             || self.saliency_groups != 0
+            || self.source_validation_groups != 0
         {
             return Err(EncodeError::InvalidConfiguration(
                 "invalid VarDCT pass count",
@@ -670,6 +693,8 @@ impl ArtifactLayout {
                 EncodeError::InvalidConfiguration("VarDCT artifact size overflow"),
             )?)?;
         Ok(Self {
+            source_validation_offset: 0,
+            source_validation_groups: 0,
             fragment_descriptor_offset,
             saliency_offset: 0,
             saliency_groups: 0,

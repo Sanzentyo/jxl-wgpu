@@ -14,6 +14,9 @@ const OPSIN_BIAS: f32 = 0.0037930732552754493;
 const NEG_OPSIN_BIAS_CBRT: f32 = -0.15595420054924863;
 const LF_QUANTIZATION_OVERFLOW: u32 = 0x40000000u;
 const HF_QUANTIZATION_OVERFLOW: u32 = 0x80000000u;
+const NON_FINITE_SOURCE: u32 = 0x20000000u;
+const SOURCE_VALIDATION_INCOMPLETE: u32 = 0x10000000u;
+const SOURCE_VALIDATED: u32 = 0x00524345u;
 var<workgroup> quantization_error: atomic<u32>;
 
 fn quantize_checked(value: f32, error: u32) -> i32 {
@@ -41,11 +44,42 @@ fn load_source_sample(address: u32) -> u32 {
     return value & params.source_sample_mask;
 }
 
+// All admitted floating precisions fit binary32 exactly. Rebase their fields instead
+// of evaluating an exponential, preserving subnormal/sign bits before GPU arithmetic.
+fn normalize_source_sample(address: u32) -> f32 {
+    let word = load_source_sample(address);
+    let exponent_bits = params.source_exponent_bits;
+    if exponent_bits == 0u { return f32(word) / f32(params.source_sample_mask); }
+    let bits = 32u - countLeadingZeros(params.source_sample_mask);
+    let fraction_bits = bits - exponent_bits - 1u;
+    let exponent_mask = (1u << exponent_bits) - 1u;
+    let exponent = (word >> fraction_bits) & exponent_mask;
+    let fraction = word & ((1u << fraction_bits) - 1u);
+    let sign = (word >> (bits - 1u)) << 31u;
+    if exponent == exponent_mask {
+        atomicOr(&quantization_error, NON_FINITE_SOURCE);
+        return 0.0;
+    }
+    let bias = (1u << (exponent_bits - 1u)) - 1u;
+    if exponent != 0u {
+        return bitcast<f32>(sign | ((exponent + 127u - bias) << 23u)
+            | (fraction << (23u - fraction_bits)));
+    }
+    if fraction == 0u { return bitcast<f32>(sign); }
+    if exponent_bits == 8u {
+        return bitcast<f32>(sign | (fraction << (23u - fraction_bits)));
+    }
+    let high_bit = 31u - countLeadingZeros(fraction);
+    let rebased_exponent = 128u - bias - fraction_bits + high_bit;
+    let rebased_fraction = (fraction ^ (1u << high_bit)) << (23u - high_bit);
+    return bitcast<f32>(sign | (rebased_exponent << 23u) | rebased_fraction);
+}
+
 fn srgb_to_linear(encoded: f32) -> f32 {
-    if encoded <= 0.04045 {
+    if abs(encoded) <= 0.04045 {
         return encoded / 12.92;
     }
-    return pow((encoded + 0.055) / 1.055, 2.4);
+    return sign(encoded) * pow((abs(encoded) + 0.055) / 1.055, 2.4);
 }
 
 fn linear_rgb_to_xyb(rgb: vec3<f32>) -> vec3<f32> {
@@ -73,11 +107,10 @@ fn linear_rgb_to_xyb(rgb: vec3<f32>) -> vec3<f32> {
 // 0 = XYB, 1 = original sRGB. No source samples cross the host boundary.
 fn normalize_rgb(address: u32) -> vec3<f32> {
     let stride = params.source_word_bytes;
-    let maximum = f32(params.source_sample_mask);
     let encoded = vec3<f32>(
-        f32(load_source_sample(address)) / maximum,
-        f32(load_source_sample(address + stride)) / maximum,
-        f32(load_source_sample(address + 2u * stride)) / maximum,
+        normalize_source_sample(address),
+        normalize_source_sample(address + stride),
+        normalize_source_sample(address + 2u * stride),
     );
     if params.color_normalization == 1u { return encoded; }
     return linear_rgb_to_xyb(vec3<f32>(

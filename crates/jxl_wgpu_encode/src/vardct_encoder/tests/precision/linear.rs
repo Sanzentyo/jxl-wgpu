@@ -8,14 +8,14 @@ use jxl_test_support::oracles::extra_channels::{floats, libjxl_output, rust_plan
 use jxl_test_support::oracles::progressive::scalar_linear_updates;
 use jxl_wgpu_decode::WgpuDecodeEngine;
 
-pub(super) struct LinearPixelOracles {
+pub(crate) struct LinearPixelOracles {
     whole: GpuDecoder<WgpuDecodeEngine>,
     windowed: GpuDecoder<WgpuDecodeEngine>,
     readback: ImageReadbackPipeline,
 }
 
 impl LinearPixelOracles {
-    pub(super) fn new(backend: &WgpuBackend) -> Self {
+    pub(crate) fn new(backend: &WgpuBackend) -> Self {
         Self {
             whole: GpuDecoder::wgpu(backend.clone()).unwrap(),
             windowed: GpuDecoder::new(
@@ -28,6 +28,10 @@ impl LinearPixelOracles {
     }
 
     pub(super) fn check(&self, encoded: &[u8], input: &[[u32; 3]], bits: u8) {
+        self.check_normalized(encoded, &normalized(input, bits));
+    }
+
+    pub(crate) fn check_normalized(&self, encoded: &[u8], input: &[[f64; 3]]) {
         let native = libjxl_output(encoded, &["--original"]).expect("native SIMD oracle required");
         let (rust, extras) = rust_planes(encoded);
         assert!(extras.is_empty());
@@ -37,7 +41,7 @@ impl LinearPixelOracles {
             let code = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
             assert!(code(a).abs_diff(code(b)) <= 1);
         }
-        check_quality(&native, input, bits);
+        check_normalized_quality(&native, input);
         let scalar = scalar_linear_updates(encoded);
         let scalar = floats(&scalar.last().filter(|u| u.complete).unwrap().pixels);
         let rust_linear: Vec<_> = rust

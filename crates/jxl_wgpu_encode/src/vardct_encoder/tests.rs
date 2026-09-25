@@ -4,6 +4,7 @@ mod ac;
 mod animation;
 mod artifact;
 mod color;
+mod floating;
 mod matrices;
 mod mixed;
 mod native;
@@ -549,6 +550,9 @@ fn abi_records_are_pod_and_word_aligned() {
     params.color_normalization = 0x127;
     params.source_word_bytes = 0x128;
     params.source_sample_mask = 0x129;
+    params.source_exponent_bits = 0x130;
+    params.source_validation_offset = 0x131;
+    params.source_validation_groups = 0x132;
     let params = [params];
     let parameter_words = bytemuck::cast_slice::<VarDctKernelParams, u32>(&params);
     assert_eq!(&parameter_words[84..88], &[0x55, 0x56, 0x57, 0x58]);
@@ -561,7 +565,8 @@ fn abi_records_are_pod_and_word_aligned() {
     assert_eq!(&parameter_words[183..186], &[0x125, 0x126, 0x127]);
 
     assert_eq!(&parameter_words[186..188], &[0x128, 0x129]);
-    assert_eq!(&parameter_words[188..], &[0; 4]);
+    assert_eq!(&parameter_words[188..191], &[0x130, 0x131, 0x132]);
+    assert_eq!(parameter_words[191], 0);
 
     let mut header: VarDctArtifactHeader = bytemuck::Zeroable::zeroed();
     header.fragment_descriptor_offset = 0x41;
@@ -612,6 +617,9 @@ fn naga_validates_vardct_shaders() {
                     ("color_normalization", 185 * 4),
                     ("source_word_bytes", 186 * 4),
                     ("source_sample_mask", 187 * 4),
+                    ("source_exponent_bits", 188 * 4),
+                    ("source_validation_offset", 189 * 4),
+                    ("source_validation_groups", 190 * 4),
                 ] {
                     assert_eq!(
                         members

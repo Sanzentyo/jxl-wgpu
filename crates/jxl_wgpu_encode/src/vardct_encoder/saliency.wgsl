@@ -5,6 +5,9 @@
 var<workgroup> contrast_sums: array<u32, 256>;
 
 fn saliency_sample(address: u32) -> i32 {
+    if params.source_exponent_bits != 0u {
+        return i32(round(clamp(normalize_source_sample(address), 0.0, 1.0) * 255.0));
+    }
     let value = load_source_sample(address);
     let mask = params.source_sample_mask;
     if mask < 255u { return i32((value * 255u + mask / 2u) / mask); }

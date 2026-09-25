@@ -20,14 +20,20 @@ fn normalize_image(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invoc
     let pixel = transform_index(group) * wg_x + lane;
     let width = params.blocks_x * 8u;
     let area = width * params.blocks_y * 8u;
-    if pixel >= area { return; }
-    let x = min(pixel % width, params.width - 1u);
-    let y = min(pixel / width, params.height - 1u);
-    let address = params.byte_offset + y * params.row_stride + x * (3u * params.source_word_bytes);
-    let components = normalize_rgb(address);
-    forward_components[pixel] = components.x;
-    forward_components[area + pixel] = components.y;
-    forward_components[2u * area + pixel] = components.z;
+    if pixel < area {
+        let x = min(pixel % width, params.width - 1u);
+        let y = min(pixel / width, params.height - 1u);
+        let address = params.byte_offset + y * params.row_stride + x * (3u * params.source_word_bytes);
+        let components = normalize_rgb(address);
+        forward_components[pixel] = components.x;
+        forward_components[area + pixel] = components.y;
+        forward_components[2u * area + pixel] = components.z;
+    }
+    workgroupBarrier();
+    if lane == 0u && transform_index(group) < params.source_validation_groups {
+        artifact_words[params.source_validation_offset + transform_index(group)] =
+            SOURCE_VALIDATED | atomicLoad(&quantization_error);
+    }
 }
 
 @compute @workgroup_size(wg_x)

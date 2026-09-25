@@ -9,7 +9,15 @@ use super::ac::write_tokens;
 
 #[test]
 fn artifact_rejects_missing_ac_writes_and_forged_layout() {
-    for (passes, saliency) in [(1, false), (3, false), (11, false), (1, true), (11, true)] {
+    for (passes, saliency, validation) in [
+        (1, false, false),
+        (3, false, false),
+        (11, false, false),
+        (1, true, false),
+        (11, true, false),
+        (1, false, true),
+        (11, true, true),
+    ] {
         let frame = VarDctFrameLayout::tiled_dct8(2057, 17).unwrap();
         let dc = fixed_prefix_code().unwrap();
         let hf = HfEntropyPlan::single_cluster_prefix().unwrap();
@@ -17,6 +25,9 @@ fn artifact_rejects_missing_ac_writes_and_forged_layout() {
             .unwrap()
             .with_passes(passes)
             .unwrap();
+        if validation {
+            layout = layout.with_source_validation(17).unwrap();
+        }
         if saliency {
             layout = layout
                 .with_saliency(frame.ac_group_count().unwrap())
@@ -90,6 +101,11 @@ fn artifact_rejects_missing_ac_writes_and_forged_layout() {
             saliency_groups: layout.saliency_groups,
         };
         words[..68].copy_from_slice(bytemuck::cast_slice(std::slice::from_ref(&header)));
+        if validation {
+            let start = layout.source_validation_offset as usize;
+            let end = start + layout.source_validation_groups as usize;
+            words[start..end].fill(super::super::types::SOURCE_VALIDATED);
+        }
         if saliency {
             let pixels = vec![[0; 3]; (frame.width * frame.height) as usize];
             for (group, (edges, contrast)) in
@@ -110,6 +126,25 @@ fn artifact_rejects_missing_ac_writes_and_forged_layout() {
             validate_artifact(bytemuck::cast_slice(words), layout, &dc, &hf, frame, None).is_ok()
         };
         assert!(valid(&words));
+        if validation {
+            let start = layout.source_validation_offset as usize;
+            let end = start + layout.source_validation_groups as usize;
+            for index in [start, end - 1] {
+                for status in [
+                    0,
+                    super::super::types::SOURCE_VALIDATED ^ 1,
+                    super::super::types::SOURCE_VALIDATED | 0x2000_0000,
+                ] {
+                    let mut corrupt = words.clone();
+                    corrupt[index] = status;
+                    assert!(!valid(&corrupt), "source validation {index}/{status:x}");
+                }
+            }
+            let mut padding = words.clone();
+            padding[end] = 1;
+            assert!(!valid(&padding));
+            assert!(layout.with_source_validation(1).is_err());
+        }
         if saliency {
             for group in [0, layout.saliency_groups - 1] {
                 let offset = (layout.saliency_offset + group * 4) as usize;

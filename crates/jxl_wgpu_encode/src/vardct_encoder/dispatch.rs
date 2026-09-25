@@ -397,7 +397,7 @@ impl VarDctBackend {
             }
         };
         self.config.group_order.validate(frame)?;
-        if source.layout.format != self.sample_format().pixel_format()
+        if !self.sample_format().matches_format(&source.layout.format)
             || source.layout.planes.len() != 1
             || !source.buffer.usage().contains(wgpu::BufferUsages::STORAGE)
         {
@@ -489,6 +489,13 @@ impl VarDctBackend {
                 }
             }
             .with_passes(progressive.passes().len())?;
+            if self.sample_format().float_precision().is_some()
+                && frame.topology != VarDctTopology::TiledDct8
+            {
+                let groups = (frame.blocks_x * frame.blocks_y * 64)
+                    .div_ceil(self.workgroup_variant.workgroup_size().0);
+                layout = layout.with_source_validation(groups)?;
+            }
             if self.config.group_order.requires_saliency() {
                 layout = layout.with_saliency(frame.ac_group_count()?)?;
             }
@@ -583,7 +590,10 @@ impl VarDctBackend {
                         color_normalization: self.color_plan.normalization(),
                         source_word_bytes: u32::from(self.sample_format().word_bytes()),
                         source_sample_mask: self.sample_format().sample_mask(),
-                        padding: [0; 4],
+                        source_exponent_bits: u32::from(self.sample_format().exponent_bits()),
+                        source_validation_offset: layout.source_validation_offset,
+                        source_validation_groups: layout.source_validation_groups,
+                        padding: [0; 1],
                     },
                     layout,
                 },
@@ -594,6 +604,15 @@ impl VarDctBackend {
                 ),
             )
         };
+        if kernel.layout.source_validation_groups != 0 {
+            let end = if kernel.layout.saliency_groups == 0 {
+                kernel.layout.artifact_words
+            } else {
+                kernel.layout.saliency_offset
+            };
+            memory.source_validation_bytes =
+                u64::from(end - kernel.layout.source_validation_offset) * 4;
+        }
         if kernel.layout.saliency_groups != 0 {
             memory.saliency_metadata_bytes =
                 u64::from(kernel.layout.artifact_words - kernel.layout.saliency_offset) * 4;
@@ -980,8 +999,10 @@ impl GpuEncodeBackend for VarDctBackend {
                 if result.is_ok() {
                     callback_lifetime.mapped.store(true, Ordering::Release);
                 }
-                callback_completion.complete(result.map_err(BackendError::ArtifactMapping));
+                // Release the callback's ownership before waking waiters: completion
+                // must let an immediately rejected artifact return its entire permit.
                 drop(callback_lifetime);
+                callback_completion.complete(result.map_err(BackendError::ArtifactMapping));
             },
         );
         let poll_permit = context.submission_poller().try_reserve()?;
@@ -1302,6 +1323,16 @@ pub(super) fn validate_artifact<'a>(
     let lf_group_count = frame
         .lf_group_count()
         .map_err(|_| BackendError::InvalidArtifact("VarDCT LF group count overflow"))?;
+    if header.status & 0x0fff_ffff == 0 {
+        if header.status & 0x1000_0000 != 0 {
+            return Err(BackendError::InvalidArtifact(
+                "incomplete VarDCT source validation",
+            ));
+        }
+        if header.status & 0x2000_0000 != 0 {
+            return Err(BackendError::VarDctNonFiniteSource);
+        }
+    }
     if matches!(header.status, 0x4000_0000 | 0x8000_0000 | 0xc000_0000) {
         return Err(BackendError::VarDctQuantizationOverflow {
             low_frequency: header.status & 0x4000_0000 != 0,
@@ -1408,10 +1439,33 @@ pub(super) fn validate_artifact<'a>(
         layout.fragment_offset,
     )?;
     let dc_end = layout.fragment_offset + layout.fragment_word_capacity;
-    let entropy_end = if layout.saliency_groups == 0 {
+    let auxiliary_end = if layout.saliency_groups == 0 {
         layout.artifact_words
     } else {
         layout.saliency_offset
+    };
+    let entropy_end = if layout.source_validation_groups == 0 {
+        auxiliary_end
+    } else {
+        let records = artifact_words(
+            words,
+            layout.source_validation_offset,
+            layout.source_validation_groups,
+        )?;
+        if records
+            .iter()
+            .any(|&status| status != super::types::SOURCE_VALIDATED)
+        {
+            return Err(BackendError::InvalidArtifact(
+                "invalid VarDCT source validation record",
+            ));
+        }
+        validate_zero_gap(
+            words,
+            layout.source_validation_offset + layout.source_validation_groups,
+            auxiliary_end,
+        )?;
+        layout.source_validation_offset
     };
     let ac = if layout.ac_descriptor_len == 0 {
         validate_zero_gap(words, dc_end, entropy_end)?;
@@ -1751,7 +1805,7 @@ impl VarDctEncoder {
         self.encoder.backend().lf_metadata()
     }
 
-    /// Selected coding domain; the accepted source remains integer RGB sRGB/D65.
+    /// Selected coding domain; the accepted source remains integer or floating RGB sRGB/D65.
     #[must_use]
     pub fn color_transform(&self) -> VarDctColorTransform {
         self.encoder.backend().config.color_transform
@@ -1793,7 +1847,7 @@ impl VarDctEncoder {
             .memory_plan_for_request(source, request)
     }
 
-    /// Begins an integer RGB animation using this encoder's transform and quantization policy.
+    /// Begins an integer or floating RGB animation using this encoder's transform and quantization policy.
     /// Frame extents must match the selected transform/map, or the tiled backend's limits.
     pub fn begin_animation(
         &self,
@@ -1873,7 +1927,7 @@ impl VarDctEncoder {
 /// GPU-only JPEG XL VarDCT encoder for a rectangular grid of independent
 /// regular DCT8 transforms.
 ///
-/// Accepts nonzero integer RGB dimensions through 16,384 pixels on each axis, with
+/// Accepts nonzero RGB dimensions through 16,384 pixels on each axis, with
 /// partial edge blocks replicated on the GPU. Every block carries quantized
 /// DC and AC, using default matrices, configurable coefficient orders and one prefix distribution.
 /// The frame has every 2,048-pixel LF group and 256-pixel AC group; a single
@@ -1921,7 +1975,7 @@ impl TiledVarDctEncoder {
         self.encoder.backend().lf_metadata()
     }
 
-    /// Selected coding domain; the accepted source remains integer RGB sRGB/D65.
+    /// Selected coding domain; the accepted source remains integer or floating RGB sRGB/D65.
     #[must_use]
     pub fn color_transform(&self) -> VarDctColorTransform {
         self.encoder.backend().config.color_transform
@@ -1971,7 +2025,7 @@ impl TiledVarDctEncoder {
         })
     }
 
-    /// Begins an integer RGB animation using this encoder's transform and quantization policy.
+    /// Begins an integer or floating RGB animation using this encoder's transform and quantization policy.
     /// Frame extents must match the selected transform/map, or the tiled backend's limits.
     pub fn begin_animation(
         &self,

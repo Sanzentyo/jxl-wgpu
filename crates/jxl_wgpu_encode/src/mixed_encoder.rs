@@ -125,7 +125,7 @@ impl MixedModeBackend {
             .push(ProfileCapability::ModularLossless {
                 min_bits_per_sample: samples.bits_per_sample(),
                 max_bits_per_sample: samples.bits_per_sample(),
-                exponent_bits_per_sample: 0,
+                exponent_bits_per_sample: samples.exponent_bits(),
             });
         capabilities.determinism = capabilities
             .determinism
@@ -156,7 +156,11 @@ impl MixedModeBackend {
         source: &BufferImageSource,
         request: &FrameEncodeRequest,
     ) -> Result<(), EncodeError> {
-        if source.layout.format != self.vardct.sample_format().pixel_format() {
+        if !self
+            .vardct
+            .sample_format()
+            .matches_format(&source.layout.format)
+        {
             return Err(UnsupportedFeature::InputFormat.into());
         }
         if request.options.save_before_color_transform {
@@ -204,7 +208,9 @@ impl GpuEncodeBackend for MixedModeBackend {
         let GpuFrameSource::Buffer(buffer) = source else {
             return false;
         };
-        buffer.layout.format == self.vardct.sample_format().pixel_format()
+        self.vardct
+            .sample_format()
+            .matches_format(&buffer.layout.format)
             && (self.modular.supports_input(source) || self.vardct.supports_input(source))
     }
 
