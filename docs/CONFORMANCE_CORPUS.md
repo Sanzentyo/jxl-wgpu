@@ -2010,6 +2010,59 @@ Existing RGB/Gray/Modular corpora, native fixtures and thresholds remain in the 
 Alpha/ICC VarDCT input, CMYK/arbitrary extras, YUV/textures, perceptual quality policy and full
 ISO conformance remain open.
 
+## ICC VarDCT and mixed input
+
+`jxl_wgpu_encode::vardct_encoder::tests::icc` covers unchanged RGB/Gray ICC declarations in
+Original and XYB coding. The color plan selects a relative working connection only for XYB:
+linear BT.709 for RGB, explicit PCS Y for Gray. Original device components remain independent
+of ICC method support. The common metadata serializer retains the complete original profile,
+and the frame plan rejects forbidden XYB/ICC post-transform reference storage before admission.
+
+Independent coefficient checks retain the one-quantizer-step bound and pinned native transform
+bases. Ten matrix/TRC families and all 27 strategies produce 74 stills using the committed
+independent linear references. Thirty Gray/RGB legacy LUT profiles and nine MPE profiles add
+78 stills using frozen independent PCS values, F64 PCS-to-RGB/Gray equations and opsin conversion.
+These include v2/v4, XYZ/Lab PCS, table/parametric curves, tetrahedral/multilinear CLUTs and
+intermediate channel expansion. Another 370 XYB submissions cover all 31 integer and 154 floating
+precisions in each of Gray and RGB, with independent word normalization and a known MPE matrix.
+
+Twelve configurations cross Gray/RGB, Original/XYB and single/map/tiled geometry at 8×8, 25×17
+and 259×3. Packed ordinary components, shifted/reversed big-endian split components and explicit
+planar `IccDevice` components produce identical codestream bytes. The tiled cases also use GPU
+local-contrast ordering over original source samples. Profile extraction is independently
+byte-exact. Rust `jxl`, native libjxl and whole/256-byte-window GPU reconstruction retain
+`2e-4 * (1 + abs(reference))` and one rounded 8-bit-code bounds. No fixtures are replaced.
+
+The native output oracle's explicit `--no-cms` mode requires original ICC passthrough or
+XYB-to-linear reconstruction and verifies the actual output declaration. This avoids selecting
+an unused suggested ICC method in libjxl's CMS when testing codec reconstruction; ICC input
+conversion remains checked separately against the frozen scalar references. Method errors are
+not masked by an automatic oracle fallback.
+
+Seventy-two indexed three-frame sequences cover RGB/Gray, all four unchanged profile intents,
+F32/12-bit inputs, all three VarDCT backends, fixed Original/XYB and mixed Modular/VarDCT Original.
+Original RGB includes signed crops and clamped Multiply references. Timed XYB presentations remain
+unretained, while hidden/reference-only/nonzero-slot post-transform requests must fail without
+advancing state or reserving job memory. Profile mismatches also preserve finality/index/budget.
+Jobs complete in reverse insertion order and share one header reservation. Whole and fragmented
+GPU outputs match native frames; Rust `jxl` checks XYB sequences and each Original initial Replace.
+Independent `jxl-oxide` checks every Original composed presentation at the same bound. Rust `jxl`
+0.6.0 has the already documented clamped-Multiply operand reversal: in the F32 RGB 25×17 fixed
+Original sequence, component 2314 is `0.6815227` versus native `0.6848609`. That full-stream
+comparison is not counted as a pass; no pixel range or tolerance is changed to accommodate it.
+
+Negative and lifetime checks include channel/profile/intent/selected-method mismatch, exact and
+one-byte-short profile limits, source NaN and both infinities, finite samples overflowing the ICC
+working conversion, corrupted completion records, exact/one-byte-short GPU and header budgets,
+cancellation, failed-admission retry, retained-ready futures and sequence assembly/drop.
+Gray/RGB padded device/linear planes, program and parameter storage belong to the existing job
+reservation and completion. Integer/tiled ICC inputs also require source-validation stamps.
+F.2's forbidden reference combinations remain separate from unsupported pre-transform encoding.
+Alpha, wider device inputs, full-range/profile conformance and the full JPEG XL goal remain open.
+
+Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib tests::icc -- --test-threads=2`;
+the [full capability gates](DEVELOPMENT.md#capability-change-gates) cover shared code regressions.
+
 ## Mixed-codec sequence encoding
 
 `vardct_encoder/tests/animation/mixed_mode.rs` exercises `MixedModeEncoder` on Apple M5/Metal

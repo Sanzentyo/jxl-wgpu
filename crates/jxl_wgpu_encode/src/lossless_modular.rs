@@ -6,7 +6,6 @@ mod color;
 mod dispatch;
 mod entropy;
 mod grid;
-mod icc;
 mod local_transforms;
 mod lz77;
 mod memory;

@@ -102,10 +102,12 @@ impl Default for VarDctQuantization {
 pub struct VarDctConfig {
     /// Stream-wide Gray/RGB source channels and precision; defaults to interleaved RGB8.
     pub sample_format: crate::ColorSampleFormat,
-    /// Stream-wide enumerated source color; defaults to sRGB/D65. ICC is not yet supported.
+    /// Stream-wide enumerated or embedded RGB/Gray ICC source color; defaults to sRGB/D65.
     pub source_color: jxl_gpu_formats::ColorSpecification,
     /// Rendering intent and positive exact binary16 image white (default 255 cd/m²).
     pub color_options: crate::ImageColorOptions,
+    /// Maximum original ICC profile bytes, checked before serialization or GPU lowering (default 16 MiB).
+    pub max_icc_profile_bytes: u64,
     /// Stream-wide coding domain for integer or floating Gray/RGB sources; defaults to XYB.
     pub color_transform: super::VarDctColorTransform,
     /// Spectral/quantized AC progression; defaults to one complete pass.
@@ -126,6 +128,7 @@ impl Default for VarDctConfig {
             sample_format: Default::default(),
             source_color: jxl_gpu_formats::ColorSpecification::Default,
             color_options: Default::default(),
+            max_icc_profile_bytes: crate::source_color::icc::DEFAULT_PROFILE_LIMIT,
             color_transform: Default::default(),
             progressive: Default::default(),
             group_order: Default::default(),

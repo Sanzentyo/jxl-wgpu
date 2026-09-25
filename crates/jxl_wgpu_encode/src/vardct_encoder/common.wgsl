@@ -16,6 +16,7 @@ const LF_QUANTIZATION_OVERFLOW: u32 = 0x40000000u;
 const HF_QUANTIZATION_OVERFLOW: u32 = 0x80000000u;
 const NON_FINITE_SOURCE: u32 = 0x20000000u;
 const SOURCE_VALIDATION_INCOMPLETE: u32 = 0x10000000u;
+const COLOR_CONVERSION_NON_FINITE: u32 = 0x08000000u;
 const SOURCE_VALIDATED: u32 = 0x00524345u;
 var<workgroup> quantization_error: atomic<u32>;
 
@@ -41,7 +42,8 @@ fn normalize_source_sample(word: u32) -> f32 {
     let fraction = word & ((1u << fraction_bits) - 1u);
     let sign = (word >> (bits - 1u)) << 31u;
     if exponent == exponent_mask {
-        atomicOr(&quantization_error, NON_FINITE_SOURCE);
+        atomicOr(&quantization_error, select(NON_FINITE_SOURCE, COLOR_CONVERSION_NON_FINITE,
+            params.color_normalization == 2u));
         return 0.0;
     }
     let bias = (1u << (exponent_bits - 1u)) - 1u;
@@ -85,7 +87,7 @@ fn source_sample(x: u32, y: u32, component: u32) -> u32 {
 }
 
 // The checked color plan selects the same domain for image/frame headers and quantization.
-// 0 = XYB, 1 = original components. No source samples cross the host boundary.
+// 0 = enumerated source to XYB, 1 = original, 2 = resident ICC linear BT.709 to XYB.
 fn normalize_rgb(x: u32, y: u32) -> vec3<f32> {
     let encoded = vec3<f32>(
         normalize_source_sample(source_sample(x, y, 0u)),
@@ -93,6 +95,9 @@ fn normalize_rgb(x: u32, y: u32) -> vec3<f32> {
         normalize_source_sample(source_sample(x, y, 2u)),
     );
     if params.color_normalization == 1u { return encoded; }
+    if params.color_normalization == 2u {
+        return linear_rgb_to_xyb(encoded * (params.source_color.intensity / 255.0));
+    }
     let color = params.source_color;
     let linear = display_to_linear(encoded, color.transfer, color.gamma, color.intensity,
         vec4<f32>(color.luminance[0], color.luminance[1], color.luminance[2], color.luminance[3]));

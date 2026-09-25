@@ -16,7 +16,7 @@ impl Default for ModularImageMetadata {
             encoding: SourceColorEncoding::default(),
             options: ImageColorOptions::default(),
             alpha: AlphaAssociation::default(),
-            max_icc_profile_bytes: super::icc::DEFAULT_PROFILE_LIMIT,
+            max_icc_profile_bytes: crate::source_color::icc::DEFAULT_PROFILE_LIMIT,
         }
     }
 }

@@ -324,6 +324,8 @@ fn device_channels(signature: IccSignature) -> Result<usize, IccError> {
 #[derive(Clone, Debug, PartialEq)]
 pub enum IccTransformEndpoint {
     Profile(Box<IccProfileProgram>),
+    /// Ideal relative linear Gray: its component is PCS Y, without a device curve.
+    LinearGray,
     Rgb {
         encoding: RgbColorEncoding,
         /// PCS Y=1 represents this image white. None uses the transfer's generic units.
@@ -336,6 +338,7 @@ impl IccTransformEndpoint {
     pub fn channels(&self) -> usize {
         match self {
             Self::Profile(p) => p.channels(),
+            Self::LinearGray => 1,
             Self::Rgb { .. } => 3,
         }
     }
@@ -343,13 +346,21 @@ impl IccTransformEndpoint {
     pub fn profile(&self) -> Option<&IccProfileProgram> {
         match self {
             Self::Profile(p) => Some(p),
-            Self::Rgb { .. } => None,
+            Self::Rgb { .. } | Self::LinearGray => None,
         }
     }
 
     fn stages(&self, direction: IccDirection) -> Result<Vec<IccStage>, IccError> {
         match self {
             Self::Profile(p) => Ok(p.program.stages().to_vec()),
+            Self::LinearGray => Ok(vec![IccStage::Matrix(match direction {
+                IccDirection::DeviceToPcs => {
+                    IccAffine::new(1, vec![0.9642, 1.0, 0.8249], vec![0.0; 3], false)?
+                }
+                IccDirection::PcsToDevice => {
+                    IccAffine::new(3, vec![0.0, 1.0, 0.0], vec![0.0], false)?
+                }
+            })]),
             Self::Rgb {
                 encoding,
                 intensity,
@@ -402,6 +413,19 @@ pub struct IccTransform {
 }
 
 impl IccTransform {
+    /// Connect the selected profile to linear Gray through PCS luminance. This is a
+    /// one-component endpoint; callers requiring RGB expansion do so after conversion.
+    pub fn to_linear_gray(
+        source: &IccProfile,
+        intent: IccRenderingIntent,
+    ) -> Result<Self, IccError> {
+        Self::connect(
+            IccTransformEndpoint::Profile(source.select(IccDirection::DeviceToPcs, intent)?.into()),
+            IccTransformEndpoint::LinearGray,
+            intent,
+        )
+    }
+
     pub fn new(
         source: &IccProfile,
         target: &IccProfile,

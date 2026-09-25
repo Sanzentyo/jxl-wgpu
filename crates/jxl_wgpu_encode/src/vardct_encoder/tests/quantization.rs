@@ -133,7 +133,7 @@ fn signed_hf_metadata_endpoints_interoperate_through_whole_and_fragmented_packet
         VarDctFrameLayout::single(VarDctStrategy::Dct8),
         &VarDctConfig::default(),
         &still_control(8, 8),
-        VarDctColorPlan::new(&VarDctConfig::default()).unwrap(),
+        &VarDctColorPlan::new(&VarDctConfig::default()).unwrap(),
     )
     .unwrap();
     let header = packets.frame_header.clone();

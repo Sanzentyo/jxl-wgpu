@@ -116,9 +116,9 @@ pub use source_color::ImageColorOptions;
 pub use vardct_encoder::{
     TiledVarDctEncoder, TiledVarDctGrid, VarDctAnimationDescriptor, VarDctAnimationSession,
     VarDctBackend, VarDctCoefficientOrders, VarDctColorTransform, VarDctConfig,
-    VarDctDequantMatrices, VarDctEncoder, VarDctGroupOrder, VarDctHfMultiplier, VarDctJob,
-    VarDctKernelLayout, VarDctLfMetadata, VarDctMatrixEncoding, VarDctMemoryPlan,
-    VarDctQuantization, VarDctRawMatrix, VarDctSequenceDescriptor, VarDctSequenceSession,
-    VarDctStrategy, VarDctStrategyMap, VarDctSubmission, VarDctTransform,
+    VarDctDequantMatrices, VarDctEncoder, VarDctGroupOrder, VarDctHfMultiplier,
+    VarDctIccMemoryPlan, VarDctJob, VarDctKernelLayout, VarDctLfMetadata, VarDctMatrixEncoding,
+    VarDctMemoryPlan, VarDctQuantization, VarDctRawMatrix, VarDctSequenceDescriptor,
+    VarDctSequenceSession, VarDctStrategy, VarDctStrategyMap, VarDctSubmission, VarDctTransform,
     VarDctTransformMemoryPlan,
 };

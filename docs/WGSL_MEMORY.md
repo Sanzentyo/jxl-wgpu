@@ -138,7 +138,7 @@ name shown in parentheses.
 | `jxl_wgpu/forward_vardct.wgsl` | `forward_vardct::Params` / `Params` | six transform/LF geometry words, task count, linearized workgroup X count, two vec4 records for strides and constant-basis offsets | 64 | 16 | uniform |
 | `jxl_wgpu/forward_vardct.wgsl` | `ForwardVarDctTask` / `Task` | three scalar source origins, coefficient and LF offsets | 20 | 4 | read-only storage element |
 | `jxl_wgpu_encode/vardct_encoder/transforms.wgsl` | `TransformTask` | block origin, coefficient/LF offsets, transform extent, matrix/order offset, AC slot offset/capacity, strategy ID, HF multiplier | 44 | 4 | read-only storage element |
-| `jxl_wgpu_encode/vardct_encoder/control.wgsl` | `VarDctKernelParams` / `Params` | source/block geometry, LF/control section ranges, topology/LF grid, LF quantization/correlation, separate 33-entry DC/HF prefix tables, HF correlation/quantization, five AC descriptor/fragment fields, linearized workgroup X count, AC pass count/word stride, eleven packed spectral/shift descriptors, saliency offset/count, color normalization, sample mask/exponent, validation offset/count, byte order, three 24-byte source records | 828 | 4 | read-only storage |
+| `jxl_wgpu_encode/vardct_encoder/control.wgsl` | `VarDctKernelParams` / `Params` | source/block geometry, LF/control section ranges, topology/LF grid, LF quantization/correlation, separate 33-entry DC/HF prefix tables, HF correlation/quantization, five AC descriptor/fragment fields, linearized workgroup X count, AC pass count/word stride, eleven packed spectral/shift descriptors, saliency offset/count, color normalization, sample mask/exponent, validation offset/count, byte order, three 24-byte source records and the 64-byte color record | 892 | 4 | read-only storage |
 | `jxl_wgpu_encode/vardct_encoder/control.wgsl` | `VarDctArtifactHeader` / header words | status/live counts, AC-presence marker, LF section ranges/total bits, source/block geometry, topology, 33-bin DC histogram, LF descriptors/grid/count, AC descriptor offset/count and fragment offset/stride/word count, AC pass count, saliency offset/count | 272 | 4 | storage/readback record |
 | `jxl_wgpu_encode/vardct_encoder/control.wgsl` | `DcFragmentDescriptor` / two words | `bit_offset, bit_len` for one row-major LF group | 8 | 4 | storage/readback element |
 | `jxl_wgpu_encode/vardct_encoder/common.wgsl` | six host words / `QuantizationEntry` | three f32 dequantization scales followed by three u32 X/Y/B coefficient-order positions | 24 | 4 | read-only storage element |
@@ -935,9 +935,8 @@ the actual map completion; notification does not authorize early GPU resource re
 
 `VarDctKernelParams` is a 892-byte storage record. Words 168–169 contain AC pass count/word
 stride; words 170–180 hold eleven `coefficient_square | (shift << 8)` descriptors.
-Words 181–182 contain saliency offset/count; word 183 selects XYB (0) or original components (1).
-Words 184–185 are sample mask and exponent width (zero for integers); 186–187 hold general
-floating-source validation offset/count. Word 188 is the big-endian flag. Words 189–206 are
+Words 181–182 contain saliency offset/count; word 183 selects enumerated XYB (0), original components (1) or linear ICC input to XYB (2).
+Words 184–185 are sample mask and exponent width (zero for integers); 186–187 hold source-validation offset/count. Word 188 is the big-endian flag. Words 189–206 are
 three VarDCT working-component `Source` records: `row_stride, byte_offset, pixel_stride, word_bytes,
 bit_shift, plane`, each with 24-byte stride and four-byte alignment. Words 207–222 hold one
 64-byte `SourceColor` record: transfer selector, gamma, intensity, four luminance/OOTF scalars
@@ -968,9 +967,28 @@ are exposed in `source_validation_bytes` and included once in each artifact and 
 allocation. Word `0x00524345` marks completion; nonfinite input adds `0x20000000`.
 The control pass aggregates every record and rejects absent/invalid stamps with `0x10000000`
 before readiness. Host validation independently requires exact completed stamps and zero
-padding. Tiled DCT8 carries the nonfinite bit through existing AC descriptors and adds no
+padding. Enumerated/original tiled DCT8 carries the nonfinite bit through existing AC descriptors and adds no
 validation storage. Missing writes, quantization overflow and nonfinite samples are distinct
 failures. Both paths retain the existing single submission/map and completion ownership.
+
+XYB ICC input reuses the same 892-byte ABI in `icc_input.wgsl`, with source bindings 0/12/13/14,
+parameters at 1, artifact at 2 and normalized device planes at 3. Its checked pipeline override
+`icc_channels` is one for Gray or three for RGB. Each invocation owns one padded pixel in each
+plane; edge replication reads the last visible source sample. Every workgroup writes a completion
+stamp, including integer input and tiled DCT8. The resident ICC pass consumes those planes and
+writes equally sized linear Gray/BT.709 planes. General normalization preserves the first pass's
+error bits; tiled encoding retains the same records through its control pass. Nonfinite original
+samples use `0x20000000`; nonfinite converted values use `0x08000000`. Both prevent readiness.
+
+`VarDctIccMemoryPlan` counts each padded allocation as `ceil(width/8)*8*ceil(height/8)*8*channels*4`,
+plus the lowered resident program, original 892-byte layout and 320-byte resident dispatch.
+The source program connects Relative without dynamic black compensation; construction rejects
+any unexpected dynamic-validation requirement. Conversion and normalization dispatch dimensions,
+storage limits and u32 offsets are checked before admission. Gray's three forward source records
+alias its one converted plane. The intermediate buffers remain in the existing completion owner;
+there is no new submission, host image conversion or independent map. Saliency binds the retained
+original layout and caller-owned source windows. The shared ICC metadata serializer separately
+reserves twice the complete header size; one still/session permit lasts through assembly or drop.
 
 Integer saliency keeps its top-eight-bit or rounded low-depth proxy. Floating saliency rounds
 `255 * clamp(sample, 0, 1)`; the authoritative normalization/transform stage still checks all

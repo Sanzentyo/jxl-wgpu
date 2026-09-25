@@ -233,11 +233,11 @@ fn original_rgb_all_strategies_match_native_coefficients_and_pixels() {
         let (words, bits, artifacts) = job.wait_with_ac_for_test().unwrap();
         assert!(native::check_ac(&words, bits, &coefficients, &oracle, config.clone()) > 0);
         let frame = assemble_frame(artifacts.packets).unwrap();
-        let mut encoded = super::super::bitstream::image_header(
+        let mut encoded = super::image_header_with_color(
             extent.width,
             extent.height,
             AnimationHeader::Still,
-            encoder.color_plan,
+            &encoder.color_plan,
         )
         .unwrap()
         .bytes()

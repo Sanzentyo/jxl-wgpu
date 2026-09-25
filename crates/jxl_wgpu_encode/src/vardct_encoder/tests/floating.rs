@@ -165,11 +165,11 @@ fn single(
         .wait_with_ac_for_test()
         .unwrap();
     native::check_ac(&ac, bits, &coefficients, oracle, config.clone());
-    let mut encoded = super::super::bitstream::image_header(
+    let mut encoded = super::image_header_with_color(
         w as u32,
         h as u32,
         AnimationHeader::Still,
-        backend.color_plan,
+        &backend.color_plan,
     )
     .unwrap()
     .bytes()

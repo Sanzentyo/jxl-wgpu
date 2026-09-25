@@ -13,6 +13,7 @@ pub(crate) struct FrameHeaderPlan {
     frame_index: FrameIndex,
     is_last: bool,
     kind: FrameKind,
+    post_color_reference: bool,
     suffix: BitFragment,
 }
 
@@ -24,6 +25,7 @@ impl FrameHeaderPlan {
     ) -> Result<Self, EncodeError> {
         validate_frame(request, source_extent, has_alpha)?;
         let regular = request.options.kind == FrameKind::Regular;
+        let can_be_referenced = can_be_referenced(request);
         let mut output = BitWriter::new();
         let have_crop = request.options.crop.is_some();
         output.write_bits(u64::from(have_crop), 1)?;
@@ -75,8 +77,6 @@ impl FrameHeaderPlan {
         }
         if !request.is_last {
             output.write_bits(u64::from(request.options.save_as_reference.get()), 2)?;
-            let can_be_referenced = request.options.timing.duration_ticks == 0
-                || request.options.save_as_reference.get() != 0;
             if !regular
                 || (request.options.color_blend.mode == BlendMode::Replace
                     && full_frame
@@ -102,6 +102,7 @@ impl FrameHeaderPlan {
             frame_index: request.frame_index,
             is_last: request.is_last,
             kind: request.options.kind,
+            post_color_reference: can_be_referenced && !request.options.save_before_color_transform,
             suffix: BitFragment::new(output.into_bytes(), bit_len)?,
         })
     }
@@ -112,6 +113,10 @@ impl FrameHeaderPlan {
 
     pub(crate) const fn is_last(&self) -> bool {
         self.is_last
+    }
+
+    pub(crate) const fn requires_post_color_reference(&self) -> bool {
+        self.post_color_reference
     }
 
     pub(crate) fn write_kind(&self, writer: &mut BitWriter) -> Result<(), EncodeError> {
@@ -242,9 +247,7 @@ fn validate_frame(
         request.canvas_height,
     );
     let resets_canvas = request.options.color_blend.mode == crate::BlendMode::Replace && full_frame;
-    let can_be_referenced = !request.is_last
-        && (request.options.timing.duration_ticks == 0
-            || request.options.save_as_reference.get() != 0);
+    let can_be_referenced = can_be_referenced(request);
     let writes_save_before = resets_canvas && can_be_referenced;
     if request.options.save_before_color_transform && !writes_save_before {
         return Err(EncodeError::InvalidConfiguration(
@@ -252,6 +255,13 @@ fn validate_frame(
         ));
     }
     Ok(())
+}
+
+fn can_be_referenced(request: &FrameEncodeRequest) -> bool {
+    !request.is_last
+        && (request.options.kind == FrameKind::ReferenceOnly
+            || request.options.timing.duration_ticks == 0
+            || request.options.save_as_reference.get() != 0)
 }
 
 fn validate_extent(

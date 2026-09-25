@@ -7,6 +7,7 @@ mod color;
 mod enumerated;
 mod floating;
 mod gray;
+mod icc;
 mod layouts;
 mod matrices;
 mod mixed;
@@ -53,12 +54,24 @@ fn image_header(
     height: u32,
     animation: crate::AnimationHeader,
 ) -> Result<crate::BitFragment, EncodeError> {
-    super::bitstream::image_header(
+    image_header_with_color(
         width,
         height,
         animation,
-        VarDctColorPlan::new(&VarDctConfig::default()).unwrap(),
+        &VarDctColorPlan::new(&VarDctConfig::default()).unwrap(),
     )
+}
+fn image_header_with_color(
+    width: u32,
+    height: u32,
+    animation: crate::AnimationHeader,
+    color: &VarDctColorPlan,
+) -> Result<crate::BitFragment, EncodeError> {
+    super::bitstream::image_header(width, height, animation, color)?
+        .finish(&jxl_wgpu::MemoryBudget::new(
+            NonZeroU64::new(u64::MAX).unwrap(),
+        ))
+        .map(|(header, _permit)| header)
 }
 use super::dispatch::{
     FORWARD_KERNEL_KEY, TILED_KERNEL_KEY, TILED_SHADER, TiledVarDctEncoder, VarDctEncoder,
@@ -403,7 +416,7 @@ fn fixed_control_plane_decodes_as_standard_black_vardct() {
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
             &VarDctConfig::default(),
             &still_control(8, 8),
-            VarDctColorPlan::new(&VarDctConfig::default()).unwrap(),
+            &VarDctColorPlan::new(&VarDctConfig::default()).unwrap(),
         )
         .unwrap(),
     )
@@ -432,7 +445,7 @@ fn fixed_control_plane_accepts_nonzero_quantized_xyb_dc() {
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
             &VarDctConfig::default(),
             &still_control(8, 8),
-            VarDctColorPlan::new(&VarDctConfig::default()).unwrap(),
+            &VarDctColorPlan::new(&VarDctConfig::default()).unwrap(),
         )
         .unwrap(),
     )
@@ -464,7 +477,7 @@ fn custom_lf_metadata_roundtrips_through_the_standard_control_plane() {
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
             &config_with_lf(metadata),
             &still_control(8, 8),
-            VarDctColorPlan::new(&VarDctConfig::default()).unwrap(),
+            &VarDctColorPlan::new(&VarDctConfig::default()).unwrap(),
         )
         .unwrap(),
     )
@@ -611,6 +624,7 @@ fn naga_validates_vardct_shaders() {
         shader_source(TILED_SHADER),
         shader_source(include_str!("transforms.wgsl")),
         shader_source(include_str!("saliency.wgsl")),
+        shader_source(include_str!("icc_input.wgsl")),
         include_str!("raw_matrices.wgsl").to_owned(),
     ] {
         let module = naga::front::wgsl::parse_str(&source).expect("VarDCT WGSL parses");

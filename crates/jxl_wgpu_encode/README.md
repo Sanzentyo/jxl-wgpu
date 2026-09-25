@@ -498,13 +498,31 @@ One checked color plan owns image/frame syntax, logical-to-working component map
 normalization and HF multipliers. It expands serialized custom xy/gamma values before GPU
 lowering, so metadata and arithmetic use the same rounding. Every admitted frame must have
 wire-equivalent color, channels and precision; explicit sRGB/Sycc aliases may match defaults.
-Undefined color, unsupported transfers, ICC, limited-range RGB/YUV and unrepresentable geometry
+Undefined color, unsupported transfers, limited-range RGB/YUV and unrepresentable geometry
 are rejected before job admission. Original components omit XYB-only matrix-scale fields and
 use their implicit neutral multipliers.
 LF metadata, matrices, orders and quantizers retain their explicit values in either domain;
 switching the domain does not imply equivalent bitrate or perceptual quality.
 The [original-RGB corpus](../../docs/CONFORMANCE_CORPUS.md#original-rgb-vardct-encoding)
 covers all three backends, sequences, progressive passes and independent pixel/coefficient checks.
+
+`source_color: ColorSpecification::Icc(profile)` also accepts RGB or Gray profiles with matching
+logical channels, ordinary swizzles or explicit `IccDevice` components. The original profile is
+preserved byte-for-byte; `color_options.rendering_intent` must equal its unchanged header intent.
+`max_icc_profile_bytes` defaults to 16 MiB; zero disables ICC input, and the standard's original
+and transformed profile limits also apply. Original coding preserves normalized device components
+without selecting an ICC method. XYB selects the profile's relative device-to-PCS method and
+uses the existing resident GPU ICC pipeline to produce linear BT.709 or one linear Gray component
+(PCS Y). Gray expansion occurs after that connection. The working intent remains Relative
+independently of the preserved presentation intent. No host pixel conversion is performed.
+Unsupported selected methods and resource limits fail before submission; finite source values
+whose color conversion becomes nonfinite return `BackendError::VarDctColorConversionNonFinite`
+before any packet is exposed. [ICC evidence](../../docs/CONFORMANCE_CORPUS.md#icc-vardct-and-mixed-input).
+
+The common frame plan rejects post-color-transform reference storage for XYB plus ICC, as required
+by F.2. This includes non-final hidden frames and reference-only frames. Final stills and timed,
+unretained XYB presentations are supported; Original ICC sequences retain the existing reference
+and crop/blend contract. VarDCT pre-transform reference storage remains unimplemented.
 
 `VarDctConfig::sample_format` uses checked `ColorSampleFormat::integer(channels, bits)` for all
 1–31-bit unsigned sources or `ColorSampleFormat::float(channels, bits, exponent_bits)` for all 154
@@ -522,7 +540,7 @@ Gray uses `ColorModel::Gray`, the configured white/transfer and a single stored 
 the gray swizzle (X, Y, Z or W; no alpha). Its checked source record is bound to each of
 the three standard VarDCT working components. The GPU reads the same source sample for
 each, while the header declares Gray and omits RGB primaries. Source windows count those
-bytes once; there is no expanded input buffer or host pixel conversion. Gray keeps the
+bytes once; enumerated/original Gray needs no expanded input buffer or host pixel conversion. Gray keeps the
 same word sizes, bit positions, byte order and unaligned row/offset support as RGB.
 
 The logical input API is `ColorSampleFormat` and `ImageSequenceDescriptor`; these replace
@@ -545,7 +563,7 @@ no arbitrary extended-range reconstruction or general quality guarantee is impli
 Subnormals enter the lossy F32 arithmetic contract; VarDCT is not a bit-preserving float codec.
 General transforms budget per-workgroup completion/error records inside the artifact/readback;
 tiled DCT8 carries errors in its existing block records. Missing or malformed validation
-records cannot publish an artifact. Alpha, ICC, subsampling and
+records cannot publish an artifact. XYB ICC additionally budgets those records for integer and tiled sources. Alpha, subsampling and
 texture inputs remain outside the VarDCT contract.
 
 VarDCT and mixed sequences declare 32-bit Modular working buffers, independently of input
@@ -740,6 +758,16 @@ and 5,268 resident transform bytes. Tiled DCT8 retains the same 24-byte entry la
 `quantization_metadata_bytes` and included in the
 job's owned bytes. It requires seven storage bindings and retains the table through completion
 or cancellation. No coefficient readback is added.
+XYB ICC adds `VarDctMemoryPlan::icc`: padded input and linear output planes (one plane each for
+Gray, three for RGB), the lowered program, an original 892-byte source-layout record and the
+resident 320-byte dispatch record. All belong to the existing job reservation, command submission
+and map completion. Saliency still reads original device samples. Original ICC adds no color
+intermediate. `icc_profile_bytes` includes the caller-owned retained profile in addressed bytes.
+The still frontends' `memory_plan` includes `icc_storage_bytes`, twice the complete image-header
+size for serialization/assembly overlap. The frame backend reports zero header storage; a sequence
+reserves one header at creation and retains it through assembly or session drop, independently of
+its submitted jobs. Success, rejected output and cancellation release their respective permits.
+
 Mode-7 selections add `raw_matrix_input_bytes` for immutable sample/descriptor/prefix storage
 and `raw_matrix_artifact_bytes` for compressed fragments and status. `readback_bytes` includes
 those fragments at the end of the existing mapped buffer. All three allocations belong to the
@@ -889,7 +917,7 @@ only; Modular and tiled sources can vary per frame. Modular retains its configur
 predictor and transform policies. Regular VarDCT frames retain configured AC progression;
 reference-only VarDCT frames use one implicit complete pass. The common contract supports
 Replace/Add/Multiply, signed crops, hidden layers, timecodes and four post-transform reference
-slots across codec boundaries. Alpha, ICC and pre-transform
+slots across codec boundaries. Embedded RGB/Gray ICC uses exact profile identity and one shared budgeted header. Alpha and pre-transform
 references and automatic mode selection require broader contracts and remain unsupported.
 Modular preserves its physical source words, including nonfinite float payloads; selected VarDCT frames require finite samples.
 Modular/VarDCT mode selection preserves these distinct contracts; including VarDCT does not make the presentation lossless.

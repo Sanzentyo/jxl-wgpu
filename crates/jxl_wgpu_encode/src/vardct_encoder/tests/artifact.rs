@@ -134,6 +134,7 @@ fn artifact_rejects_missing_ac_writes_and_forged_layout() {
                     0,
                     super::super::types::SOURCE_VALIDATED ^ 1,
                     super::super::types::SOURCE_VALIDATED | 0x2000_0000,
+                    super::super::types::SOURCE_VALIDATED | 0x0800_0000,
                 ] {
                     let mut corrupt = words.clone();
                     corrupt[index] = status;

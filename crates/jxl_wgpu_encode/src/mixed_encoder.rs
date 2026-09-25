@@ -337,7 +337,11 @@ impl MixedModeEncoder {
         descriptor: ImageSequenceDescriptor,
     ) -> Result<MixedModeSequenceSession, EncodeError> {
         let backend = self.encoder.backend();
-        let assembler = CodestreamAssembler::new(backend.vardct.sequence_header(&descriptor)?)?;
+        let (header, metadata_permit) = backend
+            .vardct
+            .sequence_header(&descriptor)?
+            .finish(self.encoder.memory_budget())?;
+        let assembler = CodestreamAssembler::new(header)?;
         let session = self.encoder.begin_session(SessionDescriptor {
             profile: backend.modular_coding.profile,
             progressive: backend.modular_coding.progressive.clone(),
@@ -347,6 +351,7 @@ impl MixedModeEncoder {
             canvas_height: descriptor.canvas_height(),
         })?;
         Ok(MixedModeSequenceSession {
+            metadata_permit,
             session,
             assembler,
             descriptor,
@@ -356,6 +361,7 @@ impl MixedModeEncoder {
 
 /// One ordered sequence using the common image contract and existing session state machine.
 pub struct MixedModeSequenceSession {
+    metadata_permit: Option<jxl_wgpu::MemoryPermit>,
     session: EncodeSession<MixedModeBackend>,
     assembler: CodestreamAssembler,
     descriptor: ImageSequenceDescriptor,
@@ -423,11 +429,13 @@ impl MixedModeSequenceSession {
     }
 
     pub fn finish_raw(self) -> Result<Vec<u8>, EncodeError> {
+        let _metadata_permit = self.metadata_permit;
         self.session.ensure_closed()?;
         self.assembler.finish_raw().map_err(Into::into)
     }
 
     pub fn finish_container(self) -> Result<Vec<u8>, EncodeError> {
+        let _metadata_permit = self.metadata_permit;
         self.session.ensure_closed()?;
         self.assembler.finish_container()
     }
@@ -437,6 +445,7 @@ impl MixedModeSequenceSession {
         inventory_limits: jxl_gpu_bitstream::InventoryLimits,
         index_limits: jxl_gpu_bitstream::FrameIndexLimits,
     ) -> Result<Vec<u8>, EncodeError> {
+        let _metadata_permit = self.metadata_permit;
         self.session.ensure_closed()?;
         self.assembler
             .finish_indexed_container(inventory_limits, index_limits)

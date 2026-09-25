@@ -27,6 +27,7 @@ pub struct VarDctSequenceSession {
     descriptor: VarDctSequenceDescriptor,
     session: EncodeSession<VarDctBackend>,
     assembler: CodestreamAssembler,
+    metadata_permit: Option<jxl_wgpu::MemoryPermit>,
 }
 
 impl VarDctSequenceSession {
@@ -45,11 +46,16 @@ impl VarDctSequenceSession {
             canvas_width: descriptor.canvas_width(),
             canvas_height: descriptor.canvas_height(),
         })?;
-        let assembler = CodestreamAssembler::new(encoder.backend().sequence_header(&descriptor)?)?;
+        let (header, metadata_permit) = encoder
+            .backend()
+            .sequence_header(&descriptor)?
+            .finish(encoder.memory_budget())?;
+        let assembler = CodestreamAssembler::new(header)?;
         Ok(Self {
             descriptor,
             session,
             assembler,
+            metadata_permit,
         })
     }
 
@@ -88,11 +94,13 @@ impl VarDctSequenceSession {
     }
 
     pub fn finish_raw(self) -> Result<Vec<u8>, EncodeError> {
+        let _metadata_permit = self.metadata_permit;
         self.session.ensure_closed()?;
         Ok(self.assembler.finish_raw()?)
     }
 
     pub fn finish_container(self) -> Result<Vec<u8>, EncodeError> {
+        let _metadata_permit = self.metadata_permit;
         self.session.ensure_closed()?;
         self.assembler.finish_container()
     }
@@ -104,6 +112,7 @@ impl VarDctSequenceSession {
         inventory_limits: jxl_gpu_bitstream::InventoryLimits,
         index_limits: jxl_gpu_bitstream::FrameIndexLimits,
     ) -> Result<Vec<u8>, EncodeError> {
+        let _metadata_permit = self.metadata_permit;
         self.session.ensure_closed()?;
         self.assembler
             .finish_indexed_container(inventory_limits, index_limits)

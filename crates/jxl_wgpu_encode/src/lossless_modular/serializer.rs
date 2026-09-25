@@ -14,7 +14,6 @@ use super::color::ModularImageMetadata;
 use super::dispatch::{LosslessModularBackend, ModularGroupPlan};
 use super::entropy::{EncodedGroup, EntropyCode};
 use super::grid::{LosslessModularGroup, LosslessModularGroupGrid};
-use super::icc::{DEFAULT_PROFILE_LIMIT, PreparedImageHeader};
 use super::lz77::LosslessModularLz77;
 use super::memory::{LosslessModularMemoryLimits, LosslessModularMemoryPlan};
 use super::predictor::{LosslessModularPredictor, LosslessModularWeightedPredictor};
@@ -31,6 +30,7 @@ use crate::ImageColorOptions;
 use crate::frame_header::{FrameHeaderPlan, write_animation_header};
 use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS, RawPrefixCode};
 use crate::source_color::SourceColorEncoding;
+use crate::source_color::icc::{DEFAULT_PROFILE_LIMIT, PreparedImageHeader};
 use crate::{
     AnimationHeader, BackendError, BitFragment, CodestreamAssembler, Determinism, EncodeError,
     EncodeProfile, EncodeSession, EncoderBufferPoolStats, EncoderCapabilities, FrameEncodeRequest,

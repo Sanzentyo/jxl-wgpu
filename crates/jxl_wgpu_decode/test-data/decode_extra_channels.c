@@ -6,6 +6,8 @@
  * --xyb requests libjxl's scaled XYB output for offline component-domain references.
  * --original requests and verifies the enumerated original encoding using libjxl 0.12.0.
  * --original-icc verifies exact original/data ICC identity before original-component output.
+ * --no-cms requires original ICC passthrough or XYB-to-linear output, neither of which
+ * needs an ICC connection; verify the selected output instead of parsing an unused method.
  * /tmp/jxl-extra-oracle INPUT.jxl [--preview] [--prefix] [--preserve-alpha] [--linear|--xyb|--original|--original-icc] [--keep-orientation] [--render-spots] > CHANNELS.f32
  */
 #include <jxl/decode.h>
@@ -23,9 +25,10 @@ static void require_icc(int ok, const char* message) {
 
 int main(int argc, char** argv) {
   if (argc < 2) return 2;
-  int unpremultiply = 1, linear = 0, xyb = 0, original = 0, original_icc = 0, keep_orientation = 0, render_spots = 0, preview = 0, prefix = 0;
+  int no_cms = 0, unpremultiply = 1, linear = 0, xyb = 0, original = 0, original_icc = 0, keep_orientation = 0, render_spots = 0, preview = 0, prefix = 0;
   for (int i=2; i<argc; ++i) {
-    if (!strcmp(argv[i], "--preserve-alpha")) unpremultiply = 0;
+    if (!strcmp(argv[i], "--no-cms")) no_cms = 1;
+    else if (!strcmp(argv[i], "--preserve-alpha")) unpremultiply = 0;
     else if (!strcmp(argv[i], "--linear")) linear = 1;
     else if (!strcmp(argv[i], "--xyb")) xyb = 1;
     else if (!strcmp(argv[i], "--original")) original = 1;
@@ -36,7 +39,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--prefix")) prefix = 1;
     else return 2;
   }
-  if (xyb + linear + original + original_icc > 1) return 2;
+  if (xyb + linear + original + original_icc > 1 || (no_cms && !linear && !original_icc)) return 2;
   if ((original || original_icc) && JxlDecoderVersion() != 12000) return 2;
   FILE* in = fopen(argv[1], "rb"); if (!in) return 2;
   if (fseek(in, 0, SEEK_END)) return 2;
@@ -46,7 +49,7 @@ int main(int argc, char** argv) {
   if (fread(data, 1, (size_t)length, in) != (size_t)length) return 2;
   fclose(in);
   JxlDecoder* dec = JxlDecoderCreate(NULL);
-  if ((linear || original || original_icc) && dec) JxlDecoderSetCms(dec, *JxlGetDefaultCms());
+  if (!no_cms && (linear || original || original_icc) && dec) JxlDecoderSetCms(dec, *JxlGetDefaultCms());
   if (!dec || JxlDecoderSubscribeEvents(dec, JXL_DEC_BASIC_INFO | JXL_DEC_COLOR_ENCODING | (preview ? JXL_DEC_PREVIEW_IMAGE : JXL_DEC_FULL_IMAGE)) != JXL_DEC_SUCCESS
       || JxlDecoderSetRenderSpotcolors(dec, render_spots) != JXL_DEC_SUCCESS
       || JxlDecoderSetUnpremultiplyAlpha(dec, unpremultiply) != JXL_DEC_SUCCESS
@@ -65,6 +68,7 @@ int main(int argc, char** argv) {
       extras = calloc(info.num_extra_channels ? info.num_extra_channels : 1, sizeof(*extras));
       if (!extras) return 2;
     } else if (status == JXL_DEC_COLOR_ENCODING) {
+      if (no_cms) require_icc((linear && !info.uses_original_profile) || (original_icc && info.uses_original_profile), "requested codec domain requires a CMS connection");
       if (original_icc) {
         size_t original_size = 0, actual_size = 0;
         if (JxlDecoderGetICCProfileSize(dec, JXL_COLOR_PROFILE_TARGET_ORIGINAL, &original_size) != JXL_DEC_SUCCESS
@@ -112,6 +116,13 @@ int main(int argc, char** argv) {
           color.rendering_intent = JXL_RENDERING_INTENT_PERCEPTUAL;
         }
         if (JxlDecoderSetOutputColorProfile(dec, &color, NULL, 0) != JXL_DEC_SUCCESS) return 3;
+        if (no_cms) {
+          JxlColorEncoding actual;
+          require_icc(JxlDecoderGetColorAsEncodedProfile(dec, JXL_COLOR_PROFILE_TARGET_DATA, &actual) == JXL_DEC_SUCCESS, "read linear output encoding");
+          require_icc(actual.color_space == color.color_space && actual.transfer_function == color.transfer_function
+                      && actual.white_point == color.white_point
+                      && (info.num_color_channels == 1 || actual.primaries == color.primaries), "linear output encoding differs");
+        }
       }
     } else if (status == JXL_DEC_NEED_PREVIEW_OUT_BUFFER) {
       if (!preview || JxlDecoderPreviewOutBufferSize(dec, &color_format, &color_size) != JXL_DEC_SUCCESS) return 3;

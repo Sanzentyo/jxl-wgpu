@@ -30,8 +30,13 @@ fn normalize_image(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invoc
     }
     workgroupBarrier();
     if lane == 0u && transform_index(group) < params.source_validation_groups {
-        artifact_words[params.source_validation_offset + transform_index(group)] =
-            SOURCE_VALIDATED | atomicLoad(&quantization_error);
+        if params.color_normalization == 2u {
+            // ICC source validation already ran. Preserve it and add converted-value errors.
+            artifact_words[params.source_validation_offset + transform_index(group)] |= atomicLoad(&quantization_error);
+        } else {
+            artifact_words[params.source_validation_offset + transform_index(group)] =
+                SOURCE_VALIDATED | atomicLoad(&quantization_error);
+        }
     }
 }
 

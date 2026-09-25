@@ -3,7 +3,10 @@
 use crate::frame_header::write_animation_header;
 use crate::sample_format::write_sample_bit_depth;
 use crate::{AnimationHeader, BitFragment, ColorSampleFormat, EncodeError};
-use crate::{ImageColorOptions, source_color::EnumeratedColorEncoding};
+use crate::{
+    ImageColorOptions,
+    source_color::{SourceColorEncoding, icc::PreparedImageHeader},
+};
 use jxl_gpu_bitstream::BitWriter;
 
 /// Stream-wide canvas and optional timebase for a Gray/RGB layered still or animation.
@@ -41,10 +44,17 @@ impl ImageSequenceDescriptor {
         &self,
         xyb_encoded: bool,
         samples: ColorSampleFormat,
-        encoding: EnumeratedColorEncoding,
+        encoding: &SourceColorEncoding,
         options: ImageColorOptions,
-    ) -> Result<crate::BitFragment, EncodeError> {
-        self.header.encode(xyb_encoded, samples, encoding, options)
+        max_icc_profile_bytes: u64,
+    ) -> Result<PreparedImageHeader, EncodeError> {
+        self.header.encode(
+            xyb_encoded,
+            samples,
+            encoding,
+            options,
+            max_icc_profile_bytes,
+        )
     }
 
     #[must_use]
@@ -123,9 +133,10 @@ impl ImageHeaderPlan {
         &self,
         xyb_encoded: bool,
         samples: ColorSampleFormat,
-        encoding: EnumeratedColorEncoding,
+        encoding: &SourceColorEncoding,
         options: ImageColorOptions,
-    ) -> Result<BitFragment, EncodeError> {
+        max_icc_profile_bytes: u64,
+    ) -> Result<PreparedImageHeader, EncodeError> {
         let mut output = BitWriter::new();
         crate::packet::append_fragment(&mut output, &self.prefix)?;
         let has_animation = self.animation.is_some();
@@ -157,7 +168,6 @@ impl ImageHeaderPlan {
         }
         output.write_bits(0, 2)?; // no image extensions
         output.write_bits(1, 1)?; // default opsin inverse matrix and upsampling weights
-        output.align_to_byte()?;
-        Ok(BitFragment::byte_aligned(output.into_bytes())?)
+        PreparedImageHeader::new(output, encoding.icc_profile(), max_icc_profile_bytes)
     }
 }

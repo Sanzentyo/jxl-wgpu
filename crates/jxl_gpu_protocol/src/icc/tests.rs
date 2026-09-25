@@ -336,6 +336,14 @@ fn gray_uses_pcs_y_and_chad_is_preserved_without_double_adaptation() {
         4096
     );
     assert_eq!(transform.target().channels(), 1);
+    let linear = IccTransform::to_linear_gray(&rgb, IccRenderingIntent::Relative).unwrap();
+    assert_eq!(linear.target(), &IccTransformEndpoint::LinearGray);
+    assert_eq!(linear.program().output_channels(), 1);
+    assert_eq!(
+        matrix(&linear)[0],
+        [10000.0 / 65536.0, 50000.0 / 65536.0, 5536.0 / 65536.0]
+    );
+    assert_eq!(offset(&linear), [0.0; 3]);
     let reverse = IccTransform::new(&gray, &rgb, IccRenderingIntent::Relative).unwrap();
     assert_eq!(
         reverse

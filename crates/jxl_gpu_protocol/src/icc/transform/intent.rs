@@ -93,7 +93,7 @@ impl Connection {
 fn media_white(endpoint: &IccTransformEndpoint) -> [f64; 3] {
     match endpoint {
         // The virtual endpoint is an already adapted, ideal v4 display in PCS D50.
-        IccTransformEndpoint::Rgb { .. } => D50,
+        IccTransformEndpoint::Rgb { .. } | IccTransformEndpoint::LinearGray => D50,
         IccTransformEndpoint::Profile(profile)
             if profile.tag.is_some_and(|tag| tag.0[3] == b'3') =>
         {
@@ -113,7 +113,7 @@ fn media_white(endpoint: &IccTransformEndpoint) -> [f64; 3] {
 
 fn black(endpoint: &IccTransformEndpoint) -> Option<[f64; 3]> {
     Some(match endpoint {
-        IccTransformEndpoint::Rgb { .. } => [0.0; 3],
+        IccTransformEndpoint::Rgb { .. } | IccTransformEndpoint::LinearGray => [0.0; 3],
         IccTransformEndpoint::Profile(profile) => match &profile.matrix_trc {
             Some(matrix) => profile_black(matrix),
             // Selected v4 LUT/MPE perceptual/saturation methods use the PCS reference black.

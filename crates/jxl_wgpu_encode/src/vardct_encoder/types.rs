@@ -244,6 +244,12 @@ pub enum VarDctKernelLayout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VarDctMemoryPlan {
     pub kernel_layout: VarDctKernelLayout,
+    /// Caller-owned profile retained by the checked color plan; included in addressed bytes.
+    pub icc_profile_bytes: u64,
+    /// Still-image header reservation. Sequence headers have their own session reservation.
+    pub icc_storage_bytes: u64,
+    /// XYB's resident ICC conversion, included in the job's total reservation.
+    pub icc: Option<super::VarDctIccMemoryPlan>,
     /// Union of bytes made addressable by the source plane bindings, counting alignment
     /// overlap once and excluding gaps between windows. The caller owns the allocation;
     /// these bytes are not charged to `owned_bytes_per_job`.
@@ -253,7 +259,7 @@ pub struct VarDctMemoryPlan {
     pub readback_bytes: u64,
     /// Local-contrast records and alignment, already included in artifact/readback bytes.
     pub saliency_metadata_bytes: u64,
-    /// General floating-source validation records/alignment, included in artifact/readback.
+    /// General floating or XYB ICC validation records/alignment, included in artifact/readback.
     pub source_validation_bytes: u64,
     /// Tiled DCT8's X/Y/B dequantization and order table; general transforms include it in `transform`.
     pub quantization_metadata_bytes: u64,
@@ -329,6 +335,9 @@ impl VarDctMemoryPlan {
             + quantization_metadata_bytes;
         Self {
             kernel_layout,
+            icc_profile_bytes: 0,
+            icc_storage_bytes: 0,
+            icc: None,
             source_binding_bytes,
             parameter_storage_bytes,
             artifact_storage_bytes,

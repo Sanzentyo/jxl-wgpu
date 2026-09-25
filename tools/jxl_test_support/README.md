@@ -67,7 +67,10 @@ The extra-channel native oracle's `--original-icc` mode requires libjxl 0.12.0 a
 between the original and actual DATA ICC bytes before returning original device samples. Original
 profile streams use their native default, because libjxl rejects an explicit ICC request for them;
 XYB streams explicitly request the original profile. This never substitutes a generated profile
-or silently accepts a different output encoding. The encoder ICC matrix separately exports the
+or silently accepts a different output encoding. Optional `--no-cms` requires XYB-to-linear
+reconstruction or original-profile passthrough; it verifies the DATA declaration and rejects
+modes that require a CMS connection. This lets independent native pixel decoding avoid selecting
+unused LUT/MPE methods. The encoder ICC matrix separately exports the
 original profile through `oracles::icc_profile`, checks raw integer/IEEE words, and compares requested
 color output with the unchanged independent scalar corpus and native-encoded fixture.
 Neither oracle is a production dependency or a fallback.

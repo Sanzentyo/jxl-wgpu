@@ -15,6 +15,7 @@ use jxl_gpu_protocol::{
 use crate::ColorChannels;
 use crate::{EncodeError, UnsupportedFeature};
 
+pub(crate) mod icc;
 mod options;
 pub use options::ImageColorOptions;
 

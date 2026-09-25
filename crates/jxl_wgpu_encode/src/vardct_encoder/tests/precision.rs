@@ -263,11 +263,11 @@ fn single(
         .unwrap();
     assert!(native::check_ac(&words, length, &coefficients, oracle, config.clone()) > 0);
     let frame = assemble_frame(artifacts.packets).unwrap();
-    let mut encoded = super::super::bitstream::image_header(
+    let mut encoded = super::image_header_with_color(
         extent.width,
         extent.height,
         AnimationHeader::Still,
-        backend.color_plan,
+        &backend.color_plan,
     )
     .unwrap()
     .bytes()

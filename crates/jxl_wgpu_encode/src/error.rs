@@ -27,6 +27,8 @@ pub enum BackendError {
     },
     #[error("VarDCT source contains a non-finite floating sample")]
     VarDctNonFiniteSource,
+    #[error("VarDCT ICC source conversion produced a non-finite working component")]
+    VarDctColorConversionNonFinite,
     #[error("GPU artifact mapping failed")]
     ArtifactMapping(#[source] wgpu::BufferAsyncError),
     #[error("the mapped GPU artifact range is invalid")]
@@ -217,6 +219,10 @@ pub enum EncodeError {
     InvalidModularRctType { rct_type: u32 },
     #[error("Modular RCT requires three color channels, received {color_channels}")]
     ModularRctColorChannels { color_channels: u32 },
+    #[error(transparent)]
+    Icc(#[from] jxl_gpu_protocol::icc::IccError),
+    #[error(transparent)]
+    ResidentIcc(#[from] jxl_wgpu::ResidentIccError),
     #[error("ICC {resource} requires {required} bytes, limit {limit}")]
     IccLimit {
         resource: &'static str,

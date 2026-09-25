@@ -139,6 +139,17 @@ All 19 official descriptors with original ICC objects additionally compare those
 objects after hash validation. These checks close the pinned suite's original-profile export
 gap; wider color/image conformance and the remaining full JPEG XL requirements remain open.
 
+## Encoder working connection
+
+VarDCT source ICC selection is owned by its immutable color plan. XYB uses the relative
+DeviceToPcs method, followed by linear BT.709 for RGB or `IccTransform::to_linear_gray` for Gray.
+The explicit `LinearGray` endpoint selects PCS Y and has one output component; it does not
+infer Gray from a converted RGB channel or reinterpret profile metadata. The existing resident
+ICC program executes all sample operations. Original-component encoding selects no CMM method.
+Both codecs share bounded unchanged-profile serialization, and the frame plan enforces the F.2
+reference rule below before GPU admission. The [encoder ICC corpus](CONFORMANCE_CORPUS.md#icc-vardct-and-mixed-input)
+records independent coefficient, output, precision, sequence and ownership checks.
+
 ## XYB reference validity
 
 ISO/IEC 18181-1:2024, F.2 excludes post-transform reference storage when both XYB and an

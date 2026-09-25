@@ -279,17 +279,6 @@ fn enumerated_admission_rejects_unbound_color_before_budget_and_releases_cancell
 
 #[test]
 fn enumerated_plan_checks_metadata_and_accepts_only_equivalent_wire_aliases() {
-    let icc = jxl_gpu_protocol::icc::IccProfile::parse(
-        Arc::from(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../jxl_wgpu_decode/test-data/embedded_icc/rgb.icc"
-            ))
-            .as_slice(),
-        ),
-        Default::default(),
-    )
-    .unwrap();
     for transform in [VarDctColorTransform::Xyb, VarDctColorTransform::Original] {
         let config = VarDctConfig {
             color_transform: transform,
@@ -319,7 +308,6 @@ fn enumerated_plan_checks_metadata_and_accepts_only_equivalent_wire_aliases() {
         }
         for color in [
             ColorSpecification::Undefined,
-            ColorSpecification::Icc(icc.clone()),
             oracle::spec(ColorSpace::Undefined, TransferFunction::Srgb),
         ] {
             assert!(

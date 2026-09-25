@@ -17,8 +17,8 @@ pub(super) fn image_header(
     width: u32,
     height: u32,
     animation: AnimationHeader,
-    color: VarDctColorPlan,
-) -> Result<BitFragment, EncodeError> {
+    color: &VarDctColorPlan,
+) -> Result<crate::source_color::icc::PreparedImageHeader, EncodeError> {
     color.image_header(&crate::ImageSequenceDescriptor::new(
         width, height, animation,
     )?)
@@ -27,7 +27,7 @@ pub(super) fn image_header(
 fn frame_header(
     progressive: &crate::ProgressivePlan,
     control: &FrameHeaderPlan,
-    color: VarDctColorPlan,
+    color: &VarDctColorPlan,
 ) -> Result<BitFragment, EncodeError> {
     let mut output = BitWriter::new();
     output.write_bits(0, 1)?; // non-default so restoration can be disabled
@@ -339,7 +339,7 @@ pub(super) fn build_frame_packet(
     frame: VarDctFrameLayout,
     config: &VarDctConfig,
     control: &FrameHeaderPlan,
-    color: VarDctColorPlan,
+    color: &VarDctColorPlan,
 ) -> Result<FramePacketSet, EncodeError> {
     config.group_order.validate(frame)?;
     config

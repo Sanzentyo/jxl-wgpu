@@ -5,20 +5,20 @@ use jxl_gpu_protocol::icc::IccProfile;
 
 use crate::{BitFragment, EncodeError};
 
-pub(super) const DEFAULT_PROFILE_LIMIT: u64 = 16 << 20;
+pub(crate) const DEFAULT_PROFILE_LIMIT: u64 = 16 << 20;
 const MAX_ICC_BYTES: u64 = 1 << 28;
 
-pub(super) struct PreparedImageHeader {
+pub(crate) struct PreparedImageHeader {
     output: BitWriter,
     profile: Option<IccProfile>,
     icc_plan: Option<IccStreamPlan>,
     serialized_bytes: usize,
-    pub(super) icc_profile_bytes: u64,
-    pub(super) icc_storage_bytes: u64,
+    pub(crate) icc_profile_bytes: u64,
+    pub(crate) icc_storage_bytes: u64,
 }
 
 impl PreparedImageHeader {
-    pub(super) fn new(
+    pub(crate) fn new(
         output: BitWriter,
         profile: Option<&IccProfile>,
         limit: u64,
@@ -55,7 +55,7 @@ impl PreparedImageHeader {
         })
     }
 
-    pub(super) fn finish(
+    pub(crate) fn finish(
         mut self,
         budget: &jxl_wgpu::MemoryBudget,
     ) -> Result<(BitFragment, Option<jxl_wgpu::MemoryPermit>), EncodeError> {
@@ -81,14 +81,14 @@ impl PreparedImageHeader {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct IccStreamPlan {
+pub(crate) struct IccStreamPlan {
     profile_bytes: u64,
     transformed_bytes: u64,
-    pub(super) bit_len: usize,
+    pub(crate) bit_len: usize,
 }
 
 impl IccStreamPlan {
-    pub(super) fn new(profile_bytes: u64, limit: u64) -> Result<Self, EncodeError> {
+    pub(crate) fn new(profile_bytes: u64, limit: u64) -> Result<Self, EncodeError> {
         for (resource, limit) in [("profile bytes", limit), ("profile bytes", MAX_ICC_BYTES)] {
             if profile_bytes > limit {
                 return Err(EncodeError::IccLimit {
@@ -129,7 +129,7 @@ impl IccStreamPlan {
         })
     }
 
-    pub(super) fn write(
+    pub(crate) fn write(
         self,
         output: &mut BitWriter,
         profile: &IccProfile,

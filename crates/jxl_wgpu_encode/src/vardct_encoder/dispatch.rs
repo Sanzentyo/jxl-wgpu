@@ -28,7 +28,7 @@ use super::types::{
     VarDctArtifactData, VarDctArtifactHeader, VarDctFrameLayout, VarDctKernelParams,
     VarDctLfMetadata, VarDctMemoryPlan, VarDctStrategy, VarDctTopology,
 };
-use super::{raw_matrices, saliency, transforms};
+use super::{icc_input, raw_matrices, saliency, transforms};
 use crate::frame_header::FrameHeaderPlan;
 use crate::{
     AnimationHeader, BackendError, BitFragment, BufferImageSource, Determinism, EncodeError,
@@ -57,6 +57,7 @@ pub(super) const TILED_WORKGROUP_STORAGE_BYTES: u32 = 2 * 64 * 16 + 4;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct VarDctDispatchPlan {
+    icc: Option<icc_input::Plan>,
     source_windows: crate::source::SourceWindows,
     kernel: VarDctKernelPlan,
     memory: VarDctMemoryPlan,
@@ -83,6 +84,7 @@ enum VarDctPipelines {
 /// constructor selects geometry at submission time. Pixels and coefficients remain
 /// on the GPU until it has packed their entropy fragments.
 pub struct VarDctBackend {
+    icc_pipeline: Option<icc_input::Pipeline>,
     pipelines: VarDctPipelines,
     workgroup_variant: KernelVariant,
     code: VarDctPrefixCode,
@@ -282,6 +284,17 @@ impl VarDctBackend {
             implemented_stages.push(KernelStage::GroupOrderSelection);
         }
         Ok(Self {
+            icc_pipeline: color_plan
+                .icc_transform
+                .as_ref()
+                .map(|transform| {
+                    icc_input::Pipeline::new(
+                        context.device(),
+                        Arc::clone(transform),
+                        workgroup_variant,
+                    )
+                })
+                .transpose()?,
             saliency_pipeline,
             raw_matrix_pipeline: raw_matrix_plan
                 .as_ref()
@@ -335,7 +348,7 @@ impl VarDctBackend {
     pub(crate) fn sequence_header(
         &self,
         descriptor: &crate::ImageSequenceDescriptor,
-    ) -> Result<BitFragment, EncodeError> {
+    ) -> Result<crate::source_color::icc::PreparedImageHeader, EncodeError> {
         self.color_plan.image_header(descriptor)
     }
 
@@ -343,10 +356,38 @@ impl VarDctBackend {
         self.color_plan.matches_format(format)
     }
 
-    /// Computes memory admission and source binding with the configured regular-frame passes.
+    /// Computes frame memory admission and source binding with configured regular-frame passes.
+    /// The still/sequence frontend owns the separate ICC image-header reservation.
     /// Use `memory_plan_for_request` for a reference-only frame's implicit single pass.
     pub fn memory_plan(&self, source: &BufferImageSource) -> Result<VarDctMemoryPlan, EncodeError> {
         Ok(self.dispatch_plan(source, &self.config.progressive)?.memory)
+    }
+
+    fn still_memory_plan(
+        &self,
+        source: &BufferImageSource,
+    ) -> Result<VarDctMemoryPlan, EncodeError> {
+        let mut plan = self.memory_plan(source)?;
+        let header = image_header(
+            source.layout.extent.width,
+            source.layout.extent.height,
+            AnimationHeader::Still,
+            &self.color_plan,
+        )?;
+        plan.icc_storage_bytes = header.icc_storage_bytes;
+        plan.owned_bytes_per_job = plan
+            .owned_bytes_per_job
+            .checked_add(header.icc_storage_bytes)
+            .ok_or(EncodeError::InvalidConfiguration(
+                "ICC job ownership overflow",
+            ))?;
+        plan.addressed_bytes_per_job = plan
+            .addressed_bytes_per_job
+            .checked_add(header.icc_storage_bytes)
+            .ok_or(EncodeError::InvalidConfiguration(
+                "ICC job addressing overflow",
+            ))?;
+        Ok(plan)
     }
 
     /// Exact admission for one request, including the implicit single pass of reference-only frames.
@@ -366,6 +407,7 @@ impl VarDctBackend {
         let extent = source.layout.extent;
         let control =
             validate_vardct_request(request, (extent.width, extent.height), &self.config)?;
+        self.color_plan.validate_frame(&control)?;
         let mut config = self.config.clone();
         config.progressive = control.effective_progressive(&config.progressive);
         let plan = self.dispatch_plan(source, &config.progressive)?;
@@ -426,7 +468,7 @@ impl VarDctBackend {
         let (lf_quantization, lf_correlation) = self.config.lf_metadata.forward_quantization();
         let hf_correlation = self.config.lf_metadata.hf_correlation();
         let common_strategy = frame.topology.strategy_id();
-        let (kernel, mut memory) = {
+        let (mut kernel, mut memory) = {
             let mut layout = match frame.topology {
                 VarDctTopology::StrategyMap => self
                     .transform_plan
@@ -441,8 +483,9 @@ impl VarDctBackend {
                 }
             }
             .with_passes(progressive.passes().len())?;
-            if self.sample_format().float_precision().is_some()
-                && frame.topology != VarDctTopology::TiledDct8
+            if self.icc_pipeline.is_some()
+                || (self.sample_format().float_precision().is_some()
+                    && frame.topology != VarDctTopology::TiledDct8)
             {
                 let groups = (frame.blocks_x * frame.blocks_y * 64)
                     .div_ceil(self.workgroup_variant.workgroup_size().0);
@@ -633,7 +676,25 @@ impl VarDctBackend {
                 }
             }
         }
+        memory.icc_profile_bytes = self.color_plan.icc_profile_bytes();
+        memory.addressed_bytes_per_job += memory.icc_profile_bytes;
+        let icc = self
+            .icc_pipeline
+            .as_ref()
+            .map(|pipeline| {
+                pipeline.plan(
+                    &mut kernel.params,
+                    self.max_storage_binding_size.min(self.max_buffer_size),
+                )
+            })
+            .transpose()?;
+        if let Some(icc) = icc {
+            memory.icc = Some(icc.memory);
+            memory.owned_bytes_per_job += icc.memory.total_bytes;
+            memory.addressed_bytes_per_job += icc.memory.total_bytes;
+        }
         Ok(VarDctDispatchPlan {
+            icc,
             source_windows,
             kernel,
             memory,
@@ -754,7 +815,32 @@ impl GpuEncodeBackend for VarDctBackend {
                 })
         });
 
-        let source_entries = plan.source_windows.entries(&source.buffer, SOURCE_BINDINGS);
+        let original_sources = plan.source_windows.entries(&source.buffer, SOURCE_BINDINGS);
+        let mut commands =
+            context
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("jxl-wgpu VarDCT encode"),
+                });
+        commands.clear_buffer(&artifact, 0, None);
+        let icc_scratch = self
+            .icc_pipeline
+            .as_ref()
+            .zip(plan.icc)
+            .map(|(pipeline, plan)| {
+                pipeline.encode(
+                    context.device(),
+                    &mut commands,
+                    plan,
+                    original_sources.clone(),
+                    &artifact,
+                )
+            })
+            .transpose()?;
+        let source_entries = icc_scratch.as_ref().map_or_else(
+            || original_sources.clone(),
+            icc_input::Scratch::source_entries,
+        );
         let params_binding_size = NonZeroU64::new(plan.memory.parameter_storage_bytes)
             .expect("the VarDCT parameter ABI is non-empty");
         let artifact_binding_size = NonZeroU64::new(plan.memory.artifact_storage_bytes)
@@ -796,13 +882,6 @@ impl GpuEncodeBackend for VarDctBackend {
                     ],
                 })
         };
-        let mut commands =
-            context
-                .device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("jxl-wgpu VarDCT encode"),
-                });
-        commands.clear_buffer(&artifact, 0, None);
         let mut transform_scratch = None;
         let job_layout = match (&self.pipelines, plan.kernel) {
             (VarDctPipelines::Transforms(pipeline), VarDctKernelPlan { layout, .. }) => {
@@ -888,8 +967,10 @@ impl GpuEncodeBackend for VarDctBackend {
             pipeline.encode(
                 context.device(),
                 &mut commands,
-                source_entries,
-                &parameters,
+                original_sources,
+                icc_scratch
+                    .as_ref()
+                    .map_or(&*parameters, |scratch| &scratch.parameters),
                 &artifact,
                 plan.frame,
             );
@@ -919,6 +1000,7 @@ impl GpuEncodeBackend for VarDctBackend {
         let callback_completion = Arc::clone(&completion);
         let readback_for_map = Arc::clone(&readback);
         let lifetime = Arc::new(VarDctJobLifetime {
+            _icc: icc_scratch,
             _parameters: parameters,
             _artifact: artifact,
             _transform: transform_scratch,
@@ -958,7 +1040,7 @@ impl GpuEncodeBackend for VarDctBackend {
             code: self.code.clone(),
             hf_entropy: self.hf_entropy.clone(),
             config,
-            color_plan: self.color_plan,
+            color_plan: self.color_plan.clone(),
             frame_layout: plan.frame,
             transform_plan: self.transform_plan.clone(),
             raw_matrix_plan: self.raw_matrix_plan.clone(),
@@ -1030,6 +1112,7 @@ impl VarDctMapCompletion {
 }
 
 struct VarDctJobLifetime {
+    _icc: Option<icc_input::Scratch>,
     _raw_matrices: Option<raw_matrices::Scratch>,
     _transform: Option<transforms::Scratch>,
     _tiled_quantization: Option<wgpu::Buffer>,
@@ -1182,7 +1265,7 @@ impl VarDctJob {
                     self.frame_layout,
                     &self.config,
                     &self.control,
-                    self.color_plan,
+                    &self.color_plan,
                 )?,
                 acceleration: None,
             })
@@ -1261,7 +1344,7 @@ pub(super) fn validate_artifact<'a>(
     let lf_group_count = frame
         .lf_group_count()
         .map_err(|_| BackendError::InvalidArtifact("VarDCT LF group count overflow"))?;
-    if header.status & 0x0fff_ffff == 0 {
+    if header.status & 0x07ff_ffff == 0 {
         if header.status & 0x1000_0000 != 0 {
             return Err(BackendError::InvalidArtifact(
                 "incomplete VarDCT source validation",
@@ -1269,6 +1352,9 @@ pub(super) fn validate_artifact<'a>(
         }
         if header.status & 0x2000_0000 != 0 {
             return Err(BackendError::VarDctNonFiniteSource);
+        }
+        if header.status & 0x0800_0000 != 0 {
+            return Err(BackendError::VarDctColorConversionNonFinite);
         }
     }
     if matches!(header.status, 0x4000_0000 | 0x8000_0000 | 0xc000_0000) {
@@ -1674,7 +1760,6 @@ pub(super) fn signed_token(value: i32) -> (u32, u32, u32) {
 /// GPU convenience encoder for one standard transform or an image-wide strategy map.
 pub struct VarDctEncoder {
     encoder: GpuEncoder<VarDctBackend>,
-    frame: VarDctFrameLayout,
 }
 
 impl VarDctEncoder {
@@ -1698,7 +1783,6 @@ impl VarDctEncoder {
         let backend = VarDctBackend::new_with_config(&context, strategy, config)?;
         Ok(Self {
             encoder: GpuEncoder::new(context, backend),
-            frame: VarDctFrameLayout::single(strategy),
         })
     }
 
@@ -1708,11 +1792,9 @@ impl VarDctEncoder {
         map: VarDctStrategyMap,
         config: VarDctConfig,
     ) -> Result<Self, EncodeError> {
-        let frame = map.frame()?;
         let backend = VarDctBackend::new_with_strategy_map(&context, map, config)?;
         Ok(Self {
             encoder: GpuEncoder::new(context, backend),
-            frame,
         })
     }
 
@@ -1770,8 +1852,9 @@ impl VarDctEncoder {
         self.encoder.memory_stats()
     }
 
+    /// Still-image admission, including any serialized ICC header storage.
     pub fn memory_plan(&self, source: &BufferImageSource) -> Result<VarDctMemoryPlan, EncodeError> {
-        self.encoder.backend().memory_plan(source)
+        self.encoder.backend().still_memory_plan(source)
     }
 
     /// Computes exact resources for the supplied physical-frame request.
@@ -1831,34 +1914,7 @@ impl VarDctEncoder {
         source: BufferImageSource,
         container: bool,
     ) -> Result<VarDctSubmission, EncodeError> {
-        self.memory_plan(&source)?;
-        let (width, height) = (self.frame.width, self.frame.height);
-        let request = FrameEncodeRequest {
-            frame_index: FrameIndex::new(0),
-            is_last: true,
-            profile: EncodeProfile::VarDct {
-                quantization: self.encoder.backend().config.quantization,
-            },
-            progressive: self.encoder.backend().config.progressive.clone(),
-            minimum_determinism: Determinism::SameDevice,
-            animation: AnimationHeader::Still,
-            canvas_width: width,
-            canvas_height: height,
-            options: FrameOptions::default(),
-        };
-        let frame = self
-            .encoder
-            .submit_frame(GpuFrameSource::Buffer(source), request)?;
-        Ok(VarDctSubmission {
-            frame: Some(frame),
-            codestream_header: image_header(
-                width,
-                height,
-                AnimationHeader::Still,
-                self.encoder.backend().color_plan,
-            )?,
-            container,
-        })
+        submit_still(&self.encoder, source, container)
     }
 }
 
@@ -1940,8 +1996,9 @@ impl TiledVarDctEncoder {
         self.encoder.memory_stats()
     }
 
+    /// Still-image admission, including any serialized ICC header storage.
     pub fn memory_plan(&self, source: &BufferImageSource) -> Result<VarDctMemoryPlan, EncodeError> {
-        self.encoder.backend().memory_plan(source)
+        self.encoder.backend().still_memory_plan(source)
     }
 
     /// Computes exact resources for the supplied physical-frame request.
@@ -2009,42 +2066,53 @@ impl TiledVarDctEncoder {
         source: BufferImageSource,
         container: bool,
     ) -> Result<VarDctSubmission, EncodeError> {
-        let frame =
-            VarDctFrameLayout::tiled_dct8(source.layout.extent.width, source.layout.extent.height)?;
-        self.memory_plan(&source)?;
-        let request = FrameEncodeRequest {
-            frame_index: FrameIndex::new(0),
-            is_last: true,
-            profile: EncodeProfile::VarDct {
-                quantization: self.encoder.backend().config.quantization,
-            },
-            progressive: self.encoder.backend().config.progressive.clone(),
-            minimum_determinism: Determinism::SameDevice,
-            animation: AnimationHeader::Still,
-            canvas_width: frame.width,
-            canvas_height: frame.height,
-            options: FrameOptions::default(),
-        };
-        let frame_submission = self
-            .encoder
-            .submit_frame(GpuFrameSource::Buffer(source), request)?;
-        Ok(VarDctSubmission {
-            frame: Some(frame_submission),
-            codestream_header: image_header(
-                frame.width,
-                frame.height,
-                AnimationHeader::Still,
-                self.encoder.backend().color_plan,
-            )?,
-            container,
-        })
+        submit_still(&self.encoder, source, container)
     }
+}
+
+fn submit_still(
+    encoder: &GpuEncoder<VarDctBackend>,
+    source: BufferImageSource,
+    container: bool,
+) -> Result<VarDctSubmission, EncodeError> {
+    let backend = encoder.backend();
+    backend.still_memory_plan(&source)?;
+    let extent = source.layout.extent;
+    let request = FrameEncodeRequest {
+        frame_index: FrameIndex::new(0),
+        is_last: true,
+        profile: EncodeProfile::VarDct {
+            quantization: backend.config.quantization,
+        },
+        progressive: backend.config.progressive.clone(),
+        minimum_determinism: Determinism::SameDevice,
+        animation: AnimationHeader::Still,
+        canvas_width: extent.width,
+        canvas_height: extent.height,
+        options: FrameOptions::default(),
+    };
+    // A variable-size image header is admitted before any GPU work and retained through assembly.
+    let (codestream_header, metadata_permit) = image_header(
+        extent.width,
+        extent.height,
+        AnimationHeader::Still,
+        &backend.color_plan,
+    )?
+    .finish(encoder.memory_budget())?;
+    let frame = encoder.submit_frame(GpuFrameSource::Buffer(source), request)?;
+    Ok(VarDctSubmission {
+        frame: Some(frame),
+        codestream_header: Some(codestream_header),
+        metadata_permit,
+        container,
+    })
 }
 
 /// Executor-independent future for a complete standard VarDCT codestream.
 pub struct VarDctSubmission {
     frame: Option<FrameSubmission<VarDctJob>>,
-    codestream_header: BitFragment,
+    codestream_header: Option<BitFragment>,
+    metadata_permit: Option<MemoryPermit>,
     container: bool,
 }
 
@@ -2058,9 +2126,16 @@ impl VarDctSubmission {
         self.assemble(frame)
     }
 
-    fn assemble(&self, frame: GpuFrameArtifacts) -> Result<Vec<u8>, EncodeError> {
+    fn assemble(&mut self, frame: GpuFrameArtifacts) -> Result<Vec<u8>, EncodeError> {
         let encoded_frame = assemble_frame(frame.packets)?;
-        let mut codestream = self.codestream_header.bytes().to_vec();
+        let mut codestream = self
+            .codestream_header
+            .take()
+            .expect("unassembled image header")
+            .into_bytes();
+        codestream
+            .try_reserve_exact(encoded_frame.bytes().len())
+            .map_err(|_| crate::PacketError::SizeOverflow)?;
         codestream.extend_from_slice(encoded_frame.bytes());
         if self.container {
             Ok(jxl_gpu_bitstream::write_container(&codestream)?)
@@ -2083,7 +2158,10 @@ impl Future for VarDctSubmission {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => {
                 submission.frame.take();
-                Poll::Ready(result.and_then(|frame| submission.assemble(frame)))
+                let result = result.and_then(|frame| submission.assemble(frame));
+                submission.codestream_header.take();
+                submission.metadata_permit.take();
+                Poll::Ready(result)
             }
         }
     }

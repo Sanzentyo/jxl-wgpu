@@ -218,11 +218,15 @@ impl ColorSampleFormat {
         let Ok(spec) = crate::source::source_spec(format) else {
             return false;
         };
-        format.model
+        (format.model
             == match self.channels {
                 ColorChannels::Gray => ColorModel::Gray,
                 ColorChannels::Rgb => ColorModel::Rgb,
             }
+            || matches!(
+                (&format.model, &format.color_spec),
+                (ColorModel::IccDevice, ColorSpecification::Icc(_))
+            ))
             && spec.format == self.channels.source_channels()
             && spec.bits_per_sample == self.bits_per_sample()
             && spec.exponent_bits_per_sample == self.exponent_bits()

@@ -57,18 +57,17 @@ or ownership rules change, and regular frames retain their requested progression
 `ImageSequenceDescriptor` compiles bounded image geometry and optional timebase fragments;
 `VarDctSequenceDescriptor` remains an alias.
 Sequence creation binds them to the backend's immutable `VarDctColorPlan`, which lowers the
-typed XYB/original-component selection, checked `ColorSampleFormat`, enumerated source color and image options once. That same plan supplies image metadata, the presence
+typed XYB/original-component selection, checked `ColorSampleFormat`, enumerated or ICC source color and image options once. That same plan supplies image metadata, the presence
 of frame color/matrix-scale fields, GPU normalization and HF channel multipliers. Jobs retain
 it through packet assembly; neither the serializer nor either GPU path infers the domain
 from other configuration. Original coding transforms normalized source components with neutral HF
 channel multipliers; XYB retains linearization, opsin conversion and its standard X/B scales.
 LF/correlation and matrix/order policy remain explicit and independent of color selection.
-All source-dependent operations stay on the GPU, using the existing allocations and completion
-lease. [Original-RGB evidence](CONFORMANCE_CORPUS.md#original-rgb-vardct-encoding).
+All source-dependent operations stay on the GPU, using completion-owned allocations. [Original-RGB evidence](CONFORMANCE_CORPUS.md#original-rgb-vardct-encoding).
 
 `VarDctConfig::source_color` is lowered to the same checked enumerated encoding that writes
 Modular metadata. Custom xy and gamma are quantized once to wire precision, then expanded for
-GPU transfer/Bradford matrix/luminance lowering. The plan rejects undefined/ICC/limited-range
+GPU transfer/Bradford matrix/luminance lowering. The plan rejects undefined/limited-range
 or unsupported color before creating pipelines and compares each source's wire encoding before
 budget admission. `ImageColorOptions` owns the common intent/positive exact-F16 image-white
 contract; the image writer emits tone metadata for either stills or animations when needed.
@@ -78,6 +77,20 @@ Original coding bypasses those conversions. A bounded 64-byte parameter tail add
 buffer or submission; GPU results still establish validity separately from metadata policy.
 [Enumerated input evidence](CONFORMANCE_CORPUS.md#enumerated-vardct-and-mixed-input).
 
+ICC sources extend that same color plan: it checks channel identity, profile byte limits and
+header intent, and selects the relative device-to-PCS method only for XYB. The shared resident
+ICC program connects to linear BT.709 or explicit `LinearGray` (PCS Y). The checked program's
+input/output channel counts determine padded buffer sizes and bindings; Gray expands from its
+one converted plane in the existing loader. A normalization pass reads the original source
+layout and publishes validation records before the resident ICC pass. General/tiled transforms
+consume the converted planes; saliency consumes the original samples. One submission/map and
+its existing completion owner retain both intermediates, program and parameter records.
+The validated frame plan exposes whether it stores a post-transform reference; the image color
+plan rejects that storage for XYB/ICC before budget admission, following the decoder's F.2 rule.
+Original ICC selects no conversion program and preserves device components. Header serialization
+is common to both codecs, with one session/still metadata permit through assembly. These plans
+keep profile policy, resource bounds and validated GPU results separate.
+
 `ColorSampleFormat` owns `ColorChannels::Gray` or `Rgb`, 1–31-bit integer or checked
 `FloatPrecision` logical precision, and a
 canonical format constructor. The shared `source` module owns physical packing, swizzle and
@@ -86,17 +99,15 @@ rejects inconsistent extents/strides/overlap, and resolves each logical componen
 word width, bit shift, pixel stride and absolute origin. Regions retain u64 absolute offsets
 until dispatch windows rebase them into checked WGSL-u32 addresses. Modular groups/streaming
 and whole-image VarDCT use the same plan and window-union accounting. Shared `source_color`
-lowering writes Gray/RGB color syntax and owns shared `ImageColorOptions`; variable ICC ownership
-stays in the Modular metadata plan. Gaps between aligned windows are neither bound nor charged as addressed
-bytes; alignment overlap is counted once. No host sample scan, repacking or extra image allocation
-is introduced.
+lowering writes Gray/RGB color syntax and owns shared `ImageColorOptions`; shared `source_color::icc::PreparedImageHeader` owns variable ICC serialization and its reservation. Gaps between aligned windows are neither bound nor charged as addressed
+bytes; alignment overlap is counted once. Source addressing introduces no host sample scan or repacking.
 
 Logical channels do not describe VarDCT's working-plane count. The color plan lowers Gray
 to `[0, 0, 0]` and RGB to `[0, 1, 2]`, selecting records from the checked source region before
 rebasing. Gray aliases one source component in the three existing shader records; GPU reads
 perform expansion before XYB or original-component normalization. Headers consume the same
 typed channels through the shared color writer, omitting Gray primaries. No layer infers Gray
-from a physical plane count, and no expanded source allocation changes admission or lifetime.
+from a physical plane count, and enumerated/original Gray adds no expanded source allocation.
 [Gray evidence](CONFORMANCE_CORPUS.md#gray-vardct-and-mixed-input).
 
 Both shaders include the same `source.wgsl` byte/word loader. It selects the checked plane,
@@ -126,7 +137,7 @@ caller selects one for each physical frame. The generic `EncodeSession` retains 
 frame counter, finality, canvas and timebase, validates before admission, and advances only
 after successful submission. Fixed-codec sessions use this same submission path. Geometry
 belongs to the selected backend: a fixed VarDCT transform/map does not constrain Modular sources.
-Both codecs accept the same logical Gray/RGB channels, integer/floating precision, enumerated color and post-transform
+Both codecs accept the same logical Gray/RGB channels, integer/floating precision, enumerated or ICC color and post-transform
 references. Physical frames may independently change their supported layout, swizzle and word byte order. XYB configuration and incompatible source/reference contracts fail before admission.
 
 Memory queries and submissions share each backend's frame preparation, including reference-only

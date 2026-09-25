@@ -159,11 +159,11 @@ pub(super) fn encode(
         .unwrap()
         .wait()
         .unwrap();
-    let mut bytes = super::super::bitstream::image_header(
+    let mut bytes = super::image_header_with_color(
         extent.width,
         extent.height,
         AnimationHeader::Still,
-        backend.color_plan,
+        &backend.color_plan,
     )
     .unwrap()
     .bytes()
