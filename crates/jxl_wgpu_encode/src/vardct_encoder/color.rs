@@ -89,7 +89,11 @@ impl VarDctColorPlan {
             return Err(UnsupportedFeature::InputFormat.into());
         }
         Ok(Self {
-            samples: crate::sample_format::ImageSamplePlan::new(config.sample_format, config.alpha),
+            samples: crate::sample_format::ImageSamplePlan::new(config.sample_format, config.alpha)
+                .with_extra_channels(
+                    &config.extra_channels,
+                    config.max_extra_channel_metadata_bytes,
+                )?,
             encoding,
             options: config.color_options,
             max_icc_profile_bytes: config.max_icc_profile_bytes,
@@ -142,7 +146,7 @@ impl VarDctColorPlan {
     ) -> Result<PreparedImageHeader, EncodeError> {
         descriptor.image_header(
             self.xyb_encoded(),
-            self.samples,
+            &self.samples,
             &self.encoding,
             self.options,
             self.max_icc_profile_bytes,

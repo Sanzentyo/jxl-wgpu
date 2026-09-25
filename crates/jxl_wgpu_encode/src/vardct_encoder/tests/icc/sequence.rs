@@ -80,6 +80,7 @@ fn icc_sequences_keep_one_profile_across_codecs_intents_and_out_of_order_complet
                             };
                             if !gray && i > 0 && transform == VarDctColorTransform::Original {
                                 options.color_blend = crate::FrameBlend {
+                                    alpha_channel: 0,
                                     mode: crate::BlendMode::Multiply,
                                     source_reference: crate::ReferenceSlot::new(1).unwrap(),
                                     clamp: true,

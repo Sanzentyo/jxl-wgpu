@@ -80,6 +80,14 @@ jxl-oxide, independently of whether color uses Modular or VarDCT. It rejects F32
 instead of rounding back to source words. The VarDCT alpha matrix uses this for every raw sample
 bit, alongside independent libjxl/Rust normalized output and actual GPU numeric output.
 
+`modular_integer::vardct_extra_words` additionally uses the pinned jxl-oxide frame, LF/HF,
+entropy and Modular decoders before presentation rendering. It returns each physical scalar
+grid's exact dimensions and integer/float representation words, including intrinsically shifted
+planes. Color coefficients are decoded only to locate Modular suffixes; no production parser or
+GPU result supplies the oracle's routing. This supports [independent VarDCT extra inputs](../../docs/CONFORMANCE_CORPUS.md#independent-vardct-extra-input)
+without rounding resampled F32 output back to source words. Native libjxl and GPU presentation
+checks remain separate.
+
 `oracles::modular_words` reads exact physical-frame component words from the pinned scalar
 libjxl decoder before float conversion or blending. It requires `JXL_MODULAR_WORD_ORACLE` and
 checks the executable's versioned output, dimensions and complete word counts. The helper uses

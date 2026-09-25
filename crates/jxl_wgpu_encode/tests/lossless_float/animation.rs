@@ -138,11 +138,13 @@ fn floating_crops_and_reference_arithmetic_match_both_cpu_decoders() {
                     },
                     crop: Some(FrameCrop::new(3, 1, 9, 1).unwrap()),
                     color_blend: FrameBlend {
+                        alpha_channel: 0,
                         mode: BlendMode::Add,
                         source_reference: slot1,
                         ..Default::default()
                     },
                     extra_channel_blends: vec![FrameBlend {
+                        alpha_channel: 0,
                         source_reference: slot1,
                         ..Default::default()
                     }],
@@ -163,11 +165,13 @@ fn floating_crops_and_reference_arithmetic_match_both_cpu_decoders() {
                         timecode: None,
                     },
                     color_blend: FrameBlend {
+                        alpha_channel: 0,
                         mode: BlendMode::Multiply,
                         source_reference: slot2,
                         ..Default::default()
                     },
                     extra_channel_blends: vec![FrameBlend {
+                        alpha_channel: 0,
                         source_reference: slot2,
                         ..Default::default()
                     }],
@@ -188,6 +192,7 @@ fn floating_crops_and_reference_arithmetic_match_both_cpu_decoders() {
                         timecode: None,
                     },
                     extra_channel_blends: vec![FrameBlend {
+                        alpha_channel: 0,
                         mode: BlendMode::Add,
                         source_reference: slot1,
                         ..Default::default()

@@ -9,10 +9,11 @@ use crate::{
 };
 use jxl_gpu_bitstream::BitWriter;
 
-/// Stream-wide canvas and optional timebase for a Gray/RGB layered still or animation with optional alpha.
+/// Stream-wide canvas and optional timebase for a Gray/RGB layered still or animation.
 ///
-/// Every frame uses the encoder's configured color/alpha channels, integer or floating precision
-/// and source color. The encoder binds the image's coding domain:
+/// Every frame uses the encoder's configured color, packed alpha and extra-channel declarations.
+/// VarDCT accepts independent scalar inputs; mixed-codec sequences currently allow packed alpha only.
+/// The encoder binds the image's coding domain:
 /// XYB or original components for VarDCT sequences, original components for mixed-codec sequences.
 /// Modular and tiled DCT8 sources may vary in extent; a single VarDCT transform or checked
 /// strategy map constrains the source extent of that codec's frames only.
@@ -43,7 +44,7 @@ impl ImageSequenceDescriptor {
     pub(crate) fn image_header(
         &self,
         xyb_encoded: bool,
-        samples: ImageSamplePlan,
+        samples: &ImageSamplePlan,
         encoding: &SourceColorEncoding,
         options: ImageColorOptions,
         max_icc_profile_bytes: u64,
@@ -132,7 +133,7 @@ impl ImageHeaderPlan {
     fn encode(
         &self,
         xyb_encoded: bool,
-        samples: ImageSamplePlan,
+        samples: &ImageSamplePlan,
         encoding: &SourceColorEncoding,
         options: ImageColorOptions,
         max_icc_profile_bytes: u64,
@@ -172,6 +173,9 @@ impl ImageHeaderPlan {
         }
         output.write_bits(0, 2)?; // no image extensions
         output.write_bits(1, 1)?; // default opsin inverse matrix and upsampling weights
-        PreparedImageHeader::new(output, encoding.icc_profile(), max_icc_profile_bytes)
+        PreparedImageHeader::new(output, encoding.icc_profile(), max_icc_profile_bytes)?
+            .account_extra_metadata(
+                samples.extra_channels.len() > usize::from(samples.alpha.is_some()),
+            )
     }
 }

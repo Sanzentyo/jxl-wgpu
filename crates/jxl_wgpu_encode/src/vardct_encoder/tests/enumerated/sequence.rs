@@ -70,6 +70,7 @@ fn enumerated_sequences_share_color_across_modular_vardct_and_rejected_frames() 
                         // RGB reference composition exercises cross-codec image-color identity.
                         if channels == ColorChannels::Rgb && i > 0 {
                             options.color_blend = crate::FrameBlend {
+                                alpha_channel: 0,
                                 mode: crate::BlendMode::Multiply,
                                 source_reference: crate::ReferenceSlot::new(1).unwrap(),
                                 clamp: true,

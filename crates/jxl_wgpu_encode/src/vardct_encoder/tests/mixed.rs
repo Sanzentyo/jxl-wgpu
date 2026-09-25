@@ -195,6 +195,8 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
         };
         let config = VarDctConfig {
             alpha: None,
+            extra_channels: Vec::new(),
+            max_extra_channel_metadata_bytes: 1 << 20,
             sample_format: Default::default(),
             source_color: jxl_gpu_formats::ColorSpecification::Default,
             color_options: Default::default(),

@@ -411,6 +411,35 @@ struct SourceWindow {
 pub(crate) struct SourceWindows([SourceWindow; 4]);
 
 impl SourceWindows {
+    /// Union across bindings of the same GPU allocation, including separately declared scalars.
+    pub(crate) fn addressed_bytes_many<'a>(
+        bindings: impl IntoIterator<Item = (&'a wgpu::Buffer, Self)>,
+    ) -> Result<u64, EncodeError> {
+        let mut allocations: Vec<(&wgpu::Buffer, Vec<SourceWindow>)> = Vec::new();
+        for (buffer, windows) in bindings {
+            if let Some((_, spans)) = allocations.iter_mut().find(|(known, _)| *known == buffer) {
+                spans.extend(windows.0);
+            } else {
+                allocations.push((buffer, windows.0.to_vec()));
+            }
+        }
+        allocations
+            .into_iter()
+            .try_fold(0u64, |mut total, (_, mut spans)| {
+                spans.sort_unstable_by_key(|span| span.start);
+                let mut end = 0;
+                for span in spans {
+                    if span.end > end {
+                        total = total
+                            .checked_add(span.end - span.start.max(end))
+                            .ok_or(EncodeError::InvalidSource("source window size overflow"))?;
+                        end = span.end;
+                    }
+                }
+                Ok(total)
+            })
+    }
+
     pub(crate) fn merge(self, other: Self) -> Self {
         Self(std::array::from_fn(|index| {
             let (left, right) = (self.0[index], other.0[index]);

@@ -18,7 +18,7 @@ fn formats(channels: ColorChannels) -> impl Iterator<Item = ColorSampleFormat> {
         )
 }
 
-fn input(extent: Extent2d, samples: ColorSampleFormat) -> Vec<u32> {
+pub(super) fn input(extent: Extent2d, samples: ColorSampleFormat) -> Vec<u32> {
     let rgb = match samples.float_precision() {
         Some(p) => floating::pixels(extent.width as usize, extent.height as usize, p),
         None => precision::pixels(
@@ -56,7 +56,7 @@ fn input(extent: Extent2d, samples: ColorSampleFormat) -> Vec<u32> {
         .collect()
 }
 
-fn upload(
+pub(super) fn upload(
     context: &WgpuContext,
     extent: Extent2d,
     config: &VarDctConfig,

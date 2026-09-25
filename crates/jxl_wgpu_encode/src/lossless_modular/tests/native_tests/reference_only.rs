@@ -125,6 +125,7 @@ fn reference_only_modular_words_composition_and_streaming_keep_all_slots() {
                         timecode: Some(100 + u32::from(slot)),
                     },
                     color_blend: FrameBlend {
+                        alpha_channel: 0,
                         mode: BlendMode::Add,
                         source_reference: ReferenceSlot::new(slot).unwrap(),
                         clamp: false,

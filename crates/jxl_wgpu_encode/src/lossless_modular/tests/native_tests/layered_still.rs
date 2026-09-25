@@ -191,12 +191,14 @@ fn layered_still_modular_preserves_physical_words_alpha_blends_and_one_presentat
                     },
                     crop,
                     color_blend: FrameBlend {
+                        alpha_channel: 0,
                         mode,
                         source_reference: ReferenceSlot::new(source).unwrap(),
                         clamp: mode == BlendMode::Multiply,
                     },
                     extra_channel_blends: if format.has_alpha() && index != 0 {
                         vec![FrameBlend {
+                            alpha_channel: 0,
                             mode: alpha_mode,
                             source_reference: ReferenceSlot::new(alpha_source).unwrap(),
                             clamp: false,

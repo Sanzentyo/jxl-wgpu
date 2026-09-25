@@ -16,7 +16,7 @@ mod boundaries;
 mod coefficients;
 mod sequence;
 
-fn profile(gray: bool) -> IccProfile {
+pub(super) fn profile(gray: bool) -> IccProfile {
     IccProfile::parse(
         fs::read(
             jxl_test_support::fixtures::embedded_icc::directory().join(if gray {
@@ -32,7 +32,7 @@ fn profile(gray: bool) -> IccProfile {
     .unwrap()
 }
 
-fn config(profile: &IccProfile, transform: VarDctColorTransform) -> VarDctConfig {
+pub(super) fn config(profile: &IccProfile, transform: VarDctColorTransform) -> VarDctConfig {
     VarDctConfig {
         sample_format: ColorSampleFormat::float(
             if profile.header().device_space.0 == *b"GRAY" {

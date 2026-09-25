@@ -562,6 +562,47 @@ existing job reservation/completion owner. No additional submission or map is in
 [Alpha conformance](../../docs/CONFORMANCE_CORPUS.md#alpha-vardct-and-mixed-input) covers exact words,
 independent native output, color independence, layouts, progression, composition and ownership.
 
+`VarDctConfig::extra_channels` declares additional scalar sources through checked
+`ExtraChannel` values. `SamplePrecision` accepts the same 31 integer and 154 floating precisions
+independently of color. Alpha (either association), Depth, SpotColor, SelectionMask, Black, CFA,
+Thermal and Optional are supported. Spot metadata uses finite binary16 values; CFA indices are
+0–274. UTF-8 names retain their exact bytes through 1071 bytes. At most 256 resolved channels,
+including packed alpha, are admitted. `max_extra_channel_metadata_bytes` defaults to 1 MiB and
+bounds the sum of name bytes plus 32 bytes per declaration before serialization.
+
+Attach one `BufferImageSource` per configured extra with `source.with_extra_channels(inputs)`.
+These sources follow `config.extra_channels` order; optional packed alpha precedes them in the
+image header and needs no attachment. `encoder.extra_channels()` returns this resolved order;
+`alpha_association()` continues to describe packed alpha only. Each attachment is a single scalar
+STORAGE-buffer view, using the shared byte-order, bit-position and unaligned-pitch addressing.
+`SamplePrecision::pixel_format()` provides its canonical non-color layout. For intrinsic shift
+`s` in 0–3, supply `ceil(frame_width / 2^s)` by `ceil(frame_height / 2^s)` samples. Geometry is
+relative to each physical frame/crop. Nested attachments, count/precision/extent mismatches and
+unreadable buffers reject before admission; input planes may alias the same allocation.
+
+All extra samples are encoded losslessly on GPU. A common image plan resolves the leading small
+channels that belong to global Modular; after the first channel larger than 256 on either axis,
+shift-three channels use LF groups and shift-zero/one/two channels use the applicable progressive
+pass. Small channels after that boundary stay in their LF/pass streams. The serializer consumes
+the same plan. The emitted frame upsampling factor is one relative to each intrinsic shift;
+presentation interpolation is separate from exact encoded sample preservation.
+
+`VarDctMemoryPlan::extra_channels` includes every scalar plane, while `alpha` is the overlapping
+packed-alpha breakdown (`VarDctAlphaMemoryPlan` remains a compatibility alias). Aggregate readback
+follows optional raw matrices in one map and is charged once. `source_binding_bytes` counts the
+union of aliased caller-owned windows. Jobs retain source buffers and all scratch until GPU
+completion. Variable image metadata has a still/session reservation through assembly or drop;
+ICC headers already include it, so `extra_channel_metadata_bytes` is zero for ICC input.
+
+Fixed-VarDCT sequences retain these declarations across frames. Supply either an empty
+`extra_channel_blends` list for all-Replace or one entry per resolved channel. `FrameBlend::alpha_channel`
+selects an existing extra index 0–10 for Blend/MultiplyAdd; other modes require zero. Each plane
+retains its own reference slot and clamp contract. [Conformance evidence](../../docs/CONFORMANCE_CORPUS.md#independent-vardct-extra-input)
+covers exact words, shifted progressive streams, native/GPU composition and ownership.
+Independent extras for complete Modular or mixed-codec encoding remain unsupported and are
+explicitly rejected. CMYK input, NonOptional/unknown semantics and per-extra lossy encoding are
+not introduced by the Black/Optional scalar declarations.
+
 The logical input API is `ColorSampleFormat` and `ImageSequenceDescriptor`; these replace
 the former RGB-only names. A sequence fixes channels and precision together, even when
 its physical frames change layout or codec. The color plan independently binds the declared color and image-white options.
@@ -583,7 +624,7 @@ Subnormals enter the lossy F32 arithmetic contract; VarDCT is not a bit-preservi
 General transforms budget per-workgroup completion/error records inside the artifact/readback;
 tiled DCT8 carries errors in its existing block records. Missing or malformed validation
 records cannot publish an artifact. XYB ICC additionally budgets those records for integer and tiled sources.
-Subsampling, arbitrary extra channels and texture inputs remain outside the VarDCT contract.
+Color subsampling, per-extra lossy distance/additional frame upsampling and texture inputs remain outside the VarDCT contract.
 
 VarDCT and mixed sequences declare 32-bit Modular working buffers, independently of input
 depth: their quantized LF coefficients are checked i32 values. This corrects the earlier
@@ -1000,7 +1041,7 @@ quantization, matrices/orders and AC passes. Single transforms and maps retain t
 extent on each frame; tiled DCT8 accepts separately checked crop extents through its 16K axis
 bound. Both support all five blend modes with alpha, signed crops, hidden zero-duration regular frames
 and four post-color-transform references. Alpha has an independent blend/reference field.
-Pre-color-transform reference storage and arbitrary extra-channel inputs remain unsupported. Mixed Modular/VarDCT sessions use
+Pre-color-transform reference storage remains unsupported. Fixed-VarDCT sequences accept the independent extra-channel declarations described above; mixed sequences currently accept packed alpha only. Mixed Modular/VarDCT sessions use
 `MixedModeEncoder`; frame names and previews remain unimplemented.
 
 Both codecs accept `FrameOptions { kind: FrameKind::ReferenceOnly, .. }` in either sequence kind.

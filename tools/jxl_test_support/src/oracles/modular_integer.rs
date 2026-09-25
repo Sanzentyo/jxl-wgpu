@@ -1,5 +1,8 @@
 //! Exact original working words from jxl-oxide, before any floating-point conversion.
 
+mod vardct_extras;
+pub use vardct_extras::{ExtraWords, vardct_extra_words};
+
 /// Exact retained extra-channel words, including Modular planes accompanying VarDCT color.
 /// Presentation arithmetic must not have converted these to F32; that is a separate oracle.
 pub fn extra_planes(data: &[u8], frame_index: usize) -> Vec<Vec<i32>> {

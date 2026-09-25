@@ -334,6 +334,9 @@ impl LosslessModularBackend {
         &self,
         source: &crate::BufferImageSource,
     ) -> Result<ModularDispatchPlan, EncodeError> {
+        if !source.extra_channels().is_empty() {
+            return Err(UnsupportedFeature::InputFormat.into());
+        }
         self.pipeline()?;
         let extent = source.layout.extent;
         let group_grid = LosslessModularGroupGrid::for_extent(

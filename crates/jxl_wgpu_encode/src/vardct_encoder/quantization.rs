@@ -105,6 +105,10 @@ pub struct VarDctConfig {
     /// Optional full-resolution alpha at the same precision, compressed losslessly on GPU.
     /// Color association is declared unchanged; no premultiplication or division is performed.
     pub alpha: Option<crate::AlphaAssociation>,
+    /// Independently stored scalar planes, following any packed alpha in codestream order.
+    pub extra_channels: Vec<crate::ExtraChannel>,
+    /// Bound for extra declarations and names, checked before image-header allocation.
+    pub max_extra_channel_metadata_bytes: u64,
     /// Stream-wide enumerated or embedded RGB/Gray ICC source color; defaults to sRGB/D65.
     pub source_color: jxl_gpu_formats::ColorSpecification,
     /// Rendering intent and positive exact binary16 image white (default 255 cd/m²).
@@ -130,6 +134,8 @@ impl Default for VarDctConfig {
         Self {
             sample_format: Default::default(),
             alpha: None,
+            extra_channels: Vec::new(),
+            max_extra_channel_metadata_bytes: 1 << 20,
             source_color: jxl_gpu_formats::ColorSpecification::Default,
             color_options: Default::default(),
             max_icc_profile_bytes: crate::source_color::icc::DEFAULT_PROFILE_LIMIT,

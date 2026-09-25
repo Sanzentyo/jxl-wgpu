@@ -89,6 +89,11 @@ struct MixedModeBackend {
 
 impl MixedModeBackend {
     fn new(context: &WgpuContext, config: MixedModeConfig) -> Result<Self, EncodeError> {
+        if !config.vardct.extra_channels.is_empty() {
+            return Err(EncodeError::InvalidConfiguration(
+                "mixed sequences require Modular support for independently declared extra sources",
+            ));
+        }
         if config.vardct.color_transform != VarDctColorTransform::Original {
             return Err(EncodeError::InvalidConfiguration(
                 "mixed Modular/VarDCT sequences require original-component coding",

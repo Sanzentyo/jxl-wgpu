@@ -434,11 +434,13 @@ mod native_tests {
                 },
                 crop: Some(crate::FrameCrop::new(-1, 1, 3, 2).unwrap()),
                 color_blend: FrameBlend {
+                    alpha_channel: 0,
                     mode: BlendMode::Add,
                     source_reference: slot_one,
                     clamp: false,
                 },
                 extra_channel_blends: vec![FrameBlend {
+                    alpha_channel: 0,
                     mode: BlendMode::Multiply,
                     source_reference: slot_one,
                     clamp: true,
@@ -2430,6 +2432,7 @@ mod native_tests {
                     },
                     crop: Some(crate::FrameCrop::new(1, 1, 2, 2).unwrap()),
                     color_blend: FrameBlend {
+                        alpha_channel: 0,
                         mode: BlendMode::Add,
                         source_reference: slot_one,
                         clamp: false,
@@ -2588,6 +2591,7 @@ mod native_tests {
             )
             .unwrap();
         let alpha_blend = FrameBlend {
+            alpha_channel: 0,
             mode: BlendMode::Blend,
             source_reference: reference,
             clamp: false,

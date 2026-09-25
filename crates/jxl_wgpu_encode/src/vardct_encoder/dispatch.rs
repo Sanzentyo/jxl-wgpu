@@ -55,9 +55,9 @@ pub(super) const FORWARD_KERNEL_KEY: &str = "vardct_encode_forward";
 pub(super) const TILED_KERNEL_KEY: &str = "vardct_encode_quantize";
 pub(super) const TILED_WORKGROUP_STORAGE_BYTES: u32 = 2 * 64 * 16 + 4;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct VarDctDispatchPlan {
-    alpha: Option<modular_plane::Plan>,
+    extra_channels: Option<modular_plane::ImagePlan>,
     icc: Option<icc_input::Plan>,
     source_windows: crate::source::SourceWindows,
     kernel: VarDctKernelPlan,
@@ -85,7 +85,7 @@ enum VarDctPipelines {
 /// constructor selects geometry at submission time. Pixels and coefficients remain
 /// on the GPU until it has packed their entropy fragments.
 pub struct VarDctBackend {
-    alpha_pipeline: Option<modular_plane::Pipeline>,
+    extra_channel_pipeline: Option<modular_plane::Pipeline>,
     icc_pipeline: Option<icc_input::Pipeline>,
     pipelines: VarDctPipelines,
     workgroup_variant: KernelVariant,
@@ -285,17 +285,15 @@ impl VarDctBackend {
         if saliency_pipeline.is_some() {
             implemented_stages.push(KernelStage::GroupOrderSelection);
         }
-        if color_plan.samples.alpha.is_some() {
+        if !color_plan.samples.extra_channels.is_empty() {
             implemented_stages.extend([
                 KernelStage::ModularPrediction,
                 KernelStage::ModularResidualTokenization,
             ]);
         }
         Ok(Self {
-            alpha_pipeline: color_plan
-                .samples
-                .alpha
-                .map(|_| modular_plane::Pipeline::new(context.device())),
+            extra_channel_pipeline: (!color_plan.samples.extra_channels.is_empty())
+                .then(|| modular_plane::Pipeline::new(context.device())),
             icc_pipeline: color_plan
                 .icc_transform
                 .as_ref()
@@ -363,6 +361,12 @@ impl VarDctBackend {
         self.color_plan.samples.alpha
     }
 
+    /// Resolved image-header order, including any packed alpha before separate scalar sources.
+    #[must_use]
+    pub fn extra_channels(&self) -> &[crate::ExtraChannel] {
+        &self.color_plan.samples.extra_channels
+    }
+
     pub(crate) fn sequence_header(
         &self,
         descriptor: &crate::ImageSequenceDescriptor,
@@ -375,7 +379,7 @@ impl VarDctBackend {
     }
 
     /// Computes frame memory admission and source binding with configured regular-frame passes.
-    /// The still/sequence frontend owns the separate ICC image-header reservation.
+    /// The still/sequence frontend owns the separate ICC/extra-channel header reservation.
     /// Use `memory_plan_for_request` for a reference-only frame's implicit single pass.
     pub fn memory_plan(&self, source: &BufferImageSource) -> Result<VarDctMemoryPlan, EncodeError> {
         Ok(self.dispatch_plan(source, &self.config.progressive)?.memory)
@@ -393,17 +397,18 @@ impl VarDctBackend {
             &self.color_plan,
         )?;
         plan.icc_storage_bytes = header.icc_storage_bytes;
+        plan.extra_channel_metadata_bytes = header.extra_storage_bytes;
         plan.owned_bytes_per_job = plan
             .owned_bytes_per_job
-            .checked_add(header.icc_storage_bytes)
+            .checked_add(header.icc_storage_bytes + header.extra_storage_bytes)
             .ok_or(EncodeError::InvalidConfiguration(
-                "ICC job ownership overflow",
+                "image metadata ownership overflow",
             ))?;
         plan.addressed_bytes_per_job = plan
             .addressed_bytes_per_job
-            .checked_add(header.icc_storage_bytes)
+            .checked_add(header.icc_storage_bytes + header.extra_storage_bytes)
             .ok_or(EncodeError::InvalidConfiguration(
-                "ICC job addressing overflow",
+                "image metadata addressing overflow",
             ))?;
         Ok(plan)
     }
@@ -427,7 +432,7 @@ impl VarDctBackend {
             request,
             (extent.width, extent.height),
             &self.config,
-            self.color_plan.samples.alpha.is_some(),
+            self.color_plan.samples.extra_channels.len(),
         )?;
         self.color_plan.validate_frame(&control)?;
         let mut config = self.config.clone();
@@ -473,6 +478,11 @@ impl VarDctBackend {
             || !source.buffer.usage().contains(wgpu::BufferUsages::STORAGE)
         {
             return Err(UnsupportedFeature::InputFormat.into());
+        }
+        if source.extra_channels().len() != self.config.extra_channels.len() {
+            return Err(EncodeError::InvalidSource(
+                "extra source count differs from the image declaration",
+            ));
         }
         let source_layout = crate::source::SourceLayout::new(
             &source.layout,
@@ -715,34 +725,37 @@ impl VarDctBackend {
             memory.owned_bytes_per_job += icc.memory.total_bytes;
             memory.addressed_bytes_per_job += icc.memory.total_bytes;
         }
-        let alpha = self
-            .color_plan
-            .samples
-            .alpha_component()
-            .map(|index| {
-                let mut sources = [region.components[index]];
-                source_windows.rebase(&mut sources, [region.offsets[index], 0, 0, 0])?;
-                let plan = modular_plane::Plan::new(
+        let extra_channels = (!self.color_plan.samples.extra_channels.is_empty())
+            .then(|| {
+                modular_plane::ImagePlan::new(
                     frame,
-                    sources[0],
-                    self.sample_format().sample_mask(),
-                    source_layout.spec.big_endian,
+                    &self.color_plan.samples,
+                    source,
+                    &source_layout,
                     progressive,
                     &self.code,
-                )?;
-                plan.validate_limits(
-                    self.max_buffer_size,
-                    self.max_storage_binding_size,
-                    self.max_compute_workgroups_per_dimension,
-                )?;
-                Ok::<_, EncodeError>(plan)
+                    modular_plane::Limits {
+                        buffer: self.max_buffer_size,
+                        binding: self.max_storage_binding_size,
+                        workgroups: self.max_compute_workgroups_per_dimension,
+                        alignment: self.storage_offset_alignment,
+                    },
+                )
             })
             .transpose()?;
-        if let Some(alpha) = alpha {
-            memory.alpha = Some(alpha.memory);
-            memory.readback_bytes += alpha.memory.readback_bytes;
-            memory.owned_bytes_per_job += alpha.memory.total_bytes;
-            memory.addressed_bytes_per_job += alpha.memory.total_bytes;
+        if let Some(extras) = &extra_channels {
+            memory.alpha = extras.packed_alpha_memory;
+            memory.extra_channels = Some(extras.memory);
+            memory.readback_bytes = memory
+                .readback_bytes
+                .checked_add(extras.memory.readback_bytes)
+                .ok_or(EncodeError::InvalidConfiguration(
+                    "extra readback size overflow",
+                ))?;
+            memory.owned_bytes_per_job += extras.memory.total_bytes;
+            memory.addressed_bytes_per_job +=
+                extras.memory.total_bytes + extras.source_bytes - memory.source_binding_bytes;
+            memory.source_binding_bytes = extras.source_bytes;
             if memory.readback_bytes > self.max_buffer_size {
                 return Err(UnsupportedFeature::DeviceLimit {
                     name: "max_buffer_size",
@@ -753,7 +766,7 @@ impl VarDctBackend {
             }
         }
         Ok(VarDctDispatchPlan {
-            alpha,
+            extra_channels,
             icc,
             source_windows,
             kernel,
@@ -787,7 +800,7 @@ fn validate_vardct_request(
     request: &FrameEncodeRequest,
     source_extent: (u32, u32),
     config: &VarDctConfig,
-    has_alpha: bool,
+    extra_channels: usize,
 ) -> Result<FrameHeaderPlan, EncodeError> {
     if request.progressive != config.progressive {
         return Err(EncodeError::InvalidConfiguration(
@@ -808,7 +821,7 @@ fn validate_vardct_request(
             "the VarDCT encoder supports only post-color-transform references",
         ));
     }
-    FrameHeaderPlan::new(request, source_extent, has_alpha)
+    FrameHeaderPlan::with_extra_channels(request, source_extent, extra_channels)
 }
 
 impl GpuEncodeBackend for VarDctBackend {
@@ -884,20 +897,20 @@ impl GpuEncodeBackend for VarDctBackend {
                     label: Some("jxl-wgpu VarDCT encode"),
                 });
         commands.clear_buffer(&artifact, 0, None);
-        let alpha_scratch =
-            self.alpha_pipeline
-                .as_ref()
-                .zip(plan.alpha)
-                .map(|(pipeline, alpha)| {
-                    pipeline.encode(
-                        context.device(),
-                        &mut commands,
-                        alpha,
-                        original_sources.clone(),
-                        &readback,
-                        plan.memory.artifact_storage_bytes + plan.memory.raw_matrix_artifact_bytes,
-                    )
-                });
+        let extra_scratch = self
+            .extra_channel_pipeline
+            .as_ref()
+            .zip(plan.extra_channels.as_ref())
+            .map_or_else(Vec::new, |(pipeline, extras)| {
+                extras.encode(
+                    pipeline,
+                    context.device(),
+                    &mut commands,
+                    &source,
+                    &readback,
+                    plan.memory.artifact_storage_bytes + plan.memory.raw_matrix_artifact_bytes,
+                )
+            });
         let icc_scratch = self
             .icc_pipeline
             .as_ref()
@@ -1075,7 +1088,8 @@ impl GpuEncodeBackend for VarDctBackend {
         let callback_completion = Arc::clone(&completion);
         let readback_for_map = Arc::clone(&readback);
         let lifetime = Arc::new(VarDctJobLifetime {
-            _alpha: alpha_scratch,
+            _source: source,
+            _extra_channels: extra_scratch,
             _icc: icc_scratch,
             _parameters: parameters,
             _artifact: artifact,
@@ -1111,7 +1125,7 @@ impl GpuEncodeBackend for VarDctBackend {
         }
 
         Ok(VarDctJob {
-            alpha_plan: plan.alpha,
+            extra_plan: plan.extra_channels,
             lifetime: Some(lifetime),
             completion,
             code: self.code.clone(),
@@ -1189,7 +1203,8 @@ impl VarDctMapCompletion {
 }
 
 struct VarDctJobLifetime {
-    _alpha: Option<modular_plane::Scratch>,
+    _source: BufferImageSource,
+    _extra_channels: Vec<modular_plane::Scratch>,
     _icc: Option<icc_input::Scratch>,
     _raw_matrices: Option<raw_matrices::Scratch>,
     _transform: Option<transforms::Scratch>,
@@ -1210,7 +1225,7 @@ impl Drop for VarDctJobLifetime {
 }
 
 pub struct VarDctJob {
-    alpha_plan: Option<modular_plane::Plan>,
+    extra_plan: Option<modular_plane::ImagePlan>,
     raw_matrix_plan: Option<Arc<raw_matrices::Plan>>,
     lifetime: Option<Arc<VarDctJobLifetime>>,
     completion: Arc<VarDctMapCompletion>,
@@ -1334,8 +1349,8 @@ impl VarDctJob {
                 artifact.raw_matrices = raw.validate(&mapped[boundary..end])?;
                 boundary = end;
             }
-            if let Some(alpha) = &self.alpha_plan {
-                artifact.alpha = alpha.validate(&mapped[boundary..], &self.code)?;
+            if let Some(extras) = &self.extra_plan {
+                artifact.extra_channels = extras.validate(&mapped[boundary..], &self.code)?;
             } else if mapped.len() != boundary {
                 return Err(BackendError::InvalidArtifact("unexpected side-plane artifact").into());
             }
@@ -1775,7 +1790,7 @@ pub(super) fn validate_artifact<'a>(
     Ok(VarDctArtifactData {
         saliency,
         raw_matrices: Default::default(),
-        alpha: Default::default(),
+        extra_channels: Default::default(),
         transform_plan,
         strategy: expected_strategy,
         dc_fragment_words: fragment_words,
@@ -1927,6 +1942,12 @@ impl VarDctEncoder {
         self.encoder.backend().alpha_association()
     }
 
+    /// Resolved image-header extra-channel declarations.
+    #[must_use]
+    pub fn extra_channels(&self) -> &[crate::ExtraChannel] {
+        self.encoder.backend().extra_channels()
+    }
+
     /// Declared presentation color encoding.
     #[must_use]
     pub fn source_color(&self) -> &jxl_gpu_formats::ColorSpecification {
@@ -2075,6 +2096,12 @@ impl TiledVarDctEncoder {
     #[must_use]
     pub fn alpha_association(&self) -> Option<crate::AlphaAssociation> {
         self.encoder.backend().alpha_association()
+    }
+
+    /// Resolved image-header extra-channel declarations.
+    #[must_use]
+    pub fn extra_channels(&self) -> &[crate::ExtraChannel] {
+        self.encoder.backend().extra_channels()
     }
 
     /// Declared presentation color encoding.

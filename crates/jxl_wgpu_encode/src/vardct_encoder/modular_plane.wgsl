@@ -1,10 +1,10 @@
-// Full-resolution side plane: one row owns one bounded, word-aligned entropy fragment.
+// Scalar side plane: one row owns one bounded, word-aligned entropy fragment.
 /*__JXL_SOURCE__*/
 struct Prefix { bits: u32, bit_len: u32, }
 struct Params {
     source: Source,
-    width: u32, height: u32, groups_x: u32, row_words: u32,
-    big_endian: u32, sample_mask: u32,
+    width: u32, height: u32, groups_x: u32, group_dim: u32, row_words: u32,
+    big_endian: u32, sample_mask: u32, channel_index: u32,
     prefix: array<Prefix, 33>,
 }
 @group(0) @binding(0) var<storage, read> source_words: array<u32>;
@@ -34,10 +34,10 @@ fn encode(@builtin(workgroup_id) id: vec3<u32>) {
     if id.x >= params.groups_x || id.y >= params.height { return; }
     let row = id.x * params.height + id.y;
     let base = row * params.row_words;
-    let x0 = id.x * 256u;
-    let width = min(256u, params.width - x0);
+    let x0 = id.x * params.group_dim;
+    let width = min(params.group_dim, params.width - x0);
     let y = id.y;
-    let first_row = (y & 255u) == 0u;
+    let first_row = (y % params.group_dim) == 0u;
     var cursor = 0u;
     for (var x = 0u; x < width; x += 1u) {
         var left = 0i;
@@ -66,7 +66,7 @@ fn encode(@builtin(workgroup_id) id: vec3<u32>) {
         cursor = append_bits(base + 4u, extra, extra_count, cursor);
     }
     if cursor > (params.row_words - 4u) * 32u { return; }
-    output_words[base] = 0x4d504c4eu;
+    output_words[base] = 0x4d504c4eu ^ params.channel_index;
     output_words[base + 1u] = row;
     output_words[base + 2u] = width;
     output_words[base + 3u] = cursor;

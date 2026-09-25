@@ -15,6 +15,7 @@ pub(crate) struct PreparedImageHeader {
     serialized_bytes: usize,
     pub(crate) icc_profile_bytes: u64,
     pub(crate) icc_storage_bytes: u64,
+    pub(crate) extra_storage_bytes: u64,
 }
 
 impl PreparedImageHeader {
@@ -52,15 +53,28 @@ impl PreparedImageHeader {
             serialized_bytes,
             icc_profile_bytes,
             icc_storage_bytes,
+            extra_storage_bytes: 0,
         })
+    }
+
+    /// ICC already owns the entire header. Otherwise independently declared extras add
+    /// variable metadata which must retain its own permit through final assembly.
+    pub(crate) fn account_extra_metadata(mut self, required: bool) -> Result<Self, EncodeError> {
+        if required && self.icc_storage_bytes == 0 {
+            self.extra_storage_bytes = (self.serialized_bytes as u64).checked_mul(2).ok_or(
+                EncodeError::InvalidConfiguration("extra metadata storage size overflow"),
+            )?;
+        }
+        Ok(self)
     }
 
     pub(crate) fn finish(
         mut self,
         budget: &jxl_wgpu::MemoryBudget,
     ) -> Result<(BitFragment, Option<jxl_wgpu::MemoryPermit>), EncodeError> {
-        let permit = (self.icc_storage_bytes != 0)
-            .then(|| budget.try_reserve(self.icc_storage_bytes))
+        let storage_bytes = self.icc_storage_bytes + self.extra_storage_bytes;
+        let permit = (storage_bytes != 0)
+            .then(|| budget.try_reserve(storage_bytes))
             .transpose()?;
         self.output
             .try_reserve_bytes(self.serialized_bytes - self.output.as_bytes().len())?;

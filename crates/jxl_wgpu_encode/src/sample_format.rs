@@ -32,20 +32,63 @@ impl AlphaAssociation {
 }
 
 /// Logical image samples, independent of physical storage or three-plane VarDCT work.
-/// Alpha currently shares the color precision and full-resolution source geometry.
-/// This owns the component count, alpha index and serialized extra-channel declaration.
-#[derive(Clone, Copy, Debug)]
+/// Packed alpha shares color precision; independent scalar inputs have separate declarations.
+/// This owns the component mapping and resolved image-header order for both frontends.
+#[derive(Clone, Debug)]
 pub(crate) struct ImageSamplePlan {
     pub(crate) color: ColorSampleFormat,
     pub(crate) alpha: Option<AlphaAssociation>,
+    pub(crate) extra_channels: std::sync::Arc<[crate::ExtraChannel]>,
 }
 
 impl ImageSamplePlan {
-    pub(crate) const fn new(color: ColorSampleFormat, alpha: Option<AlphaAssociation>) -> Self {
-        Self { color, alpha }
+    pub(crate) fn new(color: ColorSampleFormat, alpha: Option<AlphaAssociation>) -> Self {
+        let extra_channels = alpha
+            .into_iter()
+            .map(|association| crate::ExtraChannel::packed_alpha(color.precision(), association))
+            .collect();
+        Self {
+            color,
+            alpha,
+            extra_channels,
+        }
     }
 
-    pub(crate) const fn channels(self) -> crate::source::SourceChannels {
+    pub(crate) fn with_extra_channels(
+        mut self,
+        channels: &[crate::ExtraChannel],
+        limit: u64,
+    ) -> Result<Self, EncodeError> {
+        if self.extra_channels.len() + channels.len() > crate::extra_channel::MAX_EXTRA_CHANNELS {
+            return Err(EncodeError::InvalidConfiguration(
+                "extra-channel count exceeds the JPEG XL profile limit",
+            ));
+        }
+        let metadata_bytes = self
+            .extra_channels
+            .iter()
+            .chain(channels)
+            .try_fold(0u64, |total, channel| {
+                total.checked_add(channel.name().len() as u64 + 32)
+            })
+            .ok_or(EncodeError::InvalidConfiguration(
+                "extra-channel metadata size overflow",
+            ))?;
+        if metadata_bytes > limit {
+            return Err(EncodeError::InvalidConfiguration(
+                "extra-channel metadata exceeds its configured byte limit",
+            ));
+        }
+        self.extra_channels = self
+            .extra_channels
+            .iter()
+            .chain(channels)
+            .cloned()
+            .collect();
+        Ok(self)
+    }
+
+    pub(crate) const fn channels(&self) -> crate::source::SourceChannels {
         use crate::source::SourceChannels;
         match (self.color.channels(), self.alpha) {
             (ColorChannels::Gray, None) => SourceChannels::Gray,
@@ -55,11 +98,11 @@ impl ImageSamplePlan {
         }
     }
 
-    pub(crate) fn alpha_component(self) -> Option<usize> {
+    pub(crate) fn alpha_component(&self) -> Option<usize> {
         self.alpha.map(|_| self.color.channels().count() as usize)
     }
 
-    pub(crate) fn pixel_format(self) -> PixelFormat {
+    pub(crate) fn pixel_format(&self) -> PixelFormat {
         let mut format = self.color.pixel_format();
         if self.alpha.is_some() {
             let mut word = format.planes[0].words[0].clone();
@@ -74,7 +117,7 @@ impl ImageSamplePlan {
         format
     }
 
-    pub(crate) fn matches_format(self, format: &PixelFormat) -> bool {
+    pub(crate) fn matches_format(&self, format: &PixelFormat) -> bool {
         let Ok(spec) = crate::source::source_spec(format) else {
             return false;
         };
@@ -92,22 +135,10 @@ impl ImageSamplePlan {
             && spec.exponent_bits_per_sample == self.color.exponent_bits()
     }
 
-    pub(crate) fn write_extra_channels(self, output: &mut BitWriter) -> Result<(), EncodeError> {
-        let Some(alpha) = self.alpha else {
-            output.write_bits(0, 2)?;
-            return Ok(());
-        };
-        output.write_bits(1, 2)?; // one full-resolution alpha
-        let bits = self.color.bits_per_sample();
-        let exponent = self.color.exponent_bits();
-        let default = bits == 8 && exponent == 0 && alpha == AlphaAssociation::Unassociated;
-        output.write_bits(u64::from(default), 1)?;
-        if !default {
-            output.write_bits(0, 2)?; // alpha type
-            write_sample_bit_depth(output, bits, exponent)?;
-            output.write_bits(0, 2)?; // dim_shift
-            output.write_bits(0, 2)?; // empty name
-            output.write_bits(u64::from(alpha == AlphaAssociation::Associated), 1)?;
+    pub(crate) fn write_extra_channels(&self, output: &mut BitWriter) -> Result<(), EncodeError> {
+        crate::extra_channel::write_count(output, self.extra_channels.len())?;
+        for channel in self.extra_channels.iter() {
+            channel.write(output)?;
         }
         Ok(())
     }
@@ -168,20 +199,66 @@ pub struct ColorSampleFormat {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum SamplePrecision {
+enum PrecisionKind {
     Integer(u8),
     Float(FloatPrecision),
 }
 
+/// Checked sample precision shared by color and independent extra channels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SamplePrecision(PrecisionKind);
+
+impl SamplePrecision {
+    pub fn integer(bits: u8) -> Result<Self, EncodeError> {
+        Ok(ColorSampleFormat::integer(ColorChannels::Gray, bits)?.precision)
+    }
+
+    pub fn float(bits: u8, exponent_bits: u8) -> Result<Self, EncodeError> {
+        Ok(ColorSampleFormat::float(ColorChannels::Gray, bits, exponent_bits)?.precision)
+    }
+
+    #[must_use]
+    pub const fn color(self, channels: ColorChannels) -> ColorSampleFormat {
+        ColorSampleFormat {
+            channels,
+            precision: self,
+        }
+    }
+
+    /// Canonical scalar storage; layout changes do not alter the logical precision.
+    #[must_use]
+    pub fn pixel_format(self) -> PixelFormat {
+        let mut format = self.color(ColorChannels::Gray).pixel_format();
+        format.model = ColorModel::NonColor;
+        format.color_spec = ColorSpecification::Undefined;
+        format.swizzle = Swizzle::X000;
+        format
+    }
+
+    #[must_use]
+    pub const fn bit_depth(self) -> SampleBitDepth {
+        self.color(ColorChannels::Gray).bit_depth()
+    }
+
+    pub(crate) const fn mask(self) -> u32 {
+        self.color(ColorChannels::Gray).sample_mask()
+    }
+}
+
 impl ColorSampleFormat {
+    #[must_use]
+    pub const fn precision(self) -> SamplePrecision {
+        self.precision
+    }
+
     pub const RGB8: Self = Self {
         channels: ColorChannels::Rgb,
-        precision: SamplePrecision::Integer(8),
+        precision: SamplePrecision(PrecisionKind::Integer(8)),
     };
 
     pub const GRAY8: Self = Self {
         channels: ColorChannels::Gray,
-        precision: SamplePrecision::Integer(8),
+        precision: SamplePrecision(PrecisionKind::Integer(8)),
     };
 
     #[must_use]
@@ -198,7 +275,7 @@ impl ColorSampleFormat {
         }
         Ok(Self {
             channels,
-            precision: SamplePrecision::Integer(bits),
+            precision: SamplePrecision(PrecisionKind::Integer(bits)),
         })
     }
 
@@ -212,15 +289,15 @@ impl ColorSampleFormat {
             .map_err(|_| EncodeError::InvalidConfiguration("invalid color floating precision"))?;
         Ok(Self {
             channels,
-            precision: SamplePrecision::Float(precision),
+            precision: SamplePrecision(PrecisionKind::Float(precision)),
         })
     }
 
     #[must_use]
     pub const fn float_precision(self) -> Option<FloatPrecision> {
-        match self.precision {
-            SamplePrecision::Float(p) => Some(p),
-            SamplePrecision::Integer(_) => None,
+        match self.precision.0 {
+            PrecisionKind::Float(p) => Some(p),
+            PrecisionKind::Integer(_) => None,
         }
     }
 
@@ -234,9 +311,9 @@ impl ColorSampleFormat {
 
     #[must_use]
     pub const fn bits_per_sample(self) -> u8 {
-        match self.precision {
-            SamplePrecision::Integer(bits) => bits,
-            SamplePrecision::Float(p) => p.bits(),
+        match self.precision.0 {
+            PrecisionKind::Integer(bits) => bits,
+            PrecisionKind::Float(p) => p.bits(),
         }
     }
 
@@ -252,11 +329,11 @@ impl ColorSampleFormat {
 
     #[must_use]
     pub const fn bit_depth(self) -> SampleBitDepth {
-        match self.precision {
-            SamplePrecision::Integer(bits) => SampleBitDepth::Integer {
+        match self.precision.0 {
+            PrecisionKind::Integer(bits) => SampleBitDepth::Integer {
                 bits_per_sample: bits as u32,
             },
-            SamplePrecision::Float(p) => SampleBitDepth::Float {
+            PrecisionKind::Float(p) => SampleBitDepth::Float {
                 bits_per_sample: p.bits() as u32,
                 exponent_bits_per_sample: p.exponent_bits() as u32,
             },
@@ -273,14 +350,14 @@ impl ColorSampleFormat {
             },
             color_spec: ColorSpecification::Default,
             chroma_subsampling: ChromaSubsampling::None,
-            sample_kind: match self.precision {
-                SamplePrecision::Integer(_) => SampleKind::Unsigned,
-                SamplePrecision::Float(p)
+            sample_kind: match self.precision.0 {
+                PrecisionKind::Integer(_) => SampleKind::Unsigned,
+                PrecisionKind::Float(p)
                     if p == FloatPrecision::BINARY16 || p == FloatPrecision::BINARY32 =>
                 {
                     SampleKind::Float
                 }
-                SamplePrecision::Float(p) => SampleKind::CustomFloat(p),
+                PrecisionKind::Float(p) => SampleKind::CustomFloat(p),
             },
             byte_order: ByteOrder::Native,
             swizzle: match self.channels {

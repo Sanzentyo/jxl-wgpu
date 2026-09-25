@@ -2109,6 +2109,58 @@ nonfinite color samples retain the existing completion-owned byte contract. Raw-
 alpha readback tails share one map and are accounted once. No capability row is promoted to Done;
 independently sized/quantized arbitrary extras, YUV, CMYK and texture inputs remain open.
 
+## Independent VarDCT extra input
+
+`vardct_encoder::tests::extras` extends the same scalar GPU plan to independently declared
+source buffers. The precision matrix puts all 31 integer and 154 floating formats in one image
+and runs both Gray/RGB and XYB/Original color. This retains every comparison while sharing color
+work and decoder/native setup. Exact raw words cover signed zero, subnormals, both infinities and
+NaN payloads. Independent libjxl F32 output uses the existing two-epsilon relative bound, with
+exact zero/infinity signs and NaN classification.
+
+`jxl_test_support::oracles::modular_integer::vardct_extra_words` reads physical VarDCT frames
+through pinned jxl-oxide header, LF/HF, entropy and Modular code. It decodes color coefficients to
+locate the extra streams, then exports integer representation words before resampling, blending
+or float conversion. Dimensions and every source word are compared directly; no rendered F32
+plane is rounded back to an integer. This also validates shifted sources that the earlier
+retained-render oracle cannot inspect exactly.
+
+Fourteen single/five-pass streams cross 1, 255, 256, 257, 259×263, 2048×9 and 4097×19 geometry.
+Five ordered channels use shifts `[1, 0, 3, 2, 1]`, testing a small global prefix, later small LF
+planes, distinct pass brackets, partial groups, LF boundaries and an early factor-one endpoint.
+Every original scalar word remains exact. Native libjxl supplies full-resolution output for
+all channels; whole input and fragmented 256-byte GPU windows must emit identical bytes and
+match native normalized output within `2e-6` absolute error, including retained output after
+session destruction. The earlier Rust jxl progression/dimension-shift limitations remain documented
+above; this family requires the independent pre-render word and native output paths.
+
+Independent header parsing checks counts 0/1/2/17/18/256, all eight supported meanings, both alpha
+associations, finite spot metadata, CFA selector boundaries through 274, shifts 0–3 and name
+length selectors through 1071 bytes. Actual GPU/native streams retain the kinds and UTF-8 names.
+The wire count can represent 4096, but jxl-oxide and libjxl enforce the level-10 maximum of 256;
+257/4096 declarations and a packed alpha plus 256 attachments therefore reject before admission.
+Oversized/non-UTF-8 names, excessive metadata budgets and shifts beyond eightfold intrinsic
+upsampling also reject. NonOptional and unknown/reserved semantics remain outside the encoder API.
+
+Twenty three-frame animations exercise both associations, alpha selectors 1/10, every blend mode,
+independent reference sources per extra, reference-only producers, signed crops and timecodes.
+Native libjxl checks both presentations, GPU color at the unchanged `2e-4 * (1 + abs(reference))`
+bound, and four selected scalar outputs including a shifted plane at `2e-6 * (1 + abs(reference))`.
+Rejected selectors, blend counts and absent sources preserve frame index/finality for retry.
+Packed alpha plus independent extras also run all three encoder topologies with ICC and raw matrices;
+side samples retain special float words while nonfinite color still rejects publication.
+
+Resource tests cover aliased allocation accounting, exact/one-byte-deficient frame and still
+budgets, separate image-header ownership, abandoned jobs and release of retained source handles.
+Wrong source count, precision, extent, nesting and buffer usage reject before admission.
+Corrupt scalar artifacts include cross-plane swaps, channel identity, lengths, missing planes,
+trailing bytes and padding; all validation precedes packet authority. Legacy alpha tests remain
+in the full suite. Independent Modular/mixed inputs, lossy extra distance, additional frame
+upsampling policy and broader invisible-color conformance remain open (`ENC-04` Partial).
+
+Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib extra_input -- --test-threads=2`,
+then the [full capability gates](DEVELOPMENT.md#capability-change-gates).
+
 ## Mixed-codec sequence encoding
 
 `vardct_encoder/tests/animation/mixed_mode.rs` exercises `MixedModeEncoder` on Apple M5/Metal

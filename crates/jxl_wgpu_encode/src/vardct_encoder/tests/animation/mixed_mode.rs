@@ -493,6 +493,7 @@ fn mixed_mode_rejects_incompatible_contracts_before_advancing() {
             },
             FrameOptions {
                 color_blend: FrameBlend {
+                    alpha_channel: 0,
                     mode: BlendMode::Blend,
                     ..Default::default()
                 },

@@ -71,6 +71,7 @@ fn options(
             timecode,
         },
         color_blend: FrameBlend {
+            alpha_channel: 0,
             mode,
             source_reference: ReferenceSlot::new(source).unwrap(),
             clamp: mode == BlendMode::Multiply,

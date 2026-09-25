@@ -58,6 +58,7 @@ mod ans;
 mod buffer_pool;
 mod capability;
 mod error;
+mod extra_channel;
 mod frame_header;
 mod gpu;
 mod image_sequence;
@@ -80,6 +81,7 @@ pub use capability::{
     ProgressiveDownsampling, ProgressivePass, ProgressivePlan,
 };
 pub use error::{BackendError, EncodeError, PacketError, UnsupportedFeature};
+pub use extra_channel::{ExtraChannel, ExtraChannelKind};
 pub use gpu::{
     BufferImageSource, GpuEncodeBackend, GpuEncodeJob, GpuEncoder, GpuFrameSource,
     TextureImageSource, WgpuContext,
@@ -106,7 +108,7 @@ pub use packet::{
     BitFragment, EncodedFrame, FrameGroupLayout, FramePacketSet, GroupPacket, GroupPacketKind,
     assemble_frame,
 };
-pub use sample_format::{ColorChannels, ColorSampleFormat};
+pub use sample_format::{ColorChannels, ColorSampleFormat, SamplePrecision};
 pub use session::{
     AnimationHeader, BlendMode, CodestreamAssembler, EncodeSession, FrameBlend, FrameCrop,
     FrameEncodeRequest, FrameIndex, FrameKind, FrameOptions, FrameSubmission, FrameTiming,
@@ -116,9 +118,9 @@ pub use source_color::ImageColorOptions;
 pub use vardct_encoder::{
     TiledVarDctEncoder, TiledVarDctGrid, VarDctAlphaMemoryPlan, VarDctAnimationDescriptor,
     VarDctAnimationSession, VarDctBackend, VarDctCoefficientOrders, VarDctColorTransform,
-    VarDctConfig, VarDctDequantMatrices, VarDctEncoder, VarDctGroupOrder, VarDctHfMultiplier,
-    VarDctIccMemoryPlan, VarDctJob, VarDctKernelLayout, VarDctLfMetadata, VarDctMatrixEncoding,
-    VarDctMemoryPlan, VarDctQuantization, VarDctRawMatrix, VarDctSequenceDescriptor,
-    VarDctSequenceSession, VarDctStrategy, VarDctStrategyMap, VarDctSubmission, VarDctTransform,
-    VarDctTransformMemoryPlan,
+    VarDctConfig, VarDctDequantMatrices, VarDctEncoder, VarDctExtraChannelMemoryPlan,
+    VarDctGroupOrder, VarDctHfMultiplier, VarDctIccMemoryPlan, VarDctJob, VarDctKernelLayout,
+    VarDctLfMetadata, VarDctMatrixEncoding, VarDctMemoryPlan, VarDctQuantization, VarDctRawMatrix,
+    VarDctSequenceDescriptor, VarDctSequenceSession, VarDctStrategy, VarDctStrategyMap,
+    VarDctSubmission, VarDctTransform, VarDctTransformMemoryPlan,
 };

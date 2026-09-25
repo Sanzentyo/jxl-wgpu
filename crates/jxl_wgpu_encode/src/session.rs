@@ -144,6 +144,8 @@ impl FrameCrop {
 pub struct FrameBlend {
     pub mode: BlendMode,
     pub source_reference: ReferenceSlot,
+    /// Extra-channel index used by Blend/MultiplyAdd (the syntax addresses indices 0..=10).
+    pub alpha_channel: u32,
     pub clamp: bool,
 }
 

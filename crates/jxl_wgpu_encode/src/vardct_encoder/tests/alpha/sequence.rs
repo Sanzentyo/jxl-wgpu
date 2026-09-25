@@ -17,6 +17,7 @@ fn compare(actual: &[f32], expected: &[f32]) {
 
 fn blend(mode: BlendMode, source: u8) -> FrameBlend {
     FrameBlend {
+        alpha_channel: 0,
         mode,
         source_reference: ReferenceSlot::new(source).unwrap(),
         clamp: false,

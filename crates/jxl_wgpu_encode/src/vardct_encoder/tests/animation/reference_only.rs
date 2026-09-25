@@ -136,6 +136,7 @@ fn reference_only_controls_reject_absent_fields_before_admission() {
         },
         FrameOptions {
             color_blend: FrameBlend {
+                alpha_channel: 0,
                 mode: BlendMode::Add,
                 ..Default::default()
             },

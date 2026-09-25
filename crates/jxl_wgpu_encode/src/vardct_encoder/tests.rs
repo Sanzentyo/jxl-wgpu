@@ -6,6 +6,7 @@ mod animation;
 mod artifact;
 mod color;
 mod enumerated;
+mod extras;
 mod floating;
 mod gray;
 mod icc;
@@ -119,7 +120,7 @@ impl DcFixture {
         super::types::VarDctArtifactData {
             saliency: None,
             raw_matrices: Default::default(),
-            alpha: Default::default(),
+            extra_channels: Default::default(),
             transform_plan: None,
             strategy: 0,
             dc_fragment_words: &self.words,

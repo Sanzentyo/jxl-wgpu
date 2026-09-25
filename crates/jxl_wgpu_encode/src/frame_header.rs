@@ -7,7 +7,7 @@ use crate::{
 use jxl_gpu_bitstream::BitWriter;
 
 /// The checked frame kind and suffix: crop, blending, timing, references and disabled restoration.
-/// The supported fields occupy at most 256 bits, independent of image dimensions and pixels.
+/// The supported fields occupy at most 256 + 12 bits per extra channel, independent of pixels.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FrameHeaderPlan {
     frame_index: FrameIndex,
@@ -23,7 +23,21 @@ impl FrameHeaderPlan {
         source_extent: (u32, u32),
         has_alpha: bool,
     ) -> Result<Self, EncodeError> {
-        validate_frame(request, source_extent, has_alpha)?;
+        Self::with_extra_channels(request, source_extent, usize::from(has_alpha))
+    }
+
+    pub(crate) fn with_extra_channels(
+        request: &FrameEncodeRequest,
+        source_extent: (u32, u32),
+        extra_channels: usize,
+    ) -> Result<Self, EncodeError> {
+        if extra_channels > crate::extra_channel::MAX_EXTRA_CHANNELS {
+            return Err(EncodeError::InvalidConfiguration(
+                "extra-channel count exceeds the JPEG XL profile limit",
+            ));
+        }
+        validate_frame(request, source_extent, extra_channels)?;
+        let has_alpha = extra_channels != 0;
         let regular = request.options.kind == FrameKind::Regular;
         let can_be_referenced = can_be_referenced(request);
         let mut output = BitWriter::new();
@@ -50,11 +64,11 @@ impl FrameHeaderPlan {
                 has_alpha,
                 full_frame,
             )?;
-            if has_alpha {
+            for channel in 0..extra_channels {
                 let alpha_blend = request
                     .options
                     .extra_channel_blends
-                    .first()
+                    .get(channel)
                     .copied()
                     .unwrap_or_default();
                 write_blending_info(&mut output, alpha_blend, true, full_frame)?;
@@ -93,7 +107,7 @@ impl FrameHeaderPlan {
         output.write_bits(0, 2)?; // no restoration-filter extensions
         output.write_bits(0, 2)?; // no frame extensions
         let bit_len = output.bit_len();
-        if bit_len > 256 {
+        if bit_len > 256 + 12 * extra_channels {
             return Err(EncodeError::InvalidConfiguration(
                 "frame control exceeds its fixed storage bound",
             ));
@@ -151,8 +165,9 @@ impl FrameHeaderPlan {
 fn validate_frame(
     request: &FrameEncodeRequest,
     source_extent: (u32, u32),
-    has_alpha: bool,
+    extra_channels: usize,
 ) -> Result<(), EncodeError> {
+    let has_alpha = extra_channels != 0;
     if request.canvas_width == 0 || request.canvas_height == 0 {
         return Err(EncodeError::InvalidConfiguration(
             "the JPEG XL canvas must be non-empty",
@@ -194,7 +209,19 @@ fn validate_frame(
         }
         return Ok(());
     }
-    let extra_channels = usize::from(has_alpha);
+    for blend in
+        std::iter::once(&request.options.color_blend).chain(&request.options.extra_channel_blends)
+    {
+        let weighted = matches!(blend.mode, BlendMode::Blend | BlendMode::MultiplyAdd);
+        if (weighted
+            && (blend.alpha_channel > 10 || blend.alpha_channel as usize >= extra_channels))
+            || (!weighted && blend.alpha_channel != 0)
+        {
+            return Err(EncodeError::InvalidConfiguration(
+                "blend alpha selector is absent or outside its channel/syntax bounds",
+            ));
+        }
+    }
     if !request.options.extra_channel_blends.is_empty()
         && request.options.extra_channel_blends.len() != extra_channels
     {
@@ -389,7 +416,13 @@ fn write_blending_info(
     write_blend_mode(output, blend.mode)?;
     let uses_alpha = matches!(blend.mode, BlendMode::Blend | BlendMode::MultiplyAdd);
     if has_alpha && uses_alpha {
-        output.write_bits(0, 2)?; // alpha extra-channel index zero
+        match blend.alpha_channel {
+            0..=2 => output.write_bits(u64::from(blend.alpha_channel), 2)?,
+            index => {
+                output.write_bits(3, 2)?;
+                output.write_bits(u64::from(index - 3), 3)?;
+            }
+        }
     }
     if (has_alpha && uses_alpha) || blend.mode == BlendMode::Multiply {
         output.write_bits(u64::from(blend.clamp), 1)?;

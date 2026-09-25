@@ -113,6 +113,7 @@ impl WgpuContext {
 pub struct BufferImageSource {
     pub buffer: Arc<wgpu::Buffer>,
     pub layout: ImageLayout,
+    extra_channels: Vec<BufferImageSource>,
 }
 
 impl BufferImageSource {
@@ -122,7 +123,32 @@ impl BufferImageSource {
                 "GPU buffer is smaller than the declared pitch-linear image layout",
             ));
         }
-        Ok(Self { buffer, layout })
+        Ok(Self {
+            buffer,
+            layout,
+            extra_channels: Vec::new(),
+        })
+    }
+
+    /// Attach scalar sources in `VarDctConfig::extra_channels` order (after any packed alpha).
+    /// Precision and shifted extents are checked against that declaration before admission.
+    pub fn with_extra_channels(mut self, channels: Vec<Self>) -> Result<Self, EncodeError> {
+        if channels.len() > crate::extra_channel::MAX_EXTRA_CHANNELS
+            || channels
+                .iter()
+                .any(|channel| !channel.extra_channels.is_empty())
+        {
+            return Err(EncodeError::InvalidSource(
+                "extra sources must be flat and within the JPEG XL channel count",
+            ));
+        }
+        self.extra_channels = channels;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn extra_channels(&self) -> &[Self] {
+        &self.extra_channels
     }
 }
 

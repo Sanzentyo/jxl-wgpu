@@ -138,11 +138,13 @@ fn gray_and_rgb_alpha_compose_all_blends_with_independent_reference_fields() {
                         },
                         crop,
                         color_blend: FrameBlend {
+                            alpha_channel: 0,
                             mode,
                             source_reference: ReferenceSlot::new(source).unwrap(),
                             clamp: false,
                         },
                         extra_channel_blends: vec![FrameBlend {
+                            alpha_channel: 0,
                             mode: alpha_mode,
                             source_reference: ReferenceSlot::new(alpha_source).unwrap(),
                             clamp: false,

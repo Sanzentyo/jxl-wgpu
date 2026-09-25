@@ -38,8 +38,8 @@ fn frame_header(
         output.write_bits(0, 1)?; // original RGB, not YCbCr
     }
     output.write_bits(0, 2)?; // no upsampling
-    if color.samples.alpha.is_some() {
-        output.write_bits(0, 2)?; // full-resolution alpha
+    for _ in color.samples.extra_channels.iter() {
+        output.write_bits(0, 2)?; // factor one relative to the declared intrinsic dimension shift
     }
     if let Some(scales) = color.qm_scales() {
         for scale in scales {
@@ -284,6 +284,8 @@ fn write_lf_group(
         artifact.dc_fragment_descriptor(group_index)?,
     )?;
 
+    artifact.extra_channels.write_lf(output, group_index)?;
+
     // Validated strategy/quantizer metadata, zero local CfL maps,
     // and zero EPF sharpness. All source-dependent entropy is already packed.
     let first_block_bits = block_count.next_power_of_two().trailing_zeros() as u8;
@@ -344,9 +346,9 @@ pub(super) fn build_frame_packet(
     control: &FrameHeaderPlan,
     color: &VarDctColorPlan,
 ) -> Result<FramePacketSet, EncodeError> {
-    if artifact.alpha.is_present() != color.samples.alpha.is_some() {
+    if artifact.extra_channels.len() != color.samples.extra_channels.len() {
         return Err(BackendError::InvalidArtifact(
-            "alpha artifact differs from the image sample plan",
+            "extra-channel artifacts differ from the image sample plan",
         )
         .into());
     }
@@ -364,7 +366,7 @@ pub(super) fn build_frame_packet(
     if ac_groups == 1 && lf_groups == 1 && passes == 1 {
         let mut group = BitWriter::new();
         write_lf_global(&mut group, code, hf_entropy, coefficient_payload, config)?;
-        artifact.alpha.write_global(&mut group)?;
+        artifact.extra_channels.write_global(&mut group)?;
         write_lf_group(&mut group, code, artifact, frame, 0, config.quantization)?;
         hf_entropy.write_global(
             &mut group,
@@ -374,7 +376,7 @@ pub(super) fn build_frame_packet(
             artifact.raw_matrices,
         )?;
         artifact.ac.append_group(&mut group, frame, 0, 0)?;
-        artifact.alpha.write_group(&mut group, 0, 0)?;
+        artifact.extra_channels.write_group(&mut group, 0, 0)?;
         group.align_to_byte()?;
         return Ok(FramePacketSet::new(
             frame_header(&config.progressive, control, color)?,
@@ -394,7 +396,7 @@ pub(super) fn build_frame_packet(
         coefficient_payload,
         config,
     )?;
-    artifact.alpha.write_global(&mut dc_global)?;
+    artifact.extra_channels.write_global(&mut dc_global)?;
     dc_global.align_to_byte()?;
     let mut ac_global = BitWriter::new();
     hf_entropy.write_global(
@@ -449,7 +451,7 @@ pub(super) fn build_frame_packet(
                 .ac
                 .append_group(&mut output, frame, group, u32::from(pass))?;
             artifact
-                .alpha
+                .extra_channels
                 .write_group(&mut output, group, u32::from(pass))?;
             output.align_to_byte()?;
             packets.push(GroupPacket::new(

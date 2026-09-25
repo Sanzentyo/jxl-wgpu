@@ -87,11 +87,13 @@ pub(crate) fn check_cropped_frames(
             },
             crop,
             color_blend: FrameBlend {
+                alpha_channel: 0,
                 mode,
                 source_reference: ReferenceSlot::new(reference).unwrap(),
                 clamp: false,
             },
             extra_channel_blends: vec![FrameBlend {
+                alpha_channel: 0,
                 mode: extra_mode,
                 source_reference: ReferenceSlot::new(u8::from(index != 0)).unwrap(),
                 clamp: false,
