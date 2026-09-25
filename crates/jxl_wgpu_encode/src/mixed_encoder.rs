@@ -1,4 +1,4 @@
-//! Caller-selected Modular/VarDCT frames under one checked original Gray/RGB image contract.
+//! Caller-selected Modular/VarDCT frames under one checked original color/alpha image contract.
 
 use std::task::{Context, Poll};
 
@@ -33,12 +33,12 @@ pub enum VarDctTransformSelection {
 }
 
 /// Fixed policies for both frame codecs. Both use `vardct`'s stream-wide source
-/// channels/precision, source color and image color options.
+/// color/alpha channels, precision, source color and image color options.
 ///
 /// The default VarDCT domain is `Original`. An explicit XYB configuration is rejected:
 /// the image-wide XYB flag cannot change between physical frames, and the Modular backend
-/// encodes original components. Alpha, other source formats and pre-transform references
-/// require a broader common image contract.
+/// encodes original components. Arbitrary extra channels, other source formats and
+/// pre-transform references require a broader common image contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MixedModeConfig {
     pub modular: LosslessModularConfig,
@@ -326,10 +326,16 @@ impl MixedModeEncoder {
         self.encoder.backend().modular.clear_buffer_pool();
     }
 
-    /// Common source channels and precision for both frame codecs.
+    /// Common color channels and precision for both frame codecs; alpha shares this precision.
     #[must_use]
     pub fn sample_format(&self) -> crate::ColorSampleFormat {
         self.encoder.backend().vardct.sample_format()
+    }
+
+    /// Common alpha association for both frame codecs.
+    #[must_use]
+    pub fn alpha_association(&self) -> Option<crate::AlphaAssociation> {
+        self.encoder.backend().vardct.alpha_association()
     }
 
     pub fn begin_sequence(

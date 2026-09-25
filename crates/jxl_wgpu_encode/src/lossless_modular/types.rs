@@ -1,4 +1,3 @@
-use crate::EncodeError;
 use crate::prefix::{LZ77_SYMBOLS, RAW_SYMBOLS};
 
 /// JPEG XL's default Modular pass-group edge length.
@@ -83,28 +82,7 @@ const _: () = {
 
 pub use crate::source::SourceChannels as LosslessModularFormat;
 
-/// Interpretation of caller-supplied color samples relative to the alpha plane.
-/// Encoding preserves the source words, including color at zero alpha; it never multiplies,
-/// divides or discards them. The same declaration applies to every frame in an animation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum AlphaAssociation {
-    /// Color samples are independent of alpha (the default).
-    #[default]
-    Unassociated,
-    /// Color samples are already multiplied by alpha.
-    Associated,
-}
-
-impl AlphaAssociation {
-    pub(super) fn validate(self, format: LosslessModularFormat) -> Result<(), EncodeError> {
-        if self == Self::Associated && !format.has_alpha() {
-            return Err(EncodeError::InvalidConfiguration(
-                "associated source color requires an alpha channel",
-            ));
-        }
-        Ok(())
-    }
-}
+pub use crate::sample_format::AlphaAssociation;
 
 /// Selects where a multi-group lossless Modular frame stores its MA tree and entropy tables.
 ///

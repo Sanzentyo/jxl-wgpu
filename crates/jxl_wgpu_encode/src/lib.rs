@@ -29,14 +29,14 @@
 //! explicit global/LF controls and per-transform HF multipliers; content-adaptive strategy search,
 //! distance control and progressive encoding
 //! remain incomplete. [`TiledVarDctEncoder`] provides an optimized DCT8 workgroup path.
-//! Both frontends expose [`VarDctAnimationSession`] for integer/floating Gray/RGB timed crops in XYB or original sRGB, Replace/Add/Multiply,
+//! Both frontends expose [`VarDctAnimationSession`] for integer/floating Gray/GrayAlpha/RGB/RGBA timed crops in XYB or original components, all five blend modes,
 //! hidden frames and four post-color-transform references, using the same checked frame control
 //! as Modular. Each frame retains the encoder's quantization and progressive AC configuration.
 //! [`MixedModeEncoder`] selects Modular or VarDCT explicitly for each physical frame under one
-//! checked [`ImageSequenceDescriptor`]. Its shared original-sRGB contract supports layered stills,
+//! checked [`ImageSequenceDescriptor`]. Its shared original-component color contract supports layered stills,
 //! animations and post-color-transform references across both codecs. Automatic mode selection
-//! and common alpha and other source color contracts remain unimplemented. Both codecs use the
-//! same checked Gray/RGB source plan, including packed/planar/split RGB, and GPU byte/word loader.
+//! and arbitrary extra-channel inputs remain unimplemented. Both codecs use the
+//! same checked image-sample plan, including optional lossless alpha, packed/planar/split storage and a GPU byte/word loader.
 //! [`VarDctCoefficientOrders`] selects independent X/Y/B permutations for every standard size class;
 //! GPU serializers consume them without exposing image coefficients to the host.
 //!
@@ -114,9 +114,9 @@ pub use session::{
 };
 pub use source_color::ImageColorOptions;
 pub use vardct_encoder::{
-    TiledVarDctEncoder, TiledVarDctGrid, VarDctAnimationDescriptor, VarDctAnimationSession,
-    VarDctBackend, VarDctCoefficientOrders, VarDctColorTransform, VarDctConfig,
-    VarDctDequantMatrices, VarDctEncoder, VarDctGroupOrder, VarDctHfMultiplier,
+    TiledVarDctEncoder, TiledVarDctGrid, VarDctAlphaMemoryPlan, VarDctAnimationDescriptor,
+    VarDctAnimationSession, VarDctBackend, VarDctCoefficientOrders, VarDctColorTransform,
+    VarDctConfig, VarDctDequantMatrices, VarDctEncoder, VarDctGroupOrder, VarDctHfMultiplier,
     VarDctIccMemoryPlan, VarDctJob, VarDctKernelLayout, VarDctLfMetadata, VarDctMatrixEncoding,
     VarDctMemoryPlan, VarDctQuantization, VarDctRawMatrix, VarDctSequenceDescriptor,
     VarDctSequenceSession, VarDctStrategy, VarDctStrategyMap, VarDctSubmission, VarDctTransform,

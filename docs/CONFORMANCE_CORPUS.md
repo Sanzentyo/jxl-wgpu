@@ -2058,10 +2058,56 @@ cancellation, failed-admission retry, retained-ready futures and sequence assemb
 Gray/RGB padded device/linear planes, program and parameter storage belong to the existing job
 reservation and completion. Integer/tiled ICC inputs also require source-validation stamps.
 F.2's forbidden reference combinations remain separate from unsupported pre-transform encoding.
-Alpha, wider device inputs, full-range/profile conformance and the full JPEG XL goal remain open.
+Wider device inputs, full-range/profile conformance and the full JPEG XL goal remain open;
+the alpha extension is covered by the following family.
 
 Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib tests::icc -- --test-threads=2`;
 the [full capability gates](DEVELOPMENT.md#capability-change-gates) cover shared code regressions.
+
+## Alpha VarDCT and mixed input
+
+`jxl_wgpu_encode::vardct_encoder::tests::alpha` exercises the full-resolution, same-precision
+alpha contract in `VarDctConfig`. Both GrayAlpha and RGBA run all 31 integer and 154 floating
+precisions, both XYB/Original domains and both declared associations. Canonical, shifted/swizzled
+packed, planar and split sources must emit identical bytes. Extra-channel metadata retains
+precision, association and dimension shift zero. Independent jxl-oxide retains raw Modular
+extra planes: every integer bit and floating representation is compared without reconstruction
+from F32. Native libjxl and Rust jxl independently decode every normalized alpha sample.
+Floating specials cover signed zero, subnormals, both infinities and NaN payloads at all 154
+precisions; exact raw words remain the preservation evidence and numeric NaNs are classified.
+
+Global images through 256×256, horizontal/vertical partial pass groups, multi-LF geometry,
+strategy maps and tiled DCT8 cover the same row-plan routing. Tests combine progressive AC,
+an early full-resolution endpoint, reordered groups, raw matrices, caller-selected coefficient
+orders and shared/mixed/24-bit source words. All 27 strategies retain identical compressed color
+coefficients with and without alpha, including associated color at zero alpha. RGB/Gray ICC
+cases cover all three encoder topologies and byte-identical explicit device/alpha channels.
+The profile and color conversion remain separate from lossless side-plane coding.
+For multi-group alpha with a factor-one endpoint before the final coefficient pass, Rust
+`jxl 0.6.0` returns `SectionTooShort`: `Passes::downsampling_bracket` saturates `0 - 1` to zero,
+so later passes request the already decoded full-resolution plane again. Pinned libjxl uses a
+signed negative upper bound, and jxl-oxide also retains the empty bracket. The test keeps this
+specific Rust error as a witness, compares every raw word through independent jxl-oxide and
+checks numeric alpha through native libjxl; GPU numeric output exercises the same early endpoint.
+jxl-oxide's rendered custom-float alpha is not substituted for its retained words: for the
+24-bit/7-exponent zero in these cases, its F32 conversion produces `0x20000000` rather than zero.
+The encoder emits alpha once at its planned pass, and no tolerance or input case is removed
+for this discrepancy.
+
+Fixed-VarDCT and mixed Modular/VarDCT sequences exercise all five blend modes, signed crops,
+reference-only frames, independent color/alpha reference slots, timecodes and both associations.
+Native libjxl and Rust frame output are compared with the same source association, then complete
+GPU presentation with default unassociated output is checked against native libjxl at
+the unchanged `2e-4 * (1 + abs(reference))` floating bound. Wrong channel counts and extra blend
+counts must reject without consuming frame index/finality. Whole and bounded fragmented GPU
+numeric output preserves 31-bit integers and binary32 alpha after session release.
+
+Malformed side-plane artifacts cover missing readiness, row identity/count, overlong and empty
+streams, nonzero padding, truncation and trailing words. Independent buffer/binding/dispatch
+limits, one-byte-deficient/exact job budgets, abandoned submissions, completed jobs and rejected
+nonfinite color samples retain the existing completion-owned byte contract. Raw-matrix and
+alpha readback tails share one map and are accounted once. No capability row is promoted to Done;
+independently sized/quantized arbitrary extras, YUV, CMYK and texture inputs remain open.
 
 ## Mixed-codec sequence encoding
 

@@ -537,11 +537,30 @@ ignored. `sample_format.pixel_format()` remains a canonical native-endian interl
 with separate 1/2/4-byte component words and right-aligned samples.
 
 Gray uses `ColorModel::Gray`, the configured white/transfer and a single stored channel selected by
-the gray swizzle (X, Y, Z or W; no alpha). Its checked source record is bound to each of
+the gray swizzle (X, Y, Z or W, independently of optional alpha). Its checked source record is bound to each of
 the three standard VarDCT working components. The GPU reads the same source sample for
 each, while the header declares Gray and omits RGB primaries. Source windows count those
 bytes once; enumerated/original Gray needs no expanded input buffer or host pixel conversion. Gray keeps the
 same word sizes, bit positions, byte order and unaligned row/offset support as RGB.
+
+`VarDctConfig::alpha: Option<AlphaAssociation>` adds full-resolution GrayAlpha or RGBA at the
+same sample precision. `None` keeps color-only input; `Some(Unassociated)` and `Some(Associated)`
+declare the supplied association without multiplying, dividing or replacing invisible color.
+`config.pixel_format()` includes alpha; `config.sample_format.pixel_format()` describes color alone.
+`alpha_association()` reports the checked declaration on VarDCT and mixed encoder handles.
+One immutable image-sample plan owns the logical component count, alpha source index and extra-channel
+metadata for both codecs. The three color working planes retain their existing transform contract.
+
+Alpha is compressed losslessly from the original GPU words, including floating signed zero,
+subnormals, infinities and NaN payloads. A separate checked Modular side-plane plan routes images
+up to 256×256 to LF-global and larger images to 256-pixel pass groups, at the first declared
+full-resolution endpoint or the final pass. Row tasks read neighboring original samples within
+their group and produce stateless Gradient/prefix fragments; host assembly concatenates only
+validated compressed bits. The same plan supplies GPU ranges, resource bounds and packet placement.
+`VarDctMemoryPlan::alpha` exposes parameters, artifact and readback bytes, all retained by the
+existing job reservation/completion owner. No additional submission or map is introduced.
+[Alpha conformance](../../docs/CONFORMANCE_CORPUS.md#alpha-vardct-and-mixed-input) covers exact words,
+independent native output, color independence, layouts, progression, composition and ownership.
 
 The logical input API is `ColorSampleFormat` and `ImageSequenceDescriptor`; these replace
 the former RGB-only names. A sequence fixes channels and precision together, even when
@@ -563,8 +582,8 @@ no arbitrary extended-range reconstruction or general quality guarantee is impli
 Subnormals enter the lossy F32 arithmetic contract; VarDCT is not a bit-preserving float codec.
 General transforms budget per-workgroup completion/error records inside the artifact/readback;
 tiled DCT8 carries errors in its existing block records. Missing or malformed validation
-records cannot publish an artifact. XYB ICC additionally budgets those records for integer and tiled sources. Alpha, subsampling and
-texture inputs remain outside the VarDCT contract.
+records cannot publish an artifact. XYB ICC additionally budgets those records for integer and tiled sources.
+Subsampling, arbitrary extra channels and texture inputs remain outside the VarDCT contract.
 
 VarDCT and mixed sequences declare 32-bit Modular working buffers, independently of input
 depth: their quantized LF coefficients are checked i32 values. This corrects the earlier
@@ -905,7 +924,7 @@ encoder.encode(source_13_by_21)
 
 `MixedModeEncoder::new(context, MixedModeConfig)` accepts explicit per-frame choices through
 `MixedModeFrameEncoding::{Modular, VarDct}`. `begin_sequence(ImageSequenceDescriptor)` creates
-one layered still or animation with a shared integer/floating Gray/RGB enumerated-color image contract. Both codecs
+one layered still or animation with a shared integer/floating Gray/GrayAlpha/RGB/RGBA image contract. Both codecs
 use the precision in `config.vardct.sample_format` (1–31 integer bits or a legal floating precision, default RGB8) and the
 `source_color` and `color_options` in that same VarDCT configuration. Each physical frame may independently select any supported
 packed, planar or split layout, swizzle, bit position and word byte order; channels, precision and color stay fixed. The default config uses original-component
@@ -916,10 +935,12 @@ VarDCT, tiled DCT8 and default lossless Modular. An explicit XYB configuration i
 only; Modular and tiled sources can vary per frame. Modular retains its configured Prefix/ANS,
 predictor and transform policies. Regular VarDCT frames retain configured AC progression;
 reference-only VarDCT frames use one implicit complete pass. The common contract supports
-Replace/Add/Multiply, signed crops, hidden layers, timecodes and four post-transform reference
-slots across codec boundaries. Embedded RGB/Gray ICC uses exact profile identity and one shared budgeted header. Alpha and pre-transform
-references and automatic mode selection require broader contracts and remain unsupported.
-Modular preserves its physical source words, including nonfinite float payloads; selected VarDCT frames require finite samples.
+all five blend modes, signed crops, hidden layers, timecodes and four post-transform reference
+slots across codec boundaries. Optional alpha uses `config.vardct.alpha` at the color precision,
+with an independent extra-channel blend/reference field. Embedded RGB/Gray ICC uses exact profile
+identity and one shared budgeted header. Pre-transform references and automatic mode selection
+remain unsupported.
+Modular preserves its physical source words, including nonfinite float payloads; selected VarDCT frames require finite color samples; alpha remains lossless.
 Modular/VarDCT mode selection preserves these distinct contracts; including VarDCT does not make the presentation lossless.
 
 The session's `submit_frame` and `submit_last_frame` take the source, encoding choice and
@@ -973,13 +994,13 @@ working-buffer declaration changes its image header; mixed all-Modular frames re
 frame payloads and metadata apart from that image-wide working-buffer flag.
 
 `VarDctEncoder::begin_sequence` and `TiledVarDctEncoder::begin_sequence` share the same descriptor
-and session. The descriptor fixes canvas and optional timebase; the encoder binds the selected Gray/RGB channels, integer or floating precision and enumerated input color,
+and session. The descriptor fixes canvas and optional timebase; the encoder binds the selected color/alpha channels, integer or floating precision and enumerated/ICC input color,
 XYB or original-component coding, transform policy,
 quantization, matrices/orders and AC passes. Single transforms and maps retain their source
 extent on each frame; tiled DCT8 accepts separately checked crop extents through its 16K axis
-bound. Both support Replace/Add/Multiply, signed crops, hidden zero-duration regular frames and
-four post-color-transform references. Alpha-weighted modes, extra-channel contracts and
-pre-color-transform reference storage are rejected. Mixed Modular/VarDCT sessions use
+bound. Both support all five blend modes with alpha, signed crops, hidden zero-duration regular frames
+and four post-color-transform references. Alpha has an independent blend/reference field.
+Pre-color-transform reference storage and arbitrary extra-channel inputs remain unsupported. Mixed Modular/VarDCT sessions use
 `MixedModeEncoder`; frame names and previews remain unimplemented.
 
 Both codecs accept `FrameOptions { kind: FrameKind::ReferenceOnly, .. }` in either sequence kind.

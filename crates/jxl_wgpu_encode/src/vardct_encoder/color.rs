@@ -25,7 +25,7 @@ pub enum VarDctColorTransform {
 /// omits the XYB-only matrix-scale fields and must use their implicit neutral scales.
 #[derive(Clone, Debug)]
 pub(super) struct VarDctColorPlan {
-    samples: crate::ColorSampleFormat,
+    pub(super) samples: crate::sample_format::ImageSamplePlan,
     encoding: SourceColorEncoding,
     options: ImageColorOptions,
     max_icc_profile_bytes: u64,
@@ -89,7 +89,7 @@ impl VarDctColorPlan {
             return Err(UnsupportedFeature::InputFormat.into());
         }
         Ok(Self {
-            samples: config.sample_format,
+            samples: crate::sample_format::ImageSamplePlan::new(config.sample_format, config.alpha),
             encoding,
             options: config.color_options,
             max_icc_profile_bytes: config.max_icc_profile_bytes,
@@ -170,7 +170,7 @@ impl VarDctColorPlan {
     }
 
     pub(super) const fn samples(&self) -> crate::ColorSampleFormat {
-        self.samples
+        self.samples.color
     }
 
     pub(super) const fn xyb_encoded(&self) -> bool {

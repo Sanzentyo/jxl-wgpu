@@ -102,6 +102,9 @@ impl Default for VarDctQuantization {
 pub struct VarDctConfig {
     /// Stream-wide Gray/RGB source channels and precision; defaults to interleaved RGB8.
     pub sample_format: crate::ColorSampleFormat,
+    /// Optional full-resolution alpha at the same precision, compressed losslessly on GPU.
+    /// Color association is declared unchanged; no premultiplication or division is performed.
+    pub alpha: Option<crate::AlphaAssociation>,
     /// Stream-wide enumerated or embedded RGB/Gray ICC source color; defaults to sRGB/D65.
     pub source_color: jxl_gpu_formats::ColorSpecification,
     /// Rendering intent and positive exact binary16 image white (default 255 cd/m²).
@@ -126,6 +129,7 @@ impl Default for VarDctConfig {
     fn default() -> Self {
         Self {
             sample_format: Default::default(),
+            alpha: None,
             source_color: jxl_gpu_formats::ColorSpecification::Default,
             color_options: Default::default(),
             max_icc_profile_bytes: crate::source_color::icc::DEFAULT_PROFILE_LIMIT,
@@ -146,7 +150,8 @@ impl VarDctConfig {
     pub fn pixel_format(&self) -> jxl_gpu_formats::PixelFormat {
         jxl_gpu_formats::PixelFormat {
             color_spec: self.source_color.clone(),
-            ..self.sample_format.pixel_format()
+            ..crate::sample_format::ImageSamplePlan::new(self.sample_format, self.alpha)
+                .pixel_format()
         }
     }
 }

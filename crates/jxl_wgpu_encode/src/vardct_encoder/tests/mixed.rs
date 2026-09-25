@@ -194,6 +194,7 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
             &oracles
         };
         let config = VarDctConfig {
+            alpha: None,
             sample_format: Default::default(),
             source_color: jxl_gpu_formats::ColorSpecification::Default,
             color_options: Default::default(),

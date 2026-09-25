@@ -75,6 +75,11 @@ original profile through `oracles::icc_profile`, checks raw integer/IEEE words, 
 color output with the unchanged independent scalar corpus and native-encoded fixture.
 Neither oracle is a production dependency or a fallback.
 
+`oracles::modular_integer::extra_planes` reads retained I16/I32 extra-channel planes from
+jxl-oxide, independently of whether color uses Modular or VarDCT. It rejects F32 reconstruction
+instead of rounding back to source words. The VarDCT alpha matrix uses this for every raw sample
+bit, alongside independent libjxl/Rust normalized output and actual GPU numeric output.
+
 `oracles::modular_words` reads exact physical-frame component words from the pinned scalar
 libjxl decoder before float conversion or blending. It requires `JXL_MODULAR_WORD_ORACLE` and
 checks the executable's versioned output, dimensions and complete word counts. The helper uses

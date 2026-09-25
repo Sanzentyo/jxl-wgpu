@@ -105,6 +105,14 @@ pub fn rust_frame_planes(encoded: &[u8]) -> Vec<FloatPlanes> {
 pub fn rust_frame_planes_with_profile(
     encoded: &[u8],
 ) -> (Vec<FloatPlanes>, jxl::api::JxlColorProfile) {
+    try_rust_frame_planes_with_profile(encoded).unwrap()
+}
+
+/// Keep a typed native Rust decoder failure as an explicit incompatibility witness.
+/// Ordinary oracle calls still require success through `rust_frame_planes_with_profile`.
+pub fn try_rust_frame_planes_with_profile(
+    encoded: &[u8],
+) -> Result<(Vec<FloatPlanes>, jxl::api::JxlColorProfile), jxl::error::Error> {
     let mut input = encoded;
     let mut options = JxlDecoderOptions::default();
     options.render_spot_colors = false;
@@ -112,7 +120,7 @@ pub fn rust_frame_planes_with_profile(
     let decoder = JxlDecoder::<states::Initialized>::new(options);
     let ProcessingResult::Complete {
         result: mut decoder,
-    } = decoder.process(&mut input, None).unwrap()
+    } = decoder.process(&mut input, None)?
     else {
         panic!("complete header")
     };
@@ -133,8 +141,7 @@ pub fn rust_frame_planes_with_profile(
     let profile = decoder.output_color_profile().clone();
     let mut frames = Vec::new();
     loop {
-        let ProcessingResult::Complete { result: frame } =
-            decoder.process(&mut input, None).unwrap()
+        let ProcessingResult::Complete { result: frame } = decoder.process(&mut input, None)?
         else {
             panic!("complete frame")
         };
@@ -147,7 +154,7 @@ pub fn rust_frame_planes_with_profile(
                 .map(|plane| JxlOutputBuffer::new(plane, size.1, size.0 * 4)),
         );
         let ProcessingResult::Complete { result } =
-            frame.process(&mut input, &mut outputs, None).unwrap()
+            frame.process(&mut input, &mut outputs, None)?
         else {
             panic!("complete pixels")
         };
@@ -158,5 +165,5 @@ pub fn rust_frame_planes_with_profile(
             break;
         }
     }
-    (frames, profile)
+    Ok((frames, profile))
 }

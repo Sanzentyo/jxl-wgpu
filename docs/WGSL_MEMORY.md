@@ -142,6 +142,8 @@ name shown in parentheses.
 | `jxl_wgpu_encode/vardct_encoder/control.wgsl` | `VarDctArtifactHeader` / header words | status/live counts, AC-presence marker, LF section ranges/total bits, source/block geometry, topology, 33-bin DC histogram, LF descriptors/grid/count, AC descriptor offset/count and fragment offset/stride/word count, AC pass count, saliency offset/count | 272 | 4 | storage/readback record |
 | `jxl_wgpu_encode/vardct_encoder/control.wgsl` | `DcFragmentDescriptor` / two words | `bit_offset, bit_len` for one row-major LF group | 8 | 4 | storage/readback element |
 | `jxl_wgpu_encode/vardct_encoder/common.wgsl` | six host words / `QuantizationEntry` | three f32 dequantization scales followed by three u32 X/Y/B coefficient-order positions | 24 | 4 | read-only storage element |
+| `jxl_wgpu_encode/vardct_encoder/modular_plane.wgsl` | `modular_plane::Params` / `Params` | one 24-byte source record, width/height/group columns/row stride, byte order/sample mask and 33 eight-byte prefix entries | 312 | 4 | read-only storage |
+| `jxl_wgpu_encode/vardct_encoder/modular_plane.wgsl` | four completion words | readiness, row identity, sample count, entropy bit length; followed by one bounded row fragment | 16 | 4 | storage/readback record |
 | `jxl_wgpu_encode/vardct_encoder/raw_matrices.wgsl` | five task words | wire width, channel area, input sample offset, output fragment offset, fragment capacity in words | 20 | 4 | read-only storage element after 67 prefix/control words |
 | `jxl_wgpu_encode/vardct_encoder/raw_matrices.wgsl` | four completion words | ready marker, task index, sample count, fragment bit length | 16 | 4 | storage/readback element before compressed fragments |
 | `jxl_wgpu_encode/source.wgsl` | `SourceParams` / `Source` | `row_stride, byte_offset, pixel_stride, word_bytes, bit_shift, plane` | 24 | 4 | storage subrecord shared by Modular and VarDCT |
@@ -989,6 +991,26 @@ alias its one converted plane. The intermediate buffers remain in the existing c
 there is no new submission, host image conversion or independent map. Saliency binds the retained
 original layout and caller-owned source windows. The shared ICC metadata serializer separately
 reserves twice the complete header size; one still/session permit lasts through assembly or drop.
+
+Optional full-resolution alpha uses `modular_plane.wgsl` with the original source windows at
+0/12/13/14, a separate 312-byte parameter at 1 and compressed artifact at 2. Its 1×1 workgroups
+own one row each; X selects a 256-pixel group column and Y an actual image row. Prediction resets
+at each group boundary and reads only the original selected component, including raw float bits.
+Row identity is `group_column * height + y`. Each row owns four status words plus
+`ceil(min(width,256) * max_token_bits / 32)` payload words, where `max_token_bits` is derived from
+the fixed 33-symbol code and includes all 31 possible extra bits. Edge rows retain this same
+capacity with zero padding. The GPU writes readiness `0x4d504c4e`, row identity, visible width and
+bit length only after encoding; the host validates every row and exact sample/token termination
+before assembly. No pixel or residual array is returned to the host.
+
+`VarDctAlphaMemoryPlan` counts one parameter, this artifact and an equal readback tail. The tail
+follows optional raw-matrix readback inside the existing map allocation. Its bytes are exposed
+both in the alpha breakdown and total `readback_bytes`, without double charging ownership.
+All buffer/binding sizes, u32 word addresses and both workgroup axes are admitted before GPU
+allocation. These buffers join the same job completion owner and permit as ICC/color work.
+Cancellation retains them through actual completion; validation failure releases the complete
+job before returning. Alpha's group/pass placement belongs to this same immutable plan, including
+an early factor-one progression endpoint and reference-only lowering to one complete pass.
 
 Integer saliency keeps its top-eight-bit or rounded low-depth proxy. Floating saliency rounds
 `255 * clamp(sample, 0, 1)`; the authoritative normalization/transform stage still checks all

@@ -12,6 +12,7 @@ mod entropy;
 mod group_order;
 mod icc_input;
 mod matrices;
+mod modular_plane;
 mod orders;
 mod quantization;
 mod raw_matrices;
@@ -29,6 +30,7 @@ pub use dispatch::{TiledVarDctEncoder, VarDctBackend, VarDctEncoder, VarDctJob, 
 pub use group_order::VarDctGroupOrder;
 pub use icc_input::VarDctIccMemoryPlan;
 pub use matrices::{VarDctDequantMatrices, VarDctMatrixEncoding, VarDctRawMatrix};
+pub use modular_plane::VarDctAlphaMemoryPlan;
 pub use orders::VarDctCoefficientOrders;
 pub use quantization::{VarDctConfig, VarDctHfMultiplier, VarDctQuantization};
 pub use sequence::{

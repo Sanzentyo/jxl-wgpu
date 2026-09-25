@@ -1,6 +1,7 @@
 //! Existing VarDCT semantic, ABI, and GPU interoperability tests.
 
 mod ac;
+mod alpha;
 mod animation;
 mod artifact;
 mod color;
@@ -118,6 +119,7 @@ impl DcFixture {
         super::types::VarDctArtifactData {
             saliency: None,
             raw_matrices: Default::default(),
+            alpha: Default::default(),
             transform_plan: None,
             strategy: 0,
             dc_fragment_words: &self.words,

@@ -1800,25 +1800,18 @@ pub(super) fn image_header(
         u64::from(exponent_bits_per_sample == 0 && bits_per_sample <= 14),
         1,
     )?;
-    if format.has_alpha() {
-        output.write_bits(1, 2)?; // one alpha extra channel
-        if bits_per_sample == 8
-            && exponent_bits_per_sample == 0
-            && color.alpha == AlphaAssociation::Unassociated
-        {
-            output.write_bits(1, 1)?; // default 8-bit, unassociated alpha metadata
-        } else {
-            output.write_bits(0, 1)?; // explicit alpha metadata
-            output.write_bits(0, 2)?; // alpha extra-channel type
-            write_sample_bit_depth(&mut output, bits_per_sample, exponent_bits_per_sample)?;
-            output.write_bits(0, 2)?; // full-resolution dim_shift
-            output.write_bits(0, 2)?; // empty name
-            output.write_bits(u64::from(color.alpha == AlphaAssociation::Associated), 1)?;
-        }
+    let samples = if exponent_bits_per_sample == 0 {
+        crate::ColorSampleFormat::integer(format.color_channels(), bits_per_sample)?
     } else {
-        output.write_bits(0, 2)?;
-    }
-    output.write_bits(0, 1)?;
+        crate::ColorSampleFormat::float(
+            format.color_channels(),
+            bits_per_sample,
+            exponent_bits_per_sample,
+        )?
+    };
+    crate::sample_format::ImageSamplePlan::new(samples, format.has_alpha().then_some(color.alpha))
+        .write_extra_channels(&mut output)?;
+    output.write_bits(0, 1)?; // original color
     color.encoding.write(
         &mut output,
         format.color_channels(),

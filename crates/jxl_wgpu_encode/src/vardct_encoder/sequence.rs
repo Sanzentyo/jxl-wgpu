@@ -18,10 +18,10 @@ pub type VarDctSequenceDescriptor = crate::ImageSequenceDescriptor;
 
 /// Independent GPU frame submissions and deterministic sequence assembly.
 ///
-/// Supports Replace, Add and Multiply, signed crops, hidden zero-duration frames,
+/// Supports all five blend modes with alpha, signed crops, hidden zero-duration frames,
 /// timecodes and four post-color-transform reference slots. Pre-color-transform storage is
-/// rejected until the profile supports its consumers. Alpha-weighted modes require an alpha source and
-/// are rejected by this color-only profile. Frame controls are checked before GPU admission;
+/// rejected until the profile supports its consumers. Alpha uses an independent blend/reference
+/// field; weighted modes require an alpha source. Frame controls are checked before GPU admission;
 /// failure leaves the frame index and final-frame state available for retry.
 pub struct VarDctSequenceSession {
     descriptor: VarDctSequenceDescriptor,

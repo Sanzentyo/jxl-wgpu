@@ -28,7 +28,7 @@ use super::types::{
     VarDctArtifactData, VarDctArtifactHeader, VarDctFrameLayout, VarDctKernelParams,
     VarDctLfMetadata, VarDctMemoryPlan, VarDctStrategy, VarDctTopology,
 };
-use super::{icc_input, raw_matrices, saliency, transforms};
+use super::{icc_input, modular_plane, raw_matrices, saliency, transforms};
 use crate::frame_header::FrameHeaderPlan;
 use crate::{
     AnimationHeader, BackendError, BitFragment, BufferImageSource, Determinism, EncodeError,
@@ -57,6 +57,7 @@ pub(super) const TILED_WORKGROUP_STORAGE_BYTES: u32 = 2 * 64 * 16 + 4;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct VarDctDispatchPlan {
+    alpha: Option<modular_plane::Plan>,
     icc: Option<icc_input::Plan>,
     source_windows: crate::source::SourceWindows,
     kernel: VarDctKernelPlan,
@@ -84,6 +85,7 @@ enum VarDctPipelines {
 /// constructor selects geometry at submission time. Pixels and coefficients remain
 /// on the GPU until it has packed their entropy fragments.
 pub struct VarDctBackend {
+    alpha_pipeline: Option<modular_plane::Pipeline>,
     icc_pipeline: Option<icc_input::Pipeline>,
     pipelines: VarDctPipelines,
     workgroup_variant: KernelVariant,
@@ -283,7 +285,17 @@ impl VarDctBackend {
         if saliency_pipeline.is_some() {
             implemented_stages.push(KernelStage::GroupOrderSelection);
         }
+        if color_plan.samples.alpha.is_some() {
+            implemented_stages.extend([
+                KernelStage::ModularPrediction,
+                KernelStage::ModularResidualTokenization,
+            ]);
+        }
         Ok(Self {
+            alpha_pipeline: color_plan
+                .samples
+                .alpha
+                .map(|_| modular_plane::Pipeline::new(context.device())),
             icc_pipeline: color_plan
                 .icc_transform
                 .as_ref()
@@ -339,10 +351,16 @@ impl VarDctBackend {
         self.config.lf_metadata
     }
 
-    /// Stream-wide channels and precision used for source admission, GPU normalization and image metadata.
+    /// Stream-wide color channels and precision; optional alpha shares this precision.
     #[must_use]
     pub const fn sample_format(&self) -> crate::ColorSampleFormat {
         self.color_plan.samples()
+    }
+
+    /// Declared association of the optional lossless alpha plane.
+    #[must_use]
+    pub const fn alpha_association(&self) -> Option<crate::AlphaAssociation> {
+        self.color_plan.samples.alpha
     }
 
     pub(crate) fn sequence_header(
@@ -405,8 +423,12 @@ impl VarDctBackend {
         request: &FrameEncodeRequest,
     ) -> Result<(VarDctDispatchPlan, FrameHeaderPlan, VarDctConfig), EncodeError> {
         let extent = source.layout.extent;
-        let control =
-            validate_vardct_request(request, (extent.width, extent.height), &self.config)?;
+        let control = validate_vardct_request(
+            request,
+            (extent.width, extent.height),
+            &self.config,
+            self.color_plan.samples.alpha.is_some(),
+        )?;
         self.color_plan.validate_frame(&control)?;
         let mut config = self.config.clone();
         config.progressive = control.effective_progressive(&config.progressive);
@@ -693,7 +715,45 @@ impl VarDctBackend {
             memory.owned_bytes_per_job += icc.memory.total_bytes;
             memory.addressed_bytes_per_job += icc.memory.total_bytes;
         }
+        let alpha = self
+            .color_plan
+            .samples
+            .alpha_component()
+            .map(|index| {
+                let mut sources = [region.components[index]];
+                source_windows.rebase(&mut sources, [region.offsets[index], 0, 0, 0])?;
+                let plan = modular_plane::Plan::new(
+                    frame,
+                    sources[0],
+                    self.sample_format().sample_mask(),
+                    source_layout.spec.big_endian,
+                    progressive,
+                    &self.code,
+                )?;
+                plan.validate_limits(
+                    self.max_buffer_size,
+                    self.max_storage_binding_size,
+                    self.max_compute_workgroups_per_dimension,
+                )?;
+                Ok::<_, EncodeError>(plan)
+            })
+            .transpose()?;
+        if let Some(alpha) = alpha {
+            memory.alpha = Some(alpha.memory);
+            memory.readback_bytes += alpha.memory.readback_bytes;
+            memory.owned_bytes_per_job += alpha.memory.total_bytes;
+            memory.addressed_bytes_per_job += alpha.memory.total_bytes;
+            if memory.readback_bytes > self.max_buffer_size {
+                return Err(UnsupportedFeature::DeviceLimit {
+                    name: "max_buffer_size",
+                    required: memory.readback_bytes,
+                    available: self.max_buffer_size,
+                }
+                .into());
+            }
+        }
         Ok(VarDctDispatchPlan {
+            alpha,
             icc,
             source_windows,
             kernel,
@@ -727,6 +787,7 @@ fn validate_vardct_request(
     request: &FrameEncodeRequest,
     source_extent: (u32, u32),
     config: &VarDctConfig,
+    has_alpha: bool,
 ) -> Result<FrameHeaderPlan, EncodeError> {
     if request.progressive != config.progressive {
         return Err(EncodeError::InvalidConfiguration(
@@ -747,7 +808,7 @@ fn validate_vardct_request(
             "the VarDCT encoder supports only post-color-transform references",
         ));
     }
-    FrameHeaderPlan::new(request, source_extent, false)
+    FrameHeaderPlan::new(request, source_extent, has_alpha)
 }
 
 impl GpuEncodeBackend for VarDctBackend {
@@ -823,6 +884,20 @@ impl GpuEncodeBackend for VarDctBackend {
                     label: Some("jxl-wgpu VarDCT encode"),
                 });
         commands.clear_buffer(&artifact, 0, None);
+        let alpha_scratch =
+            self.alpha_pipeline
+                .as_ref()
+                .zip(plan.alpha)
+                .map(|(pipeline, alpha)| {
+                    pipeline.encode(
+                        context.device(),
+                        &mut commands,
+                        alpha,
+                        original_sources.clone(),
+                        &readback,
+                        plan.memory.artifact_storage_bytes + plan.memory.raw_matrix_artifact_bytes,
+                    )
+                });
         let icc_scratch = self
             .icc_pipeline
             .as_ref()
@@ -1000,6 +1075,7 @@ impl GpuEncodeBackend for VarDctBackend {
         let callback_completion = Arc::clone(&completion);
         let readback_for_map = Arc::clone(&readback);
         let lifetime = Arc::new(VarDctJobLifetime {
+            _alpha: alpha_scratch,
             _icc: icc_scratch,
             _parameters: parameters,
             _artifact: artifact,
@@ -1035,6 +1111,7 @@ impl GpuEncodeBackend for VarDctBackend {
         }
 
         Ok(VarDctJob {
+            alpha_plan: plan.alpha,
             lifetime: Some(lifetime),
             completion,
             code: self.code.clone(),
@@ -1112,6 +1189,7 @@ impl VarDctMapCompletion {
 }
 
 struct VarDctJobLifetime {
+    _alpha: Option<modular_plane::Scratch>,
     _icc: Option<icc_input::Scratch>,
     _raw_matrices: Option<raw_matrices::Scratch>,
     _transform: Option<transforms::Scratch>,
@@ -1132,6 +1210,7 @@ impl Drop for VarDctJobLifetime {
 }
 
 pub struct VarDctJob {
+    alpha_plan: Option<modular_plane::Plan>,
     raw_matrix_plan: Option<Arc<raw_matrices::Plan>>,
     lifetime: Option<Arc<VarDctJobLifetime>>,
     completion: Arc<VarDctMapCompletion>,
@@ -1241,7 +1320,7 @@ impl VarDctJob {
             }
         };
         let result = (|| {
-            let boundary = self.artifact_layout.artifact_bytes() as usize;
+            let mut boundary = self.artifact_layout.artifact_bytes() as usize;
             let mut artifact = validate_artifact(
                 &mapped[..boundary],
                 self.artifact_layout,
@@ -1251,9 +1330,14 @@ impl VarDctJob {
                 self.transform_plan.as_deref(),
             )?;
             if let Some(raw) = &self.raw_matrix_plan {
-                artifact.raw_matrices = raw.validate(&mapped[boundary..])?;
+                let end = boundary + raw.artifact_bytes() as usize;
+                artifact.raw_matrices = raw.validate(&mapped[boundary..end])?;
+                boundary = end;
+            }
+            if let Some(alpha) = &self.alpha_plan {
+                artifact.alpha = alpha.validate(&mapped[boundary..], &self.code)?;
             } else if mapped.len() != boundary {
-                return Err(BackendError::InvalidArtifact("unexpected raw matrix artifact").into());
+                return Err(BackendError::InvalidArtifact("unexpected side-plane artifact").into());
             }
             Ok(GpuFrameArtifacts {
                 frame_index: self.control.frame_index(),
@@ -1691,6 +1775,7 @@ pub(super) fn validate_artifact<'a>(
     Ok(VarDctArtifactData {
         saliency,
         raw_matrices: Default::default(),
+        alpha: Default::default(),
         transform_plan,
         strategy: expected_strategy,
         dc_fragment_words: fragment_words,
@@ -1836,6 +1921,12 @@ impl VarDctEncoder {
         self.encoder.backend().sample_format()
     }
 
+    /// Declared association of the optional lossless alpha plane.
+    #[must_use]
+    pub fn alpha_association(&self) -> Option<crate::AlphaAssociation> {
+        self.encoder.backend().alpha_association()
+    }
+
     /// Declared presentation color encoding.
     #[must_use]
     pub fn source_color(&self) -> &jxl_gpu_formats::ColorSpecification {
@@ -1978,6 +2069,12 @@ impl TiledVarDctEncoder {
     #[must_use]
     pub fn sample_format(&self) -> crate::ColorSampleFormat {
         self.encoder.backend().sample_format()
+    }
+
+    /// Declared association of the optional lossless alpha plane.
+    #[must_use]
+    pub fn alpha_association(&self) -> Option<crate::AlphaAssociation> {
+        self.encoder.backend().alpha_association()
     }
 
     /// Declared presentation color encoding.

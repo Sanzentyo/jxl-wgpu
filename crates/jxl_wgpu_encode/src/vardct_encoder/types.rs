@@ -250,6 +250,8 @@ pub struct VarDctMemoryPlan {
     pub icc_storage_bytes: u64,
     /// XYB's resident ICC conversion, included in the job's total reservation.
     pub icc: Option<super::VarDctIccMemoryPlan>,
+    /// Lossless full-resolution alpha, retained through the same completion map as color.
+    pub alpha: Option<super::VarDctAlphaMemoryPlan>,
     /// Union of bytes made addressable by the source plane bindings, counting alignment
     /// overlap once and excluding gaps between windows. The caller owns the allocation;
     /// these bytes are not charged to `owned_bytes_per_job`.
@@ -338,6 +340,7 @@ impl VarDctMemoryPlan {
             icc_profile_bytes: 0,
             icc_storage_bytes: 0,
             icc: None,
+            alpha: None,
             source_binding_bytes,
             parameter_storage_bytes,
             artifact_storage_bytes,
@@ -936,6 +939,7 @@ pub(super) fn align_words(words: u32) -> Result<u32, EncodeError> {
 
 #[derive(Clone, Copy)]
 pub(super) struct VarDctArtifactData<'a> {
+    pub(super) alpha: super::modular_plane::Fragments<'a>,
     pub(super) saliency: Option<&'a [super::saliency::Record]>,
     pub(super) raw_matrices: super::raw_matrices::Fragments<'a>,
     pub(super) transform_plan: Option<&'a super::strategy_map::TransformPlan>,

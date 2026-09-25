@@ -57,13 +57,25 @@ or ownership rules change, and regular frames retain their requested progression
 `ImageSequenceDescriptor` compiles bounded image geometry and optional timebase fragments;
 `VarDctSequenceDescriptor` remains an alias.
 Sequence creation binds them to the backend's immutable `VarDctColorPlan`, which lowers the
-typed XYB/original-component selection, checked `ColorSampleFormat`, enumerated or ICC source color and image options once. That same plan supplies image metadata, the presence
+typed XYB/original-component selection, checked color precision plus optional alpha in `ImageSamplePlan`, enumerated or ICC source color and image options once. That same plan supplies image metadata, the presence
 of frame color/matrix-scale fields, GPU normalization and HF channel multipliers. Jobs retain
 it through packet assembly; neither the serializer nor either GPU path infers the domain
 from other configuration. Original coding transforms normalized source components with neutral HF
 channel multipliers; XYB retains linearization, opsin conversion and its standard X/B scales.
 LF/correlation and matrix/order policy remain explicit and independent of color selection.
 All source-dependent operations stay on the GPU, using completion-owned allocations. [Original-RGB evidence](CONFORMANCE_CORPUS.md#original-rgb-vardct-encoding).
+
+`ImageSamplePlan` keeps color precision and optional alpha association separate from physical
+packing and VarDCT's three working components. Its channel mapping and extra-channel writer are
+shared with lossless Modular. `modular_plane::Plan` then resolves full-resolution alpha's group
+geometry and first full-resolution pass from the effective frame progression. It owns exact row
+fragment bounds, GPU parameters and LF-global/pass-group routing; assembly does not infer those
+from alpha flags or pixel dimensions again. GPU row tasks compute raw-word Gradient residuals and
+prefix bits directly from the original source windows, independently of ICC or color conversion.
+Only validated row identity, sample counts, exact entropy termination and zero padding establish
+artifact authority. The existing job permit/map retains side-plane parameters, artifact and
+readback through cancellation or completed assembly. This side-image boundary leaves the
+existing color transform and complete Modular frame encoder in their owning layers.
 
 `VarDctConfig::source_color` is lowered to the same checked enumerated encoding that writes
 Modular metadata. Custom xy and gamma are quantized once to wire precision, then expanded for
@@ -131,13 +143,13 @@ bounds. The map callback drops its lifetime reference before waking completion, 
 artifacts synchronously return their reservation; abandoned jobs still retain it until GPU
 completion. [Floating-input evidence](CONFORMANCE_CORPUS.md#floating-rgb-vardct-input).
 
-`MixedModeEncoder` binds this same image plan to original Gray/RGB components and hosts both existing codec
+`MixedModeEncoder` binds this same image plan to original Gray/RGB components plus optional alpha and hosts both existing codec
 backends. Its immutable per-codec `FrameCoding` values contain profile and progression; the
 caller selects one for each physical frame. The generic `EncodeSession` retains the sole
 frame counter, finality, canvas and timebase, validates before admission, and advances only
 after successful submission. Fixed-codec sessions use this same submission path. Geometry
 belongs to the selected backend: a fixed VarDCT transform/map does not constrain Modular sources.
-Both codecs accept the same logical Gray/RGB channels, integer/floating precision, enumerated or ICC color and post-transform
+Both codecs accept the same logical color/alpha channels, integer/floating precision, enumerated or ICC color and post-transform
 references. Physical frames may independently change their supported layout, swizzle and word byte order. XYB configuration and incompatible source/reference contracts fail before admission.
 
 Memory queries and submissions share each backend's frame preparation, including reference-only
@@ -157,8 +169,9 @@ Frames retain the encoder's immutable transform/quantizer policy and the legal p
 tiled crop extents. Failed submissions leave the frame index and finality available for retry;
 completed artifacts may be inserted in any order. Reference slots describe codestream metadata,
 not host-computed image state: the GPU encodes each supplied source and the decoder composes it.
-This profile emits post-color-transform references and rejects pre-transform storage, alpha
-blends and extra-channel contracts. Frame control adds no GPU allocation, binding, submission or
+This profile emits post-color-transform references and rejects pre-transform storage.
+An image-sample plan with alpha enables all five blend modes and its independent extra-channel
+blend/reference field; arbitrary extra-channel input remains outside this profile. Frame control adds no GPU allocation, binding, submission or
 map of its own; the effective pass layout determines existing artifact sizes. Completion and
 cancellation ownership remain unchanged. Syntax and conformance
 scope remain in the [animation](CONFORMANCE_CORPUS.md#vardct-animation-encoding) and

@@ -1,17 +1,17 @@
 //! Checked image geometry and timebase shared by VarDCT and mixed-codec sequences.
 
 use crate::frame_header::write_animation_header;
-use crate::sample_format::write_sample_bit_depth;
-use crate::{AnimationHeader, BitFragment, ColorSampleFormat, EncodeError};
+use crate::sample_format::{ImageSamplePlan, write_sample_bit_depth};
+use crate::{AnimationHeader, BitFragment, EncodeError};
 use crate::{
     ImageColorOptions,
     source_color::{SourceColorEncoding, icc::PreparedImageHeader},
 };
 use jxl_gpu_bitstream::BitWriter;
 
-/// Stream-wide canvas and optional timebase for a Gray/RGB layered still or animation.
+/// Stream-wide canvas and optional timebase for a Gray/RGB layered still or animation with optional alpha.
 ///
-/// Every frame uses the encoder's configured Gray/RGB channels, integer or floating precision
+/// Every frame uses the encoder's configured color/alpha channels, integer or floating precision
 /// and source color. The encoder binds the image's coding domain:
 /// XYB or original components for VarDCT sequences, original components for mixed-codec sequences.
 /// Modular and tiled DCT8 sources may vary in extent; a single VarDCT transform or checked
@@ -43,7 +43,7 @@ impl ImageSequenceDescriptor {
     pub(crate) fn image_header(
         &self,
         xyb_encoded: bool,
-        samples: ColorSampleFormat,
+        samples: ImageSamplePlan,
         encoding: &SourceColorEncoding,
         options: ImageColorOptions,
         max_icc_profile_bytes: u64,
@@ -132,7 +132,7 @@ impl ImageHeaderPlan {
     fn encode(
         &self,
         xyb_encoded: bool,
-        samples: ColorSampleFormat,
+        samples: ImageSamplePlan,
         encoding: &SourceColorEncoding,
         options: ImageColorOptions,
         max_icc_profile_bytes: u64,
@@ -154,15 +154,19 @@ impl ImageHeaderPlan {
         }
         write_sample_bit_depth(
             &mut output,
-            samples.bits_per_sample(),
-            samples.exponent_bits(),
+            samples.color.bits_per_sample(),
+            samples.color.exponent_bits(),
         )?;
         // VarDCT LF coefficients are checked i32 values independently of input depth.
         // Mixed sequences must retain that same image-wide working-buffer contract.
         output.write_bits(0, 1)?; // 32-bit Modular buffers
-        output.write_bits(0, 2)?; // no extra channels
+        samples.write_extra_channels(&mut output)?;
         output.write_bits(u64::from(xyb_encoded), 1)?;
-        encoding.write(&mut output, samples.channels(), options.rendering_intent)?;
+        encoding.write(
+            &mut output,
+            samples.color.channels(),
+            options.rendering_intent,
+        )?;
         if extra_fields {
             options.write_tone(&mut output)?;
         }

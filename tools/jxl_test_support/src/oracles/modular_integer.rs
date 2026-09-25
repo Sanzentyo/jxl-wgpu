@@ -1,5 +1,26 @@
 //! Exact original working words from jxl-oxide, before any floating-point conversion.
 
+/// Exact retained extra-channel words, including Modular planes accompanying VarDCT color.
+/// Presentation arithmetic must not have converted these to F32; that is a separate oracle.
+pub fn extra_planes(data: &[u8], frame_index: usize) -> Vec<Vec<i32>> {
+    let image = jxl_oxide::JxlImage::read_with_defaults(data).unwrap();
+    let render = image.render_frame(frame_index).unwrap();
+    render
+        .extra_channels()
+        .1
+        .iter()
+        .map(|channel| match channel {
+            jxl_render::ImageBuffer::I32(grid) => grid.buf().to_vec(),
+            jxl_render::ImageBuffer::I16(grid) => {
+                grid.buf().iter().map(|&v| i32::from(v)).collect()
+            }
+            jxl_render::ImageBuffer::F32(_) => {
+                panic!("extra-channel oracle must retain original sample words")
+            }
+        })
+        .collect()
+}
+
 /// Independently inspect local headers of a one-pass Modular encoder frame.
 /// Returns `(use_global_tree, rct_type)` for each separate pass group. Fused single-group
 /// frames have no local header. This helper accepts zero or one RCT, and intentionally

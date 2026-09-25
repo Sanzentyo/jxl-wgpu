@@ -8,6 +8,111 @@ use jxl_gpu_formats::{
 
 use crate::EncodeError;
 
+/// Interpretation of source color relative to alpha, shared by both encoders.
+/// No association conversion or invisible-color replacement is performed. Modular
+/// preserves color words; VarDCT applies its selected lossy color coding normally.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AlphaAssociation {
+    /// Color samples are independent of alpha.
+    #[default]
+    Unassociated,
+    /// Color samples are already multiplied by alpha.
+    Associated,
+}
+
+impl AlphaAssociation {
+    pub(crate) fn validate(self, format: crate::source::SourceChannels) -> Result<(), EncodeError> {
+        if self == Self::Associated && !format.has_alpha() {
+            return Err(EncodeError::InvalidConfiguration(
+                "associated source color requires an alpha channel",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Logical image samples, independent of physical storage or three-plane VarDCT work.
+/// Alpha currently shares the color precision and full-resolution source geometry.
+/// This owns the component count, alpha index and serialized extra-channel declaration.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ImageSamplePlan {
+    pub(crate) color: ColorSampleFormat,
+    pub(crate) alpha: Option<AlphaAssociation>,
+}
+
+impl ImageSamplePlan {
+    pub(crate) const fn new(color: ColorSampleFormat, alpha: Option<AlphaAssociation>) -> Self {
+        Self { color, alpha }
+    }
+
+    pub(crate) const fn channels(self) -> crate::source::SourceChannels {
+        use crate::source::SourceChannels;
+        match (self.color.channels(), self.alpha) {
+            (ColorChannels::Gray, None) => SourceChannels::Gray,
+            (ColorChannels::Gray, Some(_)) => SourceChannels::GrayAlpha,
+            (ColorChannels::Rgb, None) => SourceChannels::Rgb,
+            (ColorChannels::Rgb, Some(_)) => SourceChannels::Rgba,
+        }
+    }
+
+    pub(crate) fn alpha_component(self) -> Option<usize> {
+        self.alpha.map(|_| self.color.channels().count() as usize)
+    }
+
+    pub(crate) fn pixel_format(self) -> PixelFormat {
+        let mut format = self.color.pixel_format();
+        if self.alpha.is_some() {
+            let mut word = format.planes[0].words[0].clone();
+            word.fields.last_mut().expect("canonical sample field").kind =
+                jxl_gpu_formats::PackingFieldKind::Channel(Channel::W);
+            format.planes[0].words.push(word);
+            format.swizzle = match self.color.channels() {
+                ColorChannels::Gray => Swizzle::X00W,
+                ColorChannels::Rgb => Swizzle::XYZW,
+            };
+        }
+        format
+    }
+
+    pub(crate) fn matches_format(self, format: &PixelFormat) -> bool {
+        let Ok(spec) = crate::source::source_spec(format) else {
+            return false;
+        };
+        (format.model
+            == match self.color.channels() {
+                ColorChannels::Gray => ColorModel::Gray,
+                ColorChannels::Rgb => ColorModel::Rgb,
+            }
+            || matches!(
+                (&format.model, &format.color_spec),
+                (ColorModel::IccDevice, ColorSpecification::Icc(_))
+            ))
+            && spec.format == self.channels()
+            && spec.bits_per_sample == self.color.bits_per_sample()
+            && spec.exponent_bits_per_sample == self.color.exponent_bits()
+    }
+
+    pub(crate) fn write_extra_channels(self, output: &mut BitWriter) -> Result<(), EncodeError> {
+        let Some(alpha) = self.alpha else {
+            output.write_bits(0, 2)?;
+            return Ok(());
+        };
+        output.write_bits(1, 2)?; // one full-resolution alpha
+        let bits = self.color.bits_per_sample();
+        let exponent = self.color.exponent_bits();
+        let default = bits == 8 && exponent == 0 && alpha == AlphaAssociation::Unassociated;
+        output.write_bits(u64::from(default), 1)?;
+        if !default {
+            output.write_bits(0, 2)?; // alpha type
+            write_sample_bit_depth(output, bits, exponent)?;
+            output.write_bits(0, 2)?; // dim_shift
+            output.write_bits(0, 2)?; // empty name
+            output.write_bits(u64::from(alpha == AlphaAssociation::Associated), 1)?;
+        }
+        Ok(())
+    }
+}
+
 /// Logical color channels, separate from physical packing and VarDCT's working planes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ColorChannels {
@@ -21,13 +126,6 @@ impl ColorChannels {
         match self {
             Self::Gray => 1,
             Self::Rgb => 3,
-        }
-    }
-
-    pub(crate) const fn source_channels(self) -> crate::source::SourceChannels {
-        match self {
-            Self::Gray => crate::source::SourceChannels::Gray,
-            Self::Rgb => crate::source::SourceChannels::Rgb,
         }
     }
 
@@ -214,24 +312,6 @@ impl ColorSampleFormat {
         }
     }
 
-    pub(crate) fn matches_format(self, format: &PixelFormat) -> bool {
-        let Ok(spec) = crate::source::source_spec(format) else {
-            return false;
-        };
-        (format.model
-            == match self.channels {
-                ColorChannels::Gray => ColorModel::Gray,
-                ColorChannels::Rgb => ColorModel::Rgb,
-            }
-            || matches!(
-                (&format.model, &format.color_spec),
-                (ColorModel::IccDevice, ColorSpecification::Icc(_))
-            ))
-            && spec.format == self.channels.source_channels()
-            && spec.bits_per_sample == self.bits_per_sample()
-            && spec.exponent_bits_per_sample == self.exponent_bits()
-    }
-
     pub(crate) const fn sample_mask(self) -> u32 {
         u32::MAX >> (32 - self.bits_per_sample())
     }
@@ -306,7 +386,7 @@ mod tests {
             for format in formats {
                 let pixel_format = format.pixel_format();
                 pixel_format.validate().unwrap();
-                assert!(format.matches_format(&pixel_format));
+                assert!(ImageSamplePlan::new(format, None).matches_format(&pixel_format));
                 assert_eq!(
                     pixel_format.planes[0].words.len(),
                     channels.count() as usize
@@ -318,7 +398,7 @@ mod tests {
                     },
                     ..format
                 };
-                assert!(!other.matches_format(&pixel_format));
+                assert!(!ImageSamplePlan::new(other, None).matches_format(&pixel_format));
             }
         }
     }
