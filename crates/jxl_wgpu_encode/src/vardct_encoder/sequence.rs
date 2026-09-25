@@ -1,4 +1,4 @@
-//! Checked stream metadata and ordered assembly for RGB8 frame sequences.
+//! Checked stream metadata and ordered assembly for RGB frame sequences.
 
 use super::{VarDctBackend, VarDctConfig, VarDctJob};
 use crate::{
@@ -13,8 +13,8 @@ pub type VarDctAnimationDescriptor = VarDctSequenceDescriptor;
 /// Compatibility name for [`VarDctSequenceSession`].
 pub type VarDctAnimationSession = VarDctSequenceSession;
 
-/// Compatibility name for the common RGB8 sequence descriptor.
-pub type VarDctSequenceDescriptor = crate::Rgb8SequenceDescriptor;
+/// Compatibility name for the common RGB sequence descriptor.
+pub type VarDctSequenceDescriptor = crate::RgbSequenceDescriptor;
 
 /// Independent GPU frame submissions and deterministic sequence assembly.
 ///

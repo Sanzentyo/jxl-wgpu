@@ -33,14 +33,14 @@ fn config(entropy: LosslessModularEntropyCoding) -> MixedModeConfig {
 
 // Use the existing independent single-codec APIs to obtain physical-frame references.
 // Whole-sequence oracles below also decode the actual mixed stream, including its controls.
-struct Stills {
+pub(super) struct Stills {
     modular: LosslessModularEncoder,
     vardct: Option<VarDctEncoder>,
     tiled: Option<TiledVarDctEncoder>,
 }
 
 impl Stills {
-    fn new(context: &WgpuContext, config: &MixedModeConfig) -> Self {
+    pub(super) fn new(context: &WgpuContext, config: &MixedModeConfig) -> Self {
         let (vardct, tiled) = match &config.vardct_transform {
             VarDctTransformSelection::Single(strategy) => (
                 Some(
@@ -79,7 +79,11 @@ impl Stills {
         }
     }
 
-    fn encode(&self, source: BufferImageSource, mode: MixedModeFrameEncoding) -> Vec<u8> {
+    pub(super) fn encode(
+        &self,
+        source: BufferImageSource,
+        mode: MixedModeFrameEncoding,
+    ) -> Vec<u8> {
         match mode {
             MixedModeFrameEncoding::Modular => self.modular.encode(source),
             MixedModeFrameEncoding::VarDct => match &self.vardct {
@@ -304,7 +308,29 @@ fn mixed_mode_forced_stills_match_both_existing_encoders() {
                 session.submit_last_frame(source.clone(), mode, Default::default()),
                 Err(EncodeError::SessionClosed)
             ));
-            assert_eq!(session.finish_raw().unwrap(), stills.encode(source, mode));
+            let encoded = session.finish_raw().unwrap();
+            let baseline = stills.encode(source, mode);
+            if mode == VARDCT {
+                assert_eq!(encoded, baseline);
+            } else {
+                let header = |bytes: &[u8]| {
+                    jxl_gpu_bitstream::parse(bytes, Default::default())
+                        .unwrap()
+                        .codestream_inventory(Default::default())
+                        .unwrap()
+                        .image_header
+                };
+                let actual = header(&encoded);
+                let mut expected = header(&baseline);
+                assert!(!actual.modular_16bit_buffers);
+                assert!(expected.modular_16bit_buffers);
+                // The mixed image reserves i32 LF buffers for its configured VarDCT codec.
+                // All other metadata and the complete physical Modular frame remain identical.
+                expected.modular_16bit_buffers = false;
+                assert_eq!(actual, expected);
+                let offset = actual.bit_range.length.div_ceil(8) as usize;
+                assert_eq!(&encoded[offset..], &baseline[offset..]);
+            }
         }
     }
     assert_eq!(context.memory_stats().reserved_bytes, 0);

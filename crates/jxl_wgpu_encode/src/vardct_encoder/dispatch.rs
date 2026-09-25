@@ -290,7 +290,7 @@ impl VarDctBackend {
             topology,
             transform_plan,
             tiled_metadata,
-            color_plan: VarDctColorPlan::new(config.color_transform),
+            color_plan: VarDctColorPlan::new(config.color_transform, config.sample_format),
             config: config.clone(),
             capabilities: EncoderCapabilities {
                 profiles: vec![ProfileCapability::VarDct {
@@ -322,11 +322,17 @@ impl VarDctBackend {
         self.config.lf_metadata
     }
 
+    /// Stream-wide precision used for source admission, GPU normalization and image metadata.
+    #[must_use]
+    pub const fn sample_format(&self) -> crate::RgbSampleFormat {
+        self.color_plan.samples()
+    }
+
     pub(crate) fn sequence_header(
         &self,
-        descriptor: &crate::Rgb8SequenceDescriptor,
+        descriptor: &crate::RgbSequenceDescriptor,
     ) -> Result<BitFragment, EncodeError> {
-        descriptor.image_header(self.color_plan.xyb_encoded())
+        descriptor.image_header(self.color_plan.xyb_encoded(), self.sample_format())
     }
 
     /// Computes memory admission and source binding with the configured regular-frame passes.
@@ -391,7 +397,7 @@ impl VarDctBackend {
             }
         };
         self.config.group_order.validate(frame)?;
-        if source.layout.format != VarDctColorEncoding::SrgbD65.pixel_format()
+        if source.layout.format != self.sample_format().pixel_format()
             || source.layout.planes.len() != 1
             || !source.buffer.usage().contains(wgpu::BufferUsages::STORAGE)
         {
@@ -401,7 +407,7 @@ impl VarDctBackend {
             .layout
             .plane(0)
             .ok_or(EncodeError::InvalidSource("missing VarDCT RGB plane"))?;
-        let row_bytes = u64::from(extent.width) * 3;
+        let row_bytes = u64::from(extent.width) * 3 * u64::from(self.sample_format().word_bytes());
         if plane.row_bytes != row_bytes || plane.row_stride < row_bytes {
             return Err(EncodeError::InvalidSource(
                 "the VarDCT RGB plane has an invalid row layout",
@@ -575,7 +581,9 @@ impl VarDctBackend {
                         saliency_offset: layout.saliency_offset,
                         saliency_groups: layout.saliency_groups,
                         color_normalization: self.color_plan.normalization(),
-                        padding: [0; 6],
+                        source_word_bytes: u32::from(self.sample_format().word_bytes()),
+                        source_sample_mask: self.sample_format().sample_mask(),
+                        padding: [0; 4],
                     },
                     layout,
                 },
@@ -1743,12 +1751,18 @@ impl VarDctEncoder {
         self.encoder.backend().lf_metadata()
     }
 
-    /// Selected coding domain; the accepted source remains RGB8 sRGB/D65.
+    /// Selected coding domain; the accepted source remains integer RGB sRGB/D65.
     #[must_use]
     pub fn color_transform(&self) -> VarDctColorTransform {
         self.encoder.backend().config.color_transform
     }
 
+    #[must_use]
+    pub fn sample_format(&self) -> crate::RgbSampleFormat {
+        self.encoder.backend().sample_format()
+    }
+
+    /// Declared presentation color encoding.
     #[must_use]
     pub const fn color_encoding(&self) -> VarDctColorEncoding {
         VarDctColorEncoding::SrgbD65
@@ -1779,7 +1793,7 @@ impl VarDctEncoder {
             .memory_plan_for_request(source, request)
     }
 
-    /// Begins an RGB8 animation using this encoder's transform and quantization policy.
+    /// Begins an integer RGB animation using this encoder's transform and quantization policy.
     /// Frame extents must match the selected transform/map, or the tiled backend's limits.
     pub fn begin_animation(
         &self,
@@ -1859,7 +1873,7 @@ impl VarDctEncoder {
 /// GPU-only JPEG XL VarDCT encoder for a rectangular grid of independent
 /// regular DCT8 transforms.
 ///
-/// Accepts nonzero RGB8 dimensions through 16,384 pixels on each axis, with
+/// Accepts nonzero integer RGB dimensions through 16,384 pixels on each axis, with
 /// partial edge blocks replicated on the GPU. Every block carries quantized
 /// DC and AC, using default matrices, configurable coefficient orders and one prefix distribution.
 /// The frame has every 2,048-pixel LF group and 256-pixel AC group; a single
@@ -1907,12 +1921,18 @@ impl TiledVarDctEncoder {
         self.encoder.backend().lf_metadata()
     }
 
-    /// Selected coding domain; the accepted source remains RGB8 sRGB/D65.
+    /// Selected coding domain; the accepted source remains integer RGB sRGB/D65.
     #[must_use]
     pub fn color_transform(&self) -> VarDctColorTransform {
         self.encoder.backend().config.color_transform
     }
 
+    #[must_use]
+    pub fn sample_format(&self) -> crate::RgbSampleFormat {
+        self.encoder.backend().sample_format()
+    }
+
+    /// Declared presentation color encoding.
     #[must_use]
     pub const fn color_encoding(&self) -> VarDctColorEncoding {
         VarDctColorEncoding::SrgbD65
@@ -1951,7 +1971,7 @@ impl TiledVarDctEncoder {
         })
     }
 
-    /// Begins an RGB8 animation using this encoder's transform and quantization policy.
+    /// Begins an integer RGB animation using this encoder's transform and quantization policy.
     /// Frame extents must match the selected transform/map, or the tiled backend's limits.
     pub fn begin_animation(
         &self,

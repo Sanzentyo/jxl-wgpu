@@ -85,14 +85,14 @@ fn compare(actual: &[f32], expected: &[f32]) {
     }
 }
 
-struct PixelOracles {
+pub(super) struct PixelOracles {
     whole: GpuDecoder<WgpuDecodeEngine>,
     windowed: GpuDecoder<WgpuDecodeEngine>,
     readback: ImageReadbackPipeline,
 }
 
 impl PixelOracles {
-    fn new(backend: &WgpuBackend) -> Self {
+    pub(super) fn new(backend: &WgpuBackend) -> Self {
         Self {
             whole: GpuDecoder::wgpu(backend.clone()).unwrap(),
             windowed: GpuDecoder::new(
@@ -105,11 +105,7 @@ impl PixelOracles {
     }
 
     fn check(&self, encoded: &[u8], input: &[[u8; 3]]) {
-        let native =
-            libjxl_output(encoded, &["--original"]).expect("required pinned native RGB oracle");
-        let (rust, extras) = rust_planes(encoded);
-        assert!(extras.is_empty());
-        compare(&rust, &native);
+        let native = self.check_decoders(encoded);
         let codes: Vec<_> = native
             .as_chunks::<4>()
             .0
@@ -125,6 +121,18 @@ impl PixelOracles {
             "source PSNR {}",
             psnr(input, &codes)
         );
+    }
+
+    pub(super) fn check_decoders(&self, encoded: &[u8]) -> Vec<f32> {
+        self.check_decoders_with_rust(encoded).0
+    }
+
+    pub(super) fn check_decoders_with_rust(&self, encoded: &[u8]) -> (Vec<f32>, Vec<f32>) {
+        let native =
+            libjxl_output(encoded, &["--original"]).expect("required pinned native RGB oracle");
+        let (rust, extras) = rust_planes(encoded);
+        assert!(extras.is_empty());
+        compare(&rust, &native);
         let format = PixelFormat::rgb_f32(
             RgbChannelOrder::Rgba,
             false,
@@ -163,6 +171,7 @@ impl PixelOracles {
                 0
             );
         }
+        (native, rust)
     }
 }
 

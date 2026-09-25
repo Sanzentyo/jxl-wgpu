@@ -1,6 +1,15 @@
-// Sum absolute RGB differences to the left/up image neighbors. Source bytes and
-// integer addition make the heuristic independent of transform/prefix policy.
+// Sum absolute RGB differences to the left/up image neighbors in a bounded 8-bit
+// proxy. This only orders groups; forward transforms retain full source precision.
+// Take the top eight valid bits, or scale smaller precisions to 0..255 with rounding.
+// Integer arithmetic preserves exact RGB8 behavior and workgroup-independent sums.
 var<workgroup> contrast_sums: array<u32, 256>;
+
+fn saliency_sample(address: u32) -> i32 {
+    let value = load_source_sample(address);
+    let mask = params.source_sample_mask;
+    if mask < 255u { return i32((value * 255u + mask / 2u) / mask); }
+    return i32(value >> (24u - countLeadingZeros(mask)));
+}
 
 @compute @workgroup_size(wg_x, 1, 1)
 fn group_saliency(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
@@ -12,11 +21,13 @@ fn group_saliency(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invoca
     for (var pixel = lane; pixel < width * height; pixel += wg_x) {
         let x = left + pixel % width;
         let y = top + pixel / width;
-        let address = params.byte_offset + y * params.row_stride + x * 3u;
+        let pixel_stride = 3u * params.source_word_bytes;
+        let address = params.byte_offset + y * params.row_stride + x * pixel_stride;
         for (var channel = 0u; channel < 3u; channel += 1u) {
-            let value = i32(load_u8(address + channel));
-            if x > 0u { sum += u32(abs(value - i32(load_u8(address + channel - 3u)))); }
-            if y > 0u { sum += u32(abs(value - i32(load_u8(address + channel - params.row_stride)))); }
+            let component = address + channel * params.source_word_bytes;
+            let value = saliency_sample(component);
+            if x > 0u { sum += u32(abs(value - saliency_sample(component - pixel_stride))); }
+            if y > 0u { sum += u32(abs(value - saliency_sample(component - params.row_stride))); }
         }
     }
     // A group has at most 131072 directed edges, each contributing at most 765.

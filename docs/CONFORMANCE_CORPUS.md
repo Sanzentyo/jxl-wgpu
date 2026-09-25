@@ -1713,8 +1713,63 @@ requires one-frame sequence bytes to equal the corresponding still API.
 
 Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib original_rgb -- --test-threads=2`.
 Native tools and an actual GPU are required. No fixture or reference is replaced. Mixed
-Modular/VarDCT sequence selection has [separate evidence](#mixed-codec-sequence-encoding); other VarDCT source colors/precisions, extra channels,
+Modular/VarDCT sequence selection and [integer source precision](#integer-rgb-vardct-input) have separate evidence; other VarDCT source colors, floating precision, extra channels,
 pre-transform reference encoding and adaptive quality selection remain outside this evidence.
+
+## Integer RGB VarDCT input
+
+`vardct_encoder/tests/precision.rs` and `tests/animation/sample_precision.rs` exercise
+the checked `RgbSampleFormat` on Apple M5/Metal (2026-09-25). All 31 integer depths cross
+XYB/original sRGB and single DCT8, a 25×17 strategy map and 259×3 tiled DCT8: 186 physical
+images, including five-pass progression, replicated edges and saliency order. Independently
+packed sources use 1/2/4-byte words, unaligned prefixes and rows, full-range endpoints,
+irregular low bits and poisoned high padding. Clean and poisoned DCT8 inputs must produce
+identical bytes. Inventory must retain the declared depth and coding domain.
+
+Single DCT8 at every depth and all 27 strategies at RGB16/XYB and RGB31/original use
+independently normalized F64 samples, cosine/native impulse bases and native matrix data.
+Compressed AC values stay within one integer quantizer step. Native SIMD and Rust `jxl`
+pixels agree within one rounded RGB8 code. The 186-image matrix also keeps the existing
+`2e-4 * (1 + abs(reference))` sRGB F32 bound against both oracles, and whole/256-byte-window
+GPU outputs are identical. Large-transform F32 checks use linear output from the required
+pinned scalar libjxl oracle, avoiding SIMD reciprocal-estimate amplification near dark sRGB
+values; Rust pixels are independently linearized with the signed sRGB transfer. GPU/scalar,
+GPU/Rust and Rust/scalar retain that same numerical bound, including negative reconstructed
+values. Native SIMD remains a separate RGB8 comparison. Source PSNR exceeds 30 dB at
+the explicit new-corpus quantizers `(35252, 256, 48)`; older corpora keep their original
+quantizers and bounds. This does not promise arbitrary-input quality at other settings.
+
+All VarDCT/mixed image headers now require 32-bit Modular working buffers. The previous
+source-depth-derived 16-bit declaration could truncate LF coefficients at fine quantizers
+even for low-bit-depth sources. The sequence tests exercise this with actual native/Rust/GPU
+output. Source normalization precision and validated i32 LF working precision are distinct.
+
+Forty saliency runs cover 1/9/17/31 bits, both GPU paths and Scalar/32/64/128/256 lanes.
+An independent U64 pixel-edge traversal checks exact sums for the bounded 8-bit proxy;
+forward transforms retain full source precision. Six precision boundaries exercise both
+paths' source admission, wrong precision/endianness/kind, malformed row/binding arithmetic,
+exact and one-byte-deficient budgets, competing jobs, cancellation, release and reuse.
+
+Twelve three-frame fixed-codec sequences cover 9/16/31 bits, both coding domains, stills
+and animation. Forty-two mixed sequences cover 1/9/16/17/24/31 bits across all three VarDCT
+backends and both timebase forms. They preserve explicit mode choices, reference-only
+producers, signed crops, Add/Multiply, five regular AC passes, reverse completion insertion,
+indexed seeking and retained outputs. Native Modular original words are exact. Whole-stream
+native and GPU output is compared to explicit composition of independently Rust-decoded
+physical stills; the normal Rust/native/GPU F32 and RGB8 bounds remain unchanged.
+
+At 31 bits, jxl-oxide 0.13 panics computing its signed normalization divisor, and Rust `jxl`
+whole-stream mixed Add/Multiply output disagrees with native libjxl and independently
+composed physical stills. Those cases retain native/GPU whole-stream and independent Rust
+physical-frame composition checks; neither unavailable whole-stream oracle is counted as a
+pass. Six additional 31-bit full-canvas Replace sequences are also checked with Rust `jxl`
+whole-stream output. Other mixed precisions and the fixed VarDCT sequences retain jxl-oxide
+whole-stream comparisons.
+
+Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib integer_precision -- --test-threads=2`,
+with both required scalar/word oracle paths from the development procedure. No fixtures,
+reference data or existing numerical bounds are replaced. Floating VarDCT input, Gray/alpha,
+ICC/other colors and arbitrary packing remain outside this capability.
 
 ## Mixed-codec sequence encoding
 
@@ -1742,8 +1797,8 @@ produce identical bytes. Plain `jxli` containers seek every presentation through
 cross-codec dependencies, and retained GPU outputs survive session destruction. All original
 precision bounds and input/output lifetime checks remain in force; no oracle fallback is used.
 
-Additional cases require byte-identical forced single-frame output to both existing encoders
-under Prefix and ANS, exact and one-byte-deficient admission for each selected mode,
+Additional cases require byte-identical forced VarDCT output and identical Modular frame
+payloads/metadata apart from the corrected 32-bit working-buffer flag under Prefix and ANS, exact and one-byte-deficient admission for each selected mode,
 cross-codec budget competition with failed-final retry, abandoned resident/streamed jobs,
 encoder reuse and complete reservation release. Invalid color/frame controls and fixed-VarDCT
 source extents fail without advancing sequence state. Larger cropped Modular input remains
@@ -1759,9 +1814,9 @@ immediate-zero checks; no added delay or weaker assertion masks the race.
 
 Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib mixed_mode -- --test-threads=2`,
 with the required native tools and `JXL_MODULAR_WORD_ORACLE` from the development procedure.
-The common encoder contract remains interleaved RGB8/default sRGB with post-transform references.
-Automatic mode/quality selection, other common color/precision/alpha contracts and pre-transform
-references are not claimed. No fixture/reference or GPU ABI is replaced.
+This original matrix uses RGB8/default sRGB; [integer-input evidence](#integer-rgb-vardct-input)
+extends the common contract to 1–31 bits. Automatic mode/quality selection, floating/color/alpha
+contracts and pre-transform references remain absent. No fixtures or references are replaced.
 
 ## VarDCT animation encoding
 

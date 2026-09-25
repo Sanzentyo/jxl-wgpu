@@ -15,6 +15,7 @@ mod layered_still;
 mod mixed_mode;
 mod original_color;
 mod reference_only;
+mod sample_precision;
 
 fn timebase(numerator: u32, denominator: u32, loops: u32, timecodes: bool) -> AnimationHeader {
     AnimationHeader::Animation {
@@ -247,8 +248,10 @@ fn check_sequence(
     );
 }
 
+#[derive(Debug)]
 enum CompositionOracle {
     JxlOxide,
+    RustJxl,
     /// Native whole-stream output plus explicit composition of independently Rust-decoded stills.
     IndependentStills,
 }
@@ -437,6 +440,16 @@ fn check_sequence_with_passes(
                 })
                 .collect(),
         )
+    } else if matches!(oracle, CompositionOracle::RustJxl) {
+        Some(
+            rust_frame_planes(encoded)
+                .into_iter()
+                .map(|(pixels, extras)| {
+                    assert!(extras.is_empty());
+                    pixels
+                })
+                .collect(),
+        )
     } else {
         // jxl-oxide panics on empty off-canvas foregrounds; Rust jxl rejects oversized
         // ReferenceOnly internal buffers. Keep these inputs and compare native whole-stream
@@ -464,7 +477,7 @@ fn check_sequence_with_passes(
         );
         if let Some(other) = &other {
             compare(
-                &format!("jxl-oxide presentation {index}"),
+                &format!("{oracle:?} presentation {index}"),
                 &other[index],
                 expected,
             );

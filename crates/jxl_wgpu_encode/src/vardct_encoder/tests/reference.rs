@@ -143,8 +143,11 @@ pub(super) fn quantized_ac(pixels: &[[u8; 3]; 64], metadata: VarDctLfMetadata) -
 }
 
 pub(super) fn xyb(pixel: [u8; 3]) -> [f64; 3] {
+    xyb_normalized(pixel.map(|value| f64::from(value) / 255.0))
+}
+
+pub(super) fn xyb_normalized(pixel: [f64; 3]) -> [f64; 3] {
     let rgb = pixel.map(|value| {
-        let value = f64::from(value) / 255.0;
         if value <= 0.04045 {
             value / 12.92
         } else {

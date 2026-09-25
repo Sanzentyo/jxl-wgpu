@@ -43,7 +43,9 @@ struct Params {
     saliency_offset: u32,
     saliency_groups: u32,
     color_normalization: u32,
-    padding: array<u32, 6>,
+    source_word_bytes: u32,
+    source_sample_mask: u32,
+    padding: array<u32, 4>,
 }
 
 @group(0) @binding(0)

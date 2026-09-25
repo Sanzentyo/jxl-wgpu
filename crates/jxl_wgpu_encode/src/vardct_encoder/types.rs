@@ -140,12 +140,12 @@ impl Default for VarDctLfMetadata {
 }
 
 impl VarDctColorEncoding {
-    /// Canonical three-byte pitch-linear input format. Layouts may add an
-    /// arbitrary validated byte offset and row padding.
+    /// Canonical RGB8 convenience format with checked byte offsets and row padding.
+    /// For other integer precisions, use the encoder's `sample_format().pixel_format()`.
     #[must_use]
     pub fn pixel_format(self) -> PixelFormat {
         match self {
-            Self::SrgbD65 => crate::rgb8::source_format(),
+            Self::SrgbD65 => crate::RgbSampleFormat::RGB8.pixel_format(),
         }
     }
 }
@@ -408,7 +408,9 @@ pub(super) struct VarDctKernelParams {
     pub(super) saliency_offset: u32,
     pub(super) saliency_groups: u32,
     pub(super) color_normalization: u32,
-    pub(super) padding: [u32; 6],
+    pub(super) source_word_bytes: u32,
+    pub(super) source_sample_mask: u32,
+    pub(super) padding: [u32; 4],
 }
 
 #[repr(C)]

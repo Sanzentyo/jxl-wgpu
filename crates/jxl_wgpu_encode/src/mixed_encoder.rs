@@ -8,7 +8,7 @@ use crate::{
     EncoderBufferPoolStats, EncoderCapabilities, FrameEncodeRequest, FrameIndex, FrameOptions,
     FrameSubmission, GpuEncodeBackend, GpuEncodeJob, GpuEncoder, GpuFrameArtifacts, GpuFrameSource,
     LosslessModularBackend, LosslessModularConfig, LosslessModularJob, LosslessModularMemoryPlan,
-    ProfileCapability, ProgressivePlan, Rgb8SequenceDescriptor, SessionDescriptor,
+    ProfileCapability, ProgressivePlan, RgbSequenceDescriptor, SessionDescriptor,
     UnsupportedFeature, VarDctBackend, VarDctColorTransform, VarDctConfig, VarDctJob,
     VarDctMemoryPlan, VarDctStrategy, VarDctStrategyMap, WgpuContext,
 };
@@ -32,7 +32,8 @@ pub enum VarDctTransformSelection {
     Map(VarDctStrategyMap),
 }
 
-/// Fixed policies for both frame codecs. Sources are interleaved RGB8 sRGB/D65.
+/// Fixed policies for both frame codecs. Both use `vardct.sample_format` for source
+/// precision/storage and sRGB/D65 presentation.
 ///
 /// The default VarDCT domain is `Original`. An explicit XYB configuration is rejected:
 /// the image-wide XYB flag cannot change between physical frames, and the Modular backend
@@ -93,9 +94,10 @@ impl MixedModeBackend {
                 "mixed Modular/VarDCT sequences require original-RGB coding",
             ));
         }
+        let samples = config.vardct.sample_format;
         let modular_coding = FrameCoding {
             profile: EncodeProfile::ModularLossless {
-                sample_bit_depth: jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample: 8 },
+                sample_bit_depth: samples.bit_depth(),
             },
             progressive: ProgressivePlan::single(),
         };
@@ -121,8 +123,8 @@ impl MixedModeBackend {
         capabilities
             .profiles
             .push(ProfileCapability::ModularLossless {
-                min_bits_per_sample: 8,
-                max_bits_per_sample: 8,
+                min_bits_per_sample: samples.bits_per_sample(),
+                max_bits_per_sample: samples.bits_per_sample(),
                 exponent_bits_per_sample: 0,
             });
         capabilities.determinism = capabilities
@@ -154,7 +156,7 @@ impl MixedModeBackend {
         source: &BufferImageSource,
         request: &FrameEncodeRequest,
     ) -> Result<(), EncodeError> {
-        if source.layout.format != crate::rgb8::source_format() {
+        if source.layout.format != self.vardct.sample_format().pixel_format() {
             return Err(UnsupportedFeature::InputFormat.into());
         }
         if request.options.save_before_color_transform {
@@ -202,7 +204,7 @@ impl GpuEncodeBackend for MixedModeBackend {
         let GpuFrameSource::Buffer(buffer) = source else {
             return false;
         };
-        buffer.layout.format == crate::rgb8::source_format()
+        buffer.layout.format == self.vardct.sample_format().pixel_format()
             && (self.modular.supports_input(source) || self.vardct.supports_input(source))
     }
 
@@ -266,11 +268,11 @@ impl GpuEncodeJob for MixedModeJob {
 /// ```no_run
 /// # use jxl_wgpu_encode::{AnimationHeader, BufferImageSource, EncodeError, FrameCrop,
 /// #     FrameOptions, MixedModeConfig, MixedModeEncoder, MixedModeFrameEncoding,
-/// #     Rgb8SequenceDescriptor, WgpuContext};
+/// #     RgbSequenceDescriptor, WgpuContext};
 /// # fn layers(context: WgpuContext, background: BufferImageSource,
 /// #     patch: BufferImageSource) -> Result<Vec<u8>, EncodeError> {
 /// let encoder = MixedModeEncoder::new(context, MixedModeConfig::default())?;
-/// let mut sequence = encoder.begin_sequence(Rgb8SequenceDescriptor::new(
+/// let mut sequence = encoder.begin_sequence(RgbSequenceDescriptor::new(
 ///     640, 480, AnimationHeader::Still,
 /// )?)?;
 /// let base = sequence.submit_frame(
@@ -324,9 +326,15 @@ impl MixedModeEncoder {
         self.encoder.backend().modular.clear_buffer_pool();
     }
 
+    /// Common source precision for both frame codecs.
+    #[must_use]
+    pub fn sample_format(&self) -> crate::RgbSampleFormat {
+        self.encoder.backend().vardct.sample_format()
+    }
+
     pub fn begin_sequence(
         &self,
-        descriptor: Rgb8SequenceDescriptor,
+        descriptor: RgbSequenceDescriptor,
     ) -> Result<MixedModeSequenceSession, EncodeError> {
         let backend = self.encoder.backend();
         let assembler = CodestreamAssembler::new(backend.vardct.sequence_header(&descriptor)?)?;
@@ -350,12 +358,12 @@ impl MixedModeEncoder {
 pub struct MixedModeSequenceSession {
     session: EncodeSession<MixedModeBackend>,
     assembler: CodestreamAssembler,
-    descriptor: Rgb8SequenceDescriptor,
+    descriptor: RgbSequenceDescriptor,
 }
 
 impl MixedModeSequenceSession {
     #[must_use]
-    pub fn descriptor(&self) -> &Rgb8SequenceDescriptor {
+    pub fn descriptor(&self) -> &RgbSequenceDescriptor {
         &self.descriptor
     }
 

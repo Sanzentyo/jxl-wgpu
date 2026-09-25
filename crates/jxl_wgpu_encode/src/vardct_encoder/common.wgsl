@@ -31,6 +31,16 @@ fn load_u8(byte_address: u32) -> u32 {
     return (word >> ((byte_address & 3u) * 8u)) & 255u;
 }
 
+// Byte loads preserve arbitrary validated source offsets/strides, including words
+// crossing a storage-buffer u32 boundary. Padding bits never enter normalization.
+fn load_source_sample(address: u32) -> u32 {
+    var value = load_u8(address);
+    for (var byte = 1u; byte < params.source_word_bytes; byte += 1u) {
+        value |= load_u8(address + byte) << (8u * byte);
+    }
+    return value & params.source_sample_mask;
+}
+
 fn srgb_to_linear(encoded: f32) -> f32 {
     if encoded <= 0.04045 {
         return encoded / 12.92;
@@ -61,11 +71,13 @@ fn linear_rgb_to_xyb(rgb: vec3<f32>) -> vec3<f32> {
 
 // The checked color plan selects the same domain for image/frame headers and quantization.
 // 0 = XYB, 1 = original sRGB. No source samples cross the host boundary.
-fn normalize_rgb8(address: u32) -> vec3<f32> {
+fn normalize_rgb(address: u32) -> vec3<f32> {
+    let stride = params.source_word_bytes;
+    let maximum = f32(params.source_sample_mask);
     let encoded = vec3<f32>(
-        f32(load_u8(address)) / 255.0,
-        f32(load_u8(address + 1u)) / 255.0,
-        f32(load_u8(address + 2u)) / 255.0,
+        f32(load_source_sample(address)) / maximum,
+        f32(load_source_sample(address + stride)) / maximum,
+        f32(load_source_sample(address + 2u * stride)) / maximum,
     );
     if params.color_normalization == 1u { return encoded; }
     return linear_rgb_to_xyb(vec3<f32>(

@@ -8,6 +8,7 @@ mod matrices;
 mod mixed;
 mod native;
 mod orders;
+mod precision;
 mod progressive;
 mod quantization;
 mod raw_matrices;
@@ -51,7 +52,7 @@ fn image_header(
         width,
         height,
         animation,
-        VarDctColorPlan::new(VarDctColorTransform::Xyb),
+        VarDctColorPlan::new(VarDctColorTransform::Xyb, crate::RgbSampleFormat::RGB8),
     )
 }
 use super::dispatch::{
@@ -397,7 +398,7 @@ fn fixed_control_plane_decodes_as_standard_black_vardct() {
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
             &VarDctConfig::default(),
             &still_control(8, 8),
-            VarDctColorPlan::new(VarDctColorTransform::Xyb),
+            VarDctColorPlan::new(VarDctColorTransform::Xyb, crate::RgbSampleFormat::RGB8),
         )
         .unwrap(),
     )
@@ -426,7 +427,7 @@ fn fixed_control_plane_accepts_nonzero_quantized_xyb_dc() {
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
             &VarDctConfig::default(),
             &still_control(8, 8),
-            VarDctColorPlan::new(VarDctColorTransform::Xyb),
+            VarDctColorPlan::new(VarDctColorTransform::Xyb, crate::RgbSampleFormat::RGB8),
         )
         .unwrap(),
     )
@@ -458,7 +459,7 @@ fn custom_lf_metadata_roundtrips_through_the_standard_control_plane() {
             VarDctFrameLayout::single(VarDctStrategy::Dct8),
             &config_with_lf(metadata),
             &still_control(8, 8),
-            VarDctColorPlan::new(VarDctColorTransform::Xyb),
+            VarDctColorPlan::new(VarDctColorTransform::Xyb, crate::RgbSampleFormat::RGB8),
         )
         .unwrap(),
     )
@@ -546,6 +547,8 @@ fn abi_records_are_pod_and_word_aligned() {
     params.saliency_offset = 0x125;
     params.saliency_groups = 0x126;
     params.color_normalization = 0x127;
+    params.source_word_bytes = 0x128;
+    params.source_sample_mask = 0x129;
     let params = [params];
     let parameter_words = bytemuck::cast_slice::<VarDctKernelParams, u32>(&params);
     assert_eq!(&parameter_words[84..88], &[0x55, 0x56, 0x57, 0x58]);
@@ -556,6 +559,9 @@ fn abi_records_are_pod_and_word_aligned() {
     assert_eq!(&parameter_words[170..172], &[0x113, 0x114]);
     assert_eq!(parameter_words[182], 0x124);
     assert_eq!(&parameter_words[183..186], &[0x125, 0x126, 0x127]);
+
+    assert_eq!(&parameter_words[186..188], &[0x128, 0x129]);
+    assert_eq!(&parameter_words[188..], &[0; 4]);
 
     let mut header: VarDctArtifactHeader = bytemuck::Zeroable::zeroed();
     header.fragment_descriptor_offset = 0x41;
@@ -604,6 +610,8 @@ fn naga_validates_vardct_shaders() {
                     ("saliency_offset", 183 * 4),
                     ("saliency_groups", 184 * 4),
                     ("color_normalization", 185 * 4),
+                    ("source_word_bytes", 186 * 4),
+                    ("source_sample_mask", 187 * 4),
                 ] {
                     assert_eq!(
                         members

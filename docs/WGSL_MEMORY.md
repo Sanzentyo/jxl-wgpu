@@ -913,7 +913,7 @@ All-family exact-budget, cancellation, independent entropy and corruption tests 
 ## Progressive VarDCT encoding
 
 Mixed Modular/VarDCT sequence selection adds no shader ABI or image allocation. The common
-RGB8 descriptor fixes image geometry/timebase and original-sRGB metadata; per-frame coding
+RGB descriptor fixes image geometry/timebase; the backend binds integer precision and original-sRGB metadata; per-frame coding
 chooses an existing backend's checked dispatch plan. `MixedModeMemoryPlan` exposes that plan's
 exact resources, including reference-only VarDCT lowering to one complete pass. Both codecs
 reserve from the same context budget. Resident completion retains its permit through artifact
@@ -928,12 +928,19 @@ the actual map completion; notification does not authorize early GPU resource re
 `VarDctKernelParams` remains a 768-byte storage record. Word 170 is the AC pass count,
 word 171 is the per-pass AC word stride, and words 172–182 hold eleven descriptors:
 `coefficient_square | (shift << 8)`. Words 183–184 now hold the optional saliency word offset
-and group count. Word 185 selects normalized XYB (0) or original sRGB (1); unused descriptors
-and the six trailing padding words are zero. The immutable encoder color plan supplies this
-selector and the matching HF multipliers. Both normalization entry points use one RGB8 loader;
+and group count. Word 185 selects normalized XYB (0) or original sRGB (1). Words 186–187 hold
+the source word width (1/2/4 bytes) and valid unsigned mask (`2^bits - 1`, 1–31 bits); the four
+remaining padding words and unused pass descriptors are zero. The immutable color/sample plan
+supplies these fields, source binding geometry, image bit depth and HF multipliers. Both
+normalization entry points use one byte-addressed word loader with high-padding masking;
 original RGB skips linearization/opsin conversion. Bindings, allocations, workgroup storage,
 submissions and completion ownership are unchanged. The public `xyb_bytes` subtotal accounts
-for the normalized three-plane storage in either domain.
+for the normalized three-plane storage in either domain. Source rows contain `width * 3 * word_bytes`
+bytes; the existing last-word, alignment and u32 address checks cover arbitrary byte offsets
+and padded rows. Saliency uses the top eight valid bits, or rounded full-range scaling below
+eight bits, preserving its 765-per-edge accumulator bound and exact RGB8 statistics. This
+proxy never feeds forward transforms. Image headers declare 32-bit Modular buffers for the
+validated i32 LF coefficient contract regardless of source depth.
 `VarDctArtifactHeader` remains 272 bytes, with the pass count at word 65 and matching saliency
 offset/count at words 66–67. Both fields are zero when automatic ordering is disabled. Rust
 offset tests and WGSL layout reflection check the unchanged sizes and field positions.

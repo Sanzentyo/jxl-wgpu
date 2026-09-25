@@ -1,3 +1,5 @@
+use crate::sample_format::write_sample_bit_depth;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1828,45 +1830,6 @@ pub(super) fn image_header(
         color.encoding.icc_profile(),
         color.max_icc_profile_bytes,
     )
-}
-
-fn write_sample_bit_depth(
-    output: &mut BitWriter,
-    bits_per_sample: u8,
-    exponent_bits_per_sample: u8,
-) -> Result<(), EncodeError> {
-    if exponent_bits_per_sample != 0 {
-        jxl_gpu_formats::FloatPrecision::new(bits_per_sample, exponent_bits_per_sample)
-            .map_err(|_| EncodeError::InvalidConfiguration("invalid Modular floating precision"))?;
-        output.write_bits(1, 1)?;
-        match bits_per_sample {
-            32 => output.write_bits(0, 2)?,
-            16 => output.write_bits(1, 2)?,
-            24 => output.write_bits(2, 2)?,
-            bits => {
-                output.write_bits(3, 2)?;
-                output.write_bits(u64::from(bits - 1), 6)?;
-            }
-        }
-        output.write_bits(u64::from(exponent_bits_per_sample - 1), 4)?;
-        return Ok(());
-    }
-    if !(1..=31).contains(&bits_per_sample) {
-        return Err(EncodeError::InvalidConfiguration(
-            "lossless Modular integer depth must be in 1..=31",
-        ));
-    }
-    output.write_bits(0, 1)?; // integer samples
-    match bits_per_sample {
-        8 => output.write_bits(0, 2)?,
-        10 => output.write_bits(1, 2)?,
-        12 => output.write_bits(2, 2)?,
-        bits => {
-            output.write_bits(3, 2)?;
-            output.write_bits(u64::from(bits - 1), 6)?;
-        }
-    }
-    Ok(())
 }
 
 fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), EncodeError> {

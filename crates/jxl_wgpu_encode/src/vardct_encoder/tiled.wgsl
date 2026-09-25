@@ -57,8 +57,8 @@ fn quantize_blocks(
         // CPU-side staging/padding fallback for odd and asymmetric dimensions.
         let pixel_x = min(block_x * 8u + local_x, params.width - 1u);
         let pixel_y = min(block_y * 8u + local_y, params.height - 1u);
-        let pixel_address = params.byte_offset + pixel_y * params.row_stride + pixel_x * 3u;
-        block_components[sample] = normalize_rgb8(pixel_address);
+        let pixel_address = params.byte_offset + pixel_y * params.row_stride + pixel_x * (3u * params.source_word_bytes);
+        block_components[sample] = normalize_rgb(pixel_address);
     }
     workgroupBarrier();
 

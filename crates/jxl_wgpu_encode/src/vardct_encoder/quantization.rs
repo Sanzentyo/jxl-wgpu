@@ -100,7 +100,9 @@ impl Default for VarDctQuantization {
 /// Coding domain, quantizers, matrices, LF metadata, coefficient orders and AC passes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct VarDctConfig {
-    /// Stream-wide coding domain for RGB8 sRGB sources; defaults to XYB.
+    /// Stream-wide source precision and storage; defaults to interleaved RGB8.
+    pub sample_format: crate::RgbSampleFormat,
+    /// Stream-wide coding domain for integer RGB sRGB sources; defaults to XYB.
     pub color_transform: super::VarDctColorTransform,
     /// Spectral/quantized AC progression; defaults to one complete pass.
     pub progressive: crate::ProgressivePlan,

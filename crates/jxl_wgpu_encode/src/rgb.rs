@@ -1,28 +1,25 @@
-//! Checked RGB8 image contract shared by VarDCT and mixed-codec sequences.
+//! Checked RGB image contract shared by VarDCT and mixed-codec sequences.
 
 use crate::frame_header::write_animation_header;
-use crate::{AnimationHeader, BitFragment, EncodeError};
+use crate::sample_format::write_sample_bit_depth;
+use crate::{AnimationHeader, BitFragment, EncodeError, RgbSampleFormat};
 use jxl_gpu_bitstream::BitWriter;
-use jxl_gpu_formats::{
-    ByteOrder, Channel, ChromaSubsampling, ColorModel, ColorSpecification, PixelFormat,
-    PlaneFormat, PlaneSampling, SampleKind, Swizzle,
-};
 
-/// Stream-wide canvas and optional timebase for an RGB8 sRGB/D65 layered still or animation.
+/// Stream-wide canvas and optional timebase for an RGB sRGB/D65 layered still or animation.
 ///
-/// Every frame uses RGB8 sRGB/D65 sources. The encoder binds the image's coding domain:
+/// Every frame uses the encoder's configured integer RGB precision and sRGB/D65 sources. The encoder binds the image's coding domain:
 /// XYB or original RGB for VarDCT sequences, original RGB for mixed-codec sequences.
 /// Modular and tiled DCT8 sources may vary in extent; a single VarDCT transform or checked
 /// strategy map constrains the source extent of that codec's frames only.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Rgb8SequenceDescriptor {
+pub struct RgbSequenceDescriptor {
     canvas_width: u32,
     canvas_height: u32,
     animation: AnimationHeader,
     header: ImageHeaderPlan,
 }
 
-impl Rgb8SequenceDescriptor {
+impl RgbSequenceDescriptor {
     /// Checks the canvas/timebase. The encoder binds its color policy at `begin_sequence`.
     pub fn new(
         canvas_width: u32,
@@ -41,8 +38,9 @@ impl Rgb8SequenceDescriptor {
     pub(crate) fn image_header(
         &self,
         xyb_encoded: bool,
+        samples: RgbSampleFormat,
     ) -> Result<crate::BitFragment, EncodeError> {
-        self.header.encode(xyb_encoded)
+        self.header.encode(xyb_encoded, samples)
     }
 
     #[must_use]
@@ -64,7 +62,7 @@ impl Rgb8SequenceDescriptor {
 fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), EncodeError> {
     if !(1..(1 << 30)).contains(&size) {
         return Err(EncodeError::InvalidConfiguration(
-            "RGB8 image dimensions must be in 1..2^30",
+            "RGB image dimensions must be in 1..2^30",
         ));
     }
     let value = size - 1;
@@ -117,52 +115,39 @@ impl ImageHeaderPlan {
         })
     }
 
-    fn encode(&self, xyb_encoded: bool) -> Result<BitFragment, EncodeError> {
+    fn encode(
+        &self,
+        xyb_encoded: bool,
+        samples: RgbSampleFormat,
+    ) -> Result<BitFragment, EncodeError> {
         let mut output = BitWriter::new();
         crate::packet::append_fragment(&mut output, &self.prefix)?;
         let has_animation = self.animation.is_some();
-        if has_animation || !xyb_encoded {
-            output.write_bits(0, 1)?; // explicit image metadata
-            output.write_bits(u64::from(has_animation), 1)?;
-            if let Some(animation) = &self.animation {
-                output.write_bits(0, 3)?; // identity orientation
-                output.write_bits(0, 1)?; // no intrinsic size
-                output.write_bits(0, 1)?; // no preview
-                output.write_bits(1, 1)?; // animation present
-                crate::packet::append_fragment(&mut output, animation)?;
-            }
-            output.write_bits(0, 1)?; // integer samples
-            output.write_bits(0, 2)?; // eight bits per sample
-            output.write_bits(1, 1)?; // 16-bit Modular buffers are sufficient
-            output.write_bits(0, 2)?; // no extra channels
-            output.write_bits(u64::from(xyb_encoded), 1)?;
-            output.write_bits(1, 1)?; // default sRGB presentation
-            if has_animation {
-                output.write_bits(1, 1)?; // default tone mapping (present only with extra fields)
-            }
-            output.write_bits(0, 2)?; // no image extensions
-        } else {
-            output.write_bits(1, 1)?; // all-default image metadata: 8-bit, XYB, sRGB presentation
+        output.write_bits(0, 1)?; // explicit image metadata
+        output.write_bits(u64::from(has_animation), 1)?;
+        if let Some(animation) = &self.animation {
+            output.write_bits(0, 3)?; // identity orientation
+            output.write_bits(0, 1)?; // no intrinsic size
+            output.write_bits(0, 1)?; // no preview
+            output.write_bits(1, 1)?; // animation present
+            crate::packet::append_fragment(&mut output, animation)?;
         }
+        write_sample_bit_depth(&mut output, samples.bits_per_sample(), 0)?;
+        // VarDCT LF coefficients are checked i32 values independently of input depth.
+        // Mixed sequences must retain that same image-wide working-buffer contract.
+        output.write_bits(0, 1)?; // 32-bit Modular buffers
+        output.write_bits(0, 2)?; // no extra channels
+        output.write_bits(u64::from(xyb_encoded), 1)?;
+        output.write_bits(1, 1)?; // default sRGB presentation
+        if has_animation {
+            output.write_bits(1, 1)?; // default tone mapping (present only with extra fields)
+        }
+        output.write_bits(0, 2)?; // no image extensions
         output.write_bits(1, 1)?; // default opsin inverse matrix and upsampling weights
         output.align_to_byte()?;
         Ok(BitFragment::byte_aligned(output.into_bytes())?)
     }
 }
 
-pub(crate) fn source_format() -> PixelFormat {
-    PixelFormat {
-        model: ColorModel::Rgb,
-        color_spec: ColorSpecification::Default,
-        chroma_subsampling: ChromaSubsampling::None,
-        sample_kind: SampleKind::Unsigned,
-        byte_order: ByteOrder::Native,
-        swizzle: Swizzle::XYZ1,
-        planes: vec![PlaneFormat::separate_words(
-            PlaneSampling::FULL,
-            1,
-            &[Channel::X, Channel::Y, Channel::Z],
-            8,
-        )],
-    }
-}
+/// Compatibility name for [`RgbSequenceDescriptor`]; precision is bound by the encoder.
+pub type Rgb8SequenceDescriptor = RgbSequenceDescriptor;

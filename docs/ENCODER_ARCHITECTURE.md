@@ -54,10 +54,10 @@ packet assembly all consume that configuration. `memory_plan_for_request` uses t
 path as submission; `memory_plan` retains the configured regular-frame estimate. No shader binding
 or ownership rules change, and regular frames retain their requested progression.
 
-`Rgb8SequenceDescriptor` compiles bounded image geometry and optional timebase fragments;
+`RgbSequenceDescriptor` compiles bounded image geometry and optional timebase fragments;
 `VarDctSequenceDescriptor` remains an alias.
 Sequence creation binds them to the backend's immutable `VarDctColorPlan`, which lowers the
-typed XYB/original-RGB selection once. That same plan supplies image metadata, the presence
+typed XYB/original-RGB selection and checked `RgbSampleFormat` once. That same plan supplies image metadata, the presence
 of frame color/matrix-scale fields, GPU normalization and HF channel multipliers. Jobs retain
 it through packet assembly; neither the serializer nor either GPU path infers the domain
 from other configuration. Original RGB transforms normalized sRGB components with neutral HF
@@ -66,13 +66,23 @@ LF/correlation and matrix/order policy remain explicit and independent of color 
 All source-dependent operations stay on the GPU, using the existing allocations and completion
 lease. [Original-RGB evidence](CONFORMANCE_CORPUS.md#original-rgb-vardct-encoding).
 
+`RgbSampleFormat` owns 1–31-bit source precision, canonical word width and right-aligned
+packing. Admission, row/binding geometry, the shared GPU sample loader and image metadata
+consume this checked value. Unused high bits are masked before normalization; the same GPU
+loader feeds the bounded saliency proxy without quantizing the forward-transform input.
+Source precision does not bound VarDCT's LF integers. RGB sequence headers conservatively
+declare 32-bit Modular buffers because the GPU validates coefficients over the full i32 range,
+including low-bit-depth sources with fine quantizers. No content-dependent CPU scan or second
+header interpretation is needed. The common bit-depth writer is also used by Modular headers.
+[Integer-input evidence](CONFORMANCE_CORPUS.md#integer-rgb-vardct-input).
+
 `MixedModeEncoder` binds this same image plan to original RGB and hosts both existing codec
 backends. Its immutable per-codec `FrameCoding` values contain profile and progression; the
 caller selects one for each physical frame. The generic `EncodeSession` retains the sole
 frame counter, finality, canvas and timebase, validates before admission, and advances only
 after successful submission. Fixed-codec sessions use this same submission path. Geometry
 belongs to the selected backend: a fixed VarDCT transform/map does not constrain Modular sources.
-Both codecs accept the exact common interleaved RGB8/default-sRGB format and post-transform
+Both codecs accept the exact common interleaved integer RGB/default-sRGB format at the selected precision and post-transform
 references. XYB configuration and incompatible source/reference contracts fail before admission.
 
 Memory queries and submissions share each backend's frame preparation, including reference-only
