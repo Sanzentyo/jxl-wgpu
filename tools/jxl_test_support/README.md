@@ -41,6 +41,14 @@ provides unbounded pre-OETF XYB stills; the codec's Gamma/DCI black floor makes 
 already encoded original image unsuitable for that reference. These helpers use ordinary module
 imports and stay outside production dependencies.
 
+`oracles::resampling` shares the existing independent F64 interpolation and propagated arithmetic
+bounds between decoder and encoder extra-channel tests. It expands symmetric weights, mirrors
+edges repeatedly, applies the complete first 8× grid before subsequent stages, and crops only the
+final result. The formulas and Rust/native/WGSL bounds are unchanged from the decoder corpus;
+its counterexample still rejects premature intermediate cropping. libjxl controls cover effective
+factors through 8; larger factors use F64 and applicable jxl-oxide rendering, with exact physical
+words checked separately. [Sampling evidence](../../docs/CONFORMANCE_CORPUS.md#per-frame-vardct-extra-sampling).
+
 `oracles::vardct_matrices` loads four hash-checked native Hornuss/DCT2 matrix records, including
 their exact binary16 wire parameters. The pinned libjxl parser supplies their expected values;
 the older `jxl-vardct` parser omits the required ×64 scale for these two modes. Encoder and

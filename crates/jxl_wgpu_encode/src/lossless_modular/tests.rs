@@ -453,7 +453,7 @@ mod native_tests {
         let second = FrameHeaderPlan::new(&second_request, (3, 2), true).unwrap();
         for (index, frame) in [(0, first), (1, second)] {
             let packets = FramePacketSet::new(
-                frame_header(LosslessModularFormat::Rgba, &frame, Default::default()).unwrap(),
+                frame_header(&frame, Default::default()).unwrap(),
                 FrameGroupLayout::new(1, 1, 1).unwrap(),
                 [GroupPacket::new(GroupPacketKind::Single, Vec::new())],
             )
@@ -551,8 +551,7 @@ mod native_tests {
                 frame_index: FrameIndex::new(0),
                 is_last: true,
                 packets: FramePacketSet::new(
-                    frame_header(LosslessModularFormat::Gray, &control, Default::default())
-                        .unwrap(),
+                    frame_header(&control, Default::default()).unwrap(),
                     FrameGroupLayout::new(1, 1, 1).unwrap(),
                     [GroupPacket::new(GroupPacketKind::Single, vec![0])],
                 )

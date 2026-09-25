@@ -12,6 +12,7 @@ pub mod modular_integer;
 pub mod modular_words;
 pub mod patches;
 pub mod progressive;
+pub mod resampling;
 pub mod sample_bits;
 pub mod tone_mapping;
 pub mod vardct_matrices;

@@ -77,7 +77,8 @@ pub fn libjxl_output(data: &[u8], options: &[&str]) -> Option<Vec<f32>> {
     std::fs::remove_file(path).unwrap();
     assert!(
         decoded.status.success(),
-        "libjxl extra oracle: {}",
+        "libjxl extra oracle ({}): {}",
+        decoded.status,
         String::from_utf8_lossy(&decoded.stderr)
     );
     Some(floats(&decoded.stdout))

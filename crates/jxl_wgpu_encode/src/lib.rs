@@ -81,7 +81,7 @@ pub use capability::{
     ProgressiveDownsampling, ProgressivePass, ProgressivePlan,
 };
 pub use error::{BackendError, EncodeError, PacketError, UnsupportedFeature};
-pub use extra_channel::{ExtraChannel, ExtraChannelKind};
+pub use extra_channel::{ExtraChannel, ExtraChannelKind, ExtraChannelUpsampling};
 pub use gpu::{
     BufferImageSource, GpuEncodeBackend, GpuEncodeJob, GpuEncoder, GpuFrameSource,
     TextureImageSource, WgpuContext,

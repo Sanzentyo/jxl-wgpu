@@ -5,6 +5,35 @@ use jxl_gpu_protocol::Extent2d;
 
 use crate::{AlphaAssociation, EncodeError, FiniteF16, SamplePrecision};
 
+pub(crate) mod sampling;
+
+/// Per-frame factor, multiplied by the image-wide intrinsic dimension shift.
+/// The caller supplies already reduced scalar samples; the encoder does not resize them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ExtraChannelUpsampling {
+    #[default]
+    One,
+    Two,
+    Four,
+    Eight,
+}
+
+impl ExtraChannelUpsampling {
+    #[must_use]
+    pub const fn factor(self) -> u32 {
+        1 << self.shift()
+    }
+
+    pub(crate) const fn shift(self) -> u8 {
+        match self {
+            Self::One => 0,
+            Self::Two => 1,
+            Self::Four => 2,
+            Self::Eight => 3,
+        }
+    }
+}
+
 // JPEG XL level 10 limits the wire-representable channel count to 256.
 pub(crate) const MAX_EXTRA_CHANNELS: usize = 256;
 
@@ -22,16 +51,19 @@ pub enum ExtraChannelKind {
 }
 
 /// One scalar source, with independently checked precision and intrinsic sampling.
-/// The source extent is `ceil(frame_extent / 2^dimension_shift)` on each axis.
+/// The default source extent is `ceil(frame_extent / 2^dimension_shift)` on each axis.
+/// [`crate::FrameOptions::extra_channel_upsampling`] can further reduce it per frame.
 /// Its raw samples are compressed losslessly; presentation upsampling belongs to the decoder.
 /// Shifts are 0..=3. Names must be UTF-8 and at most 1071 bytes.
 ///
 /// ```
-/// use jxl_wgpu_encode::{ExtraChannel, ExtraChannelKind, SamplePrecision};
+/// use jxl_wgpu_encode::{ExtraChannel, ExtraChannelKind, ExtraChannelUpsampling, SamplePrecision};
 /// use jxl_gpu_protocol::Extent2d;
 /// let depth = ExtraChannel::new(ExtraChannelKind::Depth,
 ///     SamplePrecision::integer(13)?, 1, b"depth".to_vec())?;
 /// assert_eq!(depth.source_extent(Extent2d::new(17, 13)), Extent2d::new(9, 7));
+/// assert_eq!(depth.source_extent_with_upsampling(Extent2d::new(17, 13),
+///     ExtraChannelUpsampling::Four), Extent2d::new(3, 2));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -89,7 +121,17 @@ impl ExtraChannel {
 
     #[must_use]
     pub fn source_extent(&self, frame: Extent2d) -> Extent2d {
-        let factor = 1u32 << self.dimension_shift;
+        self.source_extent_with_upsampling(frame, ExtraChannelUpsampling::One)
+    }
+
+    /// Required supplied extent after both intrinsic and per-frame sampling factors.
+    #[must_use]
+    pub fn source_extent_with_upsampling(
+        &self,
+        frame: Extent2d,
+        upsampling: ExtraChannelUpsampling,
+    ) -> Extent2d {
+        let factor = upsampling.factor() << self.dimension_shift;
         Extent2d::new(frame.width.div_ceil(factor), frame.height.div_ceil(factor))
     }
 

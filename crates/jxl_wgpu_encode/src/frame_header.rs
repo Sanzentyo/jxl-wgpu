@@ -4,16 +4,20 @@ use crate::{
     AnimationHeader, BitFragment, BlendMode, EncodeError, FrameBlend, FrameEncodeRequest,
     FrameIndex, FrameKind, ProgressivePlan,
 };
+use crate::{extra_channel::sampling::ExtraChannelSamplingPlan, sample_format::ImageSamplePlan};
 use jxl_gpu_bitstream::BitWriter;
+use jxl_gpu_protocol::Extent2d;
 
-/// The checked frame kind and suffix: crop, blending, timing, references and disabled restoration.
-/// The supported fields occupy at most 256 + 12 bits per extra channel, independent of pixels.
+/// Checked frame kind, scalar sampling, crop, blending, timing, references and restoration.
+/// The suffix occupies at most 256 + 12 bits per extra channel, independent of pixels;
+/// each extra's sampling factor adds two bits in the codec-specific prefix.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FrameHeaderPlan {
     frame_index: FrameIndex,
     is_last: bool,
     kind: FrameKind,
     post_color_reference: bool,
+    extras: ExtraChannelSamplingPlan,
     suffix: BitFragment,
 }
 
@@ -23,19 +27,33 @@ impl FrameHeaderPlan {
         source_extent: (u32, u32),
         has_alpha: bool,
     ) -> Result<Self, EncodeError> {
-        Self::with_extra_channels(request, source_extent, usize::from(has_alpha))
+        let extras = ExtraChannelSamplingPlan::for_packed_alpha(
+            Extent2d::new(source_extent.0, source_extent.1),
+            has_alpha,
+            &request.options.extra_channel_upsampling,
+        )?;
+        Self::with_sampling(request, source_extent, extras)
     }
 
     pub(crate) fn with_extra_channels(
         request: &FrameEncodeRequest,
         source_extent: (u32, u32),
-        extra_channels: usize,
+        samples: &ImageSamplePlan,
     ) -> Result<Self, EncodeError> {
-        if extra_channels > crate::extra_channel::MAX_EXTRA_CHANNELS {
-            return Err(EncodeError::InvalidConfiguration(
-                "extra-channel count exceeds the JPEG XL profile limit",
-            ));
-        }
+        let extras = ExtraChannelSamplingPlan::for_image(
+            samples,
+            Extent2d::new(source_extent.0, source_extent.1),
+            &request.options.extra_channel_upsampling,
+        )?;
+        Self::with_sampling(request, source_extent, extras)
+    }
+
+    fn with_sampling(
+        request: &FrameEncodeRequest,
+        source_extent: (u32, u32),
+        extras: ExtraChannelSamplingPlan,
+    ) -> Result<Self, EncodeError> {
+        let extra_channels = extras.channels.len();
         validate_frame(request, source_extent, extra_channels)?;
         let has_alpha = extra_channels != 0;
         let regular = request.options.kind == FrameKind::Regular;
@@ -117,8 +135,13 @@ impl FrameHeaderPlan {
             is_last: request.is_last,
             kind: request.options.kind,
             post_color_reference: can_be_referenced && !request.options.save_before_color_transform,
+            extras,
             suffix: BitFragment::new(output.into_bytes(), bit_len)?,
         })
+    }
+
+    pub(crate) fn extra_channels(&self) -> &ExtraChannelSamplingPlan {
+        &self.extras
     }
 
     pub(crate) const fn frame_index(&self) -> FrameIndex {

@@ -6,6 +6,7 @@ use jxl_test_support::oracles::{extra_channels, modular_integer};
 mod boundaries;
 mod matrix;
 mod metadata;
+mod sampling;
 mod sequence;
 
 fn color_source(context: &WgpuContext, extent: Extent2d) -> BufferImageSource {

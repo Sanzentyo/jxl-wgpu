@@ -38,9 +38,7 @@ fn frame_header(
         output.write_bits(0, 1)?; // original RGB, not YCbCr
     }
     output.write_bits(0, 2)?; // no upsampling
-    for _ in color.samples.extra_channels.iter() {
-        output.write_bits(0, 2)?; // factor one relative to the declared intrinsic dimension shift
-    }
+    control.extra_channels().write(&mut output)?;
     if let Some(scales) = color.qm_scales() {
         for scale in scales {
             output.write_bits(u64::from(scale), 3)?;

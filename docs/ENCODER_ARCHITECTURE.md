@@ -182,6 +182,21 @@ not host-computed image state: the GPU encodes each supplied source and the deco
 This profile emits post-color-transform references and rejects pre-transform storage.
 VarDCT's image-sample plan enables all five blend modes, independent extra blend/reference fields
 and explicit weight-plane selection. Mixed encoding currently shares only packed alpha.
+
+`ExtraChannelSamplingPlan`, retained by `FrameHeaderPlan`, resolves each requested frame factor
+with its image-wide intrinsic shift. It owns the wire factor, effective shift/extent and packed
+versus independent source index. VarDCT's scalar plan consumes those resolved entries for source
+validation, global-prefix/LF/pass routing and GPU bounds; the header writes the same factors.
+Neither layer infers a policy from supplied dimensions. This matters on one-pixel axes where
+several factors have the same source extent. Packed alpha remains full-resolution and rejects
+any frame factor other than one. Independent scalar inputs accept effective factors through 64;
+the encoder losslessly codes caller-supplied reduced samples without resizing or resampling color.
+Generic input preflight identifies a supported source family. Request-dependent geometry,
+precision, binding/device limits and byte admission are checked together by frame preparation.
+The default memory query resolves factors of one; the request-specific query uses the same
+sampling and implicit-reference-pass plan as submission. Validated GPU artifact authority and
+completion-owned buffers remain separate from these metadata decisions.
+
 Frame control adds no GPU allocation, binding, submission or
 map of its own; the effective pass layout determines existing artifact sizes. Completion and
 cancellation ownership remain unchanged. Syntax and conformance

@@ -29,6 +29,7 @@ use super::types::{
     VarDctLfMetadata, VarDctMemoryPlan, VarDctStrategy, VarDctTopology,
 };
 use super::{icc_input, modular_plane, raw_matrices, saliency, transforms};
+use crate::extra_channel::sampling::ExtraChannelSamplingPlan;
 use crate::frame_header::FrameHeaderPlan;
 use crate::{
     AnimationHeader, BackendError, BitFragment, BufferImageSource, Determinism, EncodeError,
@@ -378,11 +379,18 @@ impl VarDctBackend {
         self.color_plan.matches_format(format)
     }
 
-    /// Computes frame memory admission and source binding with configured regular-frame passes.
+    /// Computes frame admission with configured regular-frame passes and extra factors of one.
     /// The still/sequence frontend owns the separate ICC/extra-channel header reservation.
-    /// Use `memory_plan_for_request` for a reference-only frame's implicit single pass.
+    /// Use `memory_plan_for_request` for per-frame extra sampling or reference-only passes.
     pub fn memory_plan(&self, source: &BufferImageSource) -> Result<VarDctMemoryPlan, EncodeError> {
-        Ok(self.dispatch_plan(source, &self.config.progressive)?.memory)
+        let sampling = ExtraChannelSamplingPlan::for_image(
+            &self.color_plan.samples,
+            source.layout.extent,
+            &[],
+        )?;
+        Ok(self
+            .dispatch_plan(source, &self.config.progressive, &sampling)?
+            .memory)
     }
 
     fn still_memory_plan(
@@ -413,7 +421,7 @@ impl VarDctBackend {
         Ok(plan)
     }
 
-    /// Exact admission for one request, including the implicit single pass of reference-only frames.
+    /// Exact admission for one request, including extra sampling and reference-only passes.
     pub fn memory_plan_for_request(
         &self,
         source: &BufferImageSource,
@@ -432,12 +440,12 @@ impl VarDctBackend {
             request,
             (extent.width, extent.height),
             &self.config,
-            self.color_plan.samples.extra_channels.len(),
+            &self.color_plan.samples,
         )?;
         self.color_plan.validate_frame(&control)?;
         let mut config = self.config.clone();
         config.progressive = control.effective_progressive(&config.progressive);
-        let plan = self.dispatch_plan(source, &config.progressive)?;
+        let plan = self.dispatch_plan(source, &config.progressive, control.extra_channels())?;
         Ok((plan, control, config))
     }
 
@@ -445,6 +453,7 @@ impl VarDctBackend {
         &self,
         source: &BufferImageSource,
         progressive: &ProgressivePlan,
+        sampling: &ExtraChannelSamplingPlan,
     ) -> Result<VarDctDispatchPlan, EncodeError> {
         let extent = source.layout.extent;
         let frame = match self.topology {
@@ -728,8 +737,8 @@ impl VarDctBackend {
         let extra_channels = (!self.color_plan.samples.extra_channels.is_empty())
             .then(|| {
                 modular_plane::ImagePlan::new(
-                    frame,
                     &self.color_plan.samples,
+                    sampling,
                     source,
                     &source_layout,
                     progressive,
@@ -800,7 +809,7 @@ fn validate_vardct_request(
     request: &FrameEncodeRequest,
     source_extent: (u32, u32),
     config: &VarDctConfig,
-    extra_channels: usize,
+    samples: &crate::sample_format::ImageSamplePlan,
 ) -> Result<FrameHeaderPlan, EncodeError> {
     if request.progressive != config.progressive {
         return Err(EncodeError::InvalidConfiguration(
@@ -821,7 +830,7 @@ fn validate_vardct_request(
             "the VarDCT encoder supports only post-color-transform references",
         ));
     }
-    FrameHeaderPlan::with_extra_channels(request, source_extent, extra_channels)
+    FrameHeaderPlan::with_extra_channels(request, source_extent, samples)
 }
 
 impl GpuEncodeBackend for VarDctBackend {
@@ -835,10 +844,9 @@ impl GpuEncodeBackend for VarDctBackend {
         let GpuFrameSource::Buffer(source) = source else {
             return false;
         };
-        // Input support is independent of the requested pass count. Per-frame planning checks
-        // its actual resources; a reference-only frame can fit when a multipass frame cannot.
-        self.dispatch_plan(source, &ProgressivePlan::single())
-            .is_ok()
+        // This preflight has no frame options. Actual extents, sampling, bindings and budget
+        // must be checked by prepare_frame with the caller's request, before any admission.
+        self.matches_source_format(&source.layout.format)
     }
 
     fn submit(

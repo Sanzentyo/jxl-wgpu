@@ -131,7 +131,8 @@ impl BufferImageSource {
     }
 
     /// Attach scalar sources in `VarDctConfig::extra_channels` order (after any packed alpha).
-    /// Precision and shifted extents are checked against that declaration before admission.
+    /// Precision and extents (including intrinsic shifts and the requested per-frame
+    /// upsampling factors) are checked against that declaration before admission.
     pub fn with_extra_channels(mut self, channels: Vec<Self>) -> Result<Self, EncodeError> {
         if channels.len() > crate::extra_channel::MAX_EXTRA_CHANNELS
             || channels
@@ -252,6 +253,7 @@ pub trait GpuEncodeBackend: Send + Sync + 'static {
 
     fn capabilities(&self) -> &EncoderCapabilities;
 
+    /// Source-family preflight; request-dependent geometry and resource checks belong in submit.
     fn supports_input(&self, source: &GpuFrameSource) -> bool;
 
     fn submit(
@@ -270,6 +272,7 @@ pub trait GpuEncodeBackend: 'static {
 
     fn capabilities(&self) -> &EncoderCapabilities;
 
+    /// Source-family preflight; request-dependent geometry and resource checks belong in submit.
     fn supports_input(&self, source: &GpuFrameSource) -> bool;
 
     fn submit(

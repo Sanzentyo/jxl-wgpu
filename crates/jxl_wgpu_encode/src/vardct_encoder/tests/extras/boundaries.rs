@@ -22,7 +22,7 @@ fn pair(context: &WgpuContext, extent: Extent2d) -> (VarDctConfig, BufferImageSo
     (config, source)
 }
 
-fn drain(context: &WgpuContext) {
+pub(super) fn drain(context: &WgpuContext) {
     context
         .device()
         .poll(wgpu::PollType::wait_indefinitely())
@@ -205,9 +205,13 @@ fn extra_input_artifact_identity_prevents_plane_swaps_and_malformed_publication(
     )
     .unwrap();
     let code = fixed_prefix_code().unwrap();
+    let samples = VarDctColorPlan::new(&config).unwrap().samples;
+    let sampling =
+        crate::extra_channel::sampling::ExtraChannelSamplingPlan::for_image(&samples, extent, &[])
+            .unwrap();
     let plan = ImagePlan::new(
-        VarDctFrameLayout::tiled_dct8(extent.width, extent.height).unwrap(),
-        &VarDctColorPlan::new(&config).unwrap().samples,
+        &samples,
+        &sampling,
         &source,
         &main,
         &config.progressive,

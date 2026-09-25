@@ -1,8 +1,8 @@
 //! One image-wide routing plan for all scalar sources, including packed legacy alpha.
 use super::*;
+use crate::extra_channel::sampling::ExtraChannelSamplingPlan;
 use crate::source::{SourceChannels, SourceLayout, SourceWindows};
 use crate::{BufferImageSource, sample_format::ImageSamplePlan};
-use jxl_gpu_protocol::Extent2d;
 
 #[derive(Clone, Copy)]
 pub(in crate::vardct_encoder) struct Limits {
@@ -41,8 +41,8 @@ pub(in crate::vardct_encoder) fn pass_for_shift(progression: &ProgressivePlan, s
 
 impl ImagePlan {
     pub(in crate::vardct_encoder) fn new(
-        frame: super::super::types::VarDctFrameLayout,
         samples: &ImageSamplePlan,
+        sampling: &ExtraChannelSamplingPlan,
         source: &BufferImageSource,
         main: &SourceLayout,
         progressive: &ProgressivePlan,
@@ -50,7 +50,9 @@ impl ImagePlan {
         limits: Limits,
     ) -> Result<Self, EncodeError> {
         let packed = usize::from(samples.alpha.is_some());
-        if source.extra_channels().len() + packed != samples.extra_channels.len() {
+        if source.extra_channels().len() + packed != samples.extra_channels.len()
+            || sampling.channels.len() != samples.extra_channels.len()
+        {
             return Err(EncodeError::InvalidSource(
                 "extra source count differs from the image declaration",
             ));
@@ -63,13 +65,17 @@ impl ImagePlan {
             readback_bytes: 0,
             total_bytes: 0,
         };
-        let extent = Extent2d::new(frame.width, frame.height);
-        for (index, definition) in samples.extra_channels.iter().enumerate() {
-            let input = index.checked_sub(packed);
+        for (index, (definition, sampled)) in samples
+            .extra_channels
+            .iter()
+            .zip(&*sampling.channels)
+            .enumerate()
+        {
+            let input = sampled.source;
             let independent;
             let (layout, component) = if let Some(input) = input {
                 let scalar = &source.extra_channels()[input];
-                if scalar.layout.extent != definition.source_extent(extent)
+                if scalar.layout.extent != sampled.extent
                     || !scalar.buffer.usage().contains(wgpu::BufferUsages::STORAGE)
                 {
                     return Err(EncodeError::InvalidSource(
@@ -89,7 +95,7 @@ impl ImagePlan {
             } else {
                 (main, samples.alpha_component().expect("packed alpha"))
             };
-            let plane_extent = definition.source_extent(extent);
+            let plane_extent = sampled.extent;
             let windows = layout.full_windows;
             windows.validate(limits.binding)?;
             let region = layout.region(0, 0, plane_extent.width, plane_extent.height)?;
@@ -98,7 +104,7 @@ impl ImagePlan {
             // Global Modular stops at the first oversized channel. Later small channels
             // still belong to their LF/pass streams; the serializer must not rediscover this.
             global_prefix &= plane_extent.width <= GROUP_DIM && plane_extent.height <= GROUP_DIM;
-            let shift = definition.dimension_shift();
+            let shift = sampled.shift;
             let (route, group_dim) = if global_prefix {
                 (Route::Global, GROUP_DIM)
             } else if shift >= 3 {

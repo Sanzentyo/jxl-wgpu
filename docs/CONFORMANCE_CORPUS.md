@@ -2155,11 +2155,56 @@ budgets, separate image-header ownership, abandoned jobs and release of retained
 Wrong source count, precision, extent, nesting and buffer usage reject before admission.
 Corrupt scalar artifacts include cross-plane swaps, channel identity, lengths, missing planes,
 trailing bytes and padding; all validation precedes packet authority. Legacy alpha tests remain
-in the full suite. Independent Modular/mixed inputs, lossy extra distance, additional frame
-upsampling policy and broader invisible-color conformance remain open (`ENC-04` Partial).
+in the full suite. Independent Modular/mixed inputs, lossy extra distance and broader
+invisible-color conformance remain open (`ENC-04` Partial). Per-frame scalar sampling is covered below.
 
 Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib extra_input -- --test-threads=2`,
 then the [full capability gates](DEVELOPMENT.md#capability-change-gates).
+
+## Per-frame VarDCT extra sampling
+
+`vardct_encoder::tests::extras::sampling` exercises the shared checked frame sampling plan on
+Apple M5/Metal. Four wire factors combine with intrinsic shifts 0–3 for effective factors 1–64.
+Thirty-two single/five-pass streams cross 1×1, 255×3, 256×3, 257×3, 259×263, 2048×9, 2049×17 and
+4097×19 frames. Seventeen-plane extended images contain every factor/shift pair plus a leading
+small global plane; ten-plane native controls retain every pair whose product is at most eight.
+A large plane terminates global-prefix eligibility, so later small planes must route to the
+correct LF/pass stream, including early resolution endpoints and partial groups. Independent
+jxl-oxide headers retain the separate wire factors/intrinsic shifts; its physical Modular reader
+checks every original 13-bit integer or F32 word and coded extent exactly.
+
+The independent F64 interpolation oracle moved unchanged into
+`jxl_test_support::oracles::resampling`; decoder tests consume the same helper and retain their
+intermediate-cropping counterexample. Native libjxl checks all ten planes of every control stream
+against the existing propagated native bounds. Applicable jxl-oxide rendering checks its Rust
+bounds. As documented by the [extended decoder corpus](#effective-extra-sampling-through-64),
+libjxl rejects products greater than eight and jxl-render has a single-sample-axis padding defect.
+Those limitations are not counted as successful native/render checks: extended/thin cases keep
+exact independent physical-word checks and the repeated-mirror F64 reference.
+Seventy-two GPU numeric outputs cover one-pixel, odd 2D pass-edge and LF-edge frames, every
+effective factor and floating samples under the unchanged WGSL arithmetic intervals.
+Native-compatible GPU results also keep the `2e-6` absolute bound. Twelve fragmented-input
+outputs with 256-byte GPU windows must match whole-input bytes exactly.
+
+Ten three-frame animations cross both alpha associations and all five blend modes. Each physical
+frame changes its scalar factors; reference-only producers, independent reference slots, signed
+crops and timecodes remain covered. Every encoded source word is checked before composition.
+Native libjxl checks 20 presentations, and 80 GPU outputs compare RGBA plus all three extras at
+the unchanged `2e-4` color and `2e-6` scalar bounds, each scaled by `1 + abs(reference)`.
+All three encoder topologies preserve packed-alpha ordering beside reduced independent planes.
+Explicit factor-one requests preserve legacy codestream bytes. A 256-plane frame retains every
+factor and source identity; 255/257-entry tables reject without consuming finality.
+
+Request-specific memory bounds use the reduced extents. Exact/one-byte-deficient admission,
+cancellation, retained-source release and invalid-input retry use the existing completion owner.
+Incorrect factor counts, full-size inputs supplied for reduced planes, absent declarations and
+attempts to resize packed alpha reject before allocation. Modular and mixed sequences keep their
+packed-alpha factor-one contract. The default still API and memory query remain factor one;
+color resampling, independently sourced Modular/mixed extras and lossy scalar coding remain open.
+
+Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib extra_sampling_ -- --test-threads=2`,
+the decoder `extra_upsampling` target after the shared-oracle move, then the
+[full capability gates](DEVELOPMENT.md#capability-change-gates).
 
 ## Mixed-codec sequence encoding
 

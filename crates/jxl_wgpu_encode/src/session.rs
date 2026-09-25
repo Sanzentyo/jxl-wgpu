@@ -168,6 +168,11 @@ pub struct FrameOptions {
     /// One entry per image-header extra channel. An empty vector requests default Replace
     /// contracts for every extra channel.
     pub extra_channel_blends: Vec<FrameBlend>,
+    /// Per-frame factors in image-header extra-channel order, including packed alpha.
+    /// Empty means factor one for all channels; otherwise the count must match exactly.
+    /// VarDCT accepts reduced independent scalar inputs. Packed alpha (also in Modular
+    /// and mixed sequences) requires factor one. Intrinsic dimension shifts still apply.
+    pub extra_channel_upsampling: Vec<crate::ExtraChannelUpsampling>,
     /// Standard two-bit destination slot. Slot zero means no persistent reference for a visible
     /// frame, while a zero-duration frame is referenceable even when it selects slot zero.
     pub save_as_reference: ReferenceSlot,

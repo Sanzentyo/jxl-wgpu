@@ -1054,7 +1054,7 @@ impl ModularPacketAssembler {
                 .ok_or_else(|| EncodeError::Backend("gray8 token length underflow".into()))?;
             group.align_to_byte()?;
             let packets = FramePacketSet::new(
-                frame_header(self.format, &self.frame, self.group_grid.group_size)?,
+                frame_header(&self.frame, self.group_grid.group_size)?,
                 FrameGroupLayout::new(1, 1, 1)?,
                 [GroupPacket::new(
                     GroupPacketKind::Single,
@@ -1084,7 +1084,7 @@ impl ModularPacketAssembler {
         let layout = FrameGroupLayout::new(self.group_grid.lf_groups, self.group_grid.groups, 1)?;
         Ok((
             FramePacketSet::new(
-                frame_header(self.format, &self.frame, self.group_grid.group_size)?,
+                frame_header(&self.frame, self.group_grid.group_size)?,
                 layout,
                 self.packets,
             )?,
@@ -1854,7 +1854,6 @@ fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), Enco
 }
 
 pub(super) fn frame_header(
-    format: LosslessModularFormat,
     frame: &FrameHeaderPlan,
     group_size: super::types::LosslessModularGroupSize,
 ) -> Result<BitFragment, EncodeError> {
@@ -1865,9 +1864,7 @@ pub(super) fn frame_header(
     output.write_bits(0, 2)?; // zero frame flags
     output.write_bits(0, 1)?; // no YCbCr transform
     output.write_bits(0, 2)?; // color upsampling factor one
-    if format.has_alpha() {
-        output.write_bits(0, 2)?; // alpha upsampling factor one
-    }
+    frame.extra_channels().write(&mut output)?;
     output.write_bits(u64::from(group_size.size_shift()), 2)?;
     if frame.has_passes() {
         output.write_bits(0, 2)?; // one pass when present

@@ -576,16 +576,33 @@ image header and needs no attachment. `encoder.extra_channels()` returns this re
 `alpha_association()` continues to describe packed alpha only. Each attachment is a single scalar
 STORAGE-buffer view, using the shared byte-order, bit-position and unaligned-pitch addressing.
 `SamplePrecision::pixel_format()` provides its canonical non-color layout. For intrinsic shift
-`s` in 0–3, supply `ceil(frame_width / 2^s)` by `ceil(frame_height / 2^s)` samples. Geometry is
+`s` in 0–3, the default is `ceil(frame_width / 2^s)` by `ceil(frame_height / 2^s)` samples. Geometry is
 relative to each physical frame/crop. Nested attachments, count/precision/extent mismatches and
 unreadable buffers reject before admission; input planes may alias the same allocation.
 
 All extra samples are encoded losslessly on GPU. A common image plan resolves the leading small
 channels that belong to global Modular; after the first channel larger than 256 on either axis,
-shift-three channels use LF groups and shift-zero/one/two channels use the applicable progressive
+effective shifts three through six use LF groups and shifts zero/one/two use the applicable progressive
 pass. Small channels after that boundary stay in their LF/pass streams. The serializer consumes
-the same plan. The emitted frame upsampling factor is one relative to each intrinsic shift;
-presentation interpolation is separate from exact encoded sample preservation.
+the same plan. Presentation interpolation is separate from exact encoded sample preservation.
+
+`FrameOptions::extra_channel_upsampling` selects `ExtraChannelUpsampling::{One, Two, Four, Eight}`
+per resolved extra channel for each physical VarDCT frame, including reference-only frames.
+An empty list requests all `One`; a nonempty list must include every channel, starting with
+packed alpha when present. Packed alpha requires `One` in all codecs. For an independent plane,
+the effective factor is `factor * 2^s`, through 64. Supply an already reduced source of
+`ceil(frame_extent / effective_factor)` on each axis; the encoder does not resize source pixels.
+`ExtraChannel::source_extent_with_upsampling` computes that extent, while `source_extent` keeps
+its factor-one behavior. The checked frame plan owns both wire factors and effective geometry,
+which drives the existing global/LF/pass routing and memory admission.
+
+Use `begin_sequence` with `AnimationHeader::Still` and one `submit_last_frame` to select factors
+for a still. Timed and layered sequences can change factors per physical frame; image metadata,
+canvas and color sampling stay fixed. `memory_plan_for_request` reports their exact resources;
+the ordinary `memory_plan` and `encode`/`submit` methods retain factor-one defaults. Invalid
+counts, attempts to shrink packed alpha and source extent mismatches reject before admission
+without consuming frame finality. [Sampling evidence and oracle limits](../../docs/CONFORMANCE_CORPUS.md#per-frame-vardct-extra-sampling)
+cover factors through 64, exact coded words, interpolation, references and ownership.
 
 `VarDctMemoryPlan::extra_channels` includes every scalar plane, while `alpha` is the overlapping
 packed-alpha breakdown (`VarDctAlphaMemoryPlan` remains a compatibility alias). Aggregate readback

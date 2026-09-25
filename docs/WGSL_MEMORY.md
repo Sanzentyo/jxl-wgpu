@@ -998,7 +998,10 @@ windows at 0/12/13/14, a separate 320-byte parameter at 1 and compressed artifac
 byte order, sample mask and resolved channel index. The 33 prefix entries begin at byte 56.
 Its 1×1 workgroups own one row each; X selects a planned group column and Y an actual scalar row.
 Prediction resets at group boundaries and reads only original samples, including raw float bits.
-The image plan chooses global-prefix geometry, `2048 >> shift` LF groups or `256 >> shift` pass
+The checked frame sampling plan combines intrinsic shifts and per-frame factors into an
+effective shift of 0–6 and the required scalar extent. Both header emission and scalar dispatch
+consume that plan; packed alpha retains shift zero. The image plan chooses global-prefix geometry,
+`2048 >> shift` LF groups or `256 >> shift` pass
 groups and the applicable progressive pass; neither the shader nor serializer derives routing.
 
 Row identity is `group_column * height + y`. Each row owns four status words plus
