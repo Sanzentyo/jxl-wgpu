@@ -300,7 +300,7 @@ fn extra_sampling_all_topologies_share_packed_alpha_order_and_reject_implicit_re
     ));
     request.options.extra_channel_upsampling = vec![UpsamplingFactor::One];
     assert!(matches!(
-        modular.memory_plan_for_request(&color_source(&context, extent), &request),
+        modular.memory_plan_for_request(color_source(&context, extent), &request),
         Err(EncodeError::InvalidConfiguration(_))
     ));
     let mut mixed_config = crate::MixedModeConfig::default();

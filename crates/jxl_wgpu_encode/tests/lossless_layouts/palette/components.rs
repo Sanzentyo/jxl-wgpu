@@ -66,7 +66,7 @@ fn every_component_range_keeps_unselected_channels_with_all_palette_policies() {
                     }
                 }
                 let plan = encoder
-                    .memory_plan(&upload(&rig.context, &case, extent, &expected, 0))
+                    .memory_plan(upload(&rig.context, &case, extent, &expected, 0))
                     .unwrap();
                 let bands = [1, 2, 2, 4, 4][variant % 5];
                 assert_eq!(

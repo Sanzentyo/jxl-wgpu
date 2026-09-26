@@ -79,6 +79,7 @@ mod sampling;
 mod session;
 mod source;
 mod source_color;
+mod source_input;
 mod vardct_encoder;
 
 pub use source::CmykSampleEncoding;

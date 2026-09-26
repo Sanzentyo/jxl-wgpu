@@ -113,8 +113,8 @@ impl WgpuContext {
 pub struct BufferImageSource {
     pub buffer: Arc<wgpu::Buffer>,
     pub layout: ImageLayout,
-    extra_channels: Vec<BufferImageSource>,
-    cmyk_encoding: crate::CmykSampleEncoding,
+    pub(crate) extra_channels: Vec<BufferImageSource>,
+    pub(crate) cmyk_encoding: crate::CmykSampleEncoding,
 }
 
 impl BufferImageSource {
@@ -179,8 +179,11 @@ impl BufferImageSource {
     }
 }
 
-/// One directly sampleable `wgpu` texture. Multi-planar and packed formats use
-/// [`BufferImageSource`] until portable multi-plane texture support exists.
+/// One mip/layer of a copyable, uncompressed 2D color texture.
+///
+/// `pixel_format` describes the raw copied texel bytes, including channel order and precision.
+/// No sampler, normalization, sRGB conversion, or alpha conversion is applied. The texture
+/// must have `COPY_SRC` usage. Multi-planar textures use [`BufferImageSource`] instead.
 #[derive(Clone, Debug)]
 pub struct TextureImageSource {
     pub texture: Arc<wgpu::Texture>,
@@ -188,6 +191,8 @@ pub struct TextureImageSource {
     pub pixel_format: PixelFormat,
     pub mip_level: u32,
     pub array_layer: u32,
+    pub(crate) extra_channels: Vec<BufferImageSource>,
+    pub(crate) cmyk_encoding: crate::CmykSampleEncoding,
 }
 
 impl TextureImageSource {
@@ -198,29 +203,92 @@ impl TextureImageSource {
         mip_level: u32,
         array_layer: u32,
     ) -> Result<Self, EncodeError> {
-        let size = texture.size();
-        if mip_level >= texture.mip_level_count() {
-            return Err(EncodeError::InvalidSource(
-                "texture mip level is out of range",
-            ));
-        }
-        if array_layer >= size.depth_or_array_layers {
-            return Err(EncodeError::InvalidSource(
-                "texture array layer is out of range",
-            ));
-        }
-        if pixel_format.planes.len() != 1 {
-            return Err(EncodeError::InvalidSource(
-                "multi-planar formats must use a pitch-linear GPU buffer",
-            ));
-        }
-        Ok(Self {
+        let source = Self {
             texture,
             texture_format,
             pixel_format,
             mip_level,
             array_layer,
-        })
+            extra_channels: Vec::new(),
+            cmyk_encoding: Default::default(),
+        };
+        crate::source_input::FrameInputPlan::new(source.clone().into())?;
+        Ok(source)
+    }
+
+    /// Attach independent scalar GPU buffers in the image's declared extra-channel order.
+    pub fn with_extra_channels(
+        mut self,
+        channels: Vec<BufferImageSource>,
+    ) -> Result<Self, EncodeError> {
+        if channels.len() > crate::extra_channel::MAX_EXTRA_CHANNELS
+            || channels
+                .iter()
+                .any(|channel| !channel.extra_channels().is_empty())
+        {
+            return Err(EncodeError::InvalidSource(
+                "extra sources must be flat and within the JPEG XL channel count",
+            ));
+        }
+        self.extra_channels = channels;
+        Ok(self)
+    }
+
+    /// Select the meaning of CMYK device words, with the same contract as buffer inputs.
+    pub fn with_cmyk_encoding(
+        mut self,
+        encoding: crate::CmykSampleEncoding,
+    ) -> Result<Self, EncodeError> {
+        if !matches!(&self.pixel_format.color_spec,
+            jxl_gpu_formats::ColorSpecification::Icc(profile) if profile.header().device_space.0 == *b"CMYK")
+            || self.pixel_format.model != jxl_gpu_formats::ColorModel::IccDevice
+        {
+            return Err(EncodeError::InvalidSource(
+                "CMYK sample convention requires a CMYK ICC input",
+            ));
+        }
+        self.cmyk_encoding = encoding;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn extra_channels(&self) -> &[BufferImageSource] {
+        &self.extra_channels
+    }
+
+    #[must_use]
+    pub fn cmyk_encoding(&self) -> crate::CmykSampleEncoding {
+        self.cmyk_encoding
+    }
+}
+
+impl From<BufferImageSource> for GpuFrameSource {
+    fn from(source: BufferImageSource) -> Self {
+        Self::Buffer(source)
+    }
+}
+
+impl From<TextureImageSource> for GpuFrameSource {
+    fn from(source: TextureImageSource) -> Self {
+        Self::Texture(source)
+    }
+}
+
+impl From<&BufferImageSource> for GpuFrameSource {
+    fn from(source: &BufferImageSource) -> Self {
+        source.clone().into()
+    }
+}
+
+impl From<&TextureImageSource> for GpuFrameSource {
+    fn from(source: &TextureImageSource) -> Self {
+        source.clone().into()
+    }
+}
+
+impl From<&GpuFrameSource> for GpuFrameSource {
+    fn from(source: &GpuFrameSource) -> Self {
+        source.clone()
     }
 }
 

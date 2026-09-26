@@ -1,6 +1,6 @@
 //! CMYK input conventions, independent of physical packing and ICC evaluation.
 
-/// Meaning of CMYK samples in a GPU input buffer. Alpha is never complemented.
+/// Meaning of CMYK samples in a GPU input. Alpha is never complemented.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CmykSampleEncoding {
     /// ICC device amounts: zero means no ink. Integer samples are complemented exactly on GPU.
@@ -15,7 +15,7 @@ pub enum CmykSampleEncoding {
 
 pub(super) const COMPLEMENT_INTEGER: u32 = 1 << 5;
 
-impl crate::BufferImageSource {
+impl crate::source_input::FrameInputPlan {
     pub(crate) fn validate_alpha_association(
         &self,
         association: crate::AlphaAssociation,

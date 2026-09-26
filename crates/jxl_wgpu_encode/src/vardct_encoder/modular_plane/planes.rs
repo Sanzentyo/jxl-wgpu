@@ -42,7 +42,7 @@ impl ImagePlan {
     pub(in crate::vardct_encoder) fn new(
         samples: &ImageSamplePlan,
         sampling: &ExtraChannelSamplingPlan,
-        source: &BufferImageSource,
+        source: &crate::source_input::FrameInputPlan,
         main: &SourceLayout,
         progressive: &ProgressivePlan,
         code: &VarDctPrefixCode,

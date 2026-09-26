@@ -120,7 +120,7 @@ fn extra_input_budget_union_cancellation_and_source_mismatch_preserve_admission(
     }
     for attachments in [vec![], vec![scalar.clone()], vec![scalar.clone(); 3]] {
         assert!(matches!(
-            backend.memory_plan(&source.clone().with_extra_channels(attachments).unwrap()),
+            backend.memory_plan(source.clone().with_extra_channels(attachments).unwrap()),
             Err(EncodeError::InvalidSource(_))
         ));
     }
@@ -136,7 +136,7 @@ fn extra_input_budget_union_cancellation_and_source_mismatch_preserve_admission(
     .unwrap();
     assert!(matches!(
         backend.memory_plan(
-            &source
+            source
                 .clone()
                 .with_extra_channels(vec![unreadable, scalar.clone()])
                 .unwrap()
@@ -166,7 +166,7 @@ fn extra_input_budget_union_cancellation_and_source_mismatch_preserve_admission(
         assert!(
             backend
                 .memory_plan(
-                    &source
+                    source
                         .clone()
                         .with_extra_channels(vec![wrong, scalar.clone()])
                         .unwrap()
@@ -215,7 +215,7 @@ fn extra_input_artifact_identity_prevents_plane_swaps_and_malformed_publication(
     let plan = ImagePlan::new(
         &samples,
         &sampling.extras,
-        &source,
+        &crate::source_input::FrameInputPlan::new((&source).into()).unwrap(),
         &main,
         &config.progressive,
         &code,

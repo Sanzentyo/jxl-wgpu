@@ -224,7 +224,7 @@ fn weighted_row_state_survives_streaming_and_retires_after_cancellation() {
             shifted: false,
         };
         let plan = encoder
-            .memory_plan(&upload(
+            .memory_plan(upload(
                 &rig.context,
                 &case,
                 extent,

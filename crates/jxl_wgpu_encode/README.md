@@ -9,6 +9,39 @@ The complete encoder backlog, dependencies, and acceptance gates are tracked in
 [`FULL_JPEG_XL_ROADMAP.md`](../../docs/FULL_JPEG_XL_ROADMAP.md). This README describes only the
 currently executable profiles.
 
+## GPU input storage
+
+Both encoders, fixed/mixed sequences and preview methods accept `BufferImageSource`,
+`TextureImageSource` or `GpuFrameSource`; memory queries also accept borrowed sources.
+The codec's logical color, precision, alpha and extra-channel rules apply to either storage.
+
+`TextureImageSource::new` selects one mip and array layer from a single-sample 2D color texture
+with `COPY_SRC` usage. Its `texture_format` must match the actual texture. `pixel_format` describes
+the **raw copied texel bytes**: one full-resolution plane, one pixel per element and exactly the
+texture format's uncompressed texel size. Supply BGRA packing for BGRA bytes, for example.
+Texture normalization, sRGB sampling and channel conversion are never implicit. Color metadata
+and sample interpretation come from `pixel_format`, including explicit raw bit reinterpretation;
+the texture format describes storage. Depth/stencil, compressed, multi-planar, multisample and
+non-2D textures are rejected. Signed or otherwise unsupported logical sample formats still reject.
+Independent scalar extras attach through `with_extra_channels(Vec<BufferImageSource>)`.
+CMYK textures use the same `with_cmyk_encoding` convention as buffers.
+
+A common checked input plan validates the selected extent, row pitch, allocation and device limits
+before admission. It allocates one storage buffer after reserving the job's memory, then records
+`copy_texture_to_buffer` before the first compute pass in the ordinary submission. The copy has
+256-byte rows and a four-byte-aligned allocation; it preserves integer/floating representation
+words, including Modular NaN payloads. Streamed Modular shares this copy across every histogram
+and serialization batch. No host image readback or extra queue submission is needed.
+
+Memory plans expose `source_copy_bytes` (encoder-owned, reserved once for the whole job) and
+`source_texture_bytes` (selected mip/layer texel bytes, caller-owned). `source_binding_bytes`
+and Modular's peak binding count cover caller-owned buffers, including attached scalars; the
+owned copy is excluded to avoid double counting. Addressed totals include the owned copy,
+caller-buffer windows and selected texels. Opaque driver texture allocation/tiling is excluded.
+Completion callbacks retain the original texture, copy and extras through cancellation; only
+validated artifacts may become frame or preview packets.
+[Independent input and ownership evidence](../../docs/CONFORMANCE_CORPUS.md#texture-encoder-input).
+
 GPU-produced codestreams can be wrapped with Exif/XMP/JUMBF or other opaque payloads using
 `jxl_gpu_bitstream::metadata::Metadata::write_container`. `MetadataBox::new` supports plain or
 Brotli-compressed metadata with explicit size, ratio and window limits; `as_container_box` also
@@ -459,7 +492,7 @@ The [embedded-ICC matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-embe
 checks independent original-profile bytes and source words, requested color output, private tags,
 all intents, animation identity, size limits and shared-budget lifetime.
 Independent scalar declarations use the plan described below. CMYK uses the shared input plan
-described below; YUV and textures remain outside this profile.
+described below; YUV remains outside this profile. Texture storage follows the common input plan.
 The [group-size matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-group-sizes) covers every
 size with shared/local trees, integer/IEEE source words, LF boundaries, full tiles, cropped and
 Replace animations, bounded GPU output and admission/cancellation. The default 256 configuration
@@ -751,7 +784,7 @@ Subnormals enter the lossy F32 arithmetic contract; VarDCT is not a bit-preservi
 General transforms budget per-workgroup completion/error records inside the artifact/readback;
 tiled DCT8 carries errors in its existing block records. Missing or malformed validation
 records cannot publish an artifact. XYB ICC additionally budgets those records for integer and tiled sources.
-Chroma subsampling, per-extra lossy distance, automatic source downsampling and texture inputs remain outside the VarDCT contract.
+Chroma subsampling, per-extra lossy distance and automatic source downsampling remain outside the VarDCT contract.
 
 VarDCT and mixed sequences declare 32-bit Modular working buffers, independently of input
 depth: their quantized LF coefficients are checked i32 values. This corrects the earlier

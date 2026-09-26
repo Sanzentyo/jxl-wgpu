@@ -66,7 +66,7 @@ fn scalar_aliases_admission_cancellation_and_header_memory_are_exact() {
                 ..config.clone()
             },
         )
-        .memory_plan(&original.clone().with_extra_channels(vec![scalar]).unwrap())
+        .memory_plan(original.clone().with_extra_channels(vec![scalar]).unwrap())
         .unwrap();
         assert_eq!(memory.source_binding_bytes, one.source_binding_bytes);
         assert!(memory.transform_scratch_bytes > 0);

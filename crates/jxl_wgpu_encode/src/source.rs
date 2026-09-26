@@ -432,12 +432,16 @@ struct SourceWindow {
 pub(crate) struct SourceWindows([SourceWindow; 4]);
 
 impl SourceWindows {
-    /// Union across bindings of the same GPU allocation, including separately declared scalars.
+    /// Caller-buffer union, including aliased scalars. Encoder-owned copies pass None;
+    /// their complete allocation is already charged by the input preparation plan.
     pub(crate) fn addressed_bytes_many<'a>(
-        bindings: impl IntoIterator<Item = (&'a wgpu::Buffer, Self)>,
+        bindings: impl IntoIterator<Item = (Option<&'a wgpu::Buffer>, Self)>,
     ) -> Result<u64, EncodeError> {
         let mut allocations: Vec<(&wgpu::Buffer, Vec<SourceWindow>)> = Vec::new();
         for (buffer, windows) in bindings {
+            let Some(buffer) = buffer else {
+                continue;
+            };
             if let Some((_, spans)) = allocations.iter_mut().find(|(known, _)| *known == buffer) {
                 spans.extend(windows.0);
             } else {
@@ -577,6 +581,17 @@ pub(crate) struct SourceRegion {
 }
 
 impl SourceLayout {
+    pub(crate) fn for_input(
+        source: &crate::source_input::FrameInputPlan,
+        alignment: u64,
+    ) -> Result<Self, EncodeError> {
+        Self::with_encoding(
+            &source.layout,
+            source.buffer_bytes(),
+            alignment,
+            source.cmyk_encoding(),
+        )
+    }
     #[cfg(test)]
     pub(crate) fn new(
         layout: &ImageLayout,

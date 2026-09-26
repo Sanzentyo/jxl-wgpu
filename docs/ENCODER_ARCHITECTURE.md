@@ -180,6 +180,22 @@ complemented 4-to-3 ICC connection before opsin conversion. Black still has its 
 validated raw-word artifact. Its source view shares the primary buffer lifetime and range-union
 accounting. [CMYK evidence](CONFORMANCE_CORPUS.md#cmyk-encoder-input).
 
+`FrameInputPlan` owns the physical storage choice before codec/sample lowering. Buffer plans retain
+their caller allocation; texture plans validate a single copyable 2D color mip/layer and derive
+its checked pitch-linear byte layout without allocation. Both become the same `SourceLayout`
+and scalar-owner plan. Logical formats describe raw texel bytes; no sampler, sRGB conversion or
+host pixel conversion is introduced. Unsupported texture topology/usage and copy/binding limits
+reject before admission. Still, fixed/mixed sequence and preview frontends use this common plan.
+
+Admission materializes a `PreparedInput` shared with the completion callback. It retains the
+original texture, the encoder-owned copy and attached buffers. One raw texture-to-buffer copy
+precedes the first compute pass of the existing submission. Streaming Modular records it only
+for the first histogram batch; the persistent copy permit is split from the checked peak
+reservation, and survives independently of per-batch scratch through both passes and cancellation.
+Caller-buffer range unions exclude the owned copy, whose full allocation is charged once.
+Selected texel bytes are separately addressed; driver-selected texture tiling is outside the model.
+[Texture evidence](CONFORMANCE_CORPUS.md#texture-encoder-input).
+
 `ColorSampleFormat` owns `ColorChannels::Gray` or `Rgb`, 1–31-bit integer or checked
 `FloatPrecision` logical precision, and a
 canonical format constructor. The shared `source` module owns physical packing, swizzle and
@@ -308,9 +324,10 @@ GPU pixels, entropy, submission ownership and the unindexed assembly APIs are un
 | Filters | Gaborish off, EPF zero iterations |
 | Output | raw codestream or standard `jxlc` container; private `jwgp` index emitted only for single-group Gray8 Prefix containers with default color/intent/intensity |
 
-The backend rejects textures, chroma subsampling, YUV/NV12, signed samples, unsupported color
+The backend rejects chroma subsampling, YUV/NV12, signed samples, unsupported color
 metadata, non-bijective/missing channels, mismatched component precision and progressive passes > 1.
-Storage normalization remains fused into GPU token production; no intermediate image is allocated.
+Storage normalization remains fused into GPU token production. Buffer inputs need no intermediate
+image; texture inputs use the common raw GPU copy described above.
 
 Source color lowering is bounded host metadata work. It validates full range and RGB/gray semantics,
 quantizes custom xy to `1e-6` and Gamma OETF exponents to `1e-7`, and rechecks the quantized geometry.

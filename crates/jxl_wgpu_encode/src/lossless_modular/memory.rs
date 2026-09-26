@@ -16,9 +16,13 @@ pub struct LosslessModularMemoryPlan {
     /// Maximum independently tokenized channels in any group after all local transforms.
     /// Single-pixel edge axes are skipped, so individual groups may contain fewer channels.
     pub channel_count: u32,
-    /// Union of the full source plane binding ranges, excluding gaps between planes.
+    /// Union of caller-buffer binding ranges, excluding gaps and the encoder-owned texture copy.
     pub source_binding_bytes: u64,
-    /// Largest union of source binding ranges in one GPU batch. Each plane has its own binding.
+    /// Encoder-owned texture copy, charged once for the entire job, including streaming.
+    pub source_copy_bytes: u64,
+    /// Caller-owned selected mip/layer texel bytes, excluding opaque driver allocation overhead.
+    pub source_texture_bytes: u64,
+    /// Largest caller-buffer binding union in one batch, excluding the owned texture copy.
     pub peak_source_binding_bytes: u64,
     /// Largest parameter allocation used by one streamed GPU batch.
     pub parameter_storage_bytes: u64,

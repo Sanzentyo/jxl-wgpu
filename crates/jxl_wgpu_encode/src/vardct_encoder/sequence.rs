@@ -2,8 +2,8 @@
 
 use super::{VarDctBackend, VarDctConfig, VarDctJob};
 use crate::{
-    BufferImageSource, CodestreamAssembler, Determinism, EncodeError, EncodeProfile, EncodeSession,
-    FrameIndex, FrameOptions, FrameSubmission, GpuEncoder, GpuFrameArtifacts, GpuFrameSource,
+    CodestreamAssembler, Determinism, EncodeError, EncodeProfile, EncodeSession, FrameIndex,
+    FrameOptions, FrameSubmission, GpuEncoder, GpuFrameArtifacts, GpuFrameSource,
     SessionDescriptor,
 };
 
@@ -34,7 +34,7 @@ impl VarDctSequenceSession {
     /// GPU job footprint. Completed preview storage is admitted separately at its actual size.
     pub fn preview_memory_plan(
         &self,
-        source: &BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         options: FrameOptions,
     ) -> Result<super::VarDctMemoryPlan, EncodeError> {
         let request = self.session.preview_request(
@@ -50,12 +50,12 @@ impl VarDctSequenceSession {
     /// Submits the declared preview without advancing or closing the main frame sequence.
     pub fn submit_preview(
         &mut self,
-        source: BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         options: FrameOptions,
     ) -> Result<crate::PreviewSubmission<VarDctJob>, EncodeError> {
         self.session.submit_preview(
             &mut self.assembler,
-            GpuFrameSource::Buffer(source),
+            source.into(),
             options,
             &self.session.default_coding(),
         )
@@ -104,20 +104,18 @@ impl VarDctSequenceSession {
 
     pub fn submit_frame(
         &mut self,
-        source: BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         options: FrameOptions,
     ) -> Result<FrameSubmission<VarDctJob>, EncodeError> {
-        self.session
-            .submit_frame(GpuFrameSource::Buffer(source), options)
+        self.session.submit_frame(source.into(), options)
     }
 
     pub fn submit_last_frame(
         &mut self,
-        source: BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         options: FrameOptions,
     ) -> Result<FrameSubmission<VarDctJob>, EncodeError> {
-        self.session
-            .submit_last_frame(GpuFrameSource::Buffer(source), options)
+        self.session.submit_last_frame(source.into(), options)
     }
 
     /// Inserts one validated GPU artifact, in any completion order.

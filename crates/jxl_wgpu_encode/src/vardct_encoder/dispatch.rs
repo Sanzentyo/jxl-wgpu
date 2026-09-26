@@ -32,11 +32,11 @@ use super::{icc_input, modular_plane, raw_matrices, saliency, transforms};
 use crate::frame_header::FrameHeaderPlan;
 use crate::sampling::FrameSamplingPlan;
 use crate::{
-    AnimationHeader, BackendError, BitFragment, BufferImageSource, Determinism, EncodeError,
-    EncodeProfile, EncoderCapabilities, FrameEncodeRequest, FrameIndex, FrameOptions,
-    FrameSubmission, GpuEncodeBackend, GpuEncodeJob, GpuEncoder, GpuFrameArtifacts, GpuFrameSource,
-    KernelStage, ProfileCapability, ProgressivePlan, UnsupportedFeature, VarDctConfig,
-    VarDctQuantization, WgpuContext, assemble_frame,
+    AnimationHeader, BackendError, BitFragment, Determinism, EncodeError, EncodeProfile,
+    EncoderCapabilities, FrameEncodeRequest, FrameIndex, FrameOptions, FrameSubmission,
+    GpuEncodeBackend, GpuEncodeJob, GpuEncoder, GpuFrameArtifacts, GpuFrameSource, KernelStage,
+    ProfileCapability, ProgressivePlan, UnsupportedFeature, VarDctConfig, VarDctQuantization,
+    WgpuContext, assemble_frame,
 };
 
 pub(super) const SOURCE_BINDINGS: [u32; 4] = [0, 12, 13, 14];
@@ -382,18 +382,23 @@ impl VarDctBackend {
     /// Computes frame admission with configured regular-frame passes and extra factors of one.
     /// The still/sequence frontend owns the separate ICC/extra-channel header reservation.
     /// Use `memory_plan_for_request` for per-frame sampling or reference-only passes.
-    pub fn memory_plan(&self, source: &BufferImageSource) -> Result<VarDctMemoryPlan, EncodeError> {
+    pub fn memory_plan(
+        &self,
+        source: impl Into<GpuFrameSource>,
+    ) -> Result<VarDctMemoryPlan, EncodeError> {
+        let source = crate::source_input::FrameInputPlan::new(source.into())?;
         let sampling = FrameSamplingPlan::unscaled(source.layout.extent, &self.color_plan.samples)?;
         Ok(self
-            .dispatch_plan(source, &self.config.progressive, &sampling)?
+            .dispatch_plan(&source, &self.config.progressive, &sampling)?
             .memory)
     }
 
     fn still_memory_plan(
         &self,
-        source: &BufferImageSource,
+        source: impl Into<GpuFrameSource>,
     ) -> Result<VarDctMemoryPlan, EncodeError> {
-        let mut plan = self.memory_plan(source)?;
+        let source = crate::source_input::FrameInputPlan::new(source.into())?;
+        let mut plan = self.memory_plan(&source)?;
         let header = image_header(
             source.layout.extent.width,
             source.layout.extent.height,
@@ -420,15 +425,21 @@ impl VarDctBackend {
     /// Exact admission for one request, including extra sampling and reference-only passes.
     pub fn memory_plan_for_request(
         &self,
-        source: &BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         request: &FrameEncodeRequest,
     ) -> Result<VarDctMemoryPlan, EncodeError> {
-        Ok(self.prepare_frame(source, request)?.0.memory)
+        Ok(self
+            .prepare_frame(
+                &crate::source_input::FrameInputPlan::new(source.into())?,
+                request,
+            )?
+            .0
+            .memory)
     }
 
     fn prepare_frame(
         &self,
-        source: &BufferImageSource,
+        source: &crate::source_input::FrameInputPlan,
         request: &FrameEncodeRequest,
     ) -> Result<(VarDctDispatchPlan, FrameHeaderPlan, VarDctConfig), EncodeError> {
         let extent = source.layout.extent;
@@ -447,10 +458,11 @@ impl VarDctBackend {
 
     fn dispatch_plan(
         &self,
-        source: &BufferImageSource,
+        source: &crate::source_input::FrameInputPlan,
         progressive: &ProgressivePlan,
         sampling: &FrameSamplingPlan,
     ) -> Result<VarDctDispatchPlan, EncodeError> {
+        source.validate_limits(self.max_buffer_size)?;
         let extent = sampling.color_extent;
         let frame = match self.topology {
             VarDctTopology::SingleTransform(strategy) => {
@@ -480,7 +492,7 @@ impl VarDctBackend {
         };
         self.config.group_order.validate(frame)?;
         if !self.matches_source_format(&source.layout.format)
-            || !source.buffer.usage().contains(wgpu::BufferUsages::STORAGE)
+            || !source.buffer_usage().contains(wgpu::BufferUsages::STORAGE)
         {
             return Err(UnsupportedFeature::InputFormat.into());
         }
@@ -490,7 +502,7 @@ impl VarDctBackend {
             ));
         }
         let source_layout =
-            crate::source::SourceLayout::for_source(source, self.storage_offset_alignment)?;
+            crate::source::SourceLayout::for_input(source, self.storage_offset_alignment)?;
         let color_source = if self.color_plan.icc_transform.is_some() {
             source_layout
                 .cmyk_color
@@ -501,7 +513,11 @@ impl VarDctBackend {
         };
         let source_windows = color_source.full_windows;
         source_windows.validate(self.max_storage_binding_size)?;
-        let source_binding_bytes = source_windows.addressed_bytes()?;
+        let source_binding_bytes = if source.caller_buffer().is_some() {
+            source_windows.addressed_bytes()?
+        } else {
+            0
+        };
         let region = color_source.region(0, 0, extent.width, extent.height)?;
         let (mut sources, offsets) = self.color_plan.bind_sources(&region);
         source_windows.rebase(&mut sources, offsets)?;
@@ -775,6 +791,17 @@ impl VarDctBackend {
                 .into());
             }
         }
+        memory.source_copy_bytes = source.copy_bytes;
+        memory.source_texture_bytes = source.texture_bytes;
+        memory.owned_bytes_per_job = memory
+            .owned_bytes_per_job
+            .checked_add(source.copy_bytes)
+            .ok_or(EncodeError::InvalidSource("input ownership overflow"))?;
+        memory.addressed_bytes_per_job = memory
+            .addressed_bytes_per_job
+            .checked_add(source.copy_bytes)
+            .and_then(|bytes| bytes.checked_add(source.texture_bytes))
+            .ok_or(EncodeError::InvalidSource("input addressing overflow"))?;
         Ok(VarDctDispatchPlan {
             extra_channels,
             icc,
@@ -842,12 +869,9 @@ impl GpuEncodeBackend for VarDctBackend {
     }
 
     fn supports_input(&self, source: &GpuFrameSource) -> bool {
-        let GpuFrameSource::Buffer(source) = source else {
-            return false;
-        };
         // This preflight has no frame options. Actual extents, sampling, bindings and budget
         // must be checked by prepare_frame with the caller's request, before any admission.
-        self.matches_source_format(&source.layout.format)
+        self.matches_source_format(source.pixel_format())
     }
 
     fn submit(
@@ -856,13 +880,12 @@ impl GpuEncodeBackend for VarDctBackend {
         source: GpuFrameSource,
         request: &FrameEncodeRequest,
     ) -> Result<Self::Job, EncodeError> {
-        let GpuFrameSource::Buffer(source) = source else {
-            return Err(UnsupportedFeature::InputFormat.into());
-        };
+        let source = crate::source_input::FrameInputPlan::new(source)?;
         let (plan, control, config) = self.prepare_frame(&source, request)?;
         let memory_permit = context
             .memory_budget()
             .try_reserve(plan.memory.owned_bytes_per_job)?;
+        let source = source.materialize(context.device(), None);
 
         let parameters = Arc::new(context.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("jxl-wgpu VarDCT parameters"),
@@ -905,6 +928,7 @@ impl GpuEncodeBackend for VarDctBackend {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("jxl-wgpu VarDCT encode"),
                 });
+        source.record_copy(&mut commands);
         commands.clear_buffer(&artifact, 0, None);
         let extra_scratch = self
             .extra_channel_pipeline
@@ -1212,7 +1236,7 @@ impl VarDctMapCompletion {
 }
 
 struct VarDctJobLifetime {
-    _source: BufferImageSource,
+    _source: Arc<crate::source_input::PreparedInput>,
     _extra_channels: Vec<modular_plane::Scratch>,
     _icc: Option<icc_input::Scratch>,
     _raw_matrices: Option<raw_matrices::Scratch>,
@@ -1974,14 +1998,17 @@ impl VarDctEncoder {
     }
 
     /// Still-image admission, including any serialized ICC header storage.
-    pub fn memory_plan(&self, source: &BufferImageSource) -> Result<VarDctMemoryPlan, EncodeError> {
+    pub fn memory_plan(
+        &self,
+        source: impl Into<GpuFrameSource>,
+    ) -> Result<VarDctMemoryPlan, EncodeError> {
         self.encoder.backend().still_memory_plan(source)
     }
 
     /// Computes exact resources for the supplied physical-frame request.
     pub fn memory_plan_for_request(
         &self,
-        source: &BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         request: &FrameEncodeRequest,
     ) -> Result<VarDctMemoryPlan, EncodeError> {
         self.encoder
@@ -2011,28 +2038,34 @@ impl VarDctEncoder {
         VarDctSequenceSession::new(&self.encoder, &self.encoder.backend().config, descriptor)
     }
 
-    pub fn submit(&self, source: BufferImageSource) -> Result<VarDctSubmission, EncodeError> {
+    pub fn submit(
+        &self,
+        source: impl Into<GpuFrameSource>,
+    ) -> Result<VarDctSubmission, EncodeError> {
         self.submit_inner(source, false)
     }
 
     pub fn submit_container(
         &self,
-        source: BufferImageSource,
+        source: impl Into<GpuFrameSource>,
     ) -> Result<VarDctSubmission, EncodeError> {
         self.submit_inner(source, true)
     }
 
-    pub fn encode(&self, source: BufferImageSource) -> Result<Vec<u8>, EncodeError> {
+    pub fn encode(&self, source: impl Into<GpuFrameSource>) -> Result<Vec<u8>, EncodeError> {
         self.submit(source)?.wait()
     }
 
-    pub fn encode_container(&self, source: BufferImageSource) -> Result<Vec<u8>, EncodeError> {
+    pub fn encode_container(
+        &self,
+        source: impl Into<GpuFrameSource>,
+    ) -> Result<Vec<u8>, EncodeError> {
         self.submit_container(source)?.wait()
     }
 
     fn submit_inner(
         &self,
-        source: BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         container: bool,
     ) -> Result<VarDctSubmission, EncodeError> {
         submit_still(&self.encoder, source, container)
@@ -2130,14 +2163,17 @@ impl TiledVarDctEncoder {
     }
 
     /// Still-image admission, including any serialized ICC header storage.
-    pub fn memory_plan(&self, source: &BufferImageSource) -> Result<VarDctMemoryPlan, EncodeError> {
+    pub fn memory_plan(
+        &self,
+        source: impl Into<GpuFrameSource>,
+    ) -> Result<VarDctMemoryPlan, EncodeError> {
         self.encoder.backend().still_memory_plan(source)
     }
 
     /// Computes exact resources for the supplied physical-frame request.
     pub fn memory_plan_for_request(
         &self,
-        source: &BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         request: &FrameEncodeRequest,
     ) -> Result<VarDctMemoryPlan, EncodeError> {
         self.encoder
@@ -2145,8 +2181,9 @@ impl TiledVarDctEncoder {
             .memory_plan_for_request(source, request)
     }
 
-    pub fn grid(&self, source: &BufferImageSource) -> Result<TiledVarDctGrid, EncodeError> {
-        self.memory_plan(source)?;
+    pub fn grid(&self, source: impl Into<GpuFrameSource>) -> Result<TiledVarDctGrid, EncodeError> {
+        let source = crate::source_input::FrameInputPlan::new(source.into())?;
+        self.memory_plan(&source)?;
         Ok(TiledVarDctGrid {
             passes: self.encoder.backend().config.progressive.passes().len() as u8,
             ..TiledVarDctGrid::new(source.layout.extent.width, source.layout.extent.height)?
@@ -2175,28 +2212,34 @@ impl TiledVarDctEncoder {
         VarDctSequenceSession::new(&self.encoder, &self.encoder.backend().config, descriptor)
     }
 
-    pub fn submit(&self, source: BufferImageSource) -> Result<VarDctSubmission, EncodeError> {
+    pub fn submit(
+        &self,
+        source: impl Into<GpuFrameSource>,
+    ) -> Result<VarDctSubmission, EncodeError> {
         self.submit_inner(source, false)
     }
 
     pub fn submit_container(
         &self,
-        source: BufferImageSource,
+        source: impl Into<GpuFrameSource>,
     ) -> Result<VarDctSubmission, EncodeError> {
         self.submit_inner(source, true)
     }
 
-    pub fn encode(&self, source: BufferImageSource) -> Result<Vec<u8>, EncodeError> {
+    pub fn encode(&self, source: impl Into<GpuFrameSource>) -> Result<Vec<u8>, EncodeError> {
         self.submit(source)?.wait()
     }
 
-    pub fn encode_container(&self, source: BufferImageSource) -> Result<Vec<u8>, EncodeError> {
+    pub fn encode_container(
+        &self,
+        source: impl Into<GpuFrameSource>,
+    ) -> Result<Vec<u8>, EncodeError> {
         self.submit_container(source)?.wait()
     }
 
     fn submit_inner(
         &self,
-        source: BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         container: bool,
     ) -> Result<VarDctSubmission, EncodeError> {
         submit_still(&self.encoder, source, container)
@@ -2205,9 +2248,10 @@ impl TiledVarDctEncoder {
 
 fn submit_still(
     encoder: &GpuEncoder<VarDctBackend>,
-    source: BufferImageSource,
+    source: impl Into<GpuFrameSource>,
     container: bool,
 ) -> Result<VarDctSubmission, EncodeError> {
+    let source = crate::source_input::FrameInputPlan::new(source.into())?;
     let backend = encoder.backend();
     backend.still_memory_plan(&source)?;
     let extent = source.layout.extent;
@@ -2232,7 +2276,7 @@ fn submit_still(
         &backend.color_plan,
     )?
     .finish(encoder.memory_budget())?;
-    let frame = encoder.submit_frame(GpuFrameSource::Buffer(source), request)?;
+    let frame = encoder.submit_frame(source.into_source(), request)?;
     Ok(VarDctSubmission {
         frame: Some(frame),
         codestream_header: Some(codestream_header),

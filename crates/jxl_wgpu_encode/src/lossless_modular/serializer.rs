@@ -137,9 +137,10 @@ impl LosslessModularEncoder {
     /// Animations retain one separately admitted image header across all frame jobs.
     pub fn memory_plan(
         &self,
-        source: &crate::BufferImageSource,
+        source: impl Into<GpuFrameSource>,
     ) -> Result<LosslessModularMemoryPlan, EncodeError> {
-        let mut plan = self.encoder.backend().memory_plan(source)?;
+        let source = crate::source_input::FrameInputPlan::new(source.into())?;
+        let mut plan = self.encoder.backend().memory_plan(&source)?;
         self.alpha_association.validate(plan.format)?;
         source.validate_alpha_association(self.alpha_association)?;
         let spec = lossless_modular_source_spec(&source.layout.format)?;
@@ -199,27 +200,29 @@ impl LosslessModularEncoder {
 
     pub fn submit(
         &self,
-        source: crate::BufferImageSource,
+        source: impl Into<GpuFrameSource>,
     ) -> Result<LosslessModularSubmission, EncodeError> {
+        let source = source.into();
         self.memory_plan(&source)?;
         self.submit_inner(source, false)
     }
 
     pub fn submit_container(
         &self,
-        source: crate::BufferImageSource,
+        source: impl Into<GpuFrameSource>,
     ) -> Result<LosslessModularSubmission, EncodeError> {
+        let source = source.into();
         self.memory_plan(&source)?;
         self.submit_inner(source, true)
     }
 
-    pub fn encode(&self, source: crate::BufferImageSource) -> Result<Vec<u8>, EncodeError> {
+    pub fn encode(&self, source: impl Into<GpuFrameSource>) -> Result<Vec<u8>, EncodeError> {
         self.submit(source)?.wait()
     }
 
     pub fn encode_container(
         &self,
-        source: crate::BufferImageSource,
+        source: impl Into<GpuFrameSource>,
     ) -> Result<Vec<u8>, EncodeError> {
         self.submit_container(source)?.wait()
     }
@@ -285,11 +288,12 @@ impl LosslessModularEncoder {
 
     fn submit_inner(
         &self,
-        source: crate::BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         container: bool,
     ) -> Result<LosslessModularSubmission, EncodeError> {
         // Preserve typed address/device-limit failures before the generic
         // backend admission predicate maps unsupported inputs to InputFormat.
+        let source = crate::source_input::FrameInputPlan::new(source.into())?;
         self.encoder.backend().memory_plan(&source)?;
         source.validate_alpha_association(self.alpha_association)?;
         let width = source.layout.extent.width;
@@ -331,9 +335,7 @@ impl LosslessModularEncoder {
             .with_inputs(&self.config()),
         )?
         .finish(self.encoder.memory_budget())?;
-        let frame = self
-            .encoder
-            .submit_frame(GpuFrameSource::Buffer(source), request)?;
+        let frame = self.encoder.submit_frame(source.into_source(), request)?;
         Ok(LosslessModularSubmission {
             frame: Some(frame),
             codestream_header: Some(codestream_header),
@@ -512,10 +514,11 @@ impl LosslessModularSequenceSession {
     /// GPU job footprint. Completed preview storage is admitted separately at its actual size.
     pub fn preview_memory_plan(
         &self,
-        source: &crate::BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         options: FrameOptions,
     ) -> Result<LosslessModularMemoryPlan, EncodeError> {
-        self.validate_source(source)?;
+        let source = crate::source_input::FrameInputPlan::new(source.into())?;
+        self.validate_source(&source)?;
         let request = self.session.preview_request(
             &self.assembler,
             options,
@@ -524,18 +527,19 @@ impl LosslessModularSequenceSession {
         self.session
             .encoder()
             .backend()
-            .memory_plan_for_request(source, &request)
+            .memory_plan_for_request(&source, &request)
     }
     /// Submits the declared preview without advancing or closing the main frame sequence.
     pub fn submit_preview(
         &mut self,
-        source: crate::BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         options: FrameOptions,
     ) -> Result<crate::PreviewSubmission<LosslessModularJob>, EncodeError> {
+        let source = crate::source_input::FrameInputPlan::new(source.into())?;
         self.validate_source(&source)?;
         self.session.submit_preview(
             &mut self.assembler,
-            GpuFrameSource::Buffer(source),
+            source.into_source(),
             options,
             &self.session.default_coding(),
         )
@@ -556,22 +560,23 @@ impl LosslessModularSequenceSession {
 
     pub fn submit_frame(
         &mut self,
-        source: crate::BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         options: FrameOptions,
     ) -> Result<FrameSubmission<LosslessModularJob>, EncodeError> {
+        let source = crate::source_input::FrameInputPlan::new(source.into())?;
         self.validate_source(&source)?;
-        self.session
-            .submit_frame(GpuFrameSource::Buffer(source), options)
+        self.session.submit_frame(source.into_source(), options)
     }
 
     pub fn submit_last_frame(
         &mut self,
-        source: crate::BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         options: FrameOptions,
     ) -> Result<FrameSubmission<LosslessModularJob>, EncodeError> {
+        let source = crate::source_input::FrameInputPlan::new(source.into())?;
         self.validate_source(&source)?;
         self.session
-            .submit_last_frame(GpuFrameSource::Buffer(source), options)
+            .submit_last_frame(source.into_source(), options)
     }
 
     /// Inserts one completed GPU frame. Completion order need not match frame order.
@@ -605,7 +610,10 @@ impl LosslessModularSequenceSession {
             .finish_indexed_container(inventory_limits, index_limits)
     }
 
-    fn validate_source(&self, source: &crate::BufferImageSource) -> Result<(), EncodeError> {
+    fn validate_source(
+        &self,
+        source: &crate::source_input::FrameInputPlan,
+    ) -> Result<(), EncodeError> {
         source.validate_alpha_association(self.alpha_association)?;
         let spec = lossless_modular_source_spec(&source.layout.format)?;
         if spec.packing.format != self.descriptor.format

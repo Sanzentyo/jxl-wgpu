@@ -16,6 +16,15 @@ pub(crate) enum ScalarBuffer {
 }
 
 impl ScalarBuffer {
+    pub(crate) fn caller_buffer(
+        self,
+        source: &crate::source_input::FrameInputPlan,
+    ) -> Option<&wgpu::Buffer> {
+        match self {
+            Self::Primary => source.caller_buffer(),
+            Self::Attached(index) => Some(&source.extra_channels()[index].buffer),
+        }
+    }
     pub(crate) fn buffer(self, source: &BufferImageSource) -> &wgpu::Buffer {
         match self {
             Self::Primary => &source.buffer,
@@ -33,11 +42,23 @@ impl ExtraInputPlan {
     pub(crate) fn new(
         samples: &ImageSamplePlan,
         sampling: &ExtraChannelSamplingPlan,
-        source: &BufferImageSource,
+        source: &crate::source_input::FrameInputPlan,
         main: &SourceLayout,
         alignment: u64,
     ) -> Result<Self, EncodeError> {
-        source.validate_alpha_association(samples.alpha.unwrap_or_default())?;
+        source.validate_alpha_association(
+            samples
+                .extra_channels
+                .iter()
+                .find_map(|channel| {
+                    if let crate::ExtraChannelKind::Alpha(association) = channel.kind() {
+                        Some(association)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default(),
+        )?;
         let packed = usize::from(samples.alpha.is_some());
         if source.extra_channels().len() + packed + usize::from(samples.cmyk)
             != samples.extra_channels.len()
@@ -92,10 +113,13 @@ impl ExtraInputPlan {
             independent.push(ScalarInput { layout, buffer });
         }
         let source_bytes = SourceWindows::addressed_bytes_many(
-            std::iter::once((source.buffer.as_ref(), main.full_windows)).chain(
-                independent
-                    .iter()
-                    .map(|input| (input.buffer.buffer(source), input.layout.full_windows)),
+            std::iter::once((source.caller_buffer(), main.full_windows)).chain(
+                independent.iter().map(|input| {
+                    (
+                        input.buffer.caller_buffer(source),
+                        input.layout.full_windows,
+                    )
+                }),
             ),
         )?;
         Ok(Self {

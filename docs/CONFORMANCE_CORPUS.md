@@ -2191,6 +2191,44 @@ Reproduction: run the `cmyk_input` target with `JXL_MODULAR_WORD_ORACLE`, and th
 does not establish floating ink-amount conversion, other device spaces, YUV/texture input or
 adaptive quality; the related roadmap entries remain Partial.
 
+## Texture encoder input
+
+The `texture_input` integration target exercises the shared physical input plan through Modular,
+Original/XYB VarDCT, mixed sequences and previews. Twelve storage/precision combinations cover
+R/RG/RGBA integer, UNORM/sRGB/BGRA, binary16 and binary32 carriers; logical values include 13/31-bit
+integers, signed zero, subnormals, infinities and noncanonical NaN payloads. Selected 9×5 mip/layer
+inputs have poisoned neighboring subresources and odd copied rows. Prefix and ANS outputs equal
+canonical GPU-buffer codestreams byte for byte, and both pinned scalar libjxl and jxl-oxide compare
+every original component word independently. Texture formats are raw byte carriers, so these
+checks reject accidental normalized sampling or sRGB transfer.
+
+Finite RGB/alpha and CMYK cases additionally combine independent shifted 13-bit depth with
+Original/XYB VarDCT and lossless Modular. Buffer/texture codestreams match; native Modular words
+and exact VarDCT Black/alpha/depth words retain independent references. CMYK uses integer ink
+complementation or explicitly complemented float words. Independently attached associated alpha
+now selects the same convention guard as packed alpha in both storage families; rejected ink
+amounts preserve memory and mixed-sequence state, while complemented retries remain supported.
+
+M/V/M and V/M/V sequences cover hidden references, 2× color/alpha, effective 8× depth, signed crops
+and Blend composition. Whole codestream identity compares texture and buffer sequences. Independent
+physical-word checks remain exact; fragmented real-GPU depth output matches native presentation
+at the unchanged `2e-6` bound. Both mixed preview codecs and fixed Modular preview/main input use
+textures, with independent native preview decoding and separately retained packet reservations.
+
+Admission/cancellation checks cover resident Prefix, streaming ANS and VarDCT with exact and
+one-byte-short budgets. Copy bytes are charged once and original texture handles retire with GPU
+completion; retained previews hold only packet storage. The library test
+`texture_copy_is_shared_by_all_streaming_histogram_and_serialization_batches` forces three batches,
+checks six existing submissions and one persistent 772-byte copy, validates exact words, and rejects
+a 771-byte buffer limit before allocation. Invalid public descriptors, missing usage, mismatched
+formats/texel widths, mip/layer bounds, 3D, depth and multisample textures reject before admission.
+NaN color through the general VarDCT path rejects main/preview publication and releases all job bytes.
+
+Reproduce with `cargo test --locked -p jxl_wgpu_encode --test texture_input -- --test-threads=2`
+and the named library test, retaining `JXL_MODULAR_WORD_ORACLE`. The full capability gates also
+remain required. Multi-plane texture inputs, automatic resampling, YUV and quality policy remain
+open; this does not establish those capabilities or alter existing precision bounds.
+
 ## Independent VarDCT extra input
 
 

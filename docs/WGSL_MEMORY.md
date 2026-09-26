@@ -968,7 +968,17 @@ order. The largest window must fit the storage-binding limit and u32 addressing;
 plane offsets remain u64. `source_binding_bytes` reports their union, counting overlap once
 and excluding inter-plane gaps. Caller-owned source buffers are retained through GPU completion.
 Normalization and tiled encoding require seven storage bindings; saliency requires six. Typed
-limit checks run before pipeline creation. No extra source copy, allocation or submission is added.
+limit checks run before pipeline creation. Buffer inputs add no source copy, allocation or submission.
+
+Encoder texture inputs use the same storage-buffer ABI after a checked GPU-only copy. The common
+input plan checks actual format, `COPY_SRC`, single-sample 2D topology, mip/layer bounds and exact
+one-texel logical packing before admission. `source_copy_bytes` reserves the 256-byte-row,
+four-byte-rounded storage allocation; `source_texture_bytes` accounts for the selected caller
+texels, excluding opaque driver tiling. Caller-buffer unions exclude this owned copy. Thus the
+addressed total includes each copy allocation, input texel and attached-buffer window once.
+The copy is encoded before compute in the existing submission, with no WGSL layout change.
+Streamed Modular retains the copy and its separate permit across histogram/serialization batches;
+each pending map callback shares its owner so cancellation cannot release in-flight storage.
 
 `Source.bit_shift` stores the physical shift in bits 0–4 and exact unsigned complementation in bit 5.
 The loader masks the shift before extracting the word, then conditionally subtracts it from the

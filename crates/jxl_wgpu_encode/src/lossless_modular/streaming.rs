@@ -29,7 +29,7 @@ impl LosslessModularBackend {
     pub(super) fn submit_streaming(
         &self,
         context: &WgpuContext,
-        source: crate::BufferImageSource,
+        source: Arc<crate::source_input::PreparedInput>,
         plan: ModularDispatchPlan,
         header: FrameHeaderPlan,
     ) -> Result<LosslessModularJob, EncodeError> {
@@ -67,7 +67,7 @@ impl LosslessModularBackend {
     pub(super) fn submit_streaming(
         &self,
         context: &WgpuContext,
-        source: crate::BufferImageSource,
+        source: Arc<crate::source_input::PreparedInput>,
         plan: ModularDispatchPlan,
         header: FrameHeaderPlan,
     ) -> Result<LosslessModularJob, EncodeError> {
@@ -92,7 +92,7 @@ struct StreamingModularWorker {
     ans_pipeline: Option<Arc<AnsPipelines>>,
     buffer_pool: Arc<EncoderBufferPool>,
     direct_mapping: bool,
-    source: crate::BufferImageSource,
+    source: Arc<crate::source_input::PreparedInput>,
     plan: ModularDispatchPlan,
     header: FrameHeaderPlan,
     cancelled: Arc<AtomicBool>,
@@ -103,9 +103,9 @@ impl StreamingModularWorker {
     // Consume the worker so its source and plan are released before completion is published.
     fn run(self) -> Result<GpuFrameArtifacts, EncodeError> {
         let mut histograms = FrameHistograms::default();
-        for batch in &self.plan.batches {
+        for (index, batch) in self.plan.batches.iter().enumerate() {
             ensure_streaming_job_active(&self.cancelled)?;
-            self.with_batch(batch, None, |bytes| {
+            self.with_batch(batch, None, index == 0, |bytes| {
                 accumulate_streaming_batch_histograms(&self.plan, batch, bytes, &mut histograms)
             })?;
         }
@@ -131,7 +131,7 @@ impl StreamingModularWorker {
         )?;
         for batch in &self.plan.batches {
             ensure_streaming_job_active(&self.cancelled)?;
-            self.with_batch(batch, entropy.ans(), |bytes| {
+            self.with_batch(batch, entropy.ans(), false, |bytes| {
                 serialize_streaming_batch(&self.plan, batch, bytes, &mut assembler)
             })?;
         }
@@ -148,6 +148,7 @@ impl StreamingModularWorker {
         &self,
         batch: &ModularDispatchBatch,
         codebook: Option<&AnsCodebook>,
+        copy_input: bool,
         inspect: impl FnOnce(&[u8]) -> Result<T, EncodeError>,
     ) -> Result<T, EncodeError> {
         let pending = submit_streaming_batch(StreamingBatchContext {
@@ -157,6 +158,7 @@ impl StreamingModularWorker {
             buffer_pool: &self.buffer_pool,
             direct_mapping: self.direct_mapping,
             source: &self.source,
+            copy_input,
             plan: &self.plan,
             batch,
         })?;
@@ -191,7 +193,8 @@ struct StreamingBatchContext<'a> {
     entropy: Option<(&'a wgpu::ComputePipeline, Option<&'a AnsCodebook>)>,
     buffer_pool: &'a Arc<EncoderBufferPool>,
     direct_mapping: bool,
-    source: &'a crate::BufferImageSource,
+    source: &'a Arc<crate::source_input::PreparedInput>,
+    copy_input: bool,
     plan: &'a ModularDispatchPlan,
     batch: &'a ModularDispatchBatch,
 }
@@ -238,6 +241,7 @@ fn submit_streaming_batch(
         buffer_pool,
         direct_mapping,
         source,
+        copy_input,
         plan,
         batch,
     } = submission;
@@ -292,6 +296,9 @@ fn submit_streaming_batch(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("jxl-wgpu streamed lossless modular encode"),
         });
+    if copy_input {
+        source.record_copy(&mut commands);
+    }
     commands.clear_buffer(&buffers.artifact, 0, None);
     for upload in uploads {
         upload.record(&mut commands, &buffers.parameters, &buffers.artifact);
@@ -344,14 +351,7 @@ fn submit_streaming_batch(
     let lifetime = Arc::new(EncodeJobLifetime {
         buffer_lease,
         _memory_permit: memory_permit,
-        _source_buffers: std::iter::once(Arc::clone(&source.buffer))
-            .chain(
-                source
-                    .extra_channels()
-                    .iter()
-                    .map(|input| Arc::clone(&input.buffer)),
-            )
-            .collect(),
+        _source: Arc::clone(source),
         mapped: AtomicBool::new(false),
     });
     let callback_lifetime = Arc::clone(&lifetime);
@@ -741,8 +741,8 @@ pub(super) struct ResidentLosslessModularJob {
 pub(super) struct EncodeJobLifetime {
     pub(super) buffer_lease: crate::buffer_pool::EncoderBufferLease,
     pub(super) _memory_permit: MemoryPermit,
-    // Mapping completion, including cancellation, owns all externally supplied GPU buffers.
-    pub(super) _source_buffers: Vec<Arc<wgpu::Buffer>>,
+    // Completion owns caller buffers/textures and the prepared copy, including cancellation.
+    pub(super) _source: Arc<crate::source_input::PreparedInput>,
     pub(super) mapped: AtomicBool,
 }
 
@@ -765,10 +765,11 @@ pub(super) struct BrowserStreamingLosslessModularJob {
     ans_pipeline: Option<Arc<AnsPipelines>>,
     buffer_pool: Arc<EncoderBufferPool>,
     direct_mapping: bool,
-    source: crate::BufferImageSource,
+    source: Arc<crate::source_input::PreparedInput>,
     plan: ModularDispatchPlan,
     header: FrameHeaderPlan,
     cursor: StreamingCursor,
+    copy_input: bool,
     pending: Option<PendingStreamingBatch>,
     histograms: FrameHistograms,
     assembler: Option<ModularPacketAssembler>,
@@ -779,7 +780,7 @@ impl BrowserStreamingLosslessModularJob {
     pub(super) fn new(
         context: WgpuContext,
         backend: &LosslessModularBackend,
-        source: crate::BufferImageSource,
+        source: Arc<crate::source_input::PreparedInput>,
         plan: ModularDispatchPlan,
         header: FrameHeaderPlan,
     ) -> Result<Self, EncodeError> {
@@ -794,6 +795,7 @@ impl BrowserStreamingLosslessModularJob {
             plan,
             header,
             cursor,
+            copy_input: true,
             pending: None,
             histograms: FrameHistograms::default(),
             assembler: None,
@@ -828,9 +830,11 @@ impl BrowserStreamingLosslessModularJob {
             buffer_pool: &self.buffer_pool,
             direct_mapping: self.direct_mapping,
             source: &self.source,
+            copy_input: self.copy_input,
             plan: &self.plan,
             batch,
         })?);
+        self.copy_input = false;
         Ok(())
     }
 

@@ -30,9 +30,21 @@ fn map_notification_releases_callback_ownership_before_waking_the_consumer() {
         for success in [false, true] {
             let lease = pool.checkout(context.device(), 256, 256, false);
             let readback = Arc::clone(&lease.buffers().readback);
+            let input = crate::BufferImageSource::new(
+                Arc::clone(&lease.buffers().parameters),
+                jxl_gpu_formats::ImageLayout::packed(
+                    jxl_gpu_protocol::Extent2d::new(1, 1),
+                    crate::LosslessModularFormat::Gray.pixel_format(8).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let input = crate::source_input::FrameInputPlan::new(input.into())
+                .unwrap()
+                .materialize(context.device(), None);
             let lifetime = Arc::new(EncodeJobLifetime {
                 buffer_lease: lease,
-                _source_buffers: Vec::new(),
+                _source: input,
                 _memory_permit: context.memory_budget().try_reserve(BYTES).unwrap(),
                 mapped: AtomicBool::new(false),
             });

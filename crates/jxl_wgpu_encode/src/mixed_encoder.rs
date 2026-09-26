@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 
 use crate::session::FrameCoding;
 use crate::{
-    BufferImageSource, CodestreamAssembler, Determinism, EncodeError, EncodeProfile, EncodeSession,
+    CodestreamAssembler, Determinism, EncodeError, EncodeProfile, EncodeSession,
     EncoderBufferPoolStats, EncoderCapabilities, FrameEncodeRequest, FrameIndex, FrameOptions,
     FrameSubmission, GpuEncodeBackend, GpuEncodeJob, GpuEncoder, GpuFrameArtifacts, GpuFrameSource,
     ImageSequenceDescriptor, LosslessModularBackend, LosslessModularConfig, LosslessModularJob,
@@ -165,7 +165,7 @@ impl MixedModeBackend {
 
     fn validate_request(
         &self,
-        source: &BufferImageSource,
+        source: &crate::source_input::FrameInputPlan,
         request: &FrameEncodeRequest,
     ) -> Result<(), EncodeError> {
         source.validate_alpha_association(self.vardct.alpha_association().unwrap_or_default())?;
@@ -189,18 +189,19 @@ impl MixedModeBackend {
 
     fn memory_plan(
         &self,
-        source: &BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         request: &FrameEncodeRequest,
     ) -> Result<MixedModeMemoryPlan, EncodeError> {
-        self.validate_request(source, request)?;
+        let source = crate::source_input::FrameInputPlan::new(source.into())?;
+        self.validate_request(&source, request)?;
         match request.profile {
             EncodeProfile::ModularLossless { .. } => self
                 .modular
-                .memory_plan_for_request(source, request)
+                .memory_plan_for_request(&source, request)
                 .map(MixedModeMemoryPlan::Modular),
             EncodeProfile::VarDct { .. } => self
                 .vardct
-                .memory_plan_for_request(source, request)
+                .memory_plan_for_request(&source, request)
                 .map(MixedModeMemoryPlan::VarDct),
         }
     }
@@ -214,10 +215,7 @@ impl GpuEncodeBackend for MixedModeBackend {
     }
 
     fn supports_input(&self, source: &GpuFrameSource) -> bool {
-        let GpuFrameSource::Buffer(buffer) = source else {
-            return false;
-        };
-        self.vardct.matches_source_format(&buffer.layout.format)
+        self.vardct.matches_source_format(source.pixel_format())
             && (self.modular.supports_input(source) || self.vardct.supports_input(source))
     }
 
@@ -227,10 +225,8 @@ impl GpuEncodeBackend for MixedModeBackend {
         source: GpuFrameSource,
         request: &FrameEncodeRequest,
     ) -> Result<Self::Job, EncodeError> {
-        let GpuFrameSource::Buffer(buffer) = &source else {
-            return Err(UnsupportedFeature::InputFormat.into());
-        };
-        self.validate_request(buffer, request)?;
+        let plan = crate::source_input::FrameInputPlan::new(source.clone())?;
+        self.validate_request(&plan, request)?;
         let state = match request.profile {
             EncodeProfile::ModularLossless { .. } => {
                 MixedModeJobState::Modular(self.modular.submit(context, source, request)?)
@@ -390,7 +386,7 @@ impl MixedModeSequenceSession {
     /// GPU job footprint. Completed preview storage is admitted separately at its actual size.
     pub fn preview_memory_plan(
         &self,
-        source: &BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         encoding: MixedModeFrameEncoding,
         options: FrameOptions,
     ) -> Result<MixedModeMemoryPlan, EncodeError> {
@@ -403,17 +399,13 @@ impl MixedModeSequenceSession {
     /// The preview shares image metadata but may choose either codec independently of main frames.
     pub fn submit_preview(
         &mut self,
-        source: BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         encoding: MixedModeFrameEncoding,
         options: FrameOptions,
     ) -> Result<crate::PreviewSubmission<MixedModeJob>, EncodeError> {
         let coding = self.session.encoder().backend().coding(encoding);
-        self.session.submit_preview(
-            &mut self.assembler,
-            GpuFrameSource::Buffer(source),
-            options,
-            coding,
-        )
+        self.session
+            .submit_preview(&mut self.assembler, source.into(), options, coding)
     }
 
     pub fn insert_preview(&mut self, preview: crate::EncodedPreview) -> Result<(), EncodeError> {
@@ -432,7 +424,7 @@ impl MixedModeSequenceSession {
     /// Checks the next physical frame without reserving memory or advancing sequence state.
     pub fn memory_plan(
         &self,
-        source: &BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         encoding: MixedModeFrameEncoding,
         options: FrameOptions,
         is_last: bool,
@@ -446,7 +438,7 @@ impl MixedModeSequenceSession {
 
     pub fn submit_frame(
         &mut self,
-        source: BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         encoding: MixedModeFrameEncoding,
         options: FrameOptions,
     ) -> Result<FrameSubmission<MixedModeJob>, EncodeError> {
@@ -455,7 +447,7 @@ impl MixedModeSequenceSession {
 
     pub fn submit_last_frame(
         &mut self,
-        source: BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         encoding: MixedModeFrameEncoding,
         options: FrameOptions,
     ) -> Result<FrameSubmission<MixedModeJob>, EncodeError> {
@@ -464,14 +456,14 @@ impl MixedModeSequenceSession {
 
     fn submit(
         &mut self,
-        source: BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         encoding: MixedModeFrameEncoding,
         options: FrameOptions,
         last: bool,
     ) -> Result<FrameSubmission<MixedModeJob>, EncodeError> {
         let coding = self.session.encoder().backend().coding(encoding).clone();
         self.session
-            .submit_with_coding(GpuFrameSource::Buffer(source), options, last, &coding)
+            .submit_with_coding(source.into(), options, last, &coding)
     }
 
     /// Inserts validated GPU packets; completion and insertion order may differ from frame order.

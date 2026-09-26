@@ -270,23 +270,31 @@ impl LosslessModularBackend {
 
     pub fn memory_plan(
         &self,
-        source: &crate::BufferImageSource,
+        source: impl Into<GpuFrameSource>,
     ) -> Result<LosslessModularMemoryPlan, EncodeError> {
-        Ok(self.dispatch_plan(source)?.memory)
+        Ok(self
+            .dispatch_plan(&crate::source_input::FrameInputPlan::new(source.into())?)?
+            .memory)
     }
 
     /// Computes exact resources after the same frame-control and precision checks as submission.
     pub fn memory_plan_for_request(
         &self,
-        source: &crate::BufferImageSource,
+        source: impl Into<GpuFrameSource>,
         request: &FrameEncodeRequest,
     ) -> Result<LosslessModularMemoryPlan, EncodeError> {
-        Ok(self.prepare_frame(source, request)?.0.memory)
+        Ok(self
+            .prepare_frame(
+                &crate::source_input::FrameInputPlan::new(source.into())?,
+                request,
+            )?
+            .0
+            .memory)
     }
 
     fn prepare_frame(
         &self,
-        source: &crate::BufferImageSource,
+        source: &crate::source_input::FrameInputPlan,
         request: &FrameEncodeRequest,
     ) -> Result<(ModularDispatchPlan, FrameHeaderPlan), EncodeError> {
         let spec = crate::source::source_spec(&source.layout.format)?;
@@ -351,7 +359,7 @@ impl LosslessModularBackend {
 
     pub(super) fn dispatch_plan(
         &self,
-        source: &crate::BufferImageSource,
+        source: &crate::source_input::FrameInputPlan,
     ) -> Result<ModularDispatchPlan, EncodeError> {
         let spec = crate::source::source_spec(&source.layout.format)?;
         let samples = self.config.samples(
@@ -367,10 +375,11 @@ impl LosslessModularBackend {
 
     fn dispatch_plan_with_sampling(
         &self,
-        source: &crate::BufferImageSource,
+        source: &crate::source_input::FrameInputPlan,
         sampling: &crate::sampling::FrameSamplingPlan,
     ) -> Result<ModularDispatchPlan, EncodeError> {
         self.pipeline()?;
+        source.validate_limits(self.max_buffer_size)?;
         let extent = source.layout.extent;
         let group_grid = LosslessModularGroupGrid::for_extent(
             extent.width,
@@ -379,7 +388,7 @@ impl LosslessModularBackend {
         )?;
         let source_color =
             crate::source_color::SourceColorEncoding::from_format(&source.layout.format)?;
-        let source_layout = SourceLayout::for_source(source, self.storage_offset_alignment)?;
+        let source_layout = SourceLayout::for_input(source, self.storage_offset_alignment)?;
         let source_spec = &source_layout.spec;
         let format = source_spec.format;
         let transforms = Arc::new(ModularTransformPlan::with_sampling(
@@ -405,8 +414,8 @@ impl LosslessModularBackend {
             }
             .into());
         }
-        if !source.buffer.usage().contains(wgpu::BufferUsages::STORAGE)
-            || !source.buffer.size().is_multiple_of(4)
+        if !source.buffer_usage().contains(wgpu::BufferUsages::STORAGE)
+            || !source.buffer_bytes().is_multiple_of(4)
         {
             return Err(UnsupportedFeature::InputFormat.into());
         }
@@ -925,14 +934,14 @@ impl LosslessModularBackend {
             .ok_or(EncodeError::InvalidSource("total artifact size overflow"))?;
         let peak_source_binding_bytes = batches.iter().try_fold(0u64, |peak, batch| {
             SourceWindows::addressed_bytes_many(
-                std::iter::once((source.buffer.as_ref(), batch.source_windows)).chain(
+                std::iter::once((source.caller_buffer(), batch.source_windows)).chain(
                     input_loads
                         .iter()
                         .filter(|load| {
                             load.dispatch >= batch.first_dispatch
                                 && load.dispatch < batch.first_dispatch + batch.dispatch_count
                         })
-                        .map(|load| (load.source.buffer(source), load.windows)),
+                        .map(|load| (load.source.caller_buffer(source), load.windows)),
                 ),
             )
             .map(|bytes| peak.max(bytes))
@@ -945,12 +954,14 @@ impl LosslessModularBackend {
         let owned_bytes_per_job = artifact_storage_bytes
             .checked_add(readback_bytes)
             .and_then(|value| value.checked_add(parameter_storage_bytes))
+            .and_then(|value| value.checked_add(source.copy_bytes))
             .ok_or(EncodeError::InvalidSource("per-job memory size overflow"))?;
         let icc_profile_bytes = source_color
             .icc_profile()
             .map_or(0, |profile| profile.bytes().len() as u64);
         let addressed_bytes_per_job = owned_bytes_per_job
             .checked_add(peak_source_binding_bytes)
+            .and_then(|bytes| bytes.checked_add(source.texture_bytes))
             .and_then(|bytes| bytes.checked_add(icc_profile_bytes))
             .ok_or(EncodeError::InvalidSource("per-job memory size overflow"))?;
         let batch_count = u32::try_from(batches.len())
@@ -970,6 +981,8 @@ impl LosslessModularBackend {
             exponent_bits_per_sample: source_spec.exponent_bits_per_sample,
             bytes_per_sample: source_spec.bytes_per_sample,
             channel_count: channels,
+            source_copy_bytes: source.copy_bytes,
+            source_texture_bytes: source.texture_bytes,
             source_binding_bytes,
             peak_source_binding_bytes,
             parameter_storage_bytes,
@@ -1112,12 +1125,9 @@ impl GpuEncodeBackend for LosslessModularBackend {
     }
 
     fn supports_input(&self, source: &GpuFrameSource) -> bool {
-        let GpuFrameSource::Buffer(source) = source else {
-            return false;
-        };
         // Requested sampling belongs to prepare_frame; a source-only geometry query cannot
         // determine the supplied extent of each independently upsampled scalar input.
-        self.pipeline().is_ok() && crate::source::source_spec(&source.layout.format).is_ok()
+        self.pipeline().is_ok() && crate::source::source_spec(source.pixel_format()).is_ok()
     }
 
     fn submit(
@@ -1126,24 +1136,26 @@ impl GpuEncodeBackend for LosslessModularBackend {
         source: GpuFrameSource,
         request: &FrameEncodeRequest,
     ) -> Result<Self::Job, EncodeError> {
-        let GpuFrameSource::Buffer(source) = source else {
-            return Err(UnsupportedFeature::InputFormat.into());
-        };
+        let source = crate::source_input::FrameInputPlan::new(source)?;
         let (plan, header) = self.prepare_frame(&source, request)?;
         if plan.memory.streaming {
             // A later batch may be larger than the first. Reject an already insufficient
             // peak budget before starting the worker or allocating its first batch. Batches
             // still reserve their actual bytes independently as concurrent usage changes.
-            drop(
-                context
-                    .memory_budget()
-                    .try_reserve(plan.memory.owned_bytes_per_job)?,
-            );
+            let mut admission = context
+                .memory_budget()
+                .try_reserve(plan.memory.owned_bytes_per_job)?;
+            let copy_permit = admission.split_off(source.copy_bytes).map_err(|_| {
+                BackendError::Invariant("input copy exceeds the checked peak reservation")
+            })?;
+            drop(admission);
+            let source = source.materialize(context.device(), Some(copy_permit));
             return self.submit_streaming(context, source, plan, header);
         }
         let memory_permit = context
             .memory_budget()
             .try_reserve(plan.memory.owned_bytes_per_job)?;
+        let source = source.materialize(context.device(), None);
 
         let buffer_lease = self.buffer_pool.checkout(
             context.device(),
@@ -1219,6 +1231,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("jxl-wgpu lossless modular encode"),
                 });
+        source.record_copy(&mut commands);
         commands.clear_buffer(&buffers.artifact, 0, None);
         for upload in uploads {
             upload.record(&mut commands, &buffers.parameters, &buffers.artifact);
@@ -1261,14 +1274,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
         let lifetime = Arc::new(EncodeJobLifetime {
             buffer_lease,
             _memory_permit: memory_permit,
-            _source_buffers: std::iter::once(Arc::clone(&source.buffer))
-                .chain(
-                    source
-                        .extra_channels()
-                        .iter()
-                        .map(|input| Arc::clone(&input.buffer)),
-                )
-                .collect(),
+            _source: Arc::clone(&source),
             mapped: AtomicBool::new(false),
         });
         let callback_lifetime = Arc::clone(&lifetime);
@@ -1326,6 +1332,141 @@ mod source_window_tests {
     use jxl_gpu_formats::{ImageLayout, PackingField, PackingWord};
     use jxl_gpu_protocol::Extent2d;
     use wgpu::util::DeviceExt;
+
+    #[test]
+    fn texture_copy_is_shared_by_all_streaming_histogram_and_serialization_batches() {
+        let gpu =
+            pollster::block_on(jxl_wgpu::WgpuBackend::request_default(Default::default())).unwrap();
+        let context = WgpuContext::from_backend(&gpu);
+        let extent = Extent2d::new(257, 2);
+        let format = LosslessModularFormat::Gray.pixel_format(8).unwrap();
+        let raw: Vec<_> = (0..514).map(|i| (i * 73) as u8).collect();
+        let texture = Arc::new(context.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("multi-batch texture input"),
+            size: wgpu::Extent3d {
+                width: 257,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Uint,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        }));
+        context.queue().write_texture(
+            texture.as_image_copy(),
+            &raw,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(257),
+                rows_per_image: None,
+            },
+            texture.size(),
+        );
+        let input = crate::TextureImageSource::new(
+            texture,
+            wgpu::TextureFormat::R8Uint,
+            format.clone(),
+            0,
+            0,
+        )
+        .unwrap();
+        let owner = Arc::downgrade(&input.texture);
+        let config = LosslessModularConfig {
+            entropy: LosslessModularEntropyCoding::Ans,
+            group_size: super::super::types::LosslessModularGroupSize::Pixels128,
+            ..Default::default()
+        };
+        let mut backend = LosslessModularBackend::with_config(&context, config.clone());
+        let source = crate::source_input::FrameInputPlan::new((&input).into()).unwrap();
+        let initial = backend.dispatch_plan(&source).unwrap();
+        backend.max_storage_binding_size =
+            initial.groups[0].output_size + super::super::entropy::PROFILE_BYTES;
+        let plan = backend.dispatch_plan(&source).unwrap();
+        assert_eq!(plan.memory.batch_count, 3);
+        assert_eq!(plan.memory.gpu_submission_count, 6);
+        assert_eq!(plan.memory.source_copy_bytes, 772);
+        assert_eq!(
+            plan.memory.owned_bytes_per_job,
+            772 + plan.memory.parameter_storage_bytes
+                + plan.memory.artifact_storage_bytes
+                + plan.memory.readback_bytes
+        );
+        let old_limit = backend.max_buffer_size;
+        backend.max_buffer_size = 771;
+        assert!(matches!(
+            backend.memory_plan(&input),
+            Err(EncodeError::Unsupported(UnsupportedFeature::DeviceLimit {
+                name: "max_buffer_size",
+                required: 772,
+                available: 771
+            }))
+        ));
+        assert_eq!(backend.buffer_pool_stats().allocation_misses, 0);
+        backend.max_buffer_size = old_limit;
+        drop(source);
+        let request = FrameEncodeRequest {
+            frame_index: FrameIndex::new(0),
+            is_last: true,
+            profile: EncodeProfile::ModularLossless {
+                sample_bit_depth: plan.memory.sample_bit_depth(),
+            },
+            progressive: ProgressivePlan::single(),
+            minimum_determinism: Determinism::CrossDevice,
+            animation: AnimationHeader::Still,
+            canvas_width: 257,
+            canvas_height: 2,
+            options: FrameOptions::default(),
+        };
+        let job = backend.submit(&context, input.into(), &request).unwrap();
+        let mut assembly = CodestreamAssembler::new(
+            super::super::serializer::image_header(
+                257,
+                2,
+                LosslessModularFormat::Gray,
+                8,
+                0,
+                AnimationHeader::Still,
+                Default::default(),
+            )
+            .unwrap()
+            .finish(context.memory_budget())
+            .unwrap()
+            .0,
+        )
+        .unwrap();
+        assembly.insert(job.wait().unwrap()).unwrap();
+        assert!(owner.upgrade().is_none());
+        let encoded = assembly.finish_raw().unwrap();
+        assert_eq!(
+            jxl_test_support::oracles::modular_integer::original_planes(&encoded, 0),
+            vec![raw.iter().copied().map(i32::from).collect::<Vec<_>>()]
+        );
+        let mut padded = raw;
+        padded.resize(516, 0xa5);
+        let canonical = BufferImageSource::new(
+            Arc::new(
+                context
+                    .device()
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("streamed texture canonical input"),
+                        contents: &padded,
+                        usage: wgpu::BufferUsages::STORAGE,
+                    }),
+            ),
+            ImageLayout::packed(extent, format).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            encoded,
+            LosslessModularEncoder::with_config(context.clone(), config)
+                .encode(canonical)
+                .unwrap()
+        );
+        assert_eq!(context.memory_stats().reserved_bytes, 0);
+    }
 
     #[test]
     fn every_group_size_checks_artifact_capacity_before_admission() {
@@ -1423,7 +1564,9 @@ mod source_window_tests {
         let input = BufferImageSource::new(Arc::new(buffer), layout).unwrap();
         let mut backend = LosslessModularBackend::new(&context);
         backend.max_storage_binding_size = 40 * 1024;
-        let plan = backend.dispatch_plan(&input).unwrap();
+        let plan = backend
+            .dispatch_plan(&crate::source_input::FrameInputPlan::new((&input).into()).unwrap())
+            .unwrap();
         assert_eq!(plan.batches.len(), 2);
         assert!(plan.memory.source_binding_bytes > backend.max_storage_binding_size);
         assert!(
@@ -1510,11 +1653,15 @@ mod source_window_tests {
                 ..Default::default()
             },
         );
-        let initial = backend.dispatch_plan(&input).unwrap();
+        let initial = backend
+            .dispatch_plan(&crate::source_input::FrameInputPlan::new((&input).into()).unwrap())
+            .unwrap();
         assert_eq!(initial.batches.len(), 1);
         let limit = initial.groups[0].output_size + super::super::entropy::PROFILE_BYTES;
         backend.max_storage_binding_size = limit;
-        let split = backend.dispatch_plan(&input).unwrap();
+        let split = backend
+            .dispatch_plan(&crate::source_input::FrameInputPlan::new((&input).into()).unwrap())
+            .unwrap();
         assert_eq!(split.batches.len(), 3);
         assert_eq!(split.memory.gpu_submission_count, 6);
         let mut previous_end = 0;
@@ -1537,7 +1684,8 @@ mod source_window_tests {
         assert_eq!(split.output_size, previous_end);
         backend.max_compute_workgroups_per_dimension = 39;
         assert!(matches!(
-            backend.dispatch_plan(&input),
+            backend
+                .dispatch_plan(&crate::source_input::FrameInputPlan::new((&input).into()).unwrap()),
             Err(EncodeError::Unsupported(UnsupportedFeature::DeviceLimit {
                 name: "max_compute_workgroups_per_dimension",
                 required: 40,
@@ -1545,10 +1693,14 @@ mod source_window_tests {
             }))
         ));
         backend.max_compute_workgroups_per_dimension = 40;
-        assert!(backend.dispatch_plan(&input).is_ok());
+        assert!(
+            backend
+                .dispatch_plan(&crate::source_input::FrameInputPlan::new((&input).into()).unwrap())
+                .is_ok()
+        );
         backend.max_storage_binding_size = limit - 1;
         assert!(
-            matches!(backend.dispatch_plan(&input), Err(EncodeError::Unsupported(UnsupportedFeature::DeviceLimit { name: "max_storage_buffer_binding_size", required, available })) if required == limit && available == limit - 1)
+            matches!(backend.dispatch_plan(&crate::source_input::FrameInputPlan::new((&input).into()).unwrap()), Err(EncodeError::Unsupported(UnsupportedFeature::DeviceLimit { name: "max_storage_buffer_binding_size", required, available })) if required == limit && available == limit - 1)
         );
         assert_eq!(backend.buffer_pool_stats().allocation_misses, 0);
         assert_eq!(context.memory_stats().reserved_bytes, 0);
