@@ -258,10 +258,12 @@ pub struct VarDctMemoryPlan {
     pub extra_channels: Option<super::VarDctExtraChannelMemoryPlan>,
     /// Union of caller-buffer bytes made addressable by source plane bindings, counting alignment
     /// overlap once and excluding gaps between windows. The caller owns the allocation;
-    /// these bytes are not charged to `owned_bytes_per_job`. Excludes the owned texture copy.
+    /// these bytes are not charged to `owned_bytes_per_job`. Excludes owned prepared input.
     pub source_binding_bytes: u64,
     /// Encoder-owned raw texture copy, included in the job reservation.
     pub source_copy_bytes: u64,
+    /// Encoder-owned converted RGB and parameters, included in the job reservation.
+    pub source_conversion_bytes: u64,
     /// Caller-owned selected mip/layer texel bytes, excluding driver allocation overhead.
     pub source_texture_bytes: u64,
     pub parameter_storage_bytes: u64,
@@ -353,6 +355,7 @@ impl VarDctMemoryPlan {
             extra_channels: None,
             source_binding_bytes,
             source_copy_bytes: 0,
+            source_conversion_bytes: 0,
             source_texture_bytes: 0,
             parameter_storage_bytes,
             artifact_storage_bytes,

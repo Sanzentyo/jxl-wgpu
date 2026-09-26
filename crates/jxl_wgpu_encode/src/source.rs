@@ -432,6 +432,9 @@ struct SourceWindow {
 pub(crate) struct SourceWindows([SourceWindow; 4]);
 
 impl SourceWindows {
+    pub(crate) fn prefix(end: u64) -> Self {
+        Self([SourceWindow { start: 0, end }; 4])
+    }
     /// Caller-buffer union, including aliased scalars. Encoder-owned copies pass None;
     /// their complete allocation is already charged by the input preparation plan.
     pub(crate) fn addressed_bytes_many<'a>(
@@ -491,6 +494,7 @@ impl SourceWindows {
 
     // Alignment can make neighboring plane windows overlap. Count each addressed byte once;
     // unused bindings alias the first window and do not increase source exposure.
+    #[cfg(test)]
     pub(crate) fn addressed_bytes(self) -> Result<u64, EncodeError> {
         let mut windows = self.0;
         windows.sort_unstable_by_key(|window| window.start);

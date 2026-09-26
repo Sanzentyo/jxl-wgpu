@@ -271,7 +271,9 @@ impl LosslessModularEncoder {
                 sample_bit_depth: descriptor.sample_bit_depth(),
             },
             progressive: ProgressivePlan::single(),
-            minimum_determinism: Determinism::CrossDevice,
+            // A sequence can contain explicitly converted YUV sources. Word-preserving
+            // inputs retain the backend's stronger guarantee without requiring it here.
+            minimum_determinism: Determinism::SameDevice,
             animation: descriptor.animation,
             canvas_width: descriptor.canvas_width,
             canvas_height: descriptor.canvas_height,
@@ -312,7 +314,7 @@ impl LosslessModularEncoder {
                 ),
             },
             progressive: ProgressivePlan::single(),
-            minimum_determinism: Determinism::CrossDevice,
+            minimum_determinism: source.determinism(),
             animation: AnimationHeader::Still,
             canvas_width: width,
             canvas_height: height,

@@ -196,6 +196,19 @@ Caller-buffer range unions exclude the owned copy, whose full allocation is char
 Selected texel bytes are separately addressed; driver-selected texture tiling is outside the model.
 [Texture evidence](CONFORMANCE_CORPUS.md#texture-encoder-input).
 
+Explicit `YuvImageSource` preparation extends that boundary with one checked `YuvPlan`:
+integer packing, range, matrix, chroma phase, transfer policy, RGB F32 layout, dispatch and
+resource bounds are resolved before admission. `PreparedInput` holds either the caller buffer,
+raw texture copy, or converted RGB plus its source/uniform/bindings. Codec consumers see only
+the resolved layout. Scalar attachments retain their own source plans and union accounting.
+One context-shared pipeline reconstructs chroma and converts color before ordinary codec work;
+streamed batches share one conversion and persistent permit. No CPU pixel work or extra
+submission is introduced. Converted inputs guarantee same-device repeatability; explicit
+cross-device requests reject. Complete Modular sequences accept both converted and direct
+sources without weakening direct-word preservation. The crate README owns accepted packing,
+transfer and association policies; [YUV evidence](CONFORMANCE_CORPUS.md#yuv-encoder-input)
+covers numerical conversion, independent words and the connected codec/lifetime paths.
+
 `ColorSampleFormat` owns `ColorChannels::Gray` or `Rgb`, 1–31-bit integer or checked
 `FloatPrecision` logical precision, and a
 canonical format constructor. The shared `source` module owns physical packing, swizzle and
@@ -324,10 +337,10 @@ GPU pixels, entropy, submission ownership and the unindexed assembly APIs are un
 | Filters | Gaborish off, EPF zero iterations |
 | Output | raw codestream or standard `jxlc` container; private `jwgp` index emitted only for single-group Gray8 Prefix containers with default color/intent/intensity |
 
-The backend rejects chroma subsampling, YUV/NV12, signed samples, unsupported color
+Direct sample lowering rejects chroma subsampling, unconverted YUV/NV12, signed samples, unsupported color
 metadata, non-bijective/missing channels, mismatched component precision and progressive passes > 1.
 Storage normalization remains fused into GPU token production. Buffer inputs need no intermediate
-image; texture inputs use the common raw GPU copy described above.
+image; texture and explicitly converted YUV inputs use the common preparation described above.
 
 Source color lowering is bounded host metadata work. It validates full range and RGB/gray semantics,
 quantizes custom xy to `1e-6` and Gamma OETF exponents to `1e-7`, and rechecks the quantized geometry.
@@ -855,7 +868,7 @@ quantizer search and does not establish production perceptual quality.
 The authoritative encoder items, dependencies, priorities, and acceptance gates are the `MOD-E`,
 `VDCT-E`, `ENT-E`, `ENC`, and encoder-facing `IO` rows in
 [`FULL_JPEG_XL_ROADMAP.md`](FULL_JPEG_XL_ROADMAP.md). After the structural-refactoring gate, the
-nearest work remains parallel Modular token production, native YUV/NV12-family ingestion,
+nearest work remains parallel Modular token production, source-domain lossless YUV coding,
 broader entropy/progression and the rate/quality control built on top.
 Batched codec submission and advanced performance instrumentation stay separate from
 format-completeness claims.

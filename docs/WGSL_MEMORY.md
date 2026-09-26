@@ -980,6 +980,27 @@ The copy is encoded before compute in the existing submission, with no WGSL layo
 Streamed Modular retains the copy and its separate permit across histogram/serialization batches;
 each pending map callback shares its owner so cancellation cannot release in-flight storage.
 
+Explicit YUV input preparation uses a 112-byte `YuvParams` uniform: sixteen scalar words
+(width/height/kind/order, depth/storage width/endianness/matrix, range/subsampling/output mode,
+two F32 chroma offsets/transfer/reserved), then three `vec4<u32>` plane offset/stride records
+at byte 64. Unused words are zero. Bindings 0/1/2 are read-only source `array<u32>`, writable
+interleaved RGB `array<f32>` and the uniform. A 16×16 workgroup checks output coordinates;
+integer quotient/remainder selects the chroma phase without losing large integer coordinates
+to F32 rounding. Checked extents, plane ranges, MSB packing and four-byte tail padding bound
+every byte read. A Naga test checks the portable module and all uniform offsets.
+
+`source_conversion_bytes = 12 * width * height + 112` belongs to the job reservation and
+persists across both streamed passes. Its output and uniform are materialized only after
+admission. The caller's `[0, round_up(logical_size, 4))` source binding joins the same identity
+union as attached scalar windows; aliases count once, while the owned RGB is excluded from
+caller bytes. Allocation, binding and workgroup limits reject before allocation. The cached
+pipeline is device/driver state, outside buffer byte accounting. Integer source codes and the
+accepted inverse curves have finite results throughout their bounded domain; PQ/arbitrary-gamma
+linearization rejects rather than introducing unchecked nonfinite RGB. Normal codec artifact
+validation still precedes frame/preview authority. Source handles, RGB, uniforms and bindings
+survive cancellation through the completion callback. No independent source map or queue
+submission is needed. [YUV evidence](CONFORMANCE_CORPUS.md#yuv-encoder-input).
+
 `Source.bit_shift` stores the physical shift in bits 0–4 and exact unsigned complementation in bit 5.
 The loader masks the shift before extracting the word, then conditionally subtracts it from the
 sample mask. Checked CMYK ink-amount plans set this flag only on integer CMY and Black; alpha and

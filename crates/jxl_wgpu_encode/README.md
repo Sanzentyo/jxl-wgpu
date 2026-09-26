@@ -12,7 +12,7 @@ currently executable profiles.
 ## GPU input storage
 
 Both encoders, fixed/mixed sequences and preview methods accept `BufferImageSource`,
-`TextureImageSource` or `GpuFrameSource`; memory queries also accept borrowed sources.
+`TextureImageSource`, `YuvImageSource` or `GpuFrameSource`; memory queries also accept borrowed sources.
 The codec's logical color, precision, alpha and extra-channel rules apply to either storage.
 
 `TextureImageSource::new` selects one mip and array layer from a single-sample 2D color texture
@@ -41,6 +41,56 @@ caller-buffer windows and selected texels. Opaque driver texture allocation/tili
 Completion callbacks retain the original texture, copy and extras through cancellation; only
 validated artifacts may become frame or preview packets.
 [Independent input and ownership evidence](../../docs/CONFORMANCE_CORPUS.md#texture-encoder-input).
+
+### Explicit YUV input conversion
+
+`YuvImageSource::new(buffer, YuvRgbTransfer::Preserve)` explicitly converts an integer YCbCr
+GPU buffer to full-resolution RGB binary32 in the declared source primaries and transfer.
+Both codecs, fixed/mixed sequences and previews consume this same checked RGB input plan.
+Modular preserves the **converted RGB words**, not the original subsampled YCbCr codes.
+This conversion has `SameDevice` determinism; explicit `CrossDevice` requests reject before
+admission. Direct buffer/texture words retain their existing stronger Modular guarantee.
+
+Supported packing is planar or semi-planar 8-bit/8-bit-storage and MSB-aligned 10/12/16-bit
+in 16-bit words, either byte order and either CbCr/CrCb order, plus YUYV/UYVY 4:2:2 bytes.
+Planar/semi-planar sampling supports 4:4:4, 4:2:2, 4:1:1, their vertical variants and 4:2:0.
+The descriptor must supply full/limited range, explicit RGB primaries, transfer, matrix and
+chroma location. Bilinear chroma reconstruction uses Even, Center or Odd positions and
+replicates edges, including odd dimensions. Both is accepted only on unsubsampled axes.
+The non-constant-luminance matrices are BT.601, BT.709 and BT.2020. Values outside nominal
+range are preserved; there is no implicit clipping, resizing, gamut or alpha conversion.
+
+`YuvRgbTransfer::Linear` evaluates Linear, sRGB/sYCC, BT.709, BT.2020, DCI or HLG into linear
+RGB in the same primaries. HLG produces scene-linear values without a display OOTF; image
+luminance remains the caller's `ImageOptions` declaration. BT.2020 constant luminance requires
+BT.2020 primaries/transfer and this linear output mode. Nonlinear conversion requires
+unassociated alpha. PQ and arbitrary gamma use `Preserve`: unrestricted YUV excursions cannot
+guarantee finite F32 results under those inverse curves. The preserved transfer must fit the
+JPEG XL color syntax; BT.2020's distinct transfer therefore requires `Linear`.
+
+Independent scalar attachments retain their precision, geometry and values. VarDCT/mixed
+configuration declares RGB `ColorSampleFormat::float(ColorChannels::Rgb, 32, 8)` and the
+wrapper's `pixel_format().color_spec`. Direct YUV `BufferImageSource` submission still rejects,
+so no precision-changing conversion is implicit. Multi-plane textures and lossless coding
+of the original YCbCr domain remain outside this input contract.
+
+`source_conversion_bytes` reserves exactly `12 * width * height + 112` bytes for RGB and its
+uniform, once per job. The input's padded prefix binding joins caller-buffer range unions,
+including aliased scalar attachments. Source and RGB bindings must fit the device's storage
+binding limit. One cached compute pipeline records preparation before codec work in the same
+submission. Streaming retains this allocation through all histogram/serialization batches;
+completion ownership also covers cancellation. No image pixels cross the host.
+[Independent conversion and lifetime evidence](../../docs/CONFORMANCE_CORPUS.md#yuv-encoder-input).
+
+```rust,no_run
+use jxl_wgpu_encode::{BufferImageSource, EncodeError, LosslessModularEncoder,
+    WgpuContext, YuvImageSource, YuvRgbTransfer};
+
+fn encode_yuv(context: WgpuContext, buffer: BufferImageSource) -> Result<Vec<u8>, EncodeError> {
+    let input = YuvImageSource::new(buffer, YuvRgbTransfer::Preserve)?;
+    LosslessModularEncoder::new(context).encode(input)
+}
+```
 
 GPU-produced codestreams can be wrapped with Exif/XMP/JUMBF or other opaque payloads using
 `jxl_gpu_bitstream::metadata::Metadata::write_container`. `MetadataBox::new` supports plain or
@@ -492,7 +542,8 @@ The [embedded-ICC matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-embe
 checks independent original-profile bytes and source words, requested color output, private tags,
 all intents, animation identity, size limits and shared-budget lifetime.
 Independent scalar declarations use the plan described below. CMYK uses the shared input plan
-described below; YUV remains outside this profile. Texture storage follows the common input plan.
+described below. Explicit YUV conversion and texture storage follow the common input plan above;
+only conversion results, not original YCbCr words, enter this lossless profile.
 The [group-size matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-group-sizes) covers every
 size with shared/local trees, integer/IEEE source words, LF boundaries, full tiles, cropped and
 Replace animations, bounded GPU output and admission/cancellation. The default 256 configuration
@@ -632,7 +683,7 @@ One checked color plan owns image/frame syntax, logical-to-working component map
 normalization and HF multipliers. It expands serialized custom xy/gamma values before GPU
 lowering, so metadata and arithmetic use the same rounding. Every admitted frame must have
 wire-equivalent color, channels and precision; explicit sRGB/Sycc aliases may match defaults.
-Undefined color, unsupported transfers, limited-range RGB/YUV and unrepresentable geometry
+Undefined color, unsupported transfers, limited-range RGB, direct unconverted YUV and unrepresentable geometry
 are rejected before job admission. Original components omit XYB-only matrix-scale fields and
 use their implicit neutral multipliers.
 LF metadata, matrices, orders and quantizers retain their explicit values in either domain;

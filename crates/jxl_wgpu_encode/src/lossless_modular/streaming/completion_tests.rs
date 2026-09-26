@@ -41,7 +41,7 @@ fn map_notification_releases_callback_ownership_before_waking_the_consumer() {
             .unwrap();
             let input = crate::source_input::FrameInputPlan::new(input.into())
                 .unwrap()
-                .materialize(context.device(), None);
+                .materialize(&context, None);
             let lifetime = Arc::new(EncodeJobLifetime {
                 buffer_lease: lease,
                 _source: input,

@@ -143,6 +143,7 @@ pub struct LosslessModularBackend {
     max_storage_binding_size: u64,
     max_storage_buffers_per_shader_stage: u32,
     max_buffer_size: u64,
+    input_limits: wgpu::Limits,
     storage_offset_alignment: u64,
     max_compute_workgroups_per_dimension: u32,
     pub(super) direct_mapping: bool,
@@ -245,6 +246,7 @@ impl LosslessModularBackend {
             max_storage_binding_size: limits.max_storage_buffer_binding_size,
             max_storage_buffers_per_shader_stage: limits.max_storage_buffers_per_shader_stage,
             max_buffer_size: limits.max_buffer_size,
+            input_limits: limits.clone(),
             storage_offset_alignment: u64::from(limits.min_storage_buffer_offset_alignment),
             max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
             direct_mapping: context.direct_mapping_enabled(),
@@ -297,6 +299,7 @@ impl LosslessModularBackend {
         source: &crate::source_input::FrameInputPlan,
         request: &FrameEncodeRequest,
     ) -> Result<(ModularDispatchPlan, FrameHeaderPlan), EncodeError> {
+        source.validate_request(request)?;
         let spec = crate::source::source_spec(&source.layout.format)?;
         let samples = self.config.samples(
             spec.format,
@@ -379,7 +382,7 @@ impl LosslessModularBackend {
         sampling: &crate::sampling::FrameSamplingPlan,
     ) -> Result<ModularDispatchPlan, EncodeError> {
         self.pipeline()?;
-        source.validate_limits(self.max_buffer_size)?;
+        source.validate_limits(self.max_buffer_size, &self.input_limits)?;
         let extent = source.layout.extent;
         let group_grid = LosslessModularGroupGrid::for_extent(
             extent.width,
@@ -934,15 +937,17 @@ impl LosslessModularBackend {
             .ok_or(EncodeError::InvalidSource("total artifact size overflow"))?;
         let peak_source_binding_bytes = batches.iter().try_fold(0u64, |peak, batch| {
             SourceWindows::addressed_bytes_many(
-                std::iter::once((source.caller_buffer(), batch.source_windows)).chain(
-                    input_loads
-                        .iter()
-                        .filter(|load| {
-                            load.dispatch >= batch.first_dispatch
-                                && load.dispatch < batch.first_dispatch + batch.dispatch_count
-                        })
-                        .map(|load| (load.source.caller_buffer(source), load.windows)),
-                ),
+                std::iter::once((source.caller_buffer(), batch.source_windows))
+                    .chain(
+                        input_loads
+                            .iter()
+                            .filter(|load| {
+                                load.dispatch >= batch.first_dispatch
+                                    && load.dispatch < batch.first_dispatch + batch.dispatch_count
+                            })
+                            .map(|load| (load.source.caller_buffer(source), load.windows)),
+                    )
+                    .chain(source.preparation_binding()),
             )
             .map(|bytes| peak.max(bytes))
         })?;
@@ -954,7 +959,7 @@ impl LosslessModularBackend {
         let owned_bytes_per_job = artifact_storage_bytes
             .checked_add(readback_bytes)
             .and_then(|value| value.checked_add(parameter_storage_bytes))
-            .and_then(|value| value.checked_add(source.copy_bytes))
+            .and_then(|value| value.checked_add(source.owned_bytes()))
             .ok_or(EncodeError::InvalidSource("per-job memory size overflow"))?;
         let icc_profile_bytes = source_color
             .icc_profile()
@@ -982,6 +987,7 @@ impl LosslessModularBackend {
             bytes_per_sample: source_spec.bytes_per_sample,
             channel_count: channels,
             source_copy_bytes: source.copy_bytes,
+            source_conversion_bytes: source.conversion_bytes(),
             source_texture_bytes: source.texture_bytes,
             source_binding_bytes,
             peak_source_binding_bytes,
@@ -1145,17 +1151,17 @@ impl GpuEncodeBackend for LosslessModularBackend {
             let mut admission = context
                 .memory_budget()
                 .try_reserve(plan.memory.owned_bytes_per_job)?;
-            let copy_permit = admission.split_off(source.copy_bytes).map_err(|_| {
-                BackendError::Invariant("input copy exceeds the checked peak reservation")
+            let preparation_permit = admission.split_off(source.owned_bytes()).map_err(|_| {
+                BackendError::Invariant("input preparation exceeds the checked peak reservation")
             })?;
             drop(admission);
-            let source = source.materialize(context.device(), Some(copy_permit));
+            let source = source.materialize(context, Some(preparation_permit));
             return self.submit_streaming(context, source, plan, header);
         }
         let memory_permit = context
             .memory_budget()
             .try_reserve(plan.memory.owned_bytes_per_job)?;
-        let source = source.materialize(context.device(), None);
+        let source = source.materialize(context, None);
 
         let buffer_lease = self.buffer_pool.checkout(
             context.device(),
@@ -1231,7 +1237,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("jxl-wgpu lossless modular encode"),
                 });
-        source.record_copy(&mut commands);
+        source.record_preparation(&mut commands);
         commands.clear_buffer(&buffers.artifact, 0, None);
         for upload in uploads {
             upload.record(&mut commands, &buffers.parameters, &buffers.artifact);
@@ -1465,6 +1471,136 @@ mod source_window_tests {
                 .encode(canonical)
                 .unwrap()
         );
+        assert_eq!(context.memory_stats().reserved_bytes, 0);
+    }
+
+    #[test]
+    fn yuv_conversion_is_retained_once_across_all_streaming_batches() {
+        use jxl_gpu_formats::{
+            ChromaLocation2d, ColorRange, ColorSpec, ColorSpecification, PixelFormat,
+            TransferFunction,
+        };
+        let gpu =
+            pollster::block_on(jxl_wgpu::WgpuBackend::request_default(Default::default())).unwrap();
+        let context = WgpuContext::from_backend(&gpu);
+        let extent = Extent2d::new(257, 2);
+        let mut color = ColorSpec::bt709(ColorRange::Full, ChromaLocation2d::CENTER);
+        color.transfer = TransferFunction::Linear;
+        let layout = ImageLayout::packed(
+            extent,
+            PixelFormat::nv12(ColorSpecification::Defined(color)),
+        )
+        .unwrap();
+        let mut raw = vec![128; layout.logical_size.div_ceil(4) as usize * 4];
+        for (i, v) in raw[..514].iter_mut().enumerate() {
+            *v = (i * 73) as u8;
+        }
+        let buffer = Arc::new(context.device().create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("multi-batch YUV source"),
+                contents: &raw,
+                usage: wgpu::BufferUsages::STORAGE,
+            },
+        ));
+        let owner = Arc::downgrade(&buffer);
+        let input = crate::YuvImageSource::new(
+            BufferImageSource::new(buffer, layout).unwrap(),
+            crate::YuvRgbTransfer::Preserve,
+        )
+        .unwrap();
+        let source = crate::source_input::FrameInputPlan::new(input.into()).unwrap();
+        let mut backend = LosslessModularBackend::with_config(
+            &context,
+            LosslessModularConfig {
+                entropy: LosslessModularEntropyCoding::Ans,
+                group_size: super::super::types::LosslessModularGroupSize::Pixels128,
+                ..Default::default()
+            },
+        );
+        let initial = backend.dispatch_plan(&source).unwrap();
+        backend.max_storage_binding_size = initial.groups[2].artifact_byte_offset
+            + initial.groups[2].output_size
+            - initial.groups[0].artifact_byte_offset
+            + super::super::entropy::PROFILE_BYTES;
+        let plan = backend.dispatch_plan(&source).unwrap();
+        assert!(plan.memory.batch_count >= 3);
+        assert_eq!(
+            plan.memory.gpu_submission_count,
+            plan.memory.batch_count * 2
+        );
+        assert_eq!(plan.memory.source_conversion_bytes, 6168 + 112);
+        assert_eq!(
+            plan.memory.owned_bytes_per_job,
+            6280 + plan.memory.parameter_storage_bytes
+                + plan.memory.artifact_storage_bytes
+                + plan.memory.readback_bytes
+        );
+        let limit = backend.max_buffer_size;
+        backend.max_buffer_size = 6167;
+        assert!(matches!(
+            backend.dispatch_plan(&source),
+            Err(EncodeError::Unsupported(UnsupportedFeature::DeviceLimit {
+                name: "max_buffer_size",
+                required: 6168,
+                available: 6167
+            }))
+        ));
+        assert_eq!(backend.buffer_pool_stats().allocation_misses, 0);
+        backend.max_buffer_size = limit;
+        let metadata = super::super::color::ModularImageMetadata {
+            encoding: crate::source_color::SourceColorEncoding::from_format(&source.layout.format)
+                .unwrap(),
+            ..Default::default()
+        };
+        let header = super::super::serializer::image_header(
+            257,
+            2,
+            LosslessModularFormat::Rgb,
+            32,
+            8,
+            AnimationHeader::Still,
+            metadata,
+        )
+        .unwrap()
+        .finish(context.memory_budget())
+        .unwrap()
+        .0;
+        let request = FrameEncodeRequest {
+            frame_index: FrameIndex::new(0),
+            is_last: true,
+            profile: EncodeProfile::ModularLossless {
+                sample_bit_depth: plan.memory.sample_bit_depth(),
+            },
+            progressive: ProgressivePlan::single(),
+            minimum_determinism: Determinism::SameDevice,
+            animation: AnimationHeader::Still,
+            canvas_width: 257,
+            canvas_height: 2,
+            options: FrameOptions::default(),
+        };
+        let mut assembly = CodestreamAssembler::new(header).unwrap();
+        let artifacts = backend
+            .submit(&context, source.into_source(), &request)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(owner.upgrade().is_none());
+        assembly.insert(artifacts).unwrap();
+        let encoded = assembly.finish_raw().unwrap();
+        let native = jxl_test_support::oracles::modular_words::channel_frames(&encoded).remove(0);
+        assert_eq!(
+            native,
+            jxl_test_support::oracles::modular_integer::modular_channel_words(&encoded, 0)
+        );
+        assert_eq!(native.len(), 3);
+        for plane in native {
+            assert_eq!((plane.width, plane.height), (257, 2));
+            for (i, word) in plane.words.iter().enumerate() {
+                assert!(
+                    (f64::from(f32::from_bits(*word)) - f64::from(raw[i]) / 255.0).abs() <= 2e-6
+                );
+            }
+        }
         assert_eq!(context.memory_stats().reserved_bytes, 0);
     }
 

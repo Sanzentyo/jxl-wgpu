@@ -148,7 +148,7 @@ impl StreamingModularWorker {
         &self,
         batch: &ModularDispatchBatch,
         codebook: Option<&AnsCodebook>,
-        copy_input: bool,
+        prepare_input: bool,
         inspect: impl FnOnce(&[u8]) -> Result<T, EncodeError>,
     ) -> Result<T, EncodeError> {
         let pending = submit_streaming_batch(StreamingBatchContext {
@@ -158,7 +158,7 @@ impl StreamingModularWorker {
             buffer_pool: &self.buffer_pool,
             direct_mapping: self.direct_mapping,
             source: &self.source,
-            copy_input,
+            prepare_input,
             plan: &self.plan,
             batch,
         })?;
@@ -194,7 +194,7 @@ struct StreamingBatchContext<'a> {
     buffer_pool: &'a Arc<EncoderBufferPool>,
     direct_mapping: bool,
     source: &'a Arc<crate::source_input::PreparedInput>,
-    copy_input: bool,
+    prepare_input: bool,
     plan: &'a ModularDispatchPlan,
     batch: &'a ModularDispatchBatch,
 }
@@ -241,7 +241,7 @@ fn submit_streaming_batch(
         buffer_pool,
         direct_mapping,
         source,
-        copy_input,
+        prepare_input,
         plan,
         batch,
     } = submission;
@@ -296,8 +296,8 @@ fn submit_streaming_batch(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("jxl-wgpu streamed lossless modular encode"),
         });
-    if copy_input {
-        source.record_copy(&mut commands);
+    if prepare_input {
+        source.record_preparation(&mut commands);
     }
     commands.clear_buffer(&buffers.artifact, 0, None);
     for upload in uploads {
@@ -769,7 +769,7 @@ pub(super) struct BrowserStreamingLosslessModularJob {
     plan: ModularDispatchPlan,
     header: FrameHeaderPlan,
     cursor: StreamingCursor,
-    copy_input: bool,
+    prepare_input: bool,
     pending: Option<PendingStreamingBatch>,
     histograms: FrameHistograms,
     assembler: Option<ModularPacketAssembler>,
@@ -795,7 +795,7 @@ impl BrowserStreamingLosslessModularJob {
             plan,
             header,
             cursor,
-            copy_input: true,
+            prepare_input: true,
             pending: None,
             histograms: FrameHistograms::default(),
             assembler: None,
@@ -830,11 +830,11 @@ impl BrowserStreamingLosslessModularJob {
             buffer_pool: &self.buffer_pool,
             direct_mapping: self.direct_mapping,
             source: &self.source,
-            copy_input: self.copy_input,
+            prepare_input: self.prepare_input,
             plan: &self.plan,
             batch,
         })?);
-        self.copy_input = false;
+        self.prepare_input = false;
         Ok(())
     }
 

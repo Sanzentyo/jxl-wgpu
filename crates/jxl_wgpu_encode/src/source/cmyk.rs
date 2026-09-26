@@ -15,25 +15,6 @@ pub enum CmykSampleEncoding {
 
 pub(super) const COMPLEMENT_INTEGER: u32 = 1 << 5;
 
-impl crate::source_input::FrameInputPlan {
-    pub(crate) fn validate_alpha_association(
-        &self,
-        association: crate::AlphaAssociation,
-    ) -> Result<(), crate::EncodeError> {
-        if association == crate::AlphaAssociation::Associated
-            && self.cmyk_encoding() == CmykSampleEncoding::InkAmounts
-            && matches!(&self.layout.format.color_spec, jxl_gpu_formats::ColorSpecification::Icc(profile) if profile.header().device_space.0 == *b"CMYK")
-        {
-            // Complementing ink amounts does not commute with premultiplication.
-            // Association belongs to the coded CMY domain; callers supply those words explicitly.
-            return Err(crate::EncodeError::InvalidSource(
-                "associated CMYK input requires explicit complemented samples",
-            ));
-        }
-        Ok(())
-    }
-}
-
 impl super::SourceSpec {
     pub(super) fn with_cmyk_encoding(
         mut self,

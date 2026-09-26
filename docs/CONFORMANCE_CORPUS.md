@@ -2226,8 +2226,55 @@ NaN color through the general VarDCT path rejects main/preview publication and r
 
 Reproduce with `cargo test --locked -p jxl_wgpu_encode --test texture_input -- --test-threads=2`
 and the named library test, retaining `JXL_MODULAR_WORD_ORACLE`. The full capability gates also
-remain required. Multi-plane texture inputs, automatic resampling, YUV and quality policy remain
+remain required. Multi-plane texture inputs, automatic resizing, source-domain lossless YUV and quality policy remain
 open; this does not establish those capabilities or alter existing precision bounds.
+
+## YUV encoder input
+
+The `yuv_input` target exercises explicit GPU YCbCr-to-RGB F32 preparation through both codec
+families, fixed/mixed sequences and previews. The input packing matrix covers planar and both
+semi-planar chroma orders, 8/10/12/16-bit samples, MSB padding poison, little/big-endian words,
+YUYV/UYVY, six sampling geometries, full/limited range and Even/Center/Odd chroma phases.
+Odd 9×5 sources include unaligned row pitches, gaps and reversed physical plane order.
+The color matrix additionally covers BT.601/709/2020 NCL, BT.2020 constant luminance, preserved
+Linear/sRGB/sYCC/BT.709/PQ/HLG/DCI/Gamma and explicitly linearized accepted curves, with one-pixel
+widths, nominal-range excursions and all code extrema.
+
+`jxl_test_support::oracles::yuv` independently reconstructs logical code planes in f64, using
+separable weighted sampling and an affine RGB matrix rather than the production byte loader,
+WGSL parameters or operation ordering. Every converted component exported by pinned scalar
+libjxl agrees within `2e-6` for preserved NCL RGB or `8e-6 * max(1, abs(reference))` after curve
+application. These are arithmetic bounds, not quantization allowances. Native and jxl-oxide
+Modular representation words also agree exactly under Prefix and ANS. This establishes RGB
+conversion accuracy; it does not claim losslessness of the original subsampled source domain.
+
+Original/XYB VarDCT, both fixed DCT8 and tiled geometry, consume those independently checked
+RGB words. Their encoded bytes match direct RGB inputs; fragmented GPU reconstruction is checked
+against native libjxl at the existing `2e-4 * (1 + abs(reference))` color bound. M/V/M and V/M/V
+sequences include hidden references, 2× color/alpha, effective 8× independent depth, signed crops
+and Blend composition. Physical Modular words and VarDCT extras remain exact; all presented
+color/scalar planes have independent native comparisons (`2e-6` for normalized scalars).
+Both mixed preview codecs, fixed Modular and fixed VarDCT previews share input preparation.
+Native preview words/pixels validate the result; retained preview packets no longer retain the
+converted RGB or original YUV buffer.
+
+Resident Prefix, streaming ANS and VarDCT admit exact budgets and reject one-byte-short budgets.
+Cancellation retires original buffers only after GPU completion and permits a subsequent retry.
+Aliased luma/scalar sources count their addressable bytes once. The library test
+`yuv_conversion_is_retained_once_across_all_streaming_batches` forces multiple histogram and
+serialization batches while retaining one RGB/uniform allocation, checks buffer-limit rejection
+before allocation, and compares all native/Rust words with independent neutral-chroma values.
+Naga verifies the 112-byte uniform ABI; allocation, binding and dispatch limits have typed checks.
+Malformed layouts, overlap, missing storage usage, short allocations, undefined interpretation,
+ambiguous subsampled Both siting, incompatible constant-luminance declarations, unsupported
+linearization, associated-alpha linearization and explicit CrossDevice requests reject before
+admission. Rejected preview/main calls preserve sequence index and reservations.
+
+Run `cargo test --locked -p jxl_wgpu_encode --test yuv_input -- --test-threads=2` and
+`cargo test --locked -p jxl_wgpu_encode --lib yuv_ -- --test-threads=2` with the required native
+word oracle. Full capability gates remain required. PQ/arbitrary-gamma linearization,
+association-aware nonlinear conversion, source-domain lossless YUV and multi-plane texture
+input remain open; the roadmap's `IO-02` and `ENC-01` stay Partial.
 
 ## Independent VarDCT extra input
 

@@ -113,14 +113,14 @@ impl ExtraInputPlan {
             independent.push(ScalarInput { layout, buffer });
         }
         let source_bytes = SourceWindows::addressed_bytes_many(
-            std::iter::once((source.caller_buffer(), main.full_windows)).chain(
-                independent.iter().map(|input| {
+            std::iter::once((source.caller_buffer(), main.full_windows))
+                .chain(independent.iter().map(|input| {
                     (
                         input.buffer.caller_buffer(source),
                         input.layout.full_windows,
                     )
-                }),
-            ),
+                }))
+                .chain(source.preparation_binding()),
         )?;
         Ok(Self {
             independent,

@@ -17,12 +17,41 @@ pub(crate) struct FrameInputPlan {
     pub(crate) layout: ImageLayout,
     pub(crate) copy_bytes: u64,
     pub(crate) texture_bytes: u64,
+    conversion: Option<crate::yuv_input::YuvPlan>,
 }
 
 impl FrameInputPlan {
+    pub(crate) fn determinism(&self) -> crate::Determinism {
+        if self.conversion.is_some() {
+            crate::Determinism::SameDevice
+        } else {
+            crate::Determinism::CrossDevice
+        }
+    }
+
+    pub(crate) fn validate_request(
+        &self,
+        request: &crate::FrameEncodeRequest,
+    ) -> Result<(), EncodeError> {
+        if request.minimum_determinism > self.determinism() {
+            return Err(UnsupportedFeature::InputDeterminism {
+                requested: request.minimum_determinism,
+                supported: self.determinism(),
+            }
+            .into());
+        }
+        Ok(())
+    }
     pub(crate) fn new(source: GpuFrameSource) -> Result<Self, EncodeError> {
+        let mut conversion = None;
         let (layout, copy_bytes, texture_bytes) = match &source {
             GpuFrameSource::Buffer(buffer) => (buffer.layout.clone(), 0, 0),
+            GpuFrameSource::Yuv(input) => {
+                let plan = crate::yuv_input::YuvPlan::new(input.source(), input.rgb_transfer())?;
+                let layout = plan.layout.clone();
+                conversion = Some(plan);
+                (layout, 0, 0)
+            }
             GpuFrameSource::Texture(input) => {
                 let texture = &input.texture;
                 let format = input.texture_format;
@@ -88,24 +117,91 @@ impl FrameInputPlan {
             layout,
             copy_bytes,
             texture_bytes,
+            conversion,
         })
     }
 
-    pub(crate) fn validate_limits(&self, max_buffer_size: u64) -> Result<(), EncodeError> {
-        if self.copy_bytes > max_buffer_size {
+    pub(crate) fn validate_limits(
+        &self,
+        max_buffer_size: u64,
+        limits: &wgpu::Limits,
+    ) -> Result<(), EncodeError> {
+        let allocation = self.copy_bytes.max(
+            self.conversion
+                .as_ref()
+                .map_or(0, crate::yuv_input::YuvPlan::largest_allocation),
+        );
+        if allocation > max_buffer_size {
             return Err(UnsupportedFeature::DeviceLimit {
                 name: "max_buffer_size",
-                required: self.copy_bytes,
+                required: allocation,
                 available: max_buffer_size,
             }
             .into());
+        }
+        if let Some(plan) = &self.conversion {
+            plan.validate_limits(limits)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn conversion_bytes(&self) -> u64 {
+        self.conversion
+            .as_ref()
+            .map_or(0, crate::yuv_input::YuvPlan::owned_bytes)
+    }
+
+    pub(crate) fn owned_bytes(&self) -> u64 {
+        self.copy_bytes + self.conversion_bytes()
+    }
+
+    pub(crate) fn preparation_binding(
+        &self,
+    ) -> Option<(Option<&wgpu::Buffer>, crate::source::SourceWindows)> {
+        let GpuFrameSource::Yuv(source) = &self.source else {
+            return None;
+        };
+        let plan = self.conversion.as_ref().expect("YUV preparation plan");
+        Some((
+            Some(&source.source().buffer),
+            crate::source::SourceWindows::prefix(plan.source_bytes),
+        ))
+    }
+
+    pub(crate) fn validate_alpha_association(
+        &self,
+        association: crate::AlphaAssociation,
+    ) -> Result<(), EncodeError> {
+        if association == crate::AlphaAssociation::Associated
+            && self
+                .conversion
+                .as_ref()
+                .is_some_and(crate::yuv_input::YuvPlan::requires_unassociated_alpha)
+        {
+            return Err(EncodeError::InvalidSource(
+                "nonlinear YUV conversion requires unassociated alpha",
+            ));
+        }
+        if association == crate::AlphaAssociation::Associated
+            && self.cmyk_encoding() == CmykSampleEncoding::InkAmounts
+            && matches!(&self.layout.format.color_spec, jxl_gpu_formats::ColorSpecification::Icc(profile) if profile.header().device_space.0 == *b"CMYK")
+        {
+            return Err(EncodeError::InvalidSource(
+                "associated CMYK input requires explicit complemented samples",
+            ));
         }
         Ok(())
     }
 
     pub(crate) fn buffer_bytes(&self) -> u64 {
-        self.caller_buffer()
-            .map_or(self.copy_bytes, wgpu::Buffer::size)
+        self.caller_buffer().map_or_else(
+            || {
+                self.conversion
+                    .as_ref()
+                    .map_or(self.copy_bytes, |plan| plan.layout.logical_size)
+            },
+            wgpu::Buffer::size,
+        )
     }
 
     pub(crate) fn buffer_usage(&self) -> wgpu::BufferUsages {
@@ -113,11 +209,11 @@ impl FrameInputPlan {
             .map_or(wgpu::BufferUsages::STORAGE, wgpu::Buffer::usage)
     }
 
-    /// None denotes the encoder-owned copy, excluded from caller-buffer accounting.
+    /// None denotes encoder-owned prepared RGB/texels, excluded from caller-buffer accounting.
     pub(crate) fn caller_buffer(&self) -> Option<&wgpu::Buffer> {
         match &self.source {
             GpuFrameSource::Buffer(source) => Some(&source.buffer),
-            GpuFrameSource::Texture(_) => None,
+            GpuFrameSource::Texture(_) | GpuFrameSource::Yuv(_) => None,
         }
     }
 
@@ -125,6 +221,7 @@ impl FrameInputPlan {
         match &self.source {
             GpuFrameSource::Buffer(source) => source.extra_channels(),
             GpuFrameSource::Texture(source) => source.extra_channels(),
+            GpuFrameSource::Yuv(source) => source.source().extra_channels(),
         }
     }
 
@@ -132,6 +229,7 @@ impl FrameInputPlan {
         match &self.source {
             GpuFrameSource::Buffer(source) => source.cmyk_encoding(),
             GpuFrameSource::Texture(source) => source.cmyk_encoding(),
+            GpuFrameSource::Yuv(_) => CmykSampleEncoding::default(),
         }
     }
 
@@ -140,14 +238,29 @@ impl FrameInputPlan {
     }
 
     /// The caller has reserved the complete resident peak before entering here. Streaming
-    /// separately retains a persistent copy permit while individual batches reserve scratch.
+    /// separately retains a persistent preparation permit while individual batches reserve scratch.
     pub(crate) fn materialize(
         self,
-        device: &wgpu::Device,
+        context: &crate::WgpuContext,
         permit: Option<MemoryPermit>,
     ) -> Arc<PreparedInput> {
-        let (source, texture) = match self.source {
-            GpuFrameSource::Buffer(source) => (source, None),
+        let device = context.device();
+        let (source, preparation) = match self.source {
+            GpuFrameSource::Buffer(source) => (source, InputPreparation::None),
+            GpuFrameSource::Yuv(input) => {
+                let plan = self.conversion.expect("checked YUV input plan");
+                let buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("jxl-wgpu converted RGB input"),
+                    size: plan.layout.logical_size,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                }));
+                let mut source =
+                    BufferImageSource::new(buffer, self.layout).expect("checked input allocation");
+                source.extra_channels = input.source().extra_channels.clone();
+                let preparation = plan.materialize(context, input, &source.buffer);
+                (source, InputPreparation::Yuv(Box::new(preparation)))
+            }
             GpuFrameSource::Texture(texture) => {
                 let buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("jxl-wgpu texture input copy"),
@@ -159,12 +272,12 @@ impl FrameInputPlan {
                     BufferImageSource::new(buffer, self.layout).expect("checked input allocation");
                 source.extra_channels = texture.extra_channels.clone();
                 source.cmyk_encoding = texture.cmyk_encoding;
-                (source, Some(texture))
+                (source, InputPreparation::Texture(texture))
             }
         };
         Arc::new(PreparedInput {
             source,
-            texture,
+            preparation,
             _permit: permit,
         })
     }
@@ -179,8 +292,14 @@ impl From<&FrameInputPlan> for GpuFrameSource {
 /// Shared with completion callbacks, including the last pending batch after cancellation.
 pub(crate) struct PreparedInput {
     source: BufferImageSource,
-    texture: Option<crate::TextureImageSource>,
+    preparation: InputPreparation,
     _permit: Option<MemoryPermit>,
+}
+
+enum InputPreparation {
+    None,
+    Texture(crate::TextureImageSource),
+    Yuv(Box<crate::yuv_input::PreparedYuv>),
 }
 
 impl Deref for PreparedInput {
@@ -192,9 +311,11 @@ impl Deref for PreparedInput {
 
 impl PreparedInput {
     /// Record once, before the first compute pass, on the job's ordinary submission.
-    pub(crate) fn record_copy(&self, commands: &mut wgpu::CommandEncoder) {
-        let Some(source) = &self.texture else {
-            return;
+    pub(crate) fn record_preparation(&self, commands: &mut wgpu::CommandEncoder) {
+        let source = match &self.preparation {
+            InputPreparation::None => return,
+            InputPreparation::Yuv(source) => return source.record(commands),
+            InputPreparation::Texture(source) => source,
         };
         commands.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {

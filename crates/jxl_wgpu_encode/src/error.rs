@@ -61,6 +61,11 @@ pub enum UnsupportedFeature {
     Animation,
     #[error("the backend does not provide deterministic assembly artifacts")]
     DeterministicAssembly,
+    #[error("input preparation supports {supported:?} determinism, requested {requested:?}")]
+    InputDeterminism {
+        requested: crate::Determinism,
+        supported: crate::Determinism,
+    },
     #[error("the backend is missing the required GPU kernel stage {0:?}")]
     Kernel(KernelStage),
     #[error("the device limit {name} is {available}, but at least {required} is required")]

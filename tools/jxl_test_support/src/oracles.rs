@@ -16,3 +16,4 @@ pub mod resampling;
 pub mod sample_bits;
 pub mod tone_mapping;
 pub mod vardct_matrices;
+pub mod yuv;

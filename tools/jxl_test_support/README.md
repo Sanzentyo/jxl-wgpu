@@ -45,6 +45,12 @@ provides unbounded pre-OETF XYB stills; the codec's Gamma/DCI black floor makes 
 already encoded original image unsuitable for that reference. These helpers use ordinary module
 imports and stay outside production dependencies.
 
+`oracles::yuv` reconstructs RGB in f64 from independently supplied logical Y/Cb/Cr code planes.
+It evaluates chroma coordinates and separable interpolation independently of production packing,
+GPU parameters and shaders, then applies explicit range/matrix and the independent color curves.
+Encoder input tests compare converted native Modular words with these values before testing
+VarDCT, mixed frames and preview integration. It is not a production input converter.
+
 `oracles::resampling` shares the existing independent F64 interpolation and propagated arithmetic
 bounds between decoder and encoder extra-channel tests. It expands symmetric weights, mirrors
 edges repeatedly, applies the complete first 8× grid before subsequent stages, and crops only the

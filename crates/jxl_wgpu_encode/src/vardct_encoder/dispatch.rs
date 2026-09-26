@@ -103,6 +103,7 @@ pub struct VarDctBackend {
     capabilities: EncoderCapabilities,
     max_storage_binding_size: u64,
     max_buffer_size: u64,
+    input_limits: wgpu::Limits,
     max_compute_workgroups_per_dimension: u32,
     storage_offset_alignment: u64,
 }
@@ -331,6 +332,7 @@ impl VarDctBackend {
             },
             max_storage_binding_size: limits.max_storage_buffer_binding_size,
             max_buffer_size: limits.max_buffer_size,
+            input_limits: limits.clone(),
             max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
             storage_offset_alignment: u64::from(limits.min_storage_buffer_offset_alignment),
         })
@@ -442,6 +444,7 @@ impl VarDctBackend {
         source: &crate::source_input::FrameInputPlan,
         request: &FrameEncodeRequest,
     ) -> Result<(VarDctDispatchPlan, FrameHeaderPlan, VarDctConfig), EncodeError> {
+        source.validate_request(request)?;
         let extent = source.layout.extent;
         let control = validate_vardct_request(
             request,
@@ -462,7 +465,7 @@ impl VarDctBackend {
         progressive: &ProgressivePlan,
         sampling: &FrameSamplingPlan,
     ) -> Result<VarDctDispatchPlan, EncodeError> {
-        source.validate_limits(self.max_buffer_size)?;
+        source.validate_limits(self.max_buffer_size, &self.input_limits)?;
         let extent = sampling.color_extent;
         let frame = match self.topology {
             VarDctTopology::SingleTransform(strategy) => {
@@ -513,11 +516,10 @@ impl VarDctBackend {
         };
         let source_windows = color_source.full_windows;
         source_windows.validate(self.max_storage_binding_size)?;
-        let source_binding_bytes = if source.caller_buffer().is_some() {
-            source_windows.addressed_bytes()?
-        } else {
-            0
-        };
+        let source_binding_bytes = crate::source::SourceWindows::addressed_bytes_many(
+            std::iter::once((source.caller_buffer(), source_windows))
+                .chain(source.preparation_binding()),
+        )?;
         let region = color_source.region(0, 0, extent.width, extent.height)?;
         let (mut sources, offsets) = self.color_plan.bind_sources(&region);
         source_windows.rebase(&mut sources, offsets)?;
@@ -792,14 +794,15 @@ impl VarDctBackend {
             }
         }
         memory.source_copy_bytes = source.copy_bytes;
+        memory.source_conversion_bytes = source.conversion_bytes();
         memory.source_texture_bytes = source.texture_bytes;
         memory.owned_bytes_per_job = memory
             .owned_bytes_per_job
-            .checked_add(source.copy_bytes)
+            .checked_add(source.owned_bytes())
             .ok_or(EncodeError::InvalidSource("input ownership overflow"))?;
         memory.addressed_bytes_per_job = memory
             .addressed_bytes_per_job
-            .checked_add(source.copy_bytes)
+            .checked_add(source.owned_bytes())
             .and_then(|bytes| bytes.checked_add(source.texture_bytes))
             .ok_or(EncodeError::InvalidSource("input addressing overflow"))?;
         Ok(VarDctDispatchPlan {
@@ -885,7 +888,7 @@ impl GpuEncodeBackend for VarDctBackend {
         let memory_permit = context
             .memory_budget()
             .try_reserve(plan.memory.owned_bytes_per_job)?;
-        let source = source.materialize(context.device(), None);
+        let source = source.materialize(context, None);
 
         let parameters = Arc::new(context.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("jxl-wgpu VarDCT parameters"),
@@ -928,7 +931,7 @@ impl GpuEncodeBackend for VarDctBackend {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("jxl-wgpu VarDCT encode"),
                 });
-        source.record_copy(&mut commands);
+        source.record_preparation(&mut commands);
         commands.clear_buffer(&artifact, 0, None);
         let extra_scratch = self
             .extra_channel_pipeline

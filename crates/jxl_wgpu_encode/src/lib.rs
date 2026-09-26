@@ -81,8 +81,10 @@ mod source;
 mod source_color;
 mod source_input;
 mod vardct_encoder;
+mod yuv_input;
 
 pub use source::CmykSampleEncoding;
+pub use yuv_input::{YuvImageSource, YuvRgbTransfer};
 
 pub use buffer_pool::{
     DEFAULT_ENCODER_BUFFER_POOL_BYTES, EncoderBufferPoolStats, MAX_ENCODER_BUFFER_POOL_IDLE_SETS,

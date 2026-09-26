@@ -18,6 +18,7 @@ pub struct WgpuContext {
     memory_budget: MemoryBudget,
     kernel_policy: KernelPolicy,
     direct_mapping: bool,
+    yuv_pipeline: Arc<std::sync::OnceLock<Arc<wgpu::ComputePipeline>>>,
 }
 
 const DEFAULT_ENCODER_IN_FLIGHT_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
@@ -54,6 +55,7 @@ impl WgpuContext {
             poller,
             memory_budget: MemoryBudget::new(memory_budget_bytes),
             kernel_policy: KernelPolicy::Default,
+            yuv_pipeline: Arc::default(),
         })
     }
 
@@ -67,6 +69,7 @@ impl WgpuContext {
             memory_budget: backend.transient_memory_budget().clone(),
             kernel_policy: backend.kernel_policy().clone(),
             direct_mapping: backend.direct_readback_enabled(),
+            yuv_pipeline: Arc::default(),
         }
     }
 
@@ -100,6 +103,11 @@ impl WgpuContext {
 
     pub(crate) const fn direct_mapping_enabled(&self) -> bool {
         self.direct_mapping
+    }
+
+    pub(crate) fn yuv_pipeline(&self) -> &Arc<wgpu::ComputePipeline> {
+        self.yuv_pipeline
+            .get_or_init(|| Arc::new(crate::yuv_input::pipeline(&self.device)))
     }
 
     /// Reports bytes reserved by all live encoder jobs sharing this context.
@@ -274,6 +282,18 @@ impl From<TextureImageSource> for GpuFrameSource {
     }
 }
 
+impl From<crate::YuvImageSource> for GpuFrameSource {
+    fn from(source: crate::YuvImageSource) -> Self {
+        Self::Yuv(source)
+    }
+}
+
+impl From<&crate::YuvImageSource> for GpuFrameSource {
+    fn from(source: &crate::YuvImageSource) -> Self {
+        source.clone().into()
+    }
+}
+
 impl From<&BufferImageSource> for GpuFrameSource {
     fn from(source: &BufferImageSource) -> Self {
         source.clone().into()
@@ -296,6 +316,7 @@ impl From<&GpuFrameSource> for GpuFrameSource {
 pub enum GpuFrameSource {
     Buffer(BufferImageSource),
     Texture(TextureImageSource),
+    Yuv(crate::YuvImageSource),
 }
 
 impl GpuFrameSource {
@@ -304,6 +325,7 @@ impl GpuFrameSource {
         match self {
             Self::Buffer(source) => &source.layout.format,
             Self::Texture(source) => &source.pixel_format,
+            Self::Yuv(source) => source.pixel_format(),
         }
     }
 }
