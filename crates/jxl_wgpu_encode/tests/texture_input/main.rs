@@ -10,6 +10,7 @@ use jxl_wgpu_encode::*;
 use wgpu::util::DeviceExt;
 
 mod boundaries;
+mod separate_planes;
 mod sequence;
 
 fn buffer(
@@ -318,6 +319,21 @@ fn texture_vardct_and_cmyk_share_exact_buffer_results_and_scalar_inputs() {
                     .with_cmyk_encoding(CmykSampleEncoding::Complemented)
                     .unwrap();
             }
+            let mut planar = separate_planes::split(
+                &context,
+                extent,
+                config.pixel_format(),
+                &raw,
+                &[2, 2],
+                true,
+            )
+            .with_extra_channels(canonical.extra_channels().to_vec())
+            .unwrap();
+            if cmyk && float {
+                planar = planar
+                    .with_cmyk_encoding(CmykSampleEncoding::Complemented)
+                    .unwrap();
+            }
             let modular = LosslessModularEncoder::with_config(
                 context.clone(),
                 LosslessModularConfig {
@@ -329,6 +345,7 @@ fn texture_vardct_and_cmyk_share_exact_buffer_results_and_scalar_inputs() {
             .unwrap();
             let encoded = modular.encode(input.clone()).unwrap();
             assert_eq!(encoded, modular.encode(canonical.clone()).unwrap());
+            assert_eq!(encoded, modular.encode(planar.clone()).unwrap());
             let mut expected = planes(extent, &words, 4);
             if cmyk && !float {
                 for plane in &mut expected {
@@ -358,6 +375,7 @@ fn texture_vardct_and_cmyk_share_exact_buffer_results_and_scalar_inputs() {
                     encoder.encode(canonical.clone()).unwrap(),
                     "{cmyk}/{float}/{transform:?}"
                 );
+                assert_eq!(encoded, encoder.encode(planar.clone()).unwrap());
                 let expected_primary: Vec<_> = words
                     .iter()
                     .skip(3)

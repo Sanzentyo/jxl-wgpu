@@ -23,26 +23,26 @@ fn request(extent: Extent2d, modular: bool) -> FrameEncodeRequest {
     }
 }
 
-fn drain(context: &WgpuContext, texture: Option<&std::sync::Weak<wgpu::Texture>>) {
+fn drain(context: &WgpuContext, textures: Option<&[std::sync::Weak<wgpu::Texture>]>) {
     context
         .device()
         .poll(wgpu::PollType::wait_indefinitely())
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while (context.memory_stats().reserved_bytes != 0
-        || texture.is_some_and(|owner| owner.upgrade().is_some()))
+        || textures.is_some_and(|owners| owners.iter().any(|owner| owner.upgrade().is_some())))
         && std::time::Instant::now() < deadline
     {
         context.device().poll(wgpu::PollType::Poll).unwrap();
         std::thread::yield_now();
     }
     assert_eq!(context.memory_stats().reserved_bytes, 0);
-    assert!(texture.is_none_or(|owner| owner.upgrade().is_none()));
+    assert!(textures.is_none_or(|owners| owners.iter().all(|owner| owner.upgrade().is_none())));
 }
 
 fn admission<B: GpuEncodeBackend>(
     context: &WgpuContext,
-    input: TextureImageSource,
+    input: GpuFrameSource,
     bytes: u64,
     request: &FrameEncodeRequest,
     make: impl Fn(&WgpuContext) -> B,
@@ -55,27 +55,31 @@ fn admission<B: GpuEncodeBackend>(
         )
         .unwrap();
         let backend = make(&bounded);
-        let job = backend.submit(&bounded, input.clone().into(), request);
+        let job = backend.submit(&bounded, input.clone(), request);
         if limit < bytes {
             assert!(matches!(job, Err(EncodeError::MemoryBackpressure(_))));
         } else {
             drop(job.unwrap());
             drain(&bounded, None);
             backend
-                .submit(&bounded, input.clone().into(), request)
+                .submit(&bounded, input.clone(), request)
                 .unwrap()
                 .wait()
                 .unwrap();
         }
         drain(&bounded, None);
     }
-    let owner = Arc::downgrade(&input.texture);
-    drop(
-        make(context)
-            .submit(context, input.into(), request)
-            .unwrap(),
-    );
-    drain(context, Some(&owner));
+    let owners: Vec<_> = match &input {
+        GpuFrameSource::Texture(input) => vec![Arc::downgrade(&input.texture)],
+        GpuFrameSource::TexturePlanes(input) => input
+            .planes
+            .iter()
+            .map(|plane| Arc::downgrade(&plane.texture))
+            .collect(),
+        _ => unreachable!(),
+    };
+    drop(make(context).submit(context, input, request).unwrap());
+    drain(context, Some(&owners));
 }
 
 #[test]
@@ -129,7 +133,7 @@ fn copy_storage_is_reserved_once_and_released_after_completion_or_cancellation()
         );
         admission(
             &context,
-            input,
+            input.into(),
             plan.owned_bytes_per_job,
             &request(extent, true),
             |ctx| LosslessModularBackend::with_config(ctx, config.clone()),
@@ -156,7 +160,7 @@ fn copy_storage_is_reserved_once_and_released_after_completion_or_cancellation()
     );
     admission(
         &context,
-        input,
+        input.into(),
         plan.owned_bytes_per_job,
         &request(extent, false),
         |ctx| VarDctBackend::new_tiled_dct8_with_config(ctx, config.clone()).unwrap(),
@@ -425,4 +429,72 @@ fn independent_associated_alpha_uses_the_same_cmyk_convention_check_for_both_sto
         vardct.encode(canonical).unwrap()
     );
     drain(&context, None);
+}
+
+#[test]
+fn independent_texture_planes_share_exact_budget_and_cancellation_contracts() {
+    let gpu = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
+    let context = WgpuContext::from_backend(&gpu);
+    let extent = Extent2d::new(129, 17);
+    let raw = vec![41; extent.area().unwrap() * 3];
+    let source = || {
+        separate_planes::split(
+            &context,
+            extent,
+            ColorSampleFormat::RGB8.pixel_format(),
+            &raw,
+            &[1, 1, 1],
+            false,
+        )
+    };
+    for entropy in [
+        LosslessModularEntropyCoding::Prefix,
+        LosslessModularEntropyCoding::Ans,
+    ] {
+        let config = LosslessModularConfig {
+            entropy,
+            ..Default::default()
+        };
+        let backend = LosslessModularBackend::with_config(&context, config.clone());
+        let input = source();
+        let plan = backend.memory_plan(&input).unwrap();
+        assert_eq!(plan.source_copy_bytes, 12684);
+        assert_eq!(plan.source_binding_bytes, 0);
+        assert_eq!(plan.source_texture_bytes, raw.len() as u64);
+        assert_eq!(
+            plan.owned_bytes_per_job,
+            plan.parameter_storage_bytes
+                + plan.artifact_storage_bytes
+                + plan.readback_bytes
+                + 12684
+        );
+        admission(
+            &context,
+            input.into(),
+            plan.owned_bytes_per_job,
+            &request(extent, true),
+            |ctx| LosslessModularBackend::with_config(ctx, config.clone()),
+        );
+    }
+    let backend =
+        VarDctBackend::new_tiled_dct8_with_config(&context, VarDctConfig::default()).unwrap();
+    let input = source();
+    let plan = backend.memory_plan(&input).unwrap();
+    let base = backend
+        .memory_plan(buffer(
+            &context,
+            extent,
+            ColorSampleFormat::RGB8.pixel_format(),
+            &raw,
+        ))
+        .unwrap();
+    assert_eq!(plan.source_copy_bytes, 12684);
+    assert_eq!(plan.owned_bytes_per_job, base.owned_bytes_per_job + 12684);
+    admission(
+        &context,
+        input.into(),
+        plan.owned_bytes_per_job,
+        &request(extent, false),
+        |ctx| VarDctBackend::new_tiled_dct8_with_config(ctx, VarDctConfig::default()).unwrap(),
+    );
 }

@@ -972,9 +972,11 @@ limit checks run before pipeline creation. Buffer inputs add no source copy, all
 
 Encoder texture inputs use the same storage-buffer ABI after a checked GPU-only copy. The common
 input plan checks actual format, `COPY_SRC`, single-sample 2D topology, mip/layer bounds and exact
-one-texel logical packing before admission. `source_copy_bytes` reserves the 256-byte-row,
-four-byte-rounded storage allocation; `source_texture_bytes` accounts for the selected caller
-texels, excluding opaque driver tiling. Caller-buffer unions exclude this owned copy. Thus the
+packing-element geometry for every logical plane before admission. `source_copy_bytes` reserves
+one allocation with 256-byte rows and plane offsets aligned to both four bytes and the
+corresponding texel size (including 16-byte carriers). The final size is rounded to four bytes.
+`source_texture_bytes` counts each selected texture/mip/layer identity once, even when several
+logical planes reuse it, excluding opaque driver tiling. Caller-buffer unions exclude this owned copy. Thus the
 addressed total includes each copy allocation, input texel and attached-buffer window once.
 The copy is encoded before compute in the existing submission, with no WGSL layout change.
 Streamed Modular retains the copy and its separate permit across histogram/serialization batches;
@@ -991,9 +993,10 @@ every byte read. A Naga test checks the portable module and all uniform offsets.
 
 `source_conversion_bytes = 12 * width * height + 112` belongs to the job reservation and
 persists across both streamed passes. Its output and uniform are materialized only after
-admission. The caller's `[0, round_up(logical_size, 4))` source binding joins the same identity
-union as attached scalar windows; aliases count once, while the owned RGB is excluded from
-caller bytes. Allocation, binding and workgroup limits reject before allocation. The cached
+admission. For buffer inputs, the caller's `[0, round_up(logical_size, 4))` source binding joins
+the same identity union as attached scalar windows; aliases count once. For plane textures,
+`source_copy_bytes` additionally reserves their materialized input, and all copies precede
+conversion exactly once. Both owned buffers are excluded from caller bytes. Allocation, binding and workgroup limits reject before allocation. The cached
 pipeline is device/driver state, outside buffer byte accounting. Integer source codes and the
 accepted inverse curves have finite results throughout their bounded domain; PQ/arbitrary-gamma
 linearization rejects rather than introducing unchecked nonfinite RGB. Normal codec artifact

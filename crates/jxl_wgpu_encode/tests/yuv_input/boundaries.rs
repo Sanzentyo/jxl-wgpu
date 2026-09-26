@@ -25,21 +25,20 @@ fn request(extent: Extent2d, modular: bool) -> FrameEncodeRequest {
     }
 }
 
-fn drain(context: &WgpuContext, owner: Option<&std::sync::Weak<wgpu::Buffer>>) {
+fn drain(context: &WgpuContext, owner: Option<&SourceOwners>) {
     context
         .device()
         .poll(wgpu::PollType::wait_indefinitely())
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while (context.memory_stats().reserved_bytes != 0
-        || owner.is_some_and(|p| p.upgrade().is_some()))
+    while (context.memory_stats().reserved_bytes != 0 || owner.is_some_and(|p| !p.released()))
         && std::time::Instant::now() < deadline
     {
         context.device().poll(wgpu::PollType::Poll).unwrap();
         std::thread::yield_now();
     }
     assert_eq!(context.memory_stats().reserved_bytes, 0);
-    assert!(owner.is_none_or(|p| p.upgrade().is_none()));
+    assert!(owner.is_none_or(SourceOwners::released));
 }
 
 fn admission<B: GpuEncodeBackend>(
@@ -47,6 +46,7 @@ fn admission<B: GpuEncodeBackend>(
     fixture: &Case,
     bytes: u64,
     modular: bool,
+    textures: bool,
     make: impl Fn(&WgpuContext) -> B,
 ) {
     for limit in [bytes - 1, bytes] {
@@ -57,8 +57,8 @@ fn admission<B: GpuEncodeBackend>(
         )
         .unwrap();
         let backend = make(&bounded);
-        let input = fixture.input(&bounded, YuvRgbTransfer::Preserve);
-        let owner = Arc::downgrade(&input.source().buffer);
+        let input = fixture.stored_input(&bounded, YuvRgbTransfer::Preserve, textures);
+        let owner = SourceOwners::of(&input);
         let job = backend.submit(
             &bounded,
             input.into(),
@@ -74,7 +74,9 @@ fn admission<B: GpuEncodeBackend>(
             backend
                 .submit(
                     &bounded,
-                    fixture.input(&bounded, YuvRgbTransfer::Preserve).into(),
+                    fixture
+                        .stored_input(&bounded, YuvRgbTransfer::Preserve, textures)
+                        .into(),
                     &request(fixture.layout.extent, modular),
                 )
                 .unwrap()
@@ -97,66 +99,102 @@ fn converted_input_budget_is_exact_and_cancellation_retires_sources_for_both_cod
         false,
         ColorSpec::bt709(ColorRange::Limited, ChromaLocation2d::CENTER),
     );
-    let input = fixture.input(&context, YuvRgbTransfer::Preserve);
-    let conversion = 12 * fixture.layout.extent.area().unwrap() as u64 + 112;
-    let strict_backend = LosslessModularBackend::new(&context);
-    let mut strict_request = request(fixture.layout.extent, true);
-    strict_request.minimum_determinism = Determinism::CrossDevice;
-    assert!(matches!(
-        strict_backend.memory_plan_for_request(&input, &strict_request),
-        Err(EncodeError::Unsupported(
-            UnsupportedFeature::InputDeterminism { .. }
-        ))
-    ));
-    assert!(matches!(
-        strict_backend.submit(&context, input.clone().into(), &strict_request),
-        Err(EncodeError::Unsupported(
-            UnsupportedFeature::InputDeterminism { .. }
-        ))
-    ));
-    assert_eq!(context.memory_stats().reserved_bytes, 0);
-    let binding = fixture.bytes.len() as u64;
-    for entropy in [
-        LosslessModularEntropyCoding::Prefix,
-        LosslessModularEntropyCoding::Ans,
-    ] {
-        let config = LosslessModularConfig {
-            entropy,
-            ..Default::default()
+    for textures in [false, true] {
+        let input = fixture.stored_input(&context, YuvRgbTransfer::Preserve, textures);
+        let conversion = 12 * fixture.layout.extent.area().unwrap() as u64 + 112;
+        let strict_backend = LosslessModularBackend::new(&context);
+        let mut strict_request = request(fixture.layout.extent, true);
+        strict_request.minimum_determinism = Determinism::CrossDevice;
+        assert!(matches!(
+            strict_backend.memory_plan_for_request(&input, &strict_request),
+            Err(EncodeError::Unsupported(
+                UnsupportedFeature::InputDeterminism { .. }
+            ))
+        ));
+        assert!(matches!(
+            strict_backend.submit(&context, input.clone().into(), &strict_request),
+            Err(EncodeError::Unsupported(
+                UnsupportedFeature::InputDeterminism { .. }
+            ))
+        ));
+        assert_eq!(context.memory_stats().reserved_bytes, 0);
+        let binding = if textures {
+            0
+        } else {
+            fixture.bytes.len() as u64
         };
-        let backend = LosslessModularBackend::with_config(&context, config.clone());
+        let mut copy = 0u64;
+        for plane in &fixture.layout.planes {
+            copy = copy.div_ceil(4) * 4;
+            copy +=
+                plane.row_bytes.div_ceil(256) * 256 * (u64::from(plane.sample_extent.height) - 1)
+                    + plane.row_bytes;
+        }
+        let copy = if textures { copy.div_ceil(4) * 4 } else { 0 };
+        let texture_bytes = if textures {
+            fixture
+                .layout
+                .planes
+                .iter()
+                .map(|plane| plane.row_bytes * u64::from(plane.sample_extent.height))
+                .sum()
+        } else {
+            0
+        };
+        for entropy in [
+            LosslessModularEntropyCoding::Prefix,
+            LosslessModularEntropyCoding::Ans,
+        ] {
+            let config = LosslessModularConfig {
+                entropy,
+                ..Default::default()
+            };
+            let backend = LosslessModularBackend::with_config(&context, config.clone());
+            let plan = backend.memory_plan(&input).unwrap();
+            assert_eq!(plan.source_conversion_bytes, conversion);
+            assert_eq!(plan.source_copy_bytes, copy);
+            assert_eq!(plan.source_texture_bytes, texture_bytes);
+            assert_eq!(plan.source_binding_bytes, binding);
+            assert_eq!(plan.peak_source_binding_bytes, binding);
+            assert_eq!(
+                plan.owned_bytes_per_job,
+                plan.parameter_storage_bytes
+                    + plan.artifact_storage_bytes
+                    + plan.readback_bytes
+                    + conversion
+                    + copy
+            );
+            assert_eq!(
+                plan.addressed_bytes_per_job,
+                plan.owned_bytes_per_job + binding + texture_bytes
+            );
+            admission(
+                &context,
+                &fixture,
+                plan.owned_bytes_per_job,
+                true,
+                textures,
+                |ctx| LosslessModularBackend::with_config(ctx, config.clone()),
+            );
+        }
+        let config = config(&input);
+        let backend = VarDctBackend::new_tiled_dct8_with_config(&context, config.clone()).unwrap();
         let plan = backend.memory_plan(&input).unwrap();
         assert_eq!(plan.source_conversion_bytes, conversion);
-        assert_eq!(plan.source_copy_bytes, 0);
         assert_eq!(plan.source_binding_bytes, binding);
-        assert_eq!(plan.peak_source_binding_bytes, binding);
-        assert_eq!(
-            plan.owned_bytes_per_job,
-            plan.parameter_storage_bytes
-                + plan.artifact_storage_bytes
-                + plan.readback_bytes
-                + conversion
-        );
         assert_eq!(
             plan.addressed_bytes_per_job,
-            plan.owned_bytes_per_job + binding
+            plan.owned_bytes_per_job + binding + texture_bytes
         );
-        admission(&context, &fixture, plan.owned_bytes_per_job, true, |ctx| {
-            LosslessModularBackend::with_config(ctx, config.clone())
-        });
+        admission(
+            &context,
+            &fixture,
+            plan.owned_bytes_per_job,
+            false,
+            textures,
+            |ctx| VarDctBackend::new_tiled_dct8_with_config(ctx, config.clone()).unwrap(),
+        );
     }
-    let config = config(&input);
-    let backend = VarDctBackend::new_tiled_dct8_with_config(&context, config.clone()).unwrap();
-    let plan = backend.memory_plan(&input).unwrap();
-    assert_eq!(plan.source_conversion_bytes, conversion);
-    assert_eq!(plan.source_binding_bytes, binding);
-    assert_eq!(
-        plan.addressed_bytes_per_job,
-        plan.owned_bytes_per_job + binding
-    );
-    admission(&context, &fixture, plan.owned_bytes_per_job, false, |ctx| {
-        VarDctBackend::new_tiled_dct8_with_config(ctx, config.clone()).unwrap()
-    });
     assert_eq!(context.memory_stats().reserved_bytes, 0);
 }
 
@@ -375,7 +413,7 @@ fn malformed_or_ambiguous_yuv_inputs_and_noncommuting_alpha_reject_without_admis
         .input(&context, YuvRgbTransfer::Preserve)
         .with_extra_channels(vec![extra])
         .unwrap();
-    let mut identity = preserved.source().clone();
+    let mut identity = preserved.source().as_buffer().unwrap().clone();
     let ColorSpecification::Defined(ref mut color) = identity.layout.format.color_spec else {
         unreachable!()
     };

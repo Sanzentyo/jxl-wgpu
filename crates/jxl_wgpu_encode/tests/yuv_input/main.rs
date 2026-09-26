@@ -174,6 +174,38 @@ impl Case {
     fn input(&self, context: &WgpuContext, transfer: YuvRgbTransfer) -> YuvImageSource {
         YuvImageSource::new(upload(context, self.layout.clone(), &self.bytes), transfer).unwrap()
     }
+    fn texture_input(&self, context: &WgpuContext, transfer: YuvRgbTransfer) -> YuvImageSource {
+        let planes = jxl_test_support::gpu::textures::upload_planes(
+            context.device(),
+            context.queue(),
+            &self.layout,
+            &self.bytes,
+        )
+        .into_iter()
+        .map(|texture| {
+            let format = texture.format();
+            TexturePlaneSource::new(texture, format, 1, 1).unwrap()
+        })
+        .collect();
+        YuvImageSource::new(
+            TexturePlanesSource::new(self.layout.extent, self.layout.format.clone(), planes)
+                .unwrap(),
+            transfer,
+        )
+        .unwrap()
+    }
+    fn stored_input(
+        &self,
+        context: &WgpuContext,
+        transfer: YuvRgbTransfer,
+        textures: bool,
+    ) -> YuvImageSource {
+        if textures {
+            self.texture_input(context, transfer)
+        } else {
+            self.input(context, transfer)
+        }
+    }
     fn assert_rgb(&self, channels: &[modular_integer::ExtraWords], linear: bool) {
         let expected = self.codes.rgb(self.color, linear);
         assert!(channels.len() >= 3);
@@ -285,7 +317,14 @@ fn yuv_packing_depth_range_and_chroma_phases_match_independent_f64_and_native_wo
                 );
                 let fixture = case(Extent2d::new(9, 5), packing, sampling, bits, big, color);
                 let input = fixture.input(&context, YuvRgbTransfer::Preserve);
-                let encoded = encoders[(index + phase) % 2].encode(input).unwrap();
+                let encoder = &encoders[(index + phase) % 2];
+                let encoded = encoder.encode(input).unwrap();
+                assert_eq!(
+                    encoded,
+                    encoder
+                        .encode(fixture.texture_input(&context, YuvRgbTransfer::Preserve))
+                        .unwrap()
+                );
                 let native = modular_words::channel_frames(&encoded).remove(0);
                 fixture.assert_rgb(&native, false);
                 assert_eq!(modular_integer::modular_channel_words(&encoded, 0), native);
@@ -353,6 +392,12 @@ fn yuv_color_matrices_transfers_excursions_and_single_pixel_edges_are_explicit()
                 );
                 let input = fixture.input(&context, output);
                 let encoded = encoder.encode(input).unwrap();
+                assert_eq!(
+                    encoded,
+                    encoder
+                        .encode(fixture.texture_input(&context, output))
+                        .unwrap()
+                );
                 let native = modular_words::channel_frames(&encoded).remove(0);
                 fixture.assert_rgb(&native, output == YuvRgbTransfer::Linear);
                 assert_eq!(modular_integer::modular_channel_words(&encoded, 0), native);
@@ -360,4 +405,33 @@ fn yuv_color_matrices_transfers_excursions_and_single_pixel_edges_are_explicit()
         }
     }
     assert_eq!(context.memory_stats().reserved_bytes, 0);
+}
+
+/// Retention checks must cover every caller-owned plane, not just the first handle.
+enum SourceOwners {
+    Buffer(std::sync::Weak<wgpu::Buffer>),
+    Textures(Vec<std::sync::Weak<wgpu::Texture>>),
+}
+impl SourceOwners {
+    fn of(source: &YuvImageSource) -> Self {
+        match source.source() {
+            ImageSourceStorage::Buffer(source) => Self::Buffer(Arc::downgrade(&source.buffer)),
+            ImageSourceStorage::TexturePlanes(source) => Self::Textures(
+                source
+                    .planes
+                    .iter()
+                    .map(|plane| Arc::downgrade(&plane.texture))
+                    .collect(),
+            ),
+            ImageSourceStorage::Texture(source) => {
+                Self::Textures(vec![Arc::downgrade(&source.texture)])
+            }
+        }
+    }
+    fn released(&self) -> bool {
+        match self {
+            Self::Buffer(owner) => owner.upgrade().is_none(),
+            Self::Textures(owners) => owners.iter().all(|owner| owner.upgrade().is_none()),
+        }
+    }
 }

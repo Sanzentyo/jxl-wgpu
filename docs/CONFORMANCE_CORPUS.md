@@ -2224,10 +2224,26 @@ a 771-byte buffer limit before allocation. Invalid public descriptors, missing u
 formats/texel widths, mip/layer bounds, 3D, depth and multisample textures reject before admission.
 NaN color through the general VarDCT path rejects main/preview publication and releases all job bytes.
 
+Separate-plane storage adds 24 precision/channel combinations (integer 1/8/13/31 and float
+8/3, 16/5, 24/7, 32/8; GrayAlpha/RGB/RGBA), each as planar little-endian and split big-endian
+words through both Prefix and ANS. Every output matches canonical buffer bytes and exact native
+and Rust words. Finite RG/RG color carriers extend Original/XYB comparisons with attached depth;
+CMYK+alpha adds five independent planes and a split R32/RGBA32 layout whose second copy needs
+16-byte offset alignment. Native words check complemented CMY/Black, unchanged alpha and depth.
+Three-way buffer/packed-texture/separate-texture mixed sequences retain all previous sampling,
+reference, crop and native/fragmented output checks. Separate RGB preview bytes also match
+buffer previews, with native rendering and release of every source handle before retention.
+
+Aliased plane descriptors count identical texture/mip/layer texels once and distinct layers
+separately; each logical plane still owns a copy region. Dedicated resident/streamed/VarDCT
+checks enforce exact and one-byte-short budgets and wait for every texture handle on cancellation.
+Mutated plane count, extent, format and subresource selection reject before admission; a NaN
+in a later color plane cannot publish a preview or consume main-frame finality.
+
 Reproduce with `cargo test --locked -p jxl_wgpu_encode --test texture_input -- --test-threads=2`
 and the named library test, retaining `JXL_MODULAR_WORD_ORACLE`. The full capability gates also
-remain required. Multi-plane texture inputs, automatic resizing, source-domain lossless YUV and quality policy remain
-open; this does not establish those capabilities or alter existing precision bounds.
+remain required. Native multi-planar texture formats, independently attached scalar textures,
+automatic resizing, source-domain lossless YUV and quality policy remain open; this does not establish those capabilities or alter existing precision bounds.
 
 ## YUV encoder input
 
@@ -2239,6 +2255,12 @@ Odd 9×5 sources include unaligned row pitches, gaps and reversed physical plane
 The color matrix additionally covers BT.601/709/2020 NCL, BT.2020 constant luminance, preserved
 Linear/sRGB/sYCC/BT.709/PQ/HLG/DCI/Gamma and explicitly linearized accepted curves, with one-pixel
 widths, nominal-range excursions and all code extrema.
+
+The complete packing and color matrices run from buffers and separate plane textures, with
+byte-identical codestreams. The latter use independently sized poisoned mip/layers, including
+one four-byte texel per YUYV/UYVY pair and rounded-up subsampled dimensions. Fixed/tiled
+Original/XYB, mixed/reference sequences and all preview paths compare these sources with the
+same independently checked RGB inputs. Conversion and precision policies are unchanged.
 
 `jxl_test_support::oracles::yuv` independently reconstructs logical code planes in f64, using
 separable weighted sampling and an affine RGB matrix rather than the production byte loader,
@@ -2256,10 +2278,16 @@ and Blend composition. Physical Modular words and VarDCT extras remain exact; al
 color/scalar planes have independent native comparisons (`2e-6` for normalized scalars).
 Both mixed preview codecs, fixed Modular and fixed VarDCT previews share input preparation.
 Native preview words/pixels validate the result; retained preview packets no longer retain the
-converted RGB or original YUV buffer.
+converted RGB, its raw copy, or the original YUV buffers/textures.
 
 Resident Prefix, streaming ANS and VarDCT admit exact budgets and reject one-byte-short budgets.
-Cancellation retires original buffers only after GPU completion and permits a subsequent retry.
+The same cases cover texture-copy-plus-conversion, charging both owned allocations once and
+excluding them from caller bindings. The multi-batch library test now also uses texture planes:
+its 1,032-byte copy and 6,280-byte conversion storage persist across all histogram/serialization
+batches; the 772 selected texel bytes are caller-owned. Both storage variants retain exact
+native/Rust words, finite f64 bounds, and pre-allocation buffer-limit rejection.
+
+Cancellation retires every original buffer or texture only after GPU completion and permits a subsequent retry.
 Aliased luma/scalar sources count their addressable bytes once. The library test
 `yuv_conversion_is_retained_once_across_all_streaming_batches` forces multiple histogram and
 serialization batches while retaining one RGB/uniform allocation, checks buffer-limit rejection
@@ -2273,8 +2301,8 @@ admission. Rejected preview/main calls preserve sequence index and reservations.
 Run `cargo test --locked -p jxl_wgpu_encode --test yuv_input -- --test-threads=2` and
 `cargo test --locked -p jxl_wgpu_encode --lib yuv_ -- --test-threads=2` with the required native
 word oracle. Full capability gates remain required. PQ/arbitrary-gamma linearization,
-association-aware nonlinear conversion, source-domain lossless YUV and multi-plane texture
-input remain open; the roadmap's `IO-02` and `ENC-01` stay Partial.
+association-aware nonlinear conversion, source-domain lossless YUV and native multi-planar texture
+formats remain open; the roadmap's `IO-02` and `ENC-01` stay Partial.
 
 ## Independent VarDCT extra input
 

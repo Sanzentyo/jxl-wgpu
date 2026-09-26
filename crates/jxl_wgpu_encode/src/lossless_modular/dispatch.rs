@@ -1495,113 +1495,159 @@ mod source_window_tests {
         for (i, v) in raw[..514].iter_mut().enumerate() {
             *v = (i * 73) as u8;
         }
-        let buffer = Arc::new(context.device().create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("multi-batch YUV source"),
-                contents: &raw,
-                usage: wgpu::BufferUsages::STORAGE,
-            },
-        ));
-        let owner = Arc::downgrade(&buffer);
-        let input = crate::YuvImageSource::new(
-            BufferImageSource::new(buffer, layout).unwrap(),
-            crate::YuvRgbTransfer::Preserve,
-        )
-        .unwrap();
-        let source = crate::source_input::FrameInputPlan::new(input.into()).unwrap();
-        let mut backend = LosslessModularBackend::with_config(
-            &context,
-            LosslessModularConfig {
-                entropy: LosslessModularEntropyCoding::Ans,
-                group_size: super::super::types::LosslessModularGroupSize::Pixels128,
-                ..Default::default()
-            },
-        );
-        let initial = backend.dispatch_plan(&source).unwrap();
-        backend.max_storage_binding_size = initial.groups[2].artifact_byte_offset
-            + initial.groups[2].output_size
-            - initial.groups[0].artifact_byte_offset
-            + super::super::entropy::PROFILE_BYTES;
-        let plan = backend.dispatch_plan(&source).unwrap();
-        assert!(plan.memory.batch_count >= 3);
-        assert_eq!(
-            plan.memory.gpu_submission_count,
-            plan.memory.batch_count * 2
-        );
-        assert_eq!(plan.memory.source_conversion_bytes, 6168 + 112);
-        assert_eq!(
-            plan.memory.owned_bytes_per_job,
-            6280 + plan.memory.parameter_storage_bytes
-                + plan.memory.artifact_storage_bytes
-                + plan.memory.readback_bytes
-        );
-        let limit = backend.max_buffer_size;
-        backend.max_buffer_size = 6167;
-        assert!(matches!(
-            backend.dispatch_plan(&source),
-            Err(EncodeError::Unsupported(UnsupportedFeature::DeviceLimit {
-                name: "max_buffer_size",
-                required: 6168,
-                available: 6167
-            }))
-        ));
-        assert_eq!(backend.buffer_pool_stats().allocation_misses, 0);
-        backend.max_buffer_size = limit;
-        let metadata = super::super::color::ModularImageMetadata {
-            encoding: crate::source_color::SourceColorEncoding::from_format(&source.layout.format)
+        for textures in [false, true] {
+            let buffer = Arc::new(context.device().create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("multi-batch YUV source"),
+                    contents: &raw,
+                    usage: wgpu::BufferUsages::STORAGE,
+                },
+            ));
+            let owner = Arc::downgrade(&buffer);
+            let planes = if textures {
+                jxl_test_support::gpu::textures::upload_planes(
+                    context.device(),
+                    context.queue(),
+                    &layout,
+                    &raw,
+                )
+            } else {
+                Vec::new()
+            };
+            let owners: Vec<_> = planes.iter().map(Arc::downgrade).collect();
+            let storage: crate::ImageSourceStorage = if textures {
+                drop(buffer);
+                crate::TexturePlanesSource::new(
+                    extent,
+                    layout.format.clone(),
+                    planes
+                        .into_iter()
+                        .map(|texture| {
+                            let format = texture.format();
+                            crate::TexturePlaneSource::new(texture, format, 1, 1).unwrap()
+                        })
+                        .collect(),
+                )
+                .unwrap()
+                .into()
+            } else {
+                BufferImageSource::new(buffer, layout.clone())
+                    .unwrap()
+                    .into()
+            };
+            let input =
+                crate::YuvImageSource::new(storage, crate::YuvRgbTransfer::Preserve).unwrap();
+            let source = crate::source_input::FrameInputPlan::new(input.into()).unwrap();
+            let mut backend = LosslessModularBackend::with_config(
+                &context,
+                LosslessModularConfig {
+                    entropy: LosslessModularEntropyCoding::Ans,
+                    group_size: super::super::types::LosslessModularGroupSize::Pixels128,
+                    ..Default::default()
+                },
+            );
+            let initial = backend.dispatch_plan(&source).unwrap();
+            backend.max_storage_binding_size = initial.groups[2].artifact_byte_offset
+                + initial.groups[2].output_size
+                - initial.groups[0].artifact_byte_offset
+                + super::super::entropy::PROFILE_BYTES;
+            let plan = backend.dispatch_plan(&source).unwrap();
+            assert!(plan.memory.batch_count >= 3);
+            assert_eq!(
+                plan.memory.gpu_submission_count,
+                plan.memory.batch_count * 2
+            );
+            assert_eq!(plan.memory.source_conversion_bytes, 6168 + 112);
+            let copy_bytes = if textures { 1032 } else { 0 };
+            assert_eq!(plan.memory.source_copy_bytes, copy_bytes);
+            assert_eq!(
+                plan.memory.source_texture_bytes,
+                if textures { 772 } else { 0 }
+            );
+            assert_eq!(
+                plan.memory.source_binding_bytes,
+                if textures { 0 } else { raw.len() as u64 }
+            );
+            assert_eq!(
+                plan.memory.owned_bytes_per_job,
+                6280 + copy_bytes
+                    + plan.memory.parameter_storage_bytes
+                    + plan.memory.artifact_storage_bytes
+                    + plan.memory.readback_bytes
+            );
+            let limit = backend.max_buffer_size;
+            backend.max_buffer_size = 6167;
+            assert!(matches!(
+                backend.dispatch_plan(&source),
+                Err(EncodeError::Unsupported(UnsupportedFeature::DeviceLimit {
+                    name: "max_buffer_size",
+                    required: 6168,
+                    available: 6167
+                }))
+            ));
+            assert_eq!(backend.buffer_pool_stats().allocation_misses, 0);
+            backend.max_buffer_size = limit;
+            let metadata = super::super::color::ModularImageMetadata {
+                encoding: crate::source_color::SourceColorEncoding::from_format(
+                    &source.layout.format,
+                )
                 .unwrap(),
-            ..Default::default()
-        };
-        let header = super::super::serializer::image_header(
-            257,
-            2,
-            LosslessModularFormat::Rgb,
-            32,
-            8,
-            AnimationHeader::Still,
-            metadata,
-        )
-        .unwrap()
-        .finish(context.memory_budget())
-        .unwrap()
-        .0;
-        let request = FrameEncodeRequest {
-            frame_index: FrameIndex::new(0),
-            is_last: true,
-            profile: EncodeProfile::ModularLossless {
-                sample_bit_depth: plan.memory.sample_bit_depth(),
-            },
-            progressive: ProgressivePlan::single(),
-            minimum_determinism: Determinism::SameDevice,
-            animation: AnimationHeader::Still,
-            canvas_width: 257,
-            canvas_height: 2,
-            options: FrameOptions::default(),
-        };
-        let mut assembly = CodestreamAssembler::new(header).unwrap();
-        let artifacts = backend
-            .submit(&context, source.into_source(), &request)
+                ..Default::default()
+            };
+            let header = super::super::serializer::image_header(
+                257,
+                2,
+                LosslessModularFormat::Rgb,
+                32,
+                8,
+                AnimationHeader::Still,
+                metadata,
+            )
             .unwrap()
-            .wait()
-            .unwrap();
-        assert!(owner.upgrade().is_none());
-        assembly.insert(artifacts).unwrap();
-        let encoded = assembly.finish_raw().unwrap();
-        let native = jxl_test_support::oracles::modular_words::channel_frames(&encoded).remove(0);
-        assert_eq!(
-            native,
-            jxl_test_support::oracles::modular_integer::modular_channel_words(&encoded, 0)
-        );
-        assert_eq!(native.len(), 3);
-        for plane in native {
-            assert_eq!((plane.width, plane.height), (257, 2));
-            for (i, word) in plane.words.iter().enumerate() {
-                assert!(
-                    (f64::from(f32::from_bits(*word)) - f64::from(raw[i]) / 255.0).abs() <= 2e-6
-                );
+            .finish(context.memory_budget())
+            .unwrap()
+            .0;
+            let request = FrameEncodeRequest {
+                frame_index: FrameIndex::new(0),
+                is_last: true,
+                profile: EncodeProfile::ModularLossless {
+                    sample_bit_depth: plan.memory.sample_bit_depth(),
+                },
+                progressive: ProgressivePlan::single(),
+                minimum_determinism: Determinism::SameDevice,
+                animation: AnimationHeader::Still,
+                canvas_width: 257,
+                canvas_height: 2,
+                options: FrameOptions::default(),
+            };
+            let mut assembly = CodestreamAssembler::new(header).unwrap();
+            let artifacts = backend
+                .submit(&context, source.into_source(), &request)
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert!(owner.upgrade().is_none());
+            assert!(owners.iter().all(|owner| owner.upgrade().is_none()));
+            assembly.insert(artifacts).unwrap();
+            let encoded = assembly.finish_raw().unwrap();
+            let native =
+                jxl_test_support::oracles::modular_words::channel_frames(&encoded).remove(0);
+            assert_eq!(
+                native,
+                jxl_test_support::oracles::modular_integer::modular_channel_words(&encoded, 0)
+            );
+            assert_eq!(native.len(), 3);
+            for plane in native {
+                assert_eq!((plane.width, plane.height), (257, 2));
+                for (i, word) in plane.words.iter().enumerate() {
+                    assert!(
+                        (f64::from(f32::from_bits(*word)) - f64::from(raw[i]) / 255.0).abs()
+                            <= 2e-6
+                    );
+                }
             }
+            assert_eq!(context.memory_stats().reserved_bytes, 0);
         }
-        assert_eq!(context.memory_stats().reserved_bytes, 0);
     }
 
     #[test]

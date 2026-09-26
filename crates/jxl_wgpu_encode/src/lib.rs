@@ -80,10 +80,14 @@ mod session;
 mod source;
 mod source_color;
 mod source_input;
+mod source_storage;
+mod texture_input;
 mod vardct_encoder;
 mod yuv_input;
 
 pub use source::CmykSampleEncoding;
+pub use source_storage::ImageSourceStorage;
+pub use texture_input::{TexturePlaneSource, TexturePlanesSource};
 pub use yuv_input::{YuvImageSource, YuvRgbTransfer};
 
 pub use buffer_pool::{

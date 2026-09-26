@@ -162,6 +162,12 @@ for Modular and VarDCT tests. It returns bytes and image metadata without callin
 source parsing, GPU normalization or either encoder. Channel order, sample shifts, endianness,
 poisoned gaps and unaligned pitches therefore remain fixture choices shared across targets.
 
+`gpu::textures::upload_planes` uploads logical image rows to independent raw texture carriers
+with poisoned neighboring mip/layers. It preserves the supplied packing and bytes without
+calling encoder planning or conversion, including odd packed/subsampled extents. Texture and
+YUV input tests use it to exercise portable per-plane storage against unchanged independent
+word and f64 oracles.
+
 Each decoder integration target has a `tests/<target>/main.rs` entry point. Its private modules
 live below that directory and use ordinary `mod` declarations. Examples with private helpers
 follow the same `examples/<target>/main.rs` layout. Shared helpers are imported from this crate;

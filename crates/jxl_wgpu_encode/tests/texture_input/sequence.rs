@@ -13,6 +13,7 @@ fn inputs(
 ) -> (
     TextureImageSource,
     BufferImageSource,
+    TexturePlanesSource,
     Vec<modular_integer::ExtraWords>,
 ) {
     let extent = factor.source_extent(displayed);
@@ -43,6 +44,16 @@ fn inputs(
     )
     .with_extra_channels(vec![extra.clone()])
     .unwrap();
+    let planar = separate_planes::split(
+        context,
+        extent,
+        config.pixel_format(),
+        &raw,
+        &[1, 1, 2],
+        true,
+    )
+    .with_extra_channels(vec![extra.clone()])
+    .unwrap();
     let canonical = buffer(context, extent, config.pixel_format(), &raw)
         .with_extra_channels(vec![extra])
         .unwrap();
@@ -52,7 +63,7 @@ fn inputs(
         height: scalar_extent.height,
         words: scalar,
     });
-    (input, canonical, expected)
+    (input, canonical, planar, expected)
 }
 
 #[test]
@@ -84,7 +95,7 @@ fn mixed_texture_sampling_crop_references_and_fragmented_decode_match_native() {
     for reverse in [false, true] {
         let mut encoded = Vec::new();
         let mut expected = Vec::new();
-        for use_texture in [false, true] {
+        for storage in 0..3 {
             let mut sequence = encoder
                 .begin_sequence(
                     ImageSequenceDescriptor::new(
@@ -111,14 +122,14 @@ fn mixed_texture_sampling_crop_references_and_fragmented_decode_match_native() {
                 } else {
                     UpsamplingFactor::One
                 };
-                let (input, canonical, words) = inputs(&context, displayed, factor, &depth);
-                if use_texture {
+                let (input, canonical, planar, words) = inputs(&context, displayed, factor, &depth);
+                if storage == 0 {
                     expected.push(words);
                 }
-                let source: GpuFrameSource = if use_texture {
-                    input.into()
-                } else {
-                    canonical.into()
+                let source: GpuFrameSource = match storage {
+                    0 => canonical.into(),
+                    1 => input.into(),
+                    _ => planar.into(),
                 };
                 let modular = (index != 1) != reverse;
                 let codec = if modular {
@@ -169,6 +180,7 @@ fn mixed_texture_sampling_crop_references_and_fragmented_decode_match_native() {
             encoded.push(sequence.finish_raw().unwrap());
         }
         assert_eq!(encoded[0], encoded[1]);
+        assert_eq!(encoded[0], encoded[2]);
         let encoded = &encoded[1];
         for (index, words) in expected.iter().enumerate() {
             if (index != 1) != reverse {

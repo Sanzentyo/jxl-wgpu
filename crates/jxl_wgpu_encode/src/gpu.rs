@@ -147,14 +147,7 @@ impl BufferImageSource {
         mut self,
         encoding: crate::CmykSampleEncoding,
     ) -> Result<Self, EncodeError> {
-        if !matches!(&self.layout.format.color_spec,
-            jxl_gpu_formats::ColorSpecification::Icc(profile) if profile.header().device_space.0 == *b"CMYK")
-            || self.layout.format.model != jxl_gpu_formats::ColorModel::IccDevice
-        {
-            return Err(EncodeError::InvalidSource(
-                "CMYK sample convention requires a CMYK ICC input",
-            ));
-        }
+        crate::source_storage::validate_cmyk_format(&self.layout.format)?;
         self.cmyk_encoding = encoding;
         Ok(self)
     }
@@ -168,15 +161,7 @@ impl BufferImageSource {
     /// Precision and extents (including intrinsic shifts and the requested per-frame
     /// upsampling factors) are checked against that declaration before admission.
     pub fn with_extra_channels(mut self, channels: Vec<Self>) -> Result<Self, EncodeError> {
-        if channels.len() > crate::extra_channel::MAX_EXTRA_CHANNELS
-            || channels
-                .iter()
-                .any(|channel| !channel.extra_channels.is_empty())
-        {
-            return Err(EncodeError::InvalidSource(
-                "extra sources must be flat and within the JPEG XL channel count",
-            ));
-        }
+        crate::source_storage::validate_extra_channels(&channels)?;
         self.extra_channels = channels;
         Ok(self)
     }
@@ -191,7 +176,7 @@ impl BufferImageSource {
 ///
 /// `pixel_format` describes the raw copied texel bytes, including channel order and precision.
 /// No sampler, normalization, sRGB conversion, or alpha conversion is applied. The texture
-/// must have `COPY_SRC` usage. Multi-planar textures use [`BufferImageSource`] instead.
+/// must have `COPY_SRC` usage. Separate image planes use [`crate::TexturePlanesSource`].
 #[derive(Clone, Debug)]
 pub struct TextureImageSource {
     pub texture: Arc<wgpu::Texture>,
@@ -229,15 +214,7 @@ impl TextureImageSource {
         mut self,
         channels: Vec<BufferImageSource>,
     ) -> Result<Self, EncodeError> {
-        if channels.len() > crate::extra_channel::MAX_EXTRA_CHANNELS
-            || channels
-                .iter()
-                .any(|channel| !channel.extra_channels().is_empty())
-        {
-            return Err(EncodeError::InvalidSource(
-                "extra sources must be flat and within the JPEG XL channel count",
-            ));
-        }
+        crate::source_storage::validate_extra_channels(&channels)?;
         self.extra_channels = channels;
         Ok(self)
     }
@@ -247,14 +224,7 @@ impl TextureImageSource {
         mut self,
         encoding: crate::CmykSampleEncoding,
     ) -> Result<Self, EncodeError> {
-        if !matches!(&self.pixel_format.color_spec,
-            jxl_gpu_formats::ColorSpecification::Icc(profile) if profile.header().device_space.0 == *b"CMYK")
-            || self.pixel_format.model != jxl_gpu_formats::ColorModel::IccDevice
-        {
-            return Err(EncodeError::InvalidSource(
-                "CMYK sample convention requires a CMYK ICC input",
-            ));
-        }
+        crate::source_storage::validate_cmyk_format(&self.pixel_format)?;
         self.cmyk_encoding = encoding;
         Ok(self)
     }
@@ -279,6 +249,24 @@ impl From<BufferImageSource> for GpuFrameSource {
 impl From<TextureImageSource> for GpuFrameSource {
     fn from(source: TextureImageSource) -> Self {
         Self::Texture(source)
+    }
+}
+
+impl From<crate::TexturePlanesSource> for GpuFrameSource {
+    fn from(source: crate::TexturePlanesSource) -> Self {
+        Self::TexturePlanes(source)
+    }
+}
+
+impl From<&crate::TexturePlanesSource> for GpuFrameSource {
+    fn from(source: &crate::TexturePlanesSource) -> Self {
+        Self::TexturePlanes(source.clone())
+    }
+}
+
+impl From<&crate::ImageSourceStorage> for GpuFrameSource {
+    fn from(source: &crate::ImageSourceStorage) -> Self {
+        source.clone().into()
     }
 }
 
@@ -316,6 +304,7 @@ impl From<&GpuFrameSource> for GpuFrameSource {
 pub enum GpuFrameSource {
     Buffer(BufferImageSource),
     Texture(TextureImageSource),
+    TexturePlanes(crate::TexturePlanesSource),
     Yuv(crate::YuvImageSource),
 }
 
@@ -325,6 +314,7 @@ impl GpuFrameSource {
         match self {
             Self::Buffer(source) => &source.layout.format,
             Self::Texture(source) => &source.pixel_format,
+            Self::TexturePlanes(source) => &source.pixel_format,
             Self::Yuv(source) => source.pixel_format(),
         }
     }

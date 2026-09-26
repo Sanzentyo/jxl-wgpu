@@ -2,3 +2,4 @@
 pub mod buffer;
 pub mod planes;
 pub mod rendering;
+pub mod textures;

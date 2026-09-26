@@ -12,8 +12,9 @@ currently executable profiles.
 ## GPU input storage
 
 Both encoders, fixed/mixed sequences and preview methods accept `BufferImageSource`,
-`TextureImageSource`, `YuvImageSource` or `GpuFrameSource`; memory queries also accept borrowed sources.
-The codec's logical color, precision, alpha and extra-channel rules apply to either storage.
+`TextureImageSource`, `TexturePlanesSource`, `YuvImageSource` or `GpuFrameSource`; memory queries
+also accept borrowed sources.
+The codec's logical color, precision, alpha and extra-channel rules apply to every storage form.
 
 `TextureImageSource::new` selects one mip and array layer from a single-sample 2D color texture
 with `COPY_SRC` usage. Its `texture_format` must match the actual texture. `pixel_format` describes
@@ -26,26 +27,40 @@ non-2D textures are rejected. Signed or otherwise unsupported logical sample for
 Independent scalar extras attach through `with_extra_channels(Vec<BufferImageSource>)`.
 CMYK textures use the same `with_cmyk_encoding` convention as buffers.
 
+`TexturePlanesSource::new(extent, pixel_format, planes)` supplies one `TexturePlaneSource`
+per logical format plane, in format order. Each selects its own texture/mip/layer; the selected
+size must match that plane's sampled size. Its texel width must equal one packing element,
+so packed YUYV/UYVY uses `ceil(width / 2)` four-byte texels, while NV12 uses a full-size one-byte
+luma texture and a half-size two-byte chroma texture. Odd subsampled dimensions round up.
+Planar and split RGB/CMYK/alpha storage follows the same rule, with no implicit conversion.
+These are separate portable textures; native multi-planar texture formats remain unsupported.
+Public descriptors are revalidated when queried or submitted.
+
 A common checked input plan validates the selected extent, row pitch, allocation and device limits
 before admission. It allocates one storage buffer after reserving the job's memory, then records
-`copy_texture_to_buffer` before the first compute pass in the ordinary submission. The copy has
-256-byte rows and a four-byte-aligned allocation; it preserves integer/floating representation
+one `copy_texture_to_buffer` per plane before compute in the ordinary submission. Each copy has
+256-byte rows and an offset aligned to both four bytes and its texel size. The single allocation
+is rounded to four bytes; it preserves integer/floating representation
 words, including Modular NaN payloads. Streamed Modular shares this copy across every histogram
 and serialization batch. No host image readback or extra queue submission is needed.
 
 Memory plans expose `source_copy_bytes` (encoder-owned, reserved once for the whole job) and
-`source_texture_bytes` (selected mip/layer texel bytes, caller-owned). `source_binding_bytes`
+`source_texture_bytes` (caller-owned selected texels, counting an identical texture/mip/layer
+once even when several planes refer to it). Each logical plane still needs its own copy region. `source_binding_bytes`
 and Modular's peak binding count cover caller-owned buffers, including attached scalars; the
 owned copy is excluded to avoid double counting. Addressed totals include the owned copy,
 caller-buffer windows and selected texels. Opaque driver texture allocation/tiling is excluded.
-Completion callbacks retain the original texture, copy and extras through cancellation; only
+Completion callbacks retain every original texture, the copy buffer and extras through cancellation; only
 validated artifacts may become frame or preview packets.
 [Independent input and ownership evidence](../../docs/CONFORMANCE_CORPUS.md#texture-encoder-input).
 
 ### Explicit YUV input conversion
 
-`YuvImageSource::new(buffer, YuvRgbTransfer::Preserve)` explicitly converts an integer YCbCr
-GPU buffer to full-resolution RGB binary32 in the declared source primaries and transfer.
+`YuvImageSource::new(storage, YuvRgbTransfer::Preserve)` explicitly converts integer YCbCr
+GPU storage to full-resolution RGB binary32 in the declared source primaries and transfer.
+`storage` accepts a buffer or `TexturePlanesSource` through `ImageSourceStorage`. The latter
+first copies all selected subresources into one checked pitch-linear buffer, then runs the
+same conversion. `source()` returns this storage enum; `as_buffer()` accesses buffer inputs.
 Both codecs, fixed/mixed sequences and previews consume this same checked RGB input plan.
 Modular preserves the **converted RGB words**, not the original subsampled YCbCr codes.
 This conversion has `SameDevice` determinism; explicit `CrossDevice` requests reject before
@@ -70,24 +85,25 @@ JPEG XL color syntax; BT.2020's distinct transfer therefore requires `Linear`.
 
 Independent scalar attachments retain their precision, geometry and values. VarDCT/mixed
 configuration declares RGB `ColorSampleFormat::float(ColorChannels::Rgb, 32, 8)` and the
-wrapper's `pixel_format().color_spec`. Direct YUV `BufferImageSource` submission still rejects,
-so no precision-changing conversion is implicit. Multi-plane textures and lossless coding
-of the original YCbCr domain remain outside this input contract.
+wrapper's `pixel_format().color_spec`. Direct unconverted YUV submission still rejects,
+so no precision-changing conversion is implicit. Native multi-planar texture formats and
+lossless coding of the original YCbCr domain remain outside this input contract.
 
 `source_conversion_bytes` reserves exactly `12 * width * height + 112` bytes for RGB and its
-uniform, once per job. The input's padded prefix binding joins caller-buffer range unions,
-including aliased scalar attachments. Source and RGB bindings must fit the device's storage
-binding limit. One cached compute pipeline records preparation before codec work in the same
+uniform, once per job. Texture inputs additionally reserve `source_copy_bytes`; the owned
+copy and RGB are excluded from caller-buffer unions. For buffer inputs the padded source prefix
+joins those unions, including aliased scalar attachments. Source and RGB bindings must fit the device's storage
+binding limit. Copies precede the cached conversion pipeline and codec work in the same
 submission. Streaming retains this allocation through all histogram/serialization batches;
 completion ownership also covers cancellation. No image pixels cross the host.
 [Independent conversion and lifetime evidence](../../docs/CONFORMANCE_CORPUS.md#yuv-encoder-input).
 
 ```rust,no_run
-use jxl_wgpu_encode::{BufferImageSource, EncodeError, LosslessModularEncoder,
+use jxl_wgpu_encode::{ImageSourceStorage, EncodeError, LosslessModularEncoder,
     WgpuContext, YuvImageSource, YuvRgbTransfer};
 
-fn encode_yuv(context: WgpuContext, buffer: BufferImageSource) -> Result<Vec<u8>, EncodeError> {
-    let input = YuvImageSource::new(buffer, YuvRgbTransfer::Preserve)?;
+fn encode_yuv(context: WgpuContext, storage: ImageSourceStorage) -> Result<Vec<u8>, EncodeError> {
+    let input = YuvImageSource::new(storage, YuvRgbTransfer::Preserve)?;
     LosslessModularEncoder::new(context).encode(input)
 }
 ```

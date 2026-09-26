@@ -82,6 +82,7 @@ fn yuv_vardct_original_and_xyb_consume_the_same_independently_checked_rgb() {
                     YuvRgbTransfer::Preserve
                 },
             );
+            let texture_input = fixture.texture_input(&context, input.rgb_transfer());
             let color = input.pixel_format().color_spec.clone();
             let checked = modular.encode(input.clone()).unwrap();
             let words = modular_words::channel_frames(&checked).remove(0);
@@ -96,6 +97,7 @@ fn yuv_vardct_original_and_xyb_consume_the_same_independently_checked_rgb() {
                     TiledVarDctEncoder::new_with_config(context.clone(), cfg.clone()).unwrap();
                 let encoded = encoder.encode(input.clone()).unwrap();
                 assert_eq!(encoded, encoder.encode(canonical.clone()).unwrap());
+                assert_eq!(encoded, encoder.encode(texture_input.clone()).unwrap());
                 compare_gpu(&gpu, &encoded, color.clone(), extent, 1, 0);
                 if extent.width == 8 {
                     let fixed =
@@ -103,6 +105,7 @@ fn yuv_vardct_original_and_xyb_consume_the_same_independently_checked_rgb() {
                             .unwrap();
                     let encoded = fixed.encode(input.clone()).unwrap();
                     assert_eq!(encoded, fixed.encode(canonical.clone()).unwrap());
+                    assert_eq!(encoded, fixed.encode(texture_input.clone()).unwrap());
                     compare_gpu(&gpu, &encoded, color.clone(), extent, 1, 0);
                 }
             }
@@ -191,7 +194,11 @@ fn yuv_mixed_sequences_share_sampling_crop_references_and_independent_channels()
         }
         inputs.push((
             input.with_extra_channels(extras.clone()).unwrap(),
-            canonical.with_extra_channels(extras).unwrap(),
+            canonical.with_extra_channels(extras.clone()).unwrap(),
+            fixture
+                .texture_input(&context, YuvRgbTransfer::Preserve)
+                .with_extra_channels(extras)
+                .unwrap(),
             words,
         ));
     }
@@ -208,7 +215,7 @@ fn yuv_mixed_sequences_share_sampling_crop_references_and_independent_channels()
     .unwrap();
     for reverse in [false, true] {
         let mut outputs = Vec::new();
-        for converted in [false, true] {
+        for storage in 0..3 {
             let mut sequence = encoder
                 .begin_sequence(
                     ImageSequenceDescriptor::new(
@@ -224,11 +231,11 @@ fn yuv_mixed_sequences_share_sampling_crop_references_and_independent_channels()
                     .unwrap(),
                 )
                 .unwrap();
-            for (index, (input, canonical, _)) in inputs.iter().enumerate() {
-                let source: GpuFrameSource = if converted {
-                    input.into()
-                } else {
-                    canonical.into()
+            for (index, (input, canonical, textures, _)) in inputs.iter().enumerate() {
+                let source: GpuFrameSource = match storage {
+                    0 => canonical.into(),
+                    1 => input.into(),
+                    _ => textures.into(),
                 };
                 let factor = if index == 1 {
                     UpsamplingFactor::Two
@@ -283,7 +290,8 @@ fn yuv_mixed_sequences_share_sampling_crop_references_and_independent_channels()
             outputs.push(sequence.finish_raw().unwrap());
         }
         assert_eq!(outputs[0], outputs[1]);
-        for (index, (_, _, words)) in inputs.iter().enumerate() {
+        assert_eq!(outputs[0], outputs[2]);
+        for (index, (_, _, _, words)) in inputs.iter().enumerate() {
             if (index != 1) != reverse {
                 assert_eq!(
                     &modular_integer::modular_channel_words(&outputs[1], index),
@@ -314,125 +322,128 @@ fn yuv_previews_release_conversion_storage_before_packets_are_retained() {
         true,
         ColorSpec::bt2020_ncl(ColorRange::Full, ChromaLocation2d::CENTER),
     );
-    let source = || fixture.input(&context, YuvRgbTransfer::Linear);
-    let cfg = config(&source());
-    let descriptor = ImageSequenceDescriptor::new(9, 5, AnimationHeader::Still)
-        .unwrap()
-        .with_preview(PreviewSize::new(9, 5).unwrap());
-    let mixed = MixedModeEncoder::new(
-        context.clone(),
-        MixedModeConfig {
-            vardct: cfg.clone(),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let mut outputs = Vec::new();
-    for codec in [
-        MixedModeFrameEncoding::Modular,
-        MixedModeFrameEncoding::VarDct,
-    ] {
-        let mut sequence = mixed.begin_sequence(descriptor.clone()).unwrap();
-        let input = source();
-        let owner = Arc::downgrade(&input.source().buffer);
-        sequence
-            .preview_memory_plan(&input, codec, FrameOptions::default())
+    for textures in [false, true] {
+        let source = || fixture.stored_input(&context, YuvRgbTransfer::Linear, textures);
+        let cfg = config(&source());
+        let descriptor = ImageSequenceDescriptor::new(9, 5, AnimationHeader::Still)
+            .unwrap()
+            .with_preview(PreviewSize::new(9, 5).unwrap());
+        let mixed = MixedModeEncoder::new(
+            context.clone(),
+            MixedModeConfig {
+                vardct: cfg.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut outputs = Vec::new();
+        for codec in [
+            MixedModeFrameEncoding::Modular,
+            MixedModeFrameEncoding::VarDct,
+        ] {
+            let mut sequence = mixed.begin_sequence(descriptor.clone()).unwrap();
+            let input = source();
+            let owner = SourceOwners::of(&input);
+            sequence
+                .preview_memory_plan(&input, codec, FrameOptions::default())
+                .unwrap();
+            let baseline = context.memory_stats().reserved_bytes;
+            let preview = sequence
+                .submit_preview(input, codec, FrameOptions::default())
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert!(owner.released());
+            assert_eq!(
+                context.memory_stats().reserved_bytes,
+                baseline + preview.reserved_bytes()
+            );
+            sequence.insert_preview(preview).unwrap();
+            let main = sequence
+                .submit_last_frame(source(), codec, FrameOptions::default())
+                .unwrap()
+                .wait()
+                .unwrap();
+            sequence.insert(main).unwrap();
+            outputs.push((
+                codec == MixedModeFrameEncoding::Modular,
+                sequence.finish_raw().unwrap(),
+            ));
+        }
+        let modular = LosslessModularEncoder::new(context.clone());
+        let mut sequence = modular
+            .begin_sequence(
+                LosslessModularSequenceDescriptor::from_pixel_format(
+                    9,
+                    5,
+                    source().pixel_format(),
+                    AnimationHeader::Still,
+                )
+                .unwrap()
+                .with_preview(PreviewSize::new(9, 5).unwrap()),
+            )
             .unwrap();
-        let baseline = context.memory_stats().reserved_bytes;
+        sequence
+            .preview_memory_plan(source(), FrameOptions::default())
+            .unwrap();
         let preview = sequence
-            .submit_preview(input, codec, FrameOptions::default())
+            .submit_preview(source(), FrameOptions::default())
             .unwrap()
             .wait()
             .unwrap();
-        assert!(owner.upgrade().is_none());
-        assert_eq!(
-            context.memory_stats().reserved_bytes,
-            baseline + preview.reserved_bytes()
-        );
         sequence.insert_preview(preview).unwrap();
         let main = sequence
-            .submit_last_frame(source(), codec, FrameOptions::default())
+            .submit_last_frame(source(), FrameOptions::default())
             .unwrap()
             .wait()
             .unwrap();
         sequence.insert(main).unwrap();
-        outputs.push((
-            codec == MixedModeFrameEncoding::Modular,
-            sequence.finish_raw().unwrap(),
-        ));
-    }
-    let modular = LosslessModularEncoder::new(context.clone());
-    let mut sequence = modular
-        .begin_sequence(
-            LosslessModularSequenceDescriptor::from_pixel_format(
-                9,
-                5,
-                source().pixel_format(),
-                AnimationHeader::Still,
-            )
+        outputs.push((true, sequence.finish_raw().unwrap()));
+        let vardct = TiledVarDctEncoder::new_with_config(context.clone(), cfg).unwrap();
+        let mut sequence = vardct.begin_sequence(descriptor).unwrap();
+        sequence
+            .preview_memory_plan(source(), FrameOptions::default())
+            .unwrap();
+        let preview = sequence
+            .submit_preview(source(), FrameOptions::default())
             .unwrap()
-            .with_preview(PreviewSize::new(9, 5).unwrap()),
-        )
-        .unwrap();
-    sequence
-        .preview_memory_plan(source(), FrameOptions::default())
-        .unwrap();
-    let preview = sequence
-        .submit_preview(source(), FrameOptions::default())
-        .unwrap()
-        .wait()
-        .unwrap();
-    sequence.insert_preview(preview).unwrap();
-    let main = sequence
-        .submit_last_frame(source(), FrameOptions::default())
-        .unwrap()
-        .wait()
-        .unwrap();
-    sequence.insert(main).unwrap();
-    outputs.push((true, sequence.finish_raw().unwrap()));
-    let vardct = TiledVarDctEncoder::new_with_config(context.clone(), cfg).unwrap();
-    let mut sequence = vardct.begin_sequence(descriptor).unwrap();
-    sequence
-        .preview_memory_plan(source(), FrameOptions::default())
-        .unwrap();
-    let preview = sequence
-        .submit_preview(source(), FrameOptions::default())
-        .unwrap()
-        .wait()
-        .unwrap();
-    sequence.insert_preview(preview).unwrap();
-    let main = sequence
-        .submit_last_frame(source(), FrameOptions::default())
-        .unwrap()
-        .wait()
-        .unwrap();
-    sequence.insert(main).unwrap();
-    outputs.push((false, sequence.finish_raw().unwrap()));
-    for (is_modular, encoded) in outputs {
-        let native = extra_channels::libjxl_output(&encoded, &["--preview", "--original"]).unwrap();
-        assert_eq!(native.len(), extent.area().unwrap() * 4);
-        if is_modular {
-            let words = modular_words::original_preview(&encoded);
-            assert_eq!((words.bits, words.exponent_bits), (32, 8));
-            let planes: Vec<_> = words
-                .planes
-                .into_iter()
-                .map(|words| modular_integer::ExtraWords {
-                    width: 9,
-                    height: 5,
-                    words: words.into_iter().map(|w| w as u32).collect(),
-                })
-                .collect();
-            fixture.assert_rgb(&planes, true);
+            .wait()
+            .unwrap();
+        sequence.insert_preview(preview).unwrap();
+        let main = sequence
+            .submit_last_frame(source(), FrameOptions::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        sequence.insert(main).unwrap();
+        outputs.push((false, sequence.finish_raw().unwrap()));
+        for (is_modular, encoded) in outputs {
+            let native =
+                extra_channels::libjxl_output(&encoded, &["--preview", "--original"]).unwrap();
+            assert_eq!(native.len(), extent.area().unwrap() * 4);
+            if is_modular {
+                let words = modular_words::original_preview(&encoded);
+                assert_eq!((words.bits, words.exponent_bits), (32, 8));
+                let planes: Vec<_> = words
+                    .planes
+                    .into_iter()
+                    .map(|words| modular_integer::ExtraWords {
+                        width: 9,
+                        height: 5,
+                        words: words.into_iter().map(|w| w as u32).collect(),
+                    })
+                    .collect();
+                fixture.assert_rgb(&planes, true);
+            }
+            compare_gpu(
+                &gpu,
+                &encoded,
+                source().pixel_format().color_spec.clone(),
+                extent,
+                1,
+                0,
+            );
         }
-        compare_gpu(
-            &gpu,
-            &encoded,
-            source().pixel_format().color_spec.clone(),
-            extent,
-            1,
-            0,
-        );
     }
     assert_eq!(context.memory_stats().reserved_bytes, 0);
 }

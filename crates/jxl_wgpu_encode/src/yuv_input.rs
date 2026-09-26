@@ -24,21 +24,31 @@ pub enum YuvRgbTransfer {
     Linear,
 }
 
-/// Explicit GPU conversion of a pitch-linear integer YCbCr buffer to RGB binary32.
+/// Explicit GPU conversion of integer YCbCr buffers or separate texture planes to RGB binary32.
 ///
 /// Chroma is bilinearly reconstructed at the declared locations with edge replication.
 /// Nominal-range excursions are retained. Modular preserves the resulting RGB words,
 /// not the original subsampled YCbCr samples. Independent scalar attachments are unchanged.
 #[derive(Clone, Debug)]
 pub struct YuvImageSource {
-    source: BufferImageSource,
+    source: crate::ImageSourceStorage,
     transfer: YuvRgbTransfer,
     output_format: PixelFormat,
 }
 
 impl YuvImageSource {
-    pub fn new(source: BufferImageSource, transfer: YuvRgbTransfer) -> Result<Self, EncodeError> {
-        let plan = YuvPlan::new(&source, transfer)?;
+    pub fn new(
+        source: impl Into<crate::ImageSourceStorage>,
+        transfer: YuvRgbTransfer,
+    ) -> Result<Self, EncodeError> {
+        let source = source.into();
+        let storage = crate::source_storage::StoragePlan::new(source.clone())?;
+        let plan = YuvPlan::new(
+            &storage.layout,
+            storage.buffer_bytes(),
+            storage.buffer_usage(),
+            transfer,
+        )?;
         Ok(Self {
             source,
             transfer,
@@ -47,7 +57,7 @@ impl YuvImageSource {
     }
 
     #[must_use]
-    pub fn source(&self) -> &BufferImageSource {
+    pub fn source(&self) -> &crate::ImageSourceStorage {
         &self.source
     }
 
@@ -106,10 +116,11 @@ const _: () = {
 
 impl YuvPlan {
     pub(crate) fn new(
-        source: &BufferImageSource,
+        input: &ImageLayout,
+        available_bytes: u64,
+        usage: wgpu::BufferUsages,
         transfer: YuvRgbTransfer,
     ) -> Result<Self, EncodeError> {
-        let input = &source.layout;
         let checked =
             ImageLayout::from_planes(input.extent, input.format.clone(), input.planes.clone())?;
         let source_bytes =
@@ -123,8 +134,8 @@ impl YuvPlan {
         if checked != *input
             || input.extent.width == 0
             || input.extent.height == 0
-            || source_bytes > source.buffer.size()
-            || !source.buffer.usage().contains(wgpu::BufferUsages::STORAGE)
+            || source_bytes > available_bytes
+            || !usage.contains(wgpu::BufferUsages::STORAGE)
         {
             return Err(EncodeError::InvalidSource(
                 "YUV conversion requires a canonical nonempty storage layout with word padding",
@@ -328,7 +339,7 @@ impl YuvPlan {
     pub(crate) fn materialize(
         &self,
         context: &WgpuContext,
-        input: YuvImageSource,
+        input: BufferImageSource,
         output: &wgpu::Buffer,
     ) -> PreparedYuv {
         let pipeline = context.yuv_pipeline();
@@ -348,7 +359,7 @@ impl YuvPlan {
                     wgpu::BindGroupEntry {
                         binding: 0,
                         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &input.source.buffer,
+                            buffer: &input.buffer,
                             offset: 0,
                             size: NonZeroU64::new(self.source_bytes),
                         }),
@@ -399,7 +410,7 @@ pub(crate) fn pipeline(device: &wgpu::Device) -> wgpu::ComputePipeline {
 }
 
 pub(crate) struct PreparedYuv {
-    _input: YuvImageSource,
+    _input: BufferImageSource,
     _uniform: wgpu::Buffer,
     pipeline: Arc<wgpu::ComputePipeline>,
     bind_group: wgpu::BindGroup,

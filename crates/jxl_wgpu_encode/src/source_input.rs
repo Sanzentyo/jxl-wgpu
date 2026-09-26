@@ -2,8 +2,7 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use jxl_gpu_formats::{ImageLayout, PlaneSampling};
-use jxl_gpu_protocol::Extent2d;
+use jxl_gpu_formats::ImageLayout;
 use jxl_wgpu::MemoryPermit;
 
 use crate::{
@@ -14,6 +13,7 @@ use crate::{
 /// only admission may materialize it. Scalar attachments remain caller-owned buffers.
 pub(crate) struct FrameInputPlan {
     source: GpuFrameSource,
+    storage: crate::source_storage::StoragePlan,
     pub(crate) layout: ImageLayout,
     pub(crate) copy_bytes: u64,
     pub(crate) texture_bytes: u64,
@@ -43,80 +43,33 @@ impl FrameInputPlan {
         Ok(())
     }
     pub(crate) fn new(source: GpuFrameSource) -> Result<Self, EncodeError> {
-        let mut conversion = None;
-        let (layout, copy_bytes, texture_bytes) = match &source {
-            GpuFrameSource::Buffer(buffer) => (buffer.layout.clone(), 0, 0),
-            GpuFrameSource::Yuv(input) => {
-                let plan = crate::yuv_input::YuvPlan::new(input.source(), input.rgb_transfer())?;
-                let layout = plan.layout.clone();
-                conversion = Some(plan);
-                (layout, 0, 0)
-            }
-            GpuFrameSource::Texture(input) => {
-                let texture = &input.texture;
-                let format = input.texture_format;
-                if texture.format() != format
-                    || texture.dimension() != wgpu::TextureDimension::D2
-                    || texture.sample_count() != 1
-                    || !texture.usage().contains(wgpu::TextureUsages::COPY_SRC)
-                    || input.mip_level >= texture.mip_level_count()
-                    || input.array_layer >= texture.depth_or_array_layers()
-                    || format.is_depth_stencil_format()
-                    || format.is_multi_planar_format()
-                    || format.block_dimensions() != (1, 1)
-                {
-                    return Err(EncodeError::InvalidSource(
-                        "texture input requires a matching copyable single-sample 2D color mip/layer",
-                    ));
-                }
-                let texel_bytes =
-                    format
-                        .block_copy_size(None)
-                        .ok_or(EncodeError::InvalidSource(
-                            "texture has no portable color copy layout",
-                        ))?;
-                let pixel = &input.pixel_format;
-                pixel
-                    .validate()
-                    .map_err(jxl_gpu_formats::LayoutError::from)?;
-                if pixel.planes.len() != 1
-                    || pixel.planes[0].sampling != PlaneSampling::FULL
-                    || pixel.planes[0].pixels_per_element != 1
-                    || pixel.planes[0].bits_per_element() != u64::from(texel_bytes) * 8
-                {
-                    return Err(EncodeError::InvalidSource(
-                        "pixel format must describe exactly one copied texel",
-                    ));
-                }
-                let extent = Extent2d::new(
-                    (texture.width() >> input.mip_level).max(1),
-                    (texture.height() >> input.mip_level).max(1),
-                );
-                let mut layout = ImageLayout::packed(extent, pixel.clone())?;
-                let row_bytes = layout.planes[0].row_bytes;
-                let row_stride = row_bytes.div_ceil(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT))
-                    * u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-                u32::try_from(row_stride).map_err(|_| {
-                    EncodeError::InvalidSource("texture copy row pitch exceeds u32")
-                })?;
-                layout.planes[0].row_stride = row_stride;
-                let layout = ImageLayout::from_planes(extent, pixel.clone(), layout.planes)?;
-                let copy_bytes = layout
-                    .logical_size
-                    .checked_add(3)
-                    .ok_or(EncodeError::InvalidSource("texture copy size overflow"))?
-                    & !3;
-                let texture_bytes = row_bytes
-                    .checked_mul(u64::from(extent.height))
-                    .ok_or(EncodeError::InvalidSource("texture input size overflow"))?;
-                (layout, copy_bytes, texture_bytes)
-            }
+        let (storage, transfer) = match &source {
+            GpuFrameSource::Buffer(input) => (input.clone().into(), None),
+            GpuFrameSource::Texture(input) => (input.clone().into(), None),
+            GpuFrameSource::TexturePlanes(input) => (input.clone().into(), None),
+            GpuFrameSource::Yuv(input) => (input.source().clone(), Some(input.rgb_transfer())),
         };
+        let storage = crate::source_storage::StoragePlan::new(storage)?;
+        let conversion = transfer
+            .map(|transfer| {
+                crate::yuv_input::YuvPlan::new(
+                    &storage.layout,
+                    storage.buffer_bytes(),
+                    storage.buffer_usage(),
+                    transfer,
+                )
+            })
+            .transpose()?;
+        let layout = conversion
+            .as_ref()
+            .map_or(&storage.layout, |plan| &plan.layout)
+            .clone();
         Ok(Self {
             source,
             layout,
-            copy_bytes,
-            texture_bytes,
+            copy_bytes: storage.copy_bytes,
+            texture_bytes: storage.texture_bytes,
+            storage,
             conversion,
         })
     }
@@ -158,12 +111,10 @@ impl FrameInputPlan {
     pub(crate) fn preparation_binding(
         &self,
     ) -> Option<(Option<&wgpu::Buffer>, crate::source::SourceWindows)> {
-        let GpuFrameSource::Yuv(source) = &self.source else {
-            return None;
-        };
-        let plan = self.conversion.as_ref().expect("YUV preparation plan");
+        let plan = self.conversion.as_ref()?;
+        let buffer = self.storage.caller_buffer()?;
         Some((
-            Some(&source.source().buffer),
+            Some(buffer),
             crate::source::SourceWindows::prefix(plan.source_bytes),
         ))
     }
@@ -194,43 +145,35 @@ impl FrameInputPlan {
     }
 
     pub(crate) fn buffer_bytes(&self) -> u64 {
-        self.caller_buffer().map_or_else(
-            || {
-                self.conversion
-                    .as_ref()
-                    .map_or(self.copy_bytes, |plan| plan.layout.logical_size)
-            },
-            wgpu::Buffer::size,
+        self.conversion.as_ref().map_or_else(
+            || self.storage.buffer_bytes(),
+            |plan| plan.layout.logical_size,
         )
     }
 
     pub(crate) fn buffer_usage(&self) -> wgpu::BufferUsages {
-        self.caller_buffer()
-            .map_or(wgpu::BufferUsages::STORAGE, wgpu::Buffer::usage)
+        if self.conversion.is_some() {
+            wgpu::BufferUsages::STORAGE
+        } else {
+            self.storage.buffer_usage()
+        }
     }
 
     /// None denotes encoder-owned prepared RGB/texels, excluded from caller-buffer accounting.
     pub(crate) fn caller_buffer(&self) -> Option<&wgpu::Buffer> {
-        match &self.source {
-            GpuFrameSource::Buffer(source) => Some(&source.buffer),
-            GpuFrameSource::Texture(_) | GpuFrameSource::Yuv(_) => None,
+        if self.conversion.is_some() {
+            None
+        } else {
+            self.storage.caller_buffer()
         }
     }
 
     pub(crate) fn extra_channels(&self) -> &[BufferImageSource] {
-        match &self.source {
-            GpuFrameSource::Buffer(source) => source.extra_channels(),
-            GpuFrameSource::Texture(source) => source.extra_channels(),
-            GpuFrameSource::Yuv(source) => source.source().extra_channels(),
-        }
+        self.storage.source().extra_channels()
     }
 
     pub(crate) fn cmyk_encoding(&self) -> CmykSampleEncoding {
-        match &self.source {
-            GpuFrameSource::Buffer(source) => source.cmyk_encoding(),
-            GpuFrameSource::Texture(source) => source.cmyk_encoding(),
-            GpuFrameSource::Yuv(_) => CmykSampleEncoding::default(),
-        }
+        self.storage.source().cmyk_encoding()
     }
 
     pub(crate) fn into_source(self) -> GpuFrameSource {
@@ -244,40 +187,24 @@ impl FrameInputPlan {
         context: &crate::WgpuContext,
         permit: Option<MemoryPermit>,
     ) -> Arc<PreparedInput> {
-        let device = context.device();
-        let (source, preparation) = match self.source {
-            GpuFrameSource::Buffer(source) => (source, InputPreparation::None),
-            GpuFrameSource::Yuv(input) => {
-                let plan = self.conversion.expect("checked YUV input plan");
-                let buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("jxl-wgpu converted RGB input"),
-                    size: plan.layout.logical_size,
-                    usage: wgpu::BufferUsages::STORAGE,
-                    mapped_at_creation: false,
-                }));
-                let mut source =
-                    BufferImageSource::new(buffer, self.layout).expect("checked input allocation");
-                source.extra_channels = input.source().extra_channels.clone();
-                let preparation = plan.materialize(context, input, &source.buffer);
-                (source, InputPreparation::Yuv(Box::new(preparation)))
-            }
-            GpuFrameSource::Texture(texture) => {
-                let buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("jxl-wgpu texture input copy"),
-                    size: self.copy_bytes,
-                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
-                    mapped_at_creation: false,
-                }));
-                let mut source =
-                    BufferImageSource::new(buffer, self.layout).expect("checked input allocation");
-                source.extra_channels = texture.extra_channels.clone();
-                source.cmyk_encoding = texture.cmyk_encoding;
-                (source, InputPreparation::Texture(texture))
-            }
-        };
+        let (mut source, copies) = self.storage.materialize(context.device());
+        let conversion = self.conversion.map(|plan| {
+            let buffer = Arc::new(context.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("jxl-wgpu converted RGB input"),
+                size: plan.layout.logical_size,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }));
+            let mut rgb =
+                BufferImageSource::new(buffer, self.layout).expect("checked input allocation");
+            rgb.extra_channels = source.extra_channels.clone();
+            let input = std::mem::replace(&mut source, rgb);
+            plan.materialize(context, input, &source.buffer)
+        });
         Arc::new(PreparedInput {
             source,
-            preparation,
+            copies,
+            conversion,
             _permit: permit,
         })
     }
@@ -292,14 +219,9 @@ impl From<&FrameInputPlan> for GpuFrameSource {
 /// Shared with completion callbacks, including the last pending batch after cancellation.
 pub(crate) struct PreparedInput {
     source: BufferImageSource,
-    preparation: InputPreparation,
+    copies: Option<crate::source_storage::PreparedTextureCopies>,
+    conversion: Option<crate::yuv_input::PreparedYuv>,
     _permit: Option<MemoryPermit>,
-}
-
-enum InputPreparation {
-    None,
-    Texture(crate::TextureImageSource),
-    Yuv(Box<crate::yuv_input::PreparedYuv>),
 }
 
 impl Deref for PreparedInput {
@@ -310,37 +232,13 @@ impl Deref for PreparedInput {
 }
 
 impl PreparedInput {
-    /// Record once, before the first compute pass, on the job's ordinary submission.
+    /// Record each preparation stage once, before the first codec compute pass.
     pub(crate) fn record_preparation(&self, commands: &mut wgpu::CommandEncoder) {
-        let source = match &self.preparation {
-            InputPreparation::None => return,
-            InputPreparation::Yuv(source) => return source.record(commands),
-            InputPreparation::Texture(source) => source,
-        };
-        commands.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &source.texture,
-                mip_level: source.mip_level,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: 0,
-                    z: source.array_layer,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &self.buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(self.layout.planes[0].row_stride as u32),
-                    rows_per_image: None,
-                },
-            },
-            wgpu::Extent3d {
-                width: self.layout.extent.width,
-                height: self.layout.extent.height,
-                depth_or_array_layers: 1,
-            },
-        );
+        if let Some(copies) = &self.copies {
+            copies.record(commands);
+        }
+        if let Some(conversion) = &self.conversion {
+            conversion.record(commands);
+        }
     }
 }

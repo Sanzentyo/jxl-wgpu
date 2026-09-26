@@ -180,27 +180,33 @@ complemented 4-to-3 ICC connection before opsin conversion. Black still has its 
 validated raw-word artifact. Its source view shares the primary buffer lifetime and range-union
 accounting. [CMYK evidence](CONFORMANCE_CORPUS.md#cmyk-encoder-input).
 
-`FrameInputPlan` owns the physical storage choice before codec/sample lowering. Buffer plans retain
-their caller allocation; texture plans validate a single copyable 2D color mip/layer and derive
-its checked pitch-linear byte layout without allocation. Both become the same `SourceLayout`
-and scalar-owner plan. Logical formats describe raw texel bytes; no sampler, sRGB conversion or
+`ImageSourceStorage` describes caller-owned buffers, a single texture, or separate plane
+textures. `StoragePlan` owns their checked physical layout, copy regions and selected-subresource
+accounting. Each texture plane must match its sampled extent in packing elements, with an offset
+aligned to both four bytes and its texel width. Buffer plans retain their caller allocation.
+`FrameInputPlan` composes this storage plan with optional `YuvPlan` color preparation before
+codec/sample lowering. Every frontend consumes the same resolved `SourceLayout` and scalar plan.
+Logical formats describe raw texel bytes; no sampler, sRGB conversion or
 host pixel conversion is introduced. Unsupported texture topology/usage and copy/binding limits
 reject before admission. Still, fixed/mixed sequence and preview frontends use this common plan.
 
 Admission materializes a `PreparedInput` shared with the completion callback. It retains the
-original texture, the encoder-owned copy and attached buffers. One raw texture-to-buffer copy
-precedes the first compute pass of the existing submission. Streaming Modular records it only
-for the first histogram batch; the persistent copy permit is split from the checked peak
+original textures, the single encoder-owned copy allocation and attached buffers. Each plane's
+raw texture-to-buffer copy precedes optional conversion and the codec compute passes in the
+existing submission. Streaming Modular records these stages only for the first histogram batch; the persistent copy permit is split from the checked peak
 reservation, and survives independently of per-batch scratch through both passes and cancellation.
 Caller-buffer range unions exclude the owned copy, whose full allocation is charged once.
-Selected texel bytes are separately addressed; driver-selected texture tiling is outside the model.
+Selected texel bytes count each texture/mip/layer identity once; distinct layers or mips count
+separately, even within one texture. Copy regions still belong to each logical plane.
+Driver-selected texture tiling is outside the model.
 [Texture evidence](CONFORMANCE_CORPUS.md#texture-encoder-input).
 
 Explicit `YuvImageSource` preparation extends that boundary with one checked `YuvPlan`:
 integer packing, range, matrix, chroma phase, transfer policy, RGB F32 layout, dispatch and
-resource bounds are resolved before admission. `PreparedInput` holds either the caller buffer,
-raw texture copy, or converted RGB plus its source/uniform/bindings. Codec consumers see only
-the resolved layout. Scalar attachments retain their own source plans and union accounting.
+resource bounds are resolved before admission. `PreparedInput` retains the resolved buffer
+plus optional copy and conversion stages, which can coexist. Conversion reads the checked
+storage layout regardless of its origin; codec consumers see only the resolved RGB layout.
+Scalar attachments retain their own source plans and union accounting.
 One context-shared pipeline reconstructs chroma and converts color before ordinary codec work;
 streamed batches share one conversion and persistent permit. No CPU pixel work or extra
 submission is introduced. Converted inputs guarantee same-device repeatability; explicit
