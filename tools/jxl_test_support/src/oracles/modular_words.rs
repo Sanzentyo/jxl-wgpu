@@ -78,7 +78,18 @@ pub fn palette_index_counts(encoded: &[u8]) -> [u32; 3] {
 }
 
 pub fn original_frames(encoded: &[u8]) -> Vec<FrameWords> {
-    let output = run_input(encoded, None);
+    read_frames(run_input(encoded, None))
+}
+
+/// Reads only an original-color, final Modular preview with the native preview frame context.
+/// Main bytes remain present and are not rewritten; main entropy is outside this word check.
+pub fn original_preview(encoded: &[u8]) -> FrameWords {
+    let mut frames = read_frames(run_input(encoded, Some("--preview-words")));
+    assert_eq!(frames.len(), 1);
+    frames.remove(0)
+}
+
+fn read_frames(output: Vec<u8>) -> Vec<FrameWords> {
     let mut words = words(&output, b"JXLRAW12");
     let count = words.next().expect("frame count");
     assert!((1..=64).contains(&count));

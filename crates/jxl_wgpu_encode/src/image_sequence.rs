@@ -1,4 +1,4 @@
-//! Checked image geometry and timebase shared by VarDCT and mixed-codec sequences.
+//! Checked image geometry, preview and timebase shared by every encoder.
 
 use crate::frame_header::write_animation_header;
 use crate::sample_format::{ImageSamplePlan, write_sample_bit_depth};
@@ -26,6 +26,17 @@ pub struct ImageSequenceDescriptor {
 }
 
 impl ImageSequenceDescriptor {
+    /// Declares an independently supplied GPU preview. Submit it before the first main frame.
+    #[must_use]
+    pub fn with_preview(mut self, size: crate::PreviewSize) -> Self {
+        self.header = self.header.with_preview(size);
+        self
+    }
+
+    #[must_use]
+    pub const fn preview(&self) -> Option<crate::PreviewSize> {
+        self.header.preview()
+    }
     /// Checks the canvas/timebase. The encoder binds its color policy at `begin_sequence`.
     pub fn new(
         canvas_width: u32,
@@ -104,6 +115,7 @@ fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), Enco
 pub(crate) struct ImageHeaderPlan {
     prefix: BitFragment,
     animation: Option<BitFragment>,
+    preview: Option<crate::PreviewSize>,
 }
 
 impl ImageHeaderPlan {
@@ -131,7 +143,17 @@ impl ImageHeaderPlan {
         Ok(Self {
             prefix: fragment(prefix)?,
             animation,
+            preview: None,
         })
+    }
+
+    pub(crate) fn with_preview(mut self, size: crate::PreviewSize) -> Self {
+        self.preview = Some(size);
+        self
+    }
+
+    pub(crate) const fn preview(&self) -> Option<crate::PreviewSize> {
+        self.preview
     }
 
     pub(crate) fn encode(
@@ -146,13 +168,16 @@ impl ImageHeaderPlan {
         let mut output = BitWriter::new();
         crate::packet::append_fragment(&mut output, &self.prefix)?;
         let has_animation = self.animation.is_some();
-        let extra_fields = has_animation || options.extra_fields();
+        let extra_fields = has_animation || self.preview.is_some() || options.extra_fields();
         output.write_bits(0, 1)?; // explicit image metadata
         output.write_bits(u64::from(extra_fields), 1)?;
         if extra_fields {
             output.write_bits(u64::from(options.orientation.to_exif_value() - 1), 3)?;
             output.write_bits(0, 1)?; // no intrinsic size
-            output.write_bits(0, 1)?; // no preview
+            output.write_bits(u64::from(self.preview.is_some()), 1)?;
+            if let Some(preview) = self.preview {
+                preview.write(&mut output)?;
+            }
             output.write_bits(u64::from(has_animation), 1)?;
             if let Some(animation) = &self.animation {
                 crate::packet::append_fragment(&mut output, animation)?;

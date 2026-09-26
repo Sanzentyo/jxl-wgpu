@@ -244,13 +244,11 @@ impl LosslessModularEncoder {
         self.config()
             .color_transform
             .resolve(descriptor.format, descriptor.exponent_bits_per_sample)?;
-        let (codestream_header, metadata_permit) = image_header(
-            descriptor.canvas_width,
-            descriptor.canvas_height,
+        let (codestream_header, metadata_permit) = image_header_with_plan(
+            &descriptor.header,
             descriptor.format,
             descriptor.bits_per_sample,
             descriptor.exponent_bits_per_sample,
-            descriptor.animation,
             ModularImageMetadata::new(
                 descriptor.color.clone(),
                 self.image_options,
@@ -271,7 +269,8 @@ impl LosslessModularEncoder {
         })?;
         Ok(LosslessModularSequenceSession {
             session,
-            assembler: CodestreamAssembler::new(codestream_header)?,
+            assembler: CodestreamAssembler::new(codestream_header)?
+                .with_preview(descriptor.preview()),
             descriptor,
             metadata_permit,
         })
@@ -357,9 +356,21 @@ pub struct LosslessModularSequenceDescriptor {
     exponent_bits_per_sample: u8,
     animation: AnimationHeader,
     color: SourceColorEncoding,
+    header: crate::image_sequence::ImageHeaderPlan,
 }
 
 impl LosslessModularSequenceDescriptor {
+    /// Declares an independently supplied GPU preview in the same image color/precision contract.
+    #[must_use]
+    pub fn with_preview(mut self, size: crate::PreviewSize) -> Self {
+        self.header = self.header.with_preview(size);
+        self
+    }
+
+    #[must_use]
+    pub const fn preview(&self) -> Option<crate::PreviewSize> {
+        self.header.preview()
+    }
     /// Infers stream components, precision and color from a supported source format.
     ///
     /// Frame storage may differ, but every submitted frame must have the same encoded color
@@ -427,13 +438,13 @@ impl LosslessModularSequenceDescriptor {
         animation: AnimationHeader,
     ) -> Result<Self, EncodeError> {
         // The header uses the same checked precision as still-image serialization.
-        image_header(
-            canvas_width,
-            canvas_height,
+        let header =
+            crate::image_sequence::ImageHeaderPlan::new(canvas_width, canvas_height, animation)?;
+        image_header_with_plan(
+            &header,
             format,
             bits_per_sample,
             exponent_bits_per_sample,
-            animation,
             ModularImageMetadata::default(),
         )?;
         Ok(Self {
@@ -444,6 +455,7 @@ impl LosslessModularSequenceDescriptor {
             exponent_bits_per_sample,
             animation,
             color: SourceColorEncoding::default(),
+            header,
         })
     }
 
@@ -487,6 +499,41 @@ pub struct LosslessModularSequenceSession {
 }
 
 impl LosslessModularSequenceSession {
+    /// GPU job footprint. Completed preview storage is admitted separately at its actual size.
+    pub fn preview_memory_plan(
+        &self,
+        source: &crate::BufferImageSource,
+        options: FrameOptions,
+    ) -> Result<LosslessModularMemoryPlan, EncodeError> {
+        self.validate_source(source)?;
+        let request = self.session.preview_request(
+            &self.assembler,
+            options,
+            &self.session.default_coding(),
+        )?;
+        self.session
+            .encoder()
+            .backend()
+            .memory_plan_for_request(source, &request)
+    }
+    /// Submits the declared preview without advancing or closing the main frame sequence.
+    pub fn submit_preview(
+        &mut self,
+        source: crate::BufferImageSource,
+        options: FrameOptions,
+    ) -> Result<crate::PreviewSubmission<LosslessModularJob>, EncodeError> {
+        self.validate_source(&source)?;
+        self.session.submit_preview(
+            &mut self.assembler,
+            GpuFrameSource::Buffer(source),
+            options,
+            &self.session.default_coding(),
+        )
+    }
+
+    pub fn insert_preview(&mut self, preview: crate::EncodedPreview) -> Result<(), EncodeError> {
+        Ok(self.assembler.insert_preview(preview)?)
+    }
     #[must_use]
     pub const fn descriptor(&self) -> &LosslessModularSequenceDescriptor {
         &self.descriptor
@@ -1775,6 +1822,22 @@ pub(super) fn image_header(
     animation: AnimationHeader,
     color: ModularImageMetadata,
 ) -> Result<PreparedImageHeader, EncodeError> {
+    image_header_with_plan(
+        &crate::image_sequence::ImageHeaderPlan::new(width, height, animation)?,
+        format,
+        bits_per_sample,
+        exponent_bits_per_sample,
+        color,
+    )
+}
+
+fn image_header_with_plan(
+    header: &crate::image_sequence::ImageHeaderPlan,
+    format: LosslessModularFormat,
+    bits_per_sample: u8,
+    exponent_bits_per_sample: u8,
+    color: ModularImageMetadata,
+) -> Result<PreparedImageHeader, EncodeError> {
     color.alpha.validate(format)?;
     let samples = if exponent_bits_per_sample == 0 {
         crate::ColorSampleFormat::integer(format.color_channels(), bits_per_sample)?
@@ -1789,7 +1852,7 @@ pub(super) fn image_header(
         samples,
         format.has_alpha().then_some(color.alpha),
     );
-    crate::image_sequence::ImageHeaderPlan::new(width, height, animation)?.encode(
+    header.encode(
         crate::image_sequence::ImageCoding::Modular,
         &samples,
         &color.encoding,

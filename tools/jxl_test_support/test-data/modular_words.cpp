@@ -84,7 +84,7 @@ jxl::Status AuditPalette(const jxl::Image& image, const jxl::GroupHeader& header
 }
 
 jxl::Status Decode(const std::vector<uint8_t>& raw, std::vector<Frame>* frames,
-                   std::array<uint32_t, 3>* audit = nullptr) {
+                   std::array<uint32_t, 3>* audit = nullptr, bool preview = false) {
   JxlMemoryManager memory{nullptr, [](void*, size_t size) -> void* { return std::malloc(size); }, [](void*, void* p) { std::free(p); }};
   jxl::CodecMetadata metadata;
   size_t pos;
@@ -95,7 +95,7 @@ jxl::Status Decode(const std::vector<uint8_t>& raw, std::vector<Frame>* frames,
     JXL_RETURN_IF_ERROR(jxl::ReadImageMetadata(&reader, &metadata.m));
     metadata.transform_data.nonserialized_xyb_encoded = metadata.m.xyb_encoded;
     JXL_RETURN_IF_ERROR(jxl::Bundle::Read(&reader, &metadata.transform_data));
-    JXL_ENSURE(!metadata.m.xyb_encoded && !metadata.m.have_preview && !metadata.m.color_encoding.WantICC());
+    JXL_ENSURE(!metadata.m.xyb_encoded && metadata.m.have_preview == preview && !metadata.m.color_encoding.WantICC());
     for (const auto& extra : metadata.m.extra_channel_info) {
       JXL_ENSURE(extra.dim_shift == 0);
       JXL_ENSURE(extra.bit_depth.bits_per_sample == metadata.m.bit_depth.bits_per_sample);
@@ -109,6 +109,7 @@ jxl::Status Decode(const std::vector<uint8_t>& raw, std::vector<Frame>* frames,
   while (!last) {
     JXL_ENSURE(pos < raw.size() && frames->size() < 64);
     jxl::FrameHeader header(&metadata);
+    header.nonserialized_is_preview = preview;
     std::vector<uint32_t> sizes;
     std::vector<jxl::coeff_order_t> permutation;
     jxl::FrameDimensions dim;
@@ -205,7 +206,7 @@ jxl::Status Decode(const std::vector<uint8_t>& raw, std::vector<Frame>* frames,
     frames->push_back(std::move(frame));
     last = header.is_last;
   }
-  JXL_ENSURE(pos == raw.size());
+  JXL_ENSURE(preview ? (frames->size() == 1 && pos < raw.size()) : pos == raw.size());
   return true;
 }
 
@@ -282,8 +283,9 @@ int main(int argc, char** argv) {
   const bool audit = argc == 3 && std::strcmp(argv[1], "--palette-audit") == 0;
   const bool headers = argc == 3 && std::strcmp(argv[1], "--sampling-headers") == 0;
   const bool presentation = argc == 3 && std::strcmp(argv[1], "--presentation-headers") == 0;
-  if (argc != 2 && !audit && !headers && !presentation) return 2;
-  std::ifstream input(argv[(audit || headers || presentation) ? 2 : 1], std::ios::binary);
+  const bool preview = argc == 3 && std::strcmp(argv[1], "--preview-words") == 0;
+  if (argc != 2 && !audit && !headers && !presentation && !preview) return 2;
+  std::ifstream input(argv[(audit || headers || presentation || preview) ? 2 : 1], std::ios::binary);
   if (!input) return 2;
   std::vector<uint8_t> file{std::istreambuf_iterator<char>(input), {}};
   if (file.size() > (1u << 26)) return 2;
@@ -300,7 +302,7 @@ int main(int argc, char** argv) {
     for (const auto& fields : sampling) for (uint32_t value : fields) Word(value);
     return 0;
   }
-  if (!Decode(raw, &frames, audit ? &counts : nullptr)) return 1;
+  if (!Decode(raw, &frames, audit ? &counts : nullptr, preview)) return 1;
   if (audit) {
     if (fwrite("JXLPAL12", 1, 8, stdout) != 8) return 2;
     Word(JxlDecoderVersion());

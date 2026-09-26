@@ -47,6 +47,25 @@ VarDCT/mixed i32 buffers. Orientation does not reinterpret source geometry, crop
 it is applied after reconstruction/composition, or retained under decoder `Keep` policy.
 It can require the image's extra-fields bundle without requiring non-default tone metadata.
 
+`PreviewSize` validates the independent preview axes before image-header construction. Both
+sequence descriptors feed that declaration to the same `ImageHeaderPlan` and `PreviewState`.
+The state admits one full regular Replace frame before main submission, with no crop or
+references. It derives a preview-sized request for the existing `FrameHeaderPlan`, sampling,
+color, transform and memory plans. Animation syntax still uses the image timebase, while main
+indices/finality do not advance. Mixed sessions choose the preview codec independently.
+
+`PreviewSubmission` accepts only validated backend completion, then uses the same prepared
+header/TOC assembly as ordinary frames. Actual packet and assembly byte capacity is admitted
+against the shared context budget; completed capacity remains charged in a non-cloneable
+`EncodedPreview`. Its private session identity prevents insertion into another sequence.
+Policy and geometry never stand in for validated output. Failed or abandoned admitted jobs
+leave a missing preview, so final assembly cannot publish a stream with a declared but absent
+preview. Main output remains mandatory. The bitstream crate's metadata-only image selection
+also supplies the main inventory for `jxli`, preserving physical IDs and original byte ranges.
+[Preview API](../crates/jxl_wgpu_encode/README.md#embedded-preview-encoding),
+[ownership](WGSL_MEMORY.md#memory-accounting-and-concurrency), and
+[independent evidence](CONFORMANCE_CORPUS.md#embedded-preview-encoding) describe the boundaries.
+
 `CodestreamName` validates the 1071-byte UTF-8 bound before allocating shared immutable storage.
 Frame control and extra metadata consume the same serializer, including all length buckets and
 embedded NUL bytes. Names stay attached to physical frames through out-of-order job completion;

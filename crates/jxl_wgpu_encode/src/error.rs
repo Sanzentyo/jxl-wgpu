@@ -122,6 +122,10 @@ pub enum PacketError {
     InvalidFinalFrame,
     #[error("a raw JPEG XL codestream must begin with 0xff 0x0a")]
     InvalidCodestreamHeader,
+    #[error("the declared preview has no validated completed output")]
+    MissingPreview,
+    #[error("preview output belongs to another sequence or was already inserted")]
+    UnexpectedPreview,
 }
 
 #[derive(Debug, Error)]
@@ -249,4 +253,6 @@ pub enum EncodeError {
     SessionClosed,
     #[error("the encode session must be closed with a final frame")]
     MissingFinalFrame,
+    #[error(transparent)]
+    ImageSelection(#[from] jxl_gpu_bitstream::ImageSelectionError),
 }

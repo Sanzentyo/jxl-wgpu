@@ -1068,7 +1068,7 @@ extent on each frame; tiled DCT8 accepts separately checked crop extents through
 bound. Both support all five blend modes with alpha, signed crops, hidden zero-duration regular frames
 and four post-color-transform references. Alpha has an independent blend/reference field.
 Pre-color-transform reference storage remains unsupported. Fixed-VarDCT sequences accept the independent extra-channel declarations described above; mixed sequences currently accept packed alpha only. Mixed Modular/VarDCT sessions use
-`MixedModeEncoder`; preview encoding remains unimplemented.
+`MixedModeEncoder`. These sessions also support the independent preview described below.
 
 `ImageOptions::orientation` selects any of the eight `jxl_gpu_protocol::OutputOrientation`
 values, defaulting to `Identity`. Set it through Modular's `with_image_options` or
@@ -1191,3 +1191,53 @@ animation.finish_indexed_container(Default::default(), Default::default())
 The conformance suite exercises full-frame Replace, cropped Add, reference-slot persistence, RGBA
 alpha-weighted Blend, mixed blocking/Future completion, and out-of-order completion. Every
 displayed frame is compared exactly with both published Rust `jxl` and reference `djxl`.
+
+### Embedded preview encoding
+
+`LosslessModularSequenceDescriptor::with_preview` and
+`ImageSequenceDescriptor::with_preview` declare a checked `PreviewSize` with axes in `1..=4096`,
+before orientation. Supply the preview's own GPU color and extra samples; the encoder does not
+derive a thumbnail from the main image. Existing sample/color/ICC declarations, transform policies,
+device bounds and per-frame upsampling rules apply. A fixed VarDCT transform/map constrains the
+coded preview extent just as it constrains main inputs; tiled VarDCT and Modular allow different
+extents. Mixed sessions choose either codec for the preview independently of main frame choices.
+
+Call `submit_preview` before any main submission. The preview must be a full regular Replace
+frame without crop or references. Its name, sampling and, when present, animation timing use the
+shared frame controls; the decoder presents it as a separate still. Submission does not advance
+`next_frame_index()` or close the main sequence. Completion/insertion may occur after main jobs.
+The validated, non-cloneable `EncodedPreview` can only enter its originating session through
+`insert_preview`. Missing or foreign output is a typed error; main final output is also required.
+Raw, plain-container and indexed-container completion place the preview before the main frames.
+Index generation selects main metadata while preserving original physical offsets and IDs.
+
+`preview_memory_plan` reports the existing GPU job footprint without reserving memory. Admission
+failure leaves the preview slot available for retry. After admission, cancellation or a completion
+error consumes that slot; begin a new sequence to retry. Completion reserves actual packet/assembly
+storage from the same context budget and may return `MemoryBackpressure` without publishing output.
+`EncodedPreview::reserved_bytes()` reports its retained encoded capacity, which stays charged after
+the producer/future is dropped and through insertion until assembly/error/drop. It can backpressure
+later main jobs. Final codestream vectors follow the existing caller-owned output contract.
+
+```rust,no_run
+use jxl_wgpu_encode::{AnimationHeader, BufferImageSource, EncodeError, FrameOptions,
+    LosslessModularEncoder, LosslessModularSequenceDescriptor, PreviewSize, WgpuContext};
+
+fn encode_with_preview(context: WgpuContext, main: BufferImageSource,
+    preview: BufferImageSource) -> Result<Vec<u8>, EncodeError> {
+    let encoder = LosslessModularEncoder::new(context);
+    let descriptor = LosslessModularSequenceDescriptor::from_pixel_format(
+        1920, 1080, &main.layout.format, AnimationHeader::Still,
+    )?.with_preview(PreviewSize::new(320, 180)?);
+    let mut sequence = encoder.begin_sequence(descriptor)?;
+    let preview_job = sequence.submit_preview(preview, FrameOptions::default())?;
+    let main_job = sequence.submit_last_frame(main, FrameOptions::default())?;
+    sequence.insert(main_job.wait()?)?;
+    sequence.insert_preview(preview_job.wait()?)?;
+    sequence.finish_raw()
+}
+```
+
+[Independent preview evidence](../../docs/CONFORMANCE_CORPUS.md#embedded-preview-encoding)
+covers exact Modular words, native/GPU final pixels, all eight orientations and dimension buckets,
+ICC, independent VarDCT extras, mixed animation/indexes, invalid completion and memory ownership.

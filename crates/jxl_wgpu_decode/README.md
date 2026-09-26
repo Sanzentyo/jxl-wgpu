@@ -73,6 +73,10 @@ inventory with `FramePlanError::ImageNotSelected`.
 
 Physical IDs, entropy ranges and noise seeds are never renumbered during selection or producer
 projection. `CodestreamInventory::frame_position` resolves IDs to local vector positions.
+Metadata selection now belongs to `jxl_gpu_bitstream::CodestreamInventory::select_image` and
+`ImageHeaderInventory::select_preview`, also used by encoder index generation. This crate
+re-exports the selection/error types and retains ownership, authoritative-completion and prefix
+state in `SelectedImageInventory`; metadata selection alone never validates entropy or transport.
 The preview uses noise seed `[0, 1]`; leading nonvisible main frames continue that counter,
 and the first visible main frame advances to `[1, 0]`. Reference and LF image state remain
 separate across the boundary. This matters for a preview followed by noisy progressive DC.

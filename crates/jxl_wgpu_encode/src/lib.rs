@@ -69,6 +69,7 @@ mod name;
 mod packet;
 mod permutation;
 mod prefix;
+mod preview;
 mod sample_format;
 mod sampling;
 mod session;
@@ -113,6 +114,7 @@ pub use packet::{
     BitFragment, EncodedFrame, FrameGroupLayout, FramePacketSet, GroupPacket, GroupPacketKind,
     assemble_frame,
 };
+pub use preview::{EncodedPreview, PreviewSize, PreviewSubmission};
 pub use sample_format::{ColorChannels, ColorSampleFormat, SamplePrecision};
 pub use sampling::UpsamplingFactor;
 pub use session::{

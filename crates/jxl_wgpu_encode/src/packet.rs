@@ -321,6 +321,9 @@ pub struct EncodedFrame {
 }
 
 impl EncodedFrame {
+    pub(crate) fn storage_bytes(&self) -> usize {
+        self.bytes.capacity()
+    }
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -341,52 +344,99 @@ impl EncodedFrame {
 /// sizes, and byte-aligned group packets. Image and coefficient work is not
 /// performed here.
 pub fn assemble_frame(packet_set: FramePacketSet) -> Result<EncodedFrame, PacketError> {
-    packet_set.validate_layout()?;
-    let mut writer = BitWriter::new();
-    append_fragment(&mut writer, &packet_set.frame_header)?;
-    writer
-        .write_bits(u64::from(packet_set.file_order.is_some()), 1)
-        .map_err(|_| PacketError::SizeOverflow)?;
-    if let Some(order) = &packet_set.file_order {
-        // Wire permutation maps each canonical identity to its physical position.
-        let mut inverse = vec![0u32; order.len()];
-        for (physical, &canonical) in order.iter().enumerate() {
-            inverse[canonical] = physical as u32;
-        }
-        let code =
-            crate::permutation::write_config(&mut writer).map_err(|_| PacketError::SizeOverflow)?;
-        crate::permutation::write(&mut writer, &code, &inverse, 0)
+    PreparedFrame::new(packet_set)?.finish()
+}
+
+/// Header/TOC preparation is bounded metadata work. Preview completion uses the same plan
+/// to reserve packet/assembly storage before copying image payloads into a retained frame.
+pub(crate) struct PreparedFrame {
+    header: Vec<u8>,
+    packet_set: FramePacketSet,
+    payload_bytes: usize,
+}
+
+impl PreparedFrame {
+    pub(crate) fn new(packet_set: FramePacketSet) -> Result<Self, PacketError> {
+        packet_set.validate_layout()?;
+        let mut writer = BitWriter::new();
+        append_fragment(&mut writer, &packet_set.frame_header)?;
+        writer
+            .write_bits(u64::from(packet_set.file_order.is_some()), 1)
             .map_err(|_| PacketError::SizeOverflow)?;
+        if let Some(order) = &packet_set.file_order {
+            // Wire permutation maps each canonical identity to its physical position.
+            let mut inverse = vec![0u32; order.len()];
+            for (physical, &canonical) in order.iter().enumerate() {
+                inverse[canonical] = physical as u32;
+            }
+            let code = crate::permutation::write_config(&mut writer)
+                .map_err(|_| PacketError::SizeOverflow)?;
+            crate::permutation::write(&mut writer, &code, &inverse, 0)
+                .map_err(|_| PacketError::SizeOverflow)?;
+        }
+        writer
+            .align_to_byte()
+            .map_err(|_| PacketError::SizeOverflow)?;
+        for packet in packet_set.packets_in_file_order() {
+            let size =
+                u32::try_from(packet.payload.len()).map_err(|_| PacketError::PacketTooLarge)?;
+            write_toc_size(&mut writer, size)?;
+        }
+        writer
+            .align_to_byte()
+            .map_err(|_| PacketError::SizeOverflow)?;
+        let header = writer.into_bytes();
+        let payload_bytes = packet_set
+            .packets
+            .iter()
+            .try_fold(0usize, |total, packet| {
+                total
+                    .checked_add(packet.payload.len())
+                    .ok_or(PacketError::SizeOverflow)
+            })?;
+        Ok(Self {
+            header,
+            packet_set,
+            payload_bytes,
+        })
     }
-    writer
-        .align_to_byte()
-        .map_err(|_| PacketError::SizeOverflow)?;
-    for packet in packet_set.packets_in_file_order() {
-        let size = u32::try_from(packet.payload.len()).map_err(|_| PacketError::PacketTooLarge)?;
-        write_toc_size(&mut writer, size)?;
+
+    pub(crate) fn peak_bytes(&self) -> Result<u64, PacketError> {
+        let output = self
+            .header
+            .len()
+            .checked_add(self.payload_bytes)
+            .ok_or(PacketError::SizeOverflow)?;
+        let input =
+            self.packet_set
+                .packets
+                .iter()
+                .try_fold(self.header.capacity(), |total, packet| {
+                    total
+                        .checked_add(packet.payload.capacity())
+                        .ok_or(PacketError::SizeOverflow)
+                })?;
+        u64::try_from(input.checked_add(output).ok_or(PacketError::SizeOverflow)?)
+            .map_err(|_| PacketError::SizeOverflow)
     }
-    writer
-        .align_to_byte()
-        .map_err(|_| PacketError::SizeOverflow)?;
-    let mut bytes = writer.into_bytes();
-    let payload_bytes = packet_set
-        .packets
-        .iter()
-        .try_fold(0usize, |total, packet| {
-            total
-                .checked_add(packet.payload.len())
-                .ok_or(PacketError::SizeOverflow)
-        })?;
-    bytes
-        .try_reserve(payload_bytes)
-        .map_err(|_| PacketError::SizeOverflow)?;
-    for packet in packet_set.packets_in_file_order() {
-        bytes.extend_from_slice(&packet.payload);
+
+    pub(crate) fn finish(self) -> Result<EncodedFrame, PacketError> {
+        let Self {
+            header: mut bytes,
+            packet_set,
+            payload_bytes,
+        } = self;
+        bytes
+            .try_reserve_exact(payload_bytes)
+            .map_err(|_| PacketError::SizeOverflow)?;
+        for packet in packet_set.packets_in_file_order() {
+            bytes.extend_from_slice(&packet.payload);
+        }
+        Ok(EncodedFrame {
+            bytes,
+            packet_count: packet_set.layout.toc_entries(),
+        })
     }
-    Ok(EncodedFrame {
-        bytes,
-        packet_count: packet_set.layout.toc_entries(),
-    })
 }
 
 pub(crate) fn append_fragment(

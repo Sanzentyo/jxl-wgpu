@@ -2241,7 +2241,53 @@ they do not add GPU allocations. All reservations return to zero.
 Rebuild the [native Modular word helper](../tools/jxl_test_support/README.md#native-modular-word-oracle)
 and run `cargo test --locked -p jxl_wgpu_encode --test image_metadata -- --test-threads=2`, then
 the [full capability gates](DEVELOPMENT.md#capability-change-gates). This adds explicit metadata
-declarations, not automatic source-metadata preservation, intrinsic-size or preview encoding.
+declarations, not automatic source-metadata preservation or intrinsic-size encoding. Preview
+encoding has separate evidence below.
+
+## Embedded preview encoding
+
+`crates/jxl_wgpu_encode/tests/preview` runs eight tests on Apple M5/Metal. Its 23 positive
+streams retain the full main image while encoding an independent GPU preview under the same
+checked image/color contract. No source fixture is replaced or regenerated.
+
+Sixteen Modular/VarDCT streams cover each explicit preview dimension bucket boundary
+(1/64/65/320/321/1344/1345/4096), alternating thin horizontal/vertical axes, all eight
+orientations, 1/2/4/8 color and packed-alpha factors, Gray13+alpha and RGB F32+alpha, poisoned
+planar layouts, Prefix/ANS plus local Squeeze, and Original/XYB with three AC passes. Pinned
+scalar libjxl's `--preview-words` reads each Modular preview in its native frame context and
+compares every original word exactly, including coded extents and precision. The main bytes
+remain present. This word check does not validate the later main entropy.
+
+Native libjxl's public preview/main APIs independently check both images at the unchanged
+`2e-4 * (1 + abs(reference))` F32 bound. Whole and 256-byte fragmented GPU outputs agree exactly
+under Apply/Keep orientation, and retained outputs survive session drop. Two further mixed
+animations choose each preview codec before three main frames: a reference-only producer and
+two timed Add presentations with associated alpha, timecodes and distinct preview timing.
+Reverse insertion preserves ordering. Generated `jxli` starts at the first main physical frame;
+GPU seeks reproduce sequential pixels and original timing without renumbering source IDs.
+
+Four ICC streams cover Modular and single/mapped/tiled Original VarDCT, separate preview/main
+inputs and main 2× reconstruction. Native libjxl exports the exact profile bytes and original
+ICC samples; fragmented GPU output keeps the same bound. One further VarDCT stream has its own
+preview scalar buffers, 13-bit depth and non-leading 7-bit alpha. Every decoded scalar word in
+preview and main matches its source exactly, alongside native RGBA comparisons.
+
+Invalid dimensions, kind/crop/blend/reference/timing/source geometry, late/duplicate submission
+and foreign-session output cannot authorize assembly. Exact and one-byte-short GPU budgets,
+retry after another job releases capacity, pending cancellation, retained completed futures and
+preview storage blocking main admission cover shared ownership. NaN and both infinities fail
+GPU color validation without yielding a preview; missing/dropped results cannot finalize a
+declared preview. Two internal completion tests additionally reject mismatched frame identity,
+finality and packet layout and check late exact/one-byte-short assembly admission. Completed
+preview capacity remains charged until its final owner is dropped. Decoder preview, early-prefix
+and seek regression targets retain their existing malformed-input and ownership matrices.
+
+Rebuild the [native word helper](../tools/jxl_test_support/README.md#native-modular-word-oracle),
+run `cargo test --locked -p jxl_wgpu_encode --test preview -- --test-threads=2`, then the
+[full capability gates](DEVELOPMENT.md#capability-change-gates). This is caller-supplied preview
+encoding with existing codec policies, not automatic thumbnail generation or complete JPEG XL
+conformance. Native-preview checks validate final output; existing progressive suites retain
+their independent intermediate-image evidence.
 
 ## Per-frame color and relative extra sampling
 

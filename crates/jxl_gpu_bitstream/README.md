@@ -2,6 +2,13 @@
 
 Bounded JPEG XL transport and codestream inventory for GPU codec front ends.
 
+`CodestreamInventory::select_image` selects Main or Preview from a complete inventory;
+`ImageHeaderInventory::select_preview` lowers a fully inventoried preview prefix. The shared
+`ImageSelection` and `ImageSelectionError` types are also re-exported by `jxl_wgpu_decode`.
+Selection validates metadata and keeps physical frame IDs, noise seeds and byte ranges intact.
+Preview gets its own canvas and still timing; Main excludes it. Decoder reconstruction and encoder
+index generation use this same boundary. It does not validate entropy, pixels or transport end.
+
 `ImageHeaderInventory::original_icc_profile` exports original color metadata under
 `icc_profile::IccProfileLimits`: embedded ICC bytes are borrowed unchanged; enumerated RGB,
 Gray and perceptual XYB generate owned ICCv4 bytes compatible with libjxl 0.12.0.

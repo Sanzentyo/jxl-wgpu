@@ -18,6 +18,7 @@ mod frame_index;
 mod frame_sequence;
 pub mod gain_map;
 pub mod icc_profile;
+mod image_selection;
 mod inventory;
 mod inventory_stream;
 pub mod jpeg_reconstruction;
@@ -32,6 +33,7 @@ pub use frame_sequence::{
     FrameExecutionNode, FramePlanError, FrameReference, FrameSequenceEnd, FrameSequencePlan,
     FrameSequencePresentation,
 };
+pub use image_selection::{ImageSelection, ImageSelectionError};
 
 #[cfg(test)]
 mod test_fixtures {

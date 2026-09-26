@@ -378,6 +378,45 @@ impl<B: GpuEncodeBackend> EncodeSession<B> {
         &self.encoder
     }
 
+    pub(crate) fn default_coding(&self) -> FrameCoding {
+        FrameCoding {
+            profile: self.descriptor.profile,
+            progressive: self.descriptor.progressive.clone(),
+        }
+    }
+
+    pub(crate) fn submit_preview(
+        &self,
+        assembler: &mut CodestreamAssembler,
+        source: GpuFrameSource,
+        options: FrameOptions,
+        coding: &FrameCoding,
+    ) -> Result<crate::PreviewSubmission<B::Job>, EncodeError> {
+        let request = self.preview_request(assembler, options, coding)?;
+        let frame = self.encoder.submit_frame(source, request)?;
+        Ok(assembler
+            .preview
+            .as_mut()
+            .expect("preview request checked declaration")
+            .submitted(frame, self.encoder.memory_budget()))
+    }
+
+    pub(crate) fn preview_request(
+        &self,
+        assembler: &CodestreamAssembler,
+        options: FrameOptions,
+        coding: &FrameCoding,
+    ) -> Result<FrameEncodeRequest, EncodeError> {
+        let request = self.request_for(options, true, coding)?;
+        assembler
+            .preview
+            .as_ref()
+            .ok_or(EncodeError::InvalidConfiguration(
+                "sequence has no declared preview",
+            ))?
+            .request(request)
+    }
+
     pub(crate) fn request_for(
         &self,
         options: FrameOptions,
@@ -456,6 +495,7 @@ pub(crate) fn validate_frame_timing(
 pub struct CodestreamAssembler {
     codestream_header: BitFragment,
     frames: BTreeMap<FrameIndex, (bool, EncodedFrame)>,
+    preview: Option<crate::preview::PreviewState>,
 }
 
 impl CodestreamAssembler {
@@ -470,7 +510,23 @@ impl CodestreamAssembler {
         Ok(Self {
             codestream_header,
             frames: BTreeMap::new(),
+            preview: None,
         })
+    }
+
+    pub(crate) fn with_preview(mut self, size: Option<crate::PreviewSize>) -> Self {
+        self.preview = size.map(crate::preview::PreviewState::new);
+        self
+    }
+
+    pub(crate) fn insert_preview(
+        &mut self,
+        preview: crate::EncodedPreview,
+    ) -> Result<(), PacketError> {
+        self.preview
+            .as_mut()
+            .ok_or(PacketError::UnexpectedPreview)?
+            .insert(preview)
     }
 
     pub fn insert(&mut self, artifacts: GpuFrameArtifacts) -> Result<(), PacketError> {
@@ -484,6 +540,12 @@ impl CodestreamAssembler {
     }
 
     pub fn finish_raw(self) -> Result<Vec<u8>, PacketError> {
+        let preview = self
+            .preview
+            .as_ref()
+            .map(crate::preview::PreviewState::completed)
+            .transpose()?
+            .unwrap_or_default();
         let mut saw_last = false;
         let frame_count = self.frames.len();
         for expected in 0..frame_count {
@@ -500,15 +562,19 @@ impl CodestreamAssembler {
         if frame_count == 0 || !saw_last {
             return Err(PacketError::InvalidFinalFrame);
         }
-        let additional = self.frames.values().try_fold(0usize, |bytes, (_, frame)| {
-            bytes
-                .checked_add(frame.bytes().len())
-                .ok_or(PacketError::SizeOverflow)
-        })?;
+        let additional = self
+            .frames
+            .values()
+            .try_fold(preview.len(), |bytes, (_, frame)| {
+                bytes
+                    .checked_add(frame.bytes().len())
+                    .ok_or(PacketError::SizeOverflow)
+            })?;
         let mut output = self.codestream_header.into_bytes();
         output
             .try_reserve_exact(additional)
             .map_err(|_| PacketError::SizeOverflow)?;
+        output.extend_from_slice(preview);
         for (_, frame) in self.frames.values() {
             output.extend_from_slice(frame.bytes());
         }
@@ -541,7 +607,8 @@ impl CodestreamAssembler {
                 ..Default::default()
             },
         )?;
-        let inventory = parsed.codestream_inventory(inventory_limits)?;
+        let inventory = std::sync::Arc::new(parsed.codestream_inventory(inventory_limits)?)
+            .select_image(jxl_gpu_bitstream::ImageSelection::Main)?;
         let sequence = FrameSequencePlan::negotiate(&inventory)?;
         let index = jxl_gpu_bitstream::FrameIndex::from_sequence(&sequence, index_limits)?;
         let payload = index.encode(index_limits)?;

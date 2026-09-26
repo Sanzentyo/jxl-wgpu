@@ -559,6 +559,19 @@ frame backend reports zero ICC storage to avoid charging the image header per fr
 transformed byte limits precede allocation; exact/one-byte-short, cancellation and retained-future
 checks cover resident and streamed paths. [ICC encoder evidence](CONFORMANCE_CORPUS.md#lossless-modular-embedded-icc).
 
+Embedded preview encoding reuses the selected codec's GPU job plan and completion ownership;
+it adds no WGSL binding or ABI. After validation, `PreparedFrame` reserves the sum of packet
+payload capacities, temporary header capacity and assembled frame length from the context's
+shared `MemoryBudget` before payload assembly. Header/TOC descriptors remain bounded host metadata.
+The permit shrinks to actual assembled `Vec` capacity and stays in the non-cloneable
+`EncodedPreview`, including after insertion into its originating session. GPU source leases and
+job permits retire at completion; retained preview bytes have independent ownership. A late
+storage admission failure produces no output. Final codestream/container vectors follow the
+existing caller-owned assembly contract and are not charged as retained preview storage.
+Pre-admission retry, exact/one-byte-short GPU and completion budgets, cancellation, retained
+completed futures, foreign-session rejection and missing-preview finalization are covered by
+the [preview tests](CONFORMANCE_CORPUS.md#embedded-preview-encoding).
+
 Ordinary VarDCT 2×/4×/8× frame resampling uses the scheduler's existing `upsample.wgsl` through
 `ResidentUpsamplePipeline`. Its shared 48-byte, 16-byte-aligned `Pod` stores input/output dimensions
 at offsets 0/8, row strides at 16/20, factor at 24, scalar source offset at 28, scalar sample stride

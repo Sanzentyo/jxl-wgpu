@@ -352,7 +352,7 @@ impl MixedModeEncoder {
             .vardct
             .sequence_header(&descriptor)?
             .finish(self.encoder.memory_budget())?;
-        let assembler = CodestreamAssembler::new(header)?;
+        let assembler = CodestreamAssembler::new(header)?.with_preview(descriptor.preview());
         let session = self.encoder.begin_session(SessionDescriptor {
             profile: backend.modular_coding.profile,
             progressive: backend.modular_coding.progressive.clone(),
@@ -379,6 +379,38 @@ pub struct MixedModeSequenceSession {
 }
 
 impl MixedModeSequenceSession {
+    /// GPU job footprint. Completed preview storage is admitted separately at its actual size.
+    pub fn preview_memory_plan(
+        &self,
+        source: &BufferImageSource,
+        encoding: MixedModeFrameEncoding,
+        options: FrameOptions,
+    ) -> Result<MixedModeMemoryPlan, EncodeError> {
+        let backend = self.session.encoder().backend();
+        let request =
+            self.session
+                .preview_request(&self.assembler, options, backend.coding(encoding))?;
+        backend.memory_plan(source, &request)
+    }
+    /// The preview shares image metadata but may choose either codec independently of main frames.
+    pub fn submit_preview(
+        &mut self,
+        source: BufferImageSource,
+        encoding: MixedModeFrameEncoding,
+        options: FrameOptions,
+    ) -> Result<crate::PreviewSubmission<MixedModeJob>, EncodeError> {
+        let coding = self.session.encoder().backend().coding(encoding);
+        self.session.submit_preview(
+            &mut self.assembler,
+            GpuFrameSource::Buffer(source),
+            options,
+            coding,
+        )
+    }
+
+    pub fn insert_preview(&mut self, preview: crate::EncodedPreview) -> Result<(), EncodeError> {
+        Ok(self.assembler.insert_preview(preview)?)
+    }
     #[must_use]
     pub fn descriptor(&self) -> &ImageSequenceDescriptor {
         &self.descriptor

@@ -240,6 +240,13 @@ orientation and exact name bytes for every physical frame, including hidden/refe
 frames. It has the same scope restrictions and pinned runtime check; it does not implement a
 second header parser or derive expectations from the production writer.
 
+`original_preview` uses `--preview-words` to decode one final original-color Modular preview
+with the native preview frame context. It exports exact pre-interpolation words and coded extents
+without removing or rewriting the following main bytes. Its equal-precision/equal-grid extra and
+no-ICC restrictions match original-word decoding. Main entropy is outside this specific check;
+the preview integration target separately compares main and preview rendering through libjxl's
+public output API. Rebuild the existing helper when changing this mode.
+
 Run the workspace checks from the repository root with Rust 1.98 or later, keeping that oracle
 environment available:
 

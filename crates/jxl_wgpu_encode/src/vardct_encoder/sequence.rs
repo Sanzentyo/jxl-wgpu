@@ -31,6 +31,39 @@ pub struct VarDctSequenceSession {
 }
 
 impl VarDctSequenceSession {
+    /// GPU job footprint. Completed preview storage is admitted separately at its actual size.
+    pub fn preview_memory_plan(
+        &self,
+        source: &BufferImageSource,
+        options: FrameOptions,
+    ) -> Result<super::VarDctMemoryPlan, EncodeError> {
+        let request = self.session.preview_request(
+            &self.assembler,
+            options,
+            &self.session.default_coding(),
+        )?;
+        self.session
+            .encoder()
+            .backend()
+            .memory_plan_for_request(source, &request)
+    }
+    /// Submits the declared preview without advancing or closing the main frame sequence.
+    pub fn submit_preview(
+        &mut self,
+        source: BufferImageSource,
+        options: FrameOptions,
+    ) -> Result<crate::PreviewSubmission<VarDctJob>, EncodeError> {
+        self.session.submit_preview(
+            &mut self.assembler,
+            GpuFrameSource::Buffer(source),
+            options,
+            &self.session.default_coding(),
+        )
+    }
+
+    pub fn insert_preview(&mut self, preview: crate::EncodedPreview) -> Result<(), EncodeError> {
+        Ok(self.assembler.insert_preview(preview)?)
+    }
     pub(super) fn new(
         encoder: &GpuEncoder<VarDctBackend>,
         config: &VarDctConfig,
@@ -50,7 +83,7 @@ impl VarDctSequenceSession {
             .backend()
             .sequence_header(&descriptor)?
             .finish(encoder.memory_budget())?;
-        let assembler = CodestreamAssembler::new(header)?;
+        let assembler = CodestreamAssembler::new(header)?.with_preview(descriptor.preview());
         Ok(Self {
             descriptor,
             session,
