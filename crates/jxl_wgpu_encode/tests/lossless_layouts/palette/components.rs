@@ -36,6 +36,7 @@ fn config(policy: Palette, begin: u32, count: u32, variant: usize) -> LosslessMo
             Lz77::Greedy
         },
         local_transforms: SQUEEZES[variant % 5].clone().into(),
+        ..Default::default()
     }
 }
 

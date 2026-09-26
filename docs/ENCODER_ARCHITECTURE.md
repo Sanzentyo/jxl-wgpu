@@ -115,8 +115,9 @@ All source-dependent operations stay on the GPU, using completion-owned allocati
 `ImageSamplePlan` separates checked color precision, packed alpha and independent scalar
 declarations from physical packing and VarDCT's three working components. It resolves the
 image-header order once; the legacy alpha API becomes the first ordinary scalar declaration.
-Its channel mapping and metadata writer remain shared with lossless Modular, which currently
-rejects independent attachments rather than silently dropping them.
+Its channel mapping and metadata writer are shared by Modular, VarDCT and mixed sequences.
+`ExtraInputPlan` checks independent scalar formats/extents and unions addressed windows by GPU
+allocation identity. Both codecs use the same order-sensitive Global/LF/Pass routing rule.
 
 `modular_plane::ImagePlan` binds those declarations to each frame's source windows and effective
 progression. It owns the order-sensitive global prefix, LF/pass routing, shifted group geometry,
@@ -132,7 +133,7 @@ All planes share the color job's submission and map; its permit and completion o
 source buffers, parameters, artifacts and readback through cancellation or assembly. Image-header
 storage has a separate still/session permit, shared with ICC when present. This boundary leaves
 the color transform and complete Modular frame encoder in their owning layers. Independent
-lossy distance and Modular transform integration remain later work; frame sampling is resolved
+lossy distance and arbitrary/global transform placement remain later work; frame sampling is resolved
 by the shared geometry plan below.
 
 `VarDctConfig::source_color` is lowered to the same checked enumerated encoding that writes
@@ -201,7 +202,7 @@ bounds. The map callback drops its lifetime reference before waking completion, 
 artifacts synchronously return their reservation; abandoned jobs still retain it until GPU
 completion. [Floating-input evidence](CONFORMANCE_CORPUS.md#floating-rgb-vardct-input).
 
-`MixedModeEncoder` binds this same image plan to original Gray/RGB components plus optional alpha and hosts both existing codec
+`MixedModeEncoder` binds this same image plan to original Gray/RGB components, packed alpha and independent scalar inputs, and hosts both codec
 backends. Its immutable per-codec `FrameCoding` values contain profile and progression; the
 caller selects one for each physical frame. The generic `EncodeSession` retains the sole
 frame counter, finality, canvas and timebase, validates before admission, and advances only
@@ -229,10 +230,10 @@ completed artifacts may be inserted in any order. Reference slots describe codes
 not host-computed image state: the GPU encodes each supplied source and the decoder composes it.
 This profile emits post-color-transform references and rejects pre-transform storage.
 VarDCT's image-sample plan enables all five blend modes, independent extra blend/reference fields
-and explicit weight-plane selection. Mixed encoding currently shares only packed alpha.
+and explicit weight-plane selection. Mixed encoding shares these independent declarations and packed-alpha order.
 
 `FrameSamplingPlan`, retained by `FrameHeaderPlan`, resolves the displayed crop/canvas into the
-coded color extent and an `ExtraChannelSamplingPlan`. Both codec headers and VarDCT dispatch
+coded color extent and an `ExtraChannelSamplingPlan`. Both codec headers and dispatch plans
 consume that same plan; Modular's existing transform/source plan operates on the checked coded
 extent. Supplied pixels are already reduced. The encoder performs no source downsampling, and
 crop/reference coordinates remain in the displayed grid. The Gray8 direct-copy acceleration is
@@ -519,8 +520,9 @@ the checked 609-byte Gray8 fixture is unchanged.
 
 ## Modular transform planning direction
 
-`ModularTransformPlan` resolves the supported RCT/Palette/Squeeze policy before dispatch
-lowering. A frame shares at most four concrete group shapes through one immutable plan.
+`ModularTransformPlan` resolves input routing and the supported RCT/Palette/Squeeze policy before
+dispatch lowering. Its ordered streams reference shared shapes keyed by color geometry and
+independent input identity, extent and shift, with separate LF-only and color-stream topologies.
 Each shape records ordered wire operations, explicit channel sources/extents/axes/bands and
 Palette capacities. Global RCT placement and single-group fusion are resolved there as well.
 `ModularDispatchPlan` consumes it for GPU parameters, groups, batches and memory bounds;
@@ -568,8 +570,19 @@ parameter allocation also carries the planned metadata table; a shared resident/
 copies it into private artifact storage after clearing and before dispatch. Metadata and the peak
 live arena are charged before execution, with no additional binding or buffer-pool ownership path.
 
+Independent Modular inputs first become disjoint views in that same arena. All input views are
+reserved before program jobs can retire/reuse spans; the shared resident/browser/native uploader
+loads their checked windows on GPU before transform execution. Named Squeeze on heterogeneous
+inputs lowers into the ordered program, retaining per-axis singleton elision and wire count bounds.
+Metadata tables, input parameters, load destinations and live samples are included in peak batch
+resources. No scalar fragment is appended as a separate entropy stream: all channels of each
+planned Global/LF/Pass stream share its predictor contexts and one Prefix/ANS state. LF-only streams
+have no color-local transforms. GPU-derived palette counts and validated entropy artifacts remain
+the only authority for variable wire results. Completion owners also retain every source buffer.
+
 Memory admission, dispatch parameters and transform-header structure derive from the
-resolved plan. WGSL receives a working-component/index/table source and an explicit
+resolved plan.
+ WGSL receives a working-component/index/table source and an explicit
 Squeeze axis mode/band or arena offset instead of reconstructing that mapping from an encoded
 channel number.
 GPU-dependent

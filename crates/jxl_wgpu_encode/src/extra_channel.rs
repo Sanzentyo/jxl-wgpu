@@ -5,6 +5,7 @@ use jxl_gpu_protocol::Extent2d;
 
 use crate::{AlphaAssociation, EncodeError, FiniteF16, SamplePrecision, UpsamplingFactor};
 
+pub(crate) mod input;
 pub(crate) mod sampling;
 
 // JPEG XL level 10 limits the wire-representable channel count to 256.

@@ -1,4 +1,4 @@
-//! Caller-selected Modular/VarDCT frames under one checked original color/alpha image contract.
+//! Caller-selected Modular/VarDCT frames under one checked original color/scalar image contract.
 
 use std::task::{Context, Poll};
 
@@ -33,12 +33,11 @@ pub enum VarDctTransformSelection {
 }
 
 /// Fixed policies for both frame codecs. Both use `vardct`'s stream-wide source
-/// color/alpha channels, precision, source color and image color options.
+/// color/alpha channels, independent extra channels, precision, source color and image color options.
 ///
 /// The default VarDCT domain is `Original`. An explicit XYB configuration is rejected:
 /// the image-wide XYB flag cannot change between physical frames, and the Modular backend
-/// encodes original components. Arbitrary extra channels, other source formats and
-/// pre-transform references require a broader common image contract.
+/// encodes original components. Pre-transform references remain unsupported.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MixedModeConfig {
     pub modular: LosslessModularConfig,
@@ -88,10 +87,12 @@ struct MixedModeBackend {
 }
 
 impl MixedModeBackend {
-    fn new(context: &WgpuContext, config: MixedModeConfig) -> Result<Self, EncodeError> {
-        if !config.vardct.extra_channels.is_empty() {
+    fn new(context: &WgpuContext, mut config: MixedModeConfig) -> Result<Self, EncodeError> {
+        if !config.modular.extra_channels.is_empty()
+            && config.modular.extra_channels != config.vardct.extra_channels
+        {
             return Err(EncodeError::InvalidConfiguration(
-                "mixed sequences require Modular support for independently declared extra sources",
+                "mixed codecs must use the same extra-channel declarations",
             ));
         }
         if config.vardct.color_transform != VarDctColorTransform::Original {
@@ -99,6 +100,12 @@ impl MixedModeBackend {
                 "mixed Modular/VarDCT sequences require original-component coding",
             ));
         }
+        config
+            .modular
+            .extra_channels
+            .clone_from(&config.vardct.extra_channels);
+        config.modular.max_extra_channel_metadata_bytes =
+            config.vardct.max_extra_channel_metadata_bytes;
         let samples = config.vardct.sample_format;
         let modular_coding = FrameCoding {
             profile: EncodeProfile::ModularLossless {

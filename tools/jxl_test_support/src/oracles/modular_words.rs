@@ -81,6 +81,50 @@ pub fn original_frames(encoded: &[u8]) -> Vec<FrameWords> {
     read_frames(run_input(encoded, None))
 }
 
+/// Exact physical Modular grids before upsampling, composition or float conversion.
+/// The pinned native parser/decoder determines both channel routing and dimensions.
+pub fn channel_frames(encoded: &[u8]) -> Vec<Vec<super::modular_integer::ExtraWords>> {
+    let output = run_input(encoded, Some("--channel-words"));
+    let mut words = words(&output, b"JXLCHN12");
+    let count = words.next().expect("frame count");
+    assert!((1..=64).contains(&count));
+    let frames = (0..count)
+        .map(|_| {
+            let width = words.next().expect("color width");
+            let height = words.next().expect("color height");
+            let channels = words.next().expect("channels");
+            let bits = words.next().expect("color bits");
+            let exponent = words.next().expect("color exponent");
+            assert!(width > 0 && height > 0 && (1..=259).contains(&channels));
+            assert!((1..=32).contains(&bits) && exponent <= 8);
+            let extents: Vec<_> = (0..channels)
+                .map(|_| {
+                    (
+                        words.next().expect("plane width"),
+                        words.next().expect("plane height"),
+                    )
+                })
+                .collect();
+            extents
+                .into_iter()
+                .map(|(width, height)| {
+                    let pixels = u64::from(width) * u64::from(height);
+                    assert!((1..=1 << 26).contains(&pixels));
+                    super::modular_integer::ExtraWords {
+                        width,
+                        height,
+                        words: (0..pixels)
+                            .map(|_| words.next().expect("physical sample word"))
+                            .collect(),
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    assert!(words.next().is_none(), "trailing native channel words");
+    frames
+}
+
 /// Reads only an original-color, final Modular preview with the native preview frame context.
 /// Main bytes remain present and are not rewritten; main entropy is outside this word check.
 pub fn original_preview(encoded: &[u8]) -> FrameWords {

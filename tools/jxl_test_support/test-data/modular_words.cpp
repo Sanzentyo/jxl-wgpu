@@ -1,7 +1,8 @@
 // Development-only export of libjxl's integer Modular planes before float conversion.
 // The pinned scalar library owns header/entropy parsing, prediction and all transforms.
-// This reader intentionally accepts only original-color one-pass encoder frames, with
-// equal-grid components, empty LF/HF groups and optional global RCT. Sampling-header
+// This reader accepts original-color one-pass encoder frames with optional global RCT.
+// The channel-words mode includes independently sampled scalar LF/pass planes; the original
+// raw-word mode retains its equal-grid/common-precision contract. Sampling-header
 // and presentation inspection accept either frame codec without decoding image samples.
 #include <jxl/decode.h>
 #include <jxl/version.h>
@@ -36,6 +37,7 @@ struct Reader : jxl::BitReader {
 struct Frame {
   uint32_t width, height, channels, bits, exponent;
   std::vector<uint32_t> words;
+  std::vector<std::array<uint32_t, 2>> extents;
 };
 
 uint32_t Be32(const uint8_t* p) {
@@ -84,7 +86,7 @@ jxl::Status AuditPalette(const jxl::Image& image, const jxl::GroupHeader& header
 }
 
 jxl::Status Decode(const std::vector<uint8_t>& raw, std::vector<Frame>* frames,
-                   std::array<uint32_t, 3>* audit = nullptr, bool preview = false) {
+                   std::array<uint32_t, 3>* audit = nullptr, bool preview = false, bool independent = false) {
   JxlMemoryManager memory{nullptr, [](void*, size_t size) -> void* { return std::malloc(size); }, [](void*, void* p) { std::free(p); }};
   jxl::CodecMetadata metadata;
   size_t pos;
@@ -96,7 +98,7 @@ jxl::Status Decode(const std::vector<uint8_t>& raw, std::vector<Frame>* frames,
     metadata.transform_data.nonserialized_xyb_encoded = metadata.m.xyb_encoded;
     JXL_RETURN_IF_ERROR(jxl::Bundle::Read(&reader, &metadata.transform_data));
     JXL_ENSURE(!metadata.m.xyb_encoded && metadata.m.have_preview == preview && !metadata.m.color_encoding.WantICC());
-    for (const auto& extra : metadata.m.extra_channel_info) {
+    if (!independent) for (const auto& extra : metadata.m.extra_channel_info) {
       JXL_ENSURE(extra.dim_shift == 0);
       JXL_ENSURE(extra.bit_depth.bits_per_sample == metadata.m.bit_depth.bits_per_sample);
       JXL_ENSURE(extra.bit_depth.floating_point_sample == metadata.m.bit_depth.floating_point_sample);
@@ -122,7 +124,7 @@ jxl::Status Decode(const std::vector<uint8_t>& raw, std::vector<Frame>* frames,
       // Native FrameDimensions supplies the coded grid, before presentation resampling.
       // This helper's equal-geometry planes still exclude independently sampled extras.
       JXL_ENSURE(header.upsampling == 1 || header.upsampling == 2 || header.upsampling == 4 || header.upsampling == 8);
-      for (auto up : header.extra_channel_upsampling) JXL_ENSURE(up == header.upsampling);
+      if (!independent) for (auto up : header.extra_channel_upsampling) JXL_ENSURE(up == header.upsampling);
       JXL_ENSURE(dim.xsize != 0 && dim.ysize != 0 && uint64_t(dim.xsize) * dim.ysize <= (1u << 24));
       JXL_RETURN_IF_ERROR(jxl::ReadToc(&memory, jxl::NumTocEntries(dim.num_groups, dim.num_dc_groups, 1), &reader, &sizes, &permutation));
       JXL_ENSURE(permutation.empty());
@@ -136,9 +138,22 @@ jxl::Status Decode(const std::vector<uint8_t>& raw, std::vector<Frame>* frames,
       pos += size;
     }
     const size_t channels = (metadata.m.color_encoding.IsGray() ? 1 : 3) + metadata.m.extra_channel_info.size();
-    JXL_ENSURE(channels >= 1 && channels <= 4);
+    JXL_ENSURE(channels >= 1 && channels <= (independent ? 259u : 4u));
     const int bits = metadata.m.bit_depth.bits_per_sample;
-    JXL_ASSIGN_OR_RETURN(jxl::Image image, jxl::Image::Create(&memory, dim.xsize, dim.ysize, bits, channels));
+    JXL_ASSIGN_OR_RETURN(jxl::Image image, jxl::Image::Create(&memory, dim.xsize, dim.ysize, bits, 0));
+    const size_t color_channels = metadata.m.color_encoding.IsGray() ? 1 : 3;
+    uint64_t samples = 0;
+    for (size_t c = 0; c < channels; ++c) {
+      const size_t factor = c < color_channels ? header.upsampling : header.extra_channel_upsampling[c - color_channels];
+      JXL_ENSURE(factor >= header.upsampling && factor <= 64);
+      const size_t width = jxl::DivCeil(dim.xsize_upsampled, factor);
+      const size_t height = jxl::DivCeil(dim.ysize_upsampled, factor);
+      samples += uint64_t(width) * height;
+      JXL_ENSURE(samples <= (1u << 26));
+      JXL_ASSIGN_OR_RETURN(jxl::Channel channel, jxl::Channel::Create(&memory, width, height));
+      channel.hshift = channel.vshift = jxl::CeilLog2Nonzero(factor) - jxl::CeilLog2Nonzero(header.upsampling);
+      image.channel.push_back(std::move(channel));
+    }
     jxl::Tree tree;
     jxl::ANSCode code;
     std::vector<uint8_t> contexts;
@@ -173,35 +188,72 @@ jxl::Status Decode(const std::vector<uint8_t>& raw, std::vector<Frame>* frames,
       JXL_ENSURE(image.nb_meta_channels == 0 && image.channel.size() == channels);
       for (const auto& transform : global.transforms) JXL_ENSURE(transform.id == jxl::TransformId::kRCT);
       const size_t begin = jxl::AcGroupIndex(0, 0, dim.num_groups, dim.num_dc_groups);
-      for (size_t i = 1; i < begin; ++i) JXL_ENSURE(sizes[i] == 0);
-      for (size_t group = 0; group < dim.num_groups; ++group) {
-        const auto rect = dim.GroupRect(group);
-        JXL_ASSIGN_OR_RETURN(jxl::Image part, jxl::Image::Create(&memory, rect.xsize(), rect.ysize(), bits, channels));
-        Reader reader(jxl::Bytes(raw.data() + offsets[begin + group], sizes[begin + group]));
+      JXL_ENSURE(sizes[begin - 1] == 0); // no HF-global in Modular
+      auto decode_group = [&](size_t toc, const jxl::Rect& rect, size_t edge,
+                              int min_shift, int max_shift, jxl::ModularStreamId id) -> jxl::Status {
+        JXL_ASSIGN_OR_RETURN(jxl::Image part, jxl::Image::Create(&memory, rect.xsize(), rect.ysize(), bits, 0));
+        std::vector<size_t> selected;
+        bool global_prefix = true;
+        for (size_t c = 0; c < channels; ++c) {
+          const auto& channel = image.channel[c];
+          global_prefix &= channel.w <= dim.group_dim && channel.h <= dim.group_dim;
+          const int shift = std::min(channel.hshift, channel.vshift);
+          if (global_prefix || shift < min_shift || shift > max_shift) continue;
+          const size_t x = rect.x0() >> channel.hshift;
+          const size_t y = rect.y0() >> channel.vshift;
+          JXL_ENSURE(x < channel.w && y < channel.h);
+          const size_t width = std::min(edge >> channel.hshift, channel.w - x);
+          const size_t height = std::min(edge >> channel.vshift, channel.h - y);
+          JXL_ASSIGN_OR_RETURN(jxl::Channel local, jxl::Channel::Create(&memory, width, height));
+          local.hshift = channel.hshift;
+          local.vshift = channel.vshift;
+          part.channel.push_back(std::move(local));
+          selected.push_back(c);
+        }
+        if (selected.empty()) { JXL_ENSURE(sizes[toc] == 0); return true; }
+        Reader reader(jxl::Bytes(raw.data() + offsets[toc], sizes[toc]));
         jxl::ModularOptions options;
         options.group_dim = dim.group_dim;
         jxl::GroupHeader local;
         JXL_RETURN_IF_ERROR(jxl::ModularGenericDecompress(&reader, part, audit ? &local : nullptr,
-          jxl::ModularStreamId::ModularAC(group, 0).ID(dim), &options, audit == nullptr, &tree, &code, &contexts));
+          id.ID(dim), &options, audit == nullptr, &tree, &code, &contexts));
         JXL_RETURN_IF_ERROR(FinishSection(reader));
         if (audit) {
           JXL_RETURN_IF_ERROR(AuditPalette(part, local, audit));
           part.undo_transforms(local.wp_header);
         }
-        JXL_ENSURE(!part.error && part.channel.size() == channels && part.nb_meta_channels == 0);
-        for (size_t c = 0; c < channels; ++c) {
-          JXL_ENSURE(part.channel[c].w == rect.xsize() && part.channel[c].h == rect.ysize());
-          for (size_t y = 0; y < rect.ysize(); ++y) std::copy_n(part.channel[c].Row(y), rect.xsize(), image.channel[c].Row(rect.y0() + y) + rect.x0());
+        JXL_ENSURE(!part.error && part.channel.size() == selected.size() && part.nb_meta_channels == 0);
+        for (size_t i = 0; i < selected.size(); ++i) {
+          auto& destination = image.channel[selected[i]];
+          const auto& decoded = part.channel[i];
+          const size_t x = rect.x0() >> destination.hshift;
+          const size_t y = rect.y0() >> destination.vshift;
+          JXL_ENSURE(decoded.w == std::min(edge >> destination.hshift, destination.w - x));
+          JXL_ENSURE(decoded.h == std::min(edge >> destination.vshift, destination.h - y));
+          for (size_t row = 0; row < decoded.h; ++row) std::copy_n(decoded.Row(row), decoded.w, destination.Row(y + row) + x);
         }
+        return true;
+      };
+      for (size_t group = 0; group < dim.num_dc_groups; ++group) {
+        const jxl::Rect rect((group % dim.xsize_dc_groups) * dim.dc_group_dim,
+                             (group / dim.xsize_dc_groups) * dim.dc_group_dim,
+                             dim.dc_group_dim, dim.dc_group_dim);
+        JXL_RETURN_IF_ERROR(decode_group(1 + group, rect, dim.dc_group_dim,
+                                        3, 30, jxl::ModularStreamId::ModularDC(group)));
+      }
+      for (size_t group = 0; group < dim.num_groups; ++group) {
+        JXL_RETURN_IF_ERROR(decode_group(begin + group, dim.GroupRect(group), dim.group_dim,
+                                        0, 2, jxl::ModularStreamId::ModularAC(group, 0)));
       }
     }
     if (audit && dim.num_groups == 1) JXL_RETURN_IF_ERROR(AuditPalette(image, global, audit));
     image.undo_transforms(global.wp_header);
     JXL_ENSURE(!image.error && image.nb_meta_channels == 0 && image.channel.size() == channels);
-    Frame frame{uint32_t(dim.xsize), uint32_t(dim.ysize), uint32_t(channels), uint32_t(bits), metadata.m.bit_depth.floating_point_sample ? metadata.m.bit_depth.exponent_bits_per_sample : 0, {}};
+    Frame frame{uint32_t(dim.xsize), uint32_t(dim.ysize), uint32_t(channels), uint32_t(bits), metadata.m.bit_depth.floating_point_sample ? metadata.m.bit_depth.exponent_bits_per_sample : 0, {}, {}};
     for (const auto& channel : image.channel) {
-      JXL_ENSURE(channel.w == dim.xsize && channel.h == dim.ysize);
-      for (size_t y = 0; y < dim.ysize; ++y) for (size_t x = 0; x < dim.xsize; ++x) frame.words.push_back(uint32_t(channel.Row(y)[x]));
+      if (!independent) JXL_ENSURE(channel.w == dim.xsize && channel.h == dim.ysize);
+      frame.extents.push_back({uint32_t(channel.w), uint32_t(channel.h)});
+      for (size_t y = 0; y < channel.h; ++y) for (size_t x = 0; x < channel.w; ++x) frame.words.push_back(uint32_t(channel.Row(y)[x]));
     }
     frames->push_back(std::move(frame));
     last = header.is_last;
@@ -280,12 +332,13 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  const bool independent = argc == 3 && std::strcmp(argv[1], "--channel-words") == 0;
   const bool audit = argc == 3 && std::strcmp(argv[1], "--palette-audit") == 0;
   const bool headers = argc == 3 && std::strcmp(argv[1], "--sampling-headers") == 0;
   const bool presentation = argc == 3 && std::strcmp(argv[1], "--presentation-headers") == 0;
   const bool preview = argc == 3 && std::strcmp(argv[1], "--preview-words") == 0;
-  if (argc != 2 && !audit && !headers && !presentation && !preview) return 2;
-  std::ifstream input(argv[(audit || headers || presentation || preview) ? 2 : 1], std::ios::binary);
+  if (argc != 2 && !audit && !headers && !presentation && !preview && !independent) return 2;
+  std::ifstream input(argv[(audit || headers || presentation || preview || independent) ? 2 : 1], std::ios::binary);
   if (!input) return 2;
   std::vector<uint8_t> file{std::istreambuf_iterator<char>(input), {}};
   if (file.size() > (1u << 26)) return 2;
@@ -302,18 +355,19 @@ int main(int argc, char** argv) {
     for (const auto& fields : sampling) for (uint32_t value : fields) Word(value);
     return 0;
   }
-  if (!Decode(raw, &frames, audit ? &counts : nullptr, preview)) return 1;
+  if (!Decode(raw, &frames, audit ? &counts : nullptr, preview, independent)) return 1;
   if (audit) {
     if (fwrite("JXLPAL12", 1, 8, stdout) != 8) return 2;
     Word(JxlDecoderVersion());
     for (uint32_t count : counts) Word(count);
     return 0;
   }
-  if (fwrite("JXLRAW12", 1, 8, stdout) != 8) return 2;
+  if (fwrite(independent ? "JXLCHN12" : "JXLRAW12", 1, 8, stdout) != 8) return 2;
   Word(JxlDecoderVersion());
   Word(frames.size());
   for (const auto& frame : frames) {
     for (uint32_t field : {frame.width, frame.height, frame.channels, frame.bits, frame.exponent}) Word(field);
+    if (independent) for (auto extent : frame.extents) { Word(extent[0]); Word(extent[1]); }
     for (uint32_t word : frame.words) Word(word);
   }
   return 0;

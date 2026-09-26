@@ -58,7 +58,7 @@ impl EntropyCode {
                 1 + if plan.group_grid.groups > 1
                     && plan.tree_mode == super::types::LosslessModularTreeMode::LocalPerGroup
                 {
-                    u64::from(plan.group_grid.groups)
+                    plan.transforms.streams.len() as u64
                 } else {
                     0
                 },

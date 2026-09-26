@@ -234,8 +234,12 @@ export JXL_MODULAR_WORD_ORACLE="$JXL_SCALAR_BUILD/decode_modular_words"
 ```
 
 Original-word decoding accepts color factors 1/2/4/8 with equal-grid extras and exports native
-coded dimensions before interpolation. Independent scalar grids remain outside that helper's
-word-decoding scope. `oracles::modular_words::sampling_headers` uses its `--sampling-headers`
+coded dimensions before interpolation. `channel_frames` uses `--channel-words` to additionally
+export each independently sized Modular grid, including different precision and LF/pass routing.
+The same native header/entropy/transform decoder owns those results; the versioned output records
+all plane dimensions before raw words. Libjxl's effective extra-factor limit remains eight.
+`modular_integer::modular_channel_words` independently reconstructs the physical grids through
+jxl-oxide, including extended factors; neither helper rounds rendered F32 data back to source words. `oracles::modular_words::sampling_headers` uses its `--sampling-headers`
 mode to inspect up to 64 Modular/VarDCT physical frames with the native frame-header and TOC
 readers. It reports displayed/coded dimensions, color/extra factors and pass counts without
 rendering; raw/plain-container input, no preview/ICC and no LF frames are required.

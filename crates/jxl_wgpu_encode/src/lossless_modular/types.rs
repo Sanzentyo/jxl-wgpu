@@ -147,8 +147,12 @@ impl LosslessModularGroupSize {
 /// assert_eq!(encoder.config().group_size.dimension(), 512);
 /// # }
 /// ```
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LosslessModularConfig {
+    /// Independent scalar inputs, following any packed alpha in the image declaration.
+    pub extra_channels: Vec<crate::ExtraChannel>,
+    /// Maximum bounded image-wide extra-channel metadata, including packed alpha.
+    pub max_extra_channel_metadata_bytes: u64,
     pub group_size: LosslessModularGroupSize,
     pub tree_mode: LosslessModularTreeMode,
     /// GPU source-word transform and its wire placement.
@@ -167,6 +171,44 @@ pub struct LosslessModularConfig {
     pub local_transforms: super::local_transforms::LosslessModularLocalTransforms,
     /// Optional exact local palette built on GPU after source RCT and before local transforms.
     pub palette: Option<super::palette::LosslessModularPalette>,
+}
+
+impl Default for LosslessModularConfig {
+    fn default() -> Self {
+        Self {
+            extra_channels: Vec::new(),
+            max_extra_channel_metadata_bytes: 1 << 20,
+            group_size: Default::default(),
+            tree_mode: Default::default(),
+            color_transform: Default::default(),
+            predictor: Default::default(),
+            weighted_predictor: Default::default(),
+            lz77: Default::default(),
+            entropy: Default::default(),
+            local_transforms: Default::default(),
+            palette: None,
+        }
+    }
+}
+
+impl LosslessModularConfig {
+    pub(crate) fn samples(
+        &self,
+        format: LosslessModularFormat,
+        bits: u8,
+        exponent: u8,
+    ) -> Result<crate::sample_format::ImageSamplePlan, crate::EncodeError> {
+        let color = if exponent == 0 {
+            crate::ColorSampleFormat::integer(format.color_channels(), bits)?
+        } else {
+            crate::ColorSampleFormat::float(format.color_channels(), bits, exponent)?
+        };
+        crate::sample_format::ImageSamplePlan::new(
+            color,
+            format.has_alpha().then_some(Default::default()),
+        )
+        .with_extra_channels(&self.extra_channels, self.max_extra_channel_metadata_bytes)
+    }
 }
 
 pub(super) const fn modular_sample_depth(

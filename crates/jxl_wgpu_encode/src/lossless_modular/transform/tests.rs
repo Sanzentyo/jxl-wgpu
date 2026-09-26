@@ -211,7 +211,14 @@ fn squeeze_selection_preserves_meta_and_unselected_channels_in_both_placements()
 #[test]
 fn squeeze_ranges_are_checked_in_the_post_palette_image_domain() {
     let base = LosslessModularSqueeze::VerticalThenHorizontal;
-    for (begin, count) in [(0, 0), (0, 5), (4, 1), (1, 4), (u32::MAX, 1), (1, u32::MAX)] {
+    for (begin, count) in [
+        (0, 0),
+        (0, 260),
+        (259, 1),
+        (1, 259),
+        (u32::MAX, 1),
+        (1, u32::MAX),
+    ] {
         assert!(matches!(
             base.clone().with_channels(begin, count),
             Err(EncodeError::InvalidModularSqueezeChannels { .. })

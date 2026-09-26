@@ -122,10 +122,15 @@ impl LosslessModularSqueeze {
 
     /// Selects a nonempty contiguous range of image channels after RCT and optional Palette.
     /// Channel zero is the first image channel, excluding Palette's table. Unselected channels
-    /// keep their dimensions and samples. The range must fit both the four-channel policy
-    /// domain and the actual post-Palette image topology of every submitted source.
+    /// keep their dimensions and samples. The range must fit the image input limit and each
+    /// color stream's actual post-Palette topology, including its independent scalar inputs.
+    /// Scalar channels routed to LF streams are outside this color-local selection.
     pub fn with_channels(mut self, begin: u32, count: u32) -> Result<Self, EncodeError> {
-        validate_range(begin, count, 4)?;
+        validate_range(
+            begin,
+            count,
+            3 + crate::extra_channel::MAX_EXTRA_CHANNELS as u32,
+        )?;
         let SqueezePolicy::Separable { channel_range, .. } = &mut self.policy else {
             return Err(EncodeError::InvalidConfiguration(
                 "explicit Squeeze sequences specify a range in each step",

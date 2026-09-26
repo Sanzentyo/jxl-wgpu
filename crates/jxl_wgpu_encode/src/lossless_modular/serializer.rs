@@ -154,17 +154,21 @@ impl LosslessModularEncoder {
                 self.image_options,
                 self.alpha_association,
                 self.max_icc_profile_bytes,
-            ),
+            )
+            .with_inputs(&self.config()),
         )?;
         plan.icc_profile_bytes = header.icc_profile_bytes;
         plan.icc_storage_bytes = header.icc_storage_bytes;
+        plan.extra_channel_metadata_bytes = header.extra_storage_bytes;
         plan.owned_bytes_per_job = plan
             .owned_bytes_per_job
             .checked_add(header.icc_storage_bytes)
+            .and_then(|bytes| bytes.checked_add(header.extra_storage_bytes))
             .ok_or(EncodeError::InvalidConfiguration("ICC job size overflow"))?;
         plan.addressed_bytes_per_job = plan
             .addressed_bytes_per_job
             .checked_add(header.icc_storage_bytes)
+            .and_then(|bytes| bytes.checked_add(header.extra_storage_bytes))
             .ok_or(EncodeError::InvalidConfiguration(
                 "ICC addressed size overflow",
             ))?;
@@ -254,7 +258,8 @@ impl LosslessModularEncoder {
                 self.image_options,
                 self.alpha_association,
                 self.max_icc_profile_bytes,
-            ),
+            )
+            .with_inputs(&self.config()),
         )?
         .finish(self.encoder.memory_budget())?;
         let session = self.encoder.begin_session(SessionDescriptor {
@@ -319,7 +324,8 @@ impl LosslessModularEncoder {
                 self.image_options,
                 self.alpha_association,
                 self.max_icc_profile_bytes,
-            ),
+            )
+            .with_inputs(&self.config()),
         )?
         .finish(self.encoder.memory_budget())?;
         let frame = self
@@ -969,11 +975,17 @@ impl ModularPacketAssembler {
                 GroupPacketKind::DcGlobal,
                 dc_global.into_bytes(),
             ));
-            for group in 0..group_grid.lf_groups {
-                packets.push(GroupPacket::new(
-                    GroupPacketKind::DcGroup(group),
-                    Vec::new(),
-                ));
+            if !transforms
+                .streams
+                .iter()
+                .any(|stream| stream.route == crate::extra_channel::input::ScalarRoute::Lf)
+            {
+                for group in 0..group_grid.lf_groups {
+                    packets.push(GroupPacket::new(
+                        GroupPacketKind::DcGroup(group),
+                        Vec::new(),
+                    ));
+                }
             }
             // Lossless Modular has no VarDCT HF-global payload.
             packets.push(GroupPacket::new(GroupPacketKind::AcGlobal, Vec::new()));
@@ -1016,13 +1028,14 @@ impl ModularPacketAssembler {
                 "GPU artifact groups are not in canonical order".into(),
             ));
         }
-        let source = self
-            .group_grid
-            .group(group_index)
-            .ok_or(BackendError::Invariant(
-                "Modular group index exceeds frame grid",
-            ))?;
-        let topology = self.transforms.group(source)?;
+        let stream =
+            self.transforms
+                .streams
+                .get(group_index as usize)
+                .ok_or(BackendError::Invariant(
+                    "Modular stream index exceeds frame plan",
+                ))?;
+        let topology = self.transforms.stream(group_index)?;
         let channels = topology.channels.len();
         if artifacts.len() != channels {
             return Err(EncodeError::Backend(
@@ -1069,9 +1082,13 @@ impl ModularPacketAssembler {
                 .write_stream(&mut pass_group, artifacts, encoded)?;
             pass_group.align_to_byte()?;
             self.packets.push(GroupPacket::new(
-                GroupPacketKind::AcGroup {
-                    pass: 0,
-                    group: group_index,
+                if stream.route == crate::extra_channel::input::ScalarRoute::Lf {
+                    GroupPacketKind::DcGroup(stream.region.index)
+                } else {
+                    GroupPacketKind::AcGroup {
+                        pass: 0,
+                        group: stream.region.index,
+                    }
                 },
                 pass_group.into_bytes(),
             ));
@@ -1086,7 +1103,7 @@ impl ModularPacketAssembler {
     pub(super) fn finish(
         mut self,
     ) -> Result<(FramePacketSet, Option<GpuAccelerationArtifact>), EncodeError> {
-        if self.next_group != self.group_grid.groups {
+        if self.next_group as usize != self.transforms.streams.len() {
             return Err(EncodeError::Backend(
                 "GPU artifact stream ended before every Modular group".into(),
             ));
@@ -1219,18 +1236,18 @@ pub(super) fn build_packets(
         }),
     )?;
     let mut start = 0;
-    for group in group_grid.ordered_groups() {
-        let channels = transforms.group(group)?.channels.len();
+    for group_index in 0..transforms.streams.len() as u32 {
+        let channels = transforms.stream(group_index)?.channels.len();
         let end = start + channels;
         for (channel, plan) in group_plans[start..end].iter().enumerate() {
-            if plan.group_index != group.index || plan.channel != channel as u32 {
+            if plan.group_index != group_index || plan.channel != channel as u32 {
                 return Err(BackendError::Invariant(
                     "GPU group plan channel order is not canonical",
                 )
                 .into());
             }
         }
-        assembler.push_group(group.index, &artifacts[start..end], None)?;
+        assembler.push_group(group_index, &artifacts[start..end], None)?;
         start = end;
     }
     assembler.finish()
@@ -1851,7 +1868,11 @@ fn image_header_with_plan(
     let samples = crate::sample_format::ImageSamplePlan::new(
         samples,
         format.has_alpha().then_some(color.alpha),
-    );
+    )
+    .with_extra_channels(
+        &color.extra_channels,
+        color.max_extra_channel_metadata_bytes,
+    )?;
     header.encode(
         crate::image_sequence::ImageCoding::Modular,
         &samples,

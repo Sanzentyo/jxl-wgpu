@@ -6,6 +6,7 @@ use super::rct::LosslessModularRctType;
 use super::squeeze::SqueezeAxes;
 use super::types::{LosslessModularConfig, LosslessModularFormat};
 use crate::{BackendError, EncodeError};
+pub(super) mod input;
 pub(super) mod program;
 use program::TransformProgram;
 
@@ -22,15 +23,17 @@ pub(super) enum SampleSource {
     PaletteIndex,
     PaletteTable,
     Arena(u32),
+    Independent(usize),
 }
 
 impl SampleSource {
-    pub(super) const fn kernel_value(self) -> u32 {
+    pub(super) fn kernel_value(self) -> u32 {
         match self {
             Self::Component(WorkingComponent(value)) => value,
             Self::PaletteIndex => 4,
             Self::PaletteTable => 5,
             Self::Arena(_) => 6,
+            Self::Independent(_) => unreachable!("source inputs must be lowered into the arena"),
         }
     }
 }
@@ -201,6 +204,8 @@ pub(super) struct GroupTransformPlan {
     pub(super) operations: Vec<TransformOperation>,
     pub(super) palette: Option<PlannedPalette>,
     pub(super) transform_program: Option<TransformProgram>,
+    input_shape: Vec<([u32; 2], u8, usize)>,
+    has_color: bool,
 }
 
 impl GroupTransformPlan {
@@ -211,8 +216,13 @@ impl GroupTransformPlan {
         config: &LosslessModularConfig,
         local_rct: Option<LosslessModularRctType>,
         squeeze_range: &std::ops::Range<u32>,
+        stream: &input::PlannedStream,
     ) -> Result<Self, EncodeError> {
-        let mut channels: Vec<_> = (0..format.channel_count())
+        let mut channels: Vec<_> = (0..if stream.has_color() {
+            format.channel_count()
+        } else {
+            0
+        })
             .map(|component| PlannedChannel {
                 extent,
                 source: SampleSource::Component(WorkingComponent(component)),
@@ -221,6 +231,13 @@ impl GroupTransformPlan {
                 band: 0,
             })
             .collect();
+        channels.extend(stream.extras.iter().map(|extra| PlannedChannel {
+            extent: extra.extent,
+            source: SampleSource::Independent(extra.source),
+            shifts: [extra.shift; 2],
+            squeeze: SqueezeAxes::None,
+            band: 0,
+        }));
         let mut operations = Vec::new();
         if let Some(rct) = local_rct {
             operations.push(TransformOperation::Rct(PlannedRct::source(rct)));
@@ -252,6 +269,12 @@ impl GroupTransformPlan {
             );
             operations.push(TransformOperation::Palette(palette));
         }
+        let input_shape = stream
+            .extras
+            .iter()
+            .map(|extra| (extra.extent, extra.shift, extra.source))
+            .collect();
+        let has_color = stream.has_color();
         let squeeze_policy = config.local_transforms.squeeze_policy();
         let squeeze = squeeze_policy.map_or(SqueezeAxes::None, |policy| {
             policy.for_extent(extent[0], extent[1])
@@ -261,6 +284,42 @@ impl GroupTransformPlan {
             &mut channels[meta + squeeze_range.start as usize..meta + squeeze_range.end as usize]
         {
             channel.squeeze = squeeze;
+        }
+        if !stream.extras.is_empty() {
+            let (transform_program, steps) = if let Some(sequence) =
+                squeeze_policy.and_then(|policy| policy.steps())
+            {
+                let (program, steps) = TransformProgram::squeeze(&mut channels, meta, sequence)?;
+                (program, steps)
+            } else if let Some(sequence) = config.local_transforms.operations() {
+                let (program, resolved) = TransformProgram::new(&mut channels, meta, sequence)?;
+                operations.extend(resolved);
+                (program, Vec::new())
+            } else {
+                TransformProgram::named(
+                    &mut channels,
+                    meta,
+                    squeeze,
+                    squeeze_policy.and_then(|policy| policy.in_place()) == Some(true),
+                )?
+            };
+            if !steps.is_empty() {
+                operations.push(TransformOperation::Squeeze(steps));
+            }
+            if operations.len() > 273 {
+                return Err(EncodeError::InvalidModularTransformCount {
+                    count: operations.len(),
+                });
+            }
+            return Ok(Self {
+                extent,
+                channels,
+                operations,
+                palette,
+                transform_program: Some(transform_program),
+                input_shape,
+                has_color,
+            });
         }
         let mut steps = Vec::new();
         for stage in 0..squeeze.stages() {
@@ -342,11 +401,13 @@ impl GroupTransformPlan {
             operations,
             palette,
             transform_program,
+            input_shape,
+            has_color,
         })
     }
 }
 
-/// A frame shares at most four concrete edge-group topologies across every consumer.
+/// A frame shares checked color/scalar stream topologies across every consumer.
 #[derive(Clone, Debug)]
 pub(super) struct ModularTransformPlan {
     pub(super) global_operations: Vec<TransformOperation>,
@@ -356,9 +417,11 @@ pub(super) struct ModularTransformPlan {
     pub(super) prefix_channels: usize,
     pub(super) extended_prediction_domain: bool,
     shapes: Vec<GroupTransformPlan>,
+    pub(super) streams: Vec<input::PlannedStream>,
 }
 
 impl ModularTransformPlan {
+    #[cfg(test)]
     pub(super) fn new(
         grid: LosslessModularGroupGrid,
         format: LosslessModularFormat,
@@ -366,17 +429,28 @@ impl ModularTransformPlan {
         exponent_bits: u8,
         config: LosslessModularConfig,
     ) -> Result<Self, EncodeError> {
+        let samples = config.samples(format, depth, exponent_bits)?;
+        let sampling = crate::sampling::FrameSamplingPlan::unscaled(
+            jxl_gpu_protocol::Extent2d::new(grid.width, grid.height),
+            &samples,
+        )?;
+        Self::with_sampling(grid, format, depth, exponent_bits, config, &sampling.extras)
+    }
+
+    pub(super) fn with_sampling(
+        grid: LosslessModularGroupGrid,
+        format: LosslessModularFormat,
+        depth: u8,
+        exponent_bits: u8,
+        config: LosslessModularConfig,
+        sampling: &crate::extra_channel::sampling::ExtraChannelSamplingPlan,
+    ) -> Result<Self, EncodeError> {
         if let Some(palette) = config.palette {
             palette.validate(format)?;
         }
         let image_count = config.palette.map_or(format.channel_count(), |palette| {
             format.channel_count() - palette.components(format) + 1
         });
-        let squeeze_range = if let Some(squeeze) = config.local_transforms.squeeze_policy() {
-            squeeze.resolve_range(image_count)?
-        } else {
-            0..image_count
-        };
         let rct = config.color_transform.resolve(format, exponent_bits)?;
         let mut global_operations = Vec::new();
         if let Some(rct) = rct.filter(|rct| !rct.local && grid.groups > 1) {
@@ -387,22 +461,40 @@ impl ModularTransformPlan {
             .map(|rct| rct.rct_type);
         let mut shapes: Vec<GroupTransformPlan> = Vec::with_capacity(4);
         let mut dispatches = 0u32;
-        for group in grid.ordered_groups() {
+        let mut streams = input::streams(grid, sampling);
+        for stream in &mut streams {
+            let group = stream.region;
             let extent = [group.width, group.height];
-            let shape = if let Some(index) = shapes.iter().position(|shape| shape.extent == extent)
-            {
+            let input_shape: Vec<_> = stream
+                .extras
+                .iter()
+                .map(|extra| (extra.extent, extra.shift, extra.source))
+                .collect();
+            let shape = if let Some(index) = shapes.iter().position(|shape| {
+                shape.extent == extent
+                    && shape.input_shape == input_shape
+                    && shape.has_color == stream.has_color()
+            }) {
                 index
             } else {
+                // Local color transforms belong to color streams. LF scalar streams retain
+                // their intrinsic topology and share only the frame's prediction/entropy policy.
+                let scalar_config = LosslessModularConfig::default();
+                let (policy, rct, count) = if stream.has_color() {
+                    (&config, local_rct, image_count + stream.extras.len() as u32)
+                } else {
+                    (&scalar_config, None, stream.extras.len() as u32)
+                };
+                let range = policy
+                    .local_transforms
+                    .squeeze_policy()
+                    .map_or(Ok(0..count), |squeeze| squeeze.resolve_range(count))?;
                 shapes.push(GroupTransformPlan::new(
-                    extent,
-                    format,
-                    depth,
-                    &config,
-                    local_rct,
-                    &squeeze_range,
+                    extent, format, depth, policy, rct, &range, stream,
                 )?);
                 shapes.len() - 1
             };
+            stream.shape = shape;
             dispatches = dispatches
                 .checked_add(shapes[shape].channels.len() as u32)
                 .ok_or(EncodeError::InvalidSource(
@@ -416,40 +508,58 @@ impl ModularTransformPlan {
             .ok_or(BackendError::Invariant("empty Modular topology"))?;
         // Keep the established prefix-table policy even when a group's one-pixel axes elide
         // Squeeze. This is an entropy upper bound, not another physical channel topology.
-        let prefix_channels = if config.local_transforms.uses_program() {
-            max_channels.min(4) as usize
-        } else {
-            (u32::from(config.palette.is_some())
-                + image_count
-                + squeeze_range.len() as u32
-                    * ((1
-                        << config
-                            .local_transforms
-                            .squeeze_policy()
-                            .map_or(0, |squeeze| squeeze.stages()))
-                        - 1))
-                .min(4) as usize
-        };
+        let prefix_channels =
+            if !config.extra_channels.is_empty() || config.local_transforms.uses_program() {
+                max_channels.min(4) as usize
+            } else {
+                let squeeze_range = config
+                    .local_transforms
+                    .squeeze_policy()
+                    .map_or(Ok(0..image_count), |squeeze| {
+                        squeeze.resolve_range(image_count)
+                    })?;
+                (u32::from(config.palette.is_some())
+                    + image_count
+                    + squeeze_range.len() as u32
+                        * ((1
+                            << config
+                                .local_transforms
+                                .squeeze_policy()
+                                .map_or(0, |squeeze| squeeze.stages()))
+                            - 1))
+                    .min(4) as usize
+            };
         Ok(Self {
             global_operations,
             rct_type: rct.map_or(42, |rct| rct.rct_type.value()),
             max_channels,
             dispatches,
             prefix_channels,
-            extended_prediction_domain: config.palette.is_some()
+            extended_prediction_domain: !config.extra_channels.is_empty()
+                || config.palette.is_some()
                 || config.local_transforms.uses_program()
                 || config.local_transforms.uses_squeeze(),
             shapes,
+            streams,
         })
     }
 
+    #[cfg(test)]
     pub(super) fn group(
         &self,
         group: LosslessModularGroup,
     ) -> Result<&GroupTransformPlan, EncodeError> {
-        self.shapes
+        self.streams
             .iter()
-            .find(|shape| shape.extent == [group.width, group.height])
+            .find(|stream| stream.has_color() && stream.region.index == group.index)
+            .map(|stream| &self.shapes[stream.shape])
             .ok_or_else(|| BackendError::Invariant("Modular group has no planned topology").into())
+    }
+
+    pub(super) fn stream(&self, index: u32) -> Result<&GroupTransformPlan, EncodeError> {
+        self.streams
+            .get(index as usize)
+            .map(|stream| &self.shapes[stream.shape])
+            .ok_or_else(|| BackendError::Invariant("Modular stream has no planned topology").into())
     }
 }

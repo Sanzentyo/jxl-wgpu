@@ -1,3 +1,4 @@
+use bytemuck::Zeroable;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -95,6 +96,15 @@ pub(super) struct ModularDispatchBatch {
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct ModularInputLoad {
+    pub(super) dispatch: usize,
+    pub(super) source: usize,
+    pub(super) windows: SourceWindows,
+    pub(super) params: ModularParams,
+    pub(super) parameter_offset: u64,
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct ModularDispatchPlan {
     pub(super) width: u32,
     pub(super) height: u32,
@@ -109,6 +119,7 @@ pub(super) struct ModularDispatchPlan {
     pub(super) lz77: LosslessModularLz77,
     pub(super) entropy: LosslessModularEntropyCoding,
     pub(super) parameters: Vec<ModularParams>,
+    pub(super) input_loads: Vec<ModularInputLoad>,
     pub(super) groups: Vec<ModularGroupPlan>,
     pub(super) batches: Vec<ModularDispatchBatch>,
     pub(super) output_size: u64,
@@ -119,7 +130,8 @@ pub(super) struct ModularDispatchPlan {
 ///
 /// It never reads source pixels on the CPU. Gray, GrayAlpha, RGB and RGBA components may occupy packed,
 /// planar or split storage with explicit swizzles, bit positions and word byte order. Samples
-/// have one common 1-31-bit integer or binary16/binary32 precision.
+/// in the main source have one common integer or floating precision. Attached Gray sources
+/// carry independently declared precision and sampling, checked by the shared frame input plan.
 /// The selected reversible color transform operates on source words. The GPU
 /// emits predictor residual tokens and histograms, then optionally serializes ANS on GPU.
 /// The host validates artifacts and assembles the selected entropy stream.
@@ -180,7 +192,10 @@ impl LosslessModularBackend {
                             constants: &[
                                 (
                                     "transform_program_enabled",
-                                    f64::from(u32::from(config.local_transforms.uses_program())),
+                                    f64::from(u32::from(
+                                        config.local_transforms.uses_program()
+                                            || !config.extra_channels.is_empty(),
+                                    )),
                                 ),
                                 (
                                     "squeeze_enabled",
@@ -281,8 +296,18 @@ impl LosslessModularBackend {
         source: &crate::BufferImageSource,
         request: &FrameEncodeRequest,
     ) -> Result<(ModularDispatchPlan, FrameHeaderPlan), EncodeError> {
-        let plan = self.dispatch_plan(source)?;
-        let header = validate_modular_frame_request(request, &plan)?;
+        let spec = crate::source::source_spec(&source.layout.format)?;
+        let samples = self.config.samples(
+            spec.format,
+            spec.bits_per_sample,
+            spec.exponent_bits_per_sample,
+        )?;
+        let header = FrameHeaderPlan::with_extra_channels(
+            request,
+            (source.layout.extent.width, source.layout.extent.height),
+            &samples,
+        )?;
+        let plan = self.dispatch_plan_with_sampling(source, header.sampling())?;
         if request.profile
             != (EncodeProfile::ModularLossless {
                 sample_bit_depth: modular_sample_depth(
@@ -334,9 +359,22 @@ impl LosslessModularBackend {
         &self,
         source: &crate::BufferImageSource,
     ) -> Result<ModularDispatchPlan, EncodeError> {
-        if !source.extra_channels().is_empty() {
-            return Err(UnsupportedFeature::InputFormat.into());
-        }
+        let spec = crate::source::source_spec(&source.layout.format)?;
+        let samples = self.config.samples(
+            spec.format,
+            spec.bits_per_sample,
+            spec.exponent_bits_per_sample,
+        )?;
+        let sampling =
+            crate::sampling::FrameSamplingPlan::unscaled(source.layout.extent, &samples)?;
+        self.dispatch_plan_with_sampling(source, &sampling)
+    }
+
+    fn dispatch_plan_with_sampling(
+        &self,
+        source: &crate::BufferImageSource,
+        sampling: &crate::sampling::FrameSamplingPlan,
+    ) -> Result<ModularDispatchPlan, EncodeError> {
         self.pipeline()?;
         let extent = source.layout.extent;
         let group_grid = LosslessModularGroupGrid::for_extent(
@@ -353,12 +391,13 @@ impl LosslessModularBackend {
         )?;
         let source_spec = &source_layout.spec;
         let format = source_spec.format;
-        let transforms = Arc::new(ModularTransformPlan::new(
+        let transforms = Arc::new(ModularTransformPlan::with_sampling(
             group_grid,
             format,
             source_spec.bits_per_sample,
             source_spec.exponent_bits_per_sample,
             self.config.clone(),
+            &sampling.extras,
         )?);
         let channels = transforms.max_channels;
         let dispatches = transforms.dispatches;
@@ -380,7 +419,19 @@ impl LosslessModularBackend {
         {
             return Err(UnsupportedFeature::InputFormat.into());
         }
-        let source_binding_bytes = source_layout.full_windows.addressed_bytes()?;
+        let samples = self.config.samples(
+            format,
+            source_spec.bits_per_sample,
+            source_spec.exponent_bits_per_sample,
+        )?;
+        let inputs = crate::extra_channel::input::ExtraInputPlan::new(
+            &samples,
+            &sampling.extras,
+            source,
+            &source_layout,
+            self.storage_offset_alignment,
+        )?;
+        let source_binding_bytes = inputs.source_bytes;
         let dispatch_count = usize::try_from(dispatches)
             .map_err(|_| EncodeError::InvalidSource("Modular dispatch count overflow"))?;
         if !256_u64.is_multiple_of(self.storage_offset_alignment.max(1)) {
@@ -393,6 +444,7 @@ impl LosslessModularBackend {
         }
         let artifact_alignment = self.storage_offset_alignment.max(4);
         let mut parameters = Vec::with_capacity(dispatch_count);
+        let mut input_loads = Vec::new();
         let mut groups = Vec::with_capacity(dispatch_count);
         let mut absolute_source_offsets = Vec::with_capacity(dispatch_count);
         let mut batches =
@@ -406,8 +458,9 @@ impl LosslessModularBackend {
         let mut batch_first_dispatch = 0usize;
         let mut batch_artifact_offset = 0u64;
         let mut batch_source_windows = SourceWindows::default();
-        for group in group_grid.ordered_groups() {
-            let topology = transforms.group(group)?;
+        for (stream_index, stream) in transforms.streams.iter().enumerate() {
+            let group = stream.region;
+            let topology = transforms.stream(stream_index as u32)?;
             let channels = topology.channels.len() as u32;
             let palette = topology.palette;
             let palette_capacity = palette.map_or(0, |palette| palette.capacity.entries());
@@ -416,7 +469,11 @@ impl LosslessModularBackend {
                 .transform_program
                 .as_ref()
                 .map_or(0, |program| program.scratch_bytes());
-            let group_source = source_layout.region(group.x, group.y, group.width, group.height)?;
+            let group_source = if stream.has_color() {
+                source_layout.region(group.x, group.y, group.width, group.height)?
+            } else {
+                source_layout.region(0, 0, 1, 1)?
+            };
             group_source
                 .windows
                 .validate(self.max_storage_binding_size)?;
@@ -554,6 +611,46 @@ impl LosslessModularBackend {
             } else {
                 0
             };
+            if let Some(program) = &topology.transform_program {
+                for load in &program.inputs {
+                    let input = &inputs.independent[load.source];
+                    let region = stream
+                        .extras
+                        .iter()
+                        .find(|extra| extra.source == load.source)
+                        .ok_or(BackendError::Invariant("missing planned scalar source"))?;
+                    let mut view = input.region(
+                        region.origin[0],
+                        region.origin[1],
+                        load.extent[0],
+                        load.extent[1],
+                    )?;
+                    view.windows.validate(self.max_storage_binding_size)?;
+                    view.windows
+                        .rebase(&mut view.components[..1], view.offsets)?;
+                    let destination = u64::from(transform_program_word_offset)
+                        + program.metadata_words()
+                        + u64::from(load.offset);
+                    input_loads.push(ModularInputLoad {
+                        dispatch: parameters.len(),
+                        source: load.source,
+                        windows: view.windows,
+                        parameter_offset: 0,
+                        params: ModularParams {
+                            width: load.extent[0],
+                            height: load.extent[1],
+                            output_word_offset: u32::try_from(destination).map_err(|_| {
+                                EncodeError::InvalidSource("scalar arena exceeds WGSL indexing")
+                            })?,
+                            sample_source: 7,
+                            sample_mask: u32::MAX >> (32 - input.spec.bits_per_sample),
+                            big_endian: u32::from(input.spec.big_endian),
+                            sources: view.components,
+                            ..ModularParams::zeroed()
+                        },
+                    });
+                }
+            }
             for (channel, layout) in layouts.into_iter().enumerate() {
                 let ModularChannelLayout {
                     width,
@@ -663,7 +760,7 @@ impl LosslessModularBackend {
                     } else {
                         0
                     },
-                    group_index: group.index,
+                    group_index: stream_index as u32,
                     width,
                     height,
                     channel,
@@ -717,6 +814,20 @@ impl LosslessModularBackend {
                     .ok_or(EncodeError::InvalidSource(
                         "transform parameter size overflow",
                     ))?;
+            }
+            for load in input_loads.iter_mut().filter(|load| {
+                load.dispatch >= batch.first_dispatch
+                    && load.dispatch < batch.first_dispatch + batch.dispatch_count
+            }) {
+                load.parameter_offset = align_up(batch.parameter_bytes, 256).ok_or(
+                    EncodeError::InvalidSource("scalar input parameter alignment overflow"),
+                )?;
+                batch.parameter_bytes =
+                    load.parameter_offset
+                        .checked_add(256)
+                        .ok_or(EncodeError::InvalidSource(
+                            "scalar input parameter size overflow",
+                        ))?;
             }
             if self.config.entropy == LosslessModularEntropyCoding::Ans {
                 let parameter_offset =
@@ -821,10 +932,23 @@ impl LosslessModularBackend {
             })
             .ok_or(EncodeError::InvalidSource("total artifact size overflow"))?;
         let peak_source_binding_bytes = batches.iter().try_fold(0u64, |peak, batch| {
-            batch
-                .source_windows
-                .addressed_bytes()
-                .map(|bytes| peak.max(bytes))
+            SourceWindows::addressed_bytes_many(
+                std::iter::once((source.buffer.as_ref(), batch.source_windows)).chain(
+                    input_loads
+                        .iter()
+                        .filter(|load| {
+                            load.dispatch >= batch.first_dispatch
+                                && load.dispatch < batch.first_dispatch + batch.dispatch_count
+                        })
+                        .map(|load| {
+                            (
+                                source.extra_channels()[load.source].buffer.as_ref(),
+                                load.windows,
+                            )
+                        }),
+                ),
+            )
+            .map(|bytes| peak.max(bytes))
         })?;
         let readback_bytes = if self.direct_mapping {
             0
@@ -896,6 +1020,7 @@ impl LosslessModularBackend {
             streaming,
             icc_profile_bytes,
             icc_storage_bytes: 0,
+            extra_channel_metadata_bytes: 0,
             owned_bytes_per_job,
             addressed_bytes_per_job,
         };
@@ -913,6 +1038,7 @@ impl LosslessModularBackend {
             weighted_predictor: self.config.weighted_predictor,
             lz77: self.config.lz77,
             parameters,
+            input_loads,
             groups,
             batches,
             output_size,
@@ -991,13 +1117,6 @@ fn modular_dispatch_batch(
         source_windows: context.source_windows,
     })
 }
-pub(super) fn validate_modular_frame_request(
-    request: &FrameEncodeRequest,
-    plan: &ModularDispatchPlan,
-) -> Result<FrameHeaderPlan, EncodeError> {
-    FrameHeaderPlan::new(request, (plan.width, plan.height), plan.format.has_alpha())
-}
-
 impl GpuEncodeBackend for LosslessModularBackend {
     type Job = LosslessModularJob;
 
@@ -1009,7 +1128,9 @@ impl GpuEncodeBackend for LosslessModularBackend {
         let GpuFrameSource::Buffer(source) = source else {
             return false;
         };
-        self.dispatch_plan(source).is_ok()
+        // Requested sampling belongs to prepare_frame; a source-only geometry query cannot
+        // determine the supplied extent of each independently upsampled scalar input.
+        self.pipeline().is_ok() && crate::source::source_spec(&source.layout.format).is_ok()
     }
 
     fn submit(
@@ -1115,6 +1236,17 @@ impl GpuEncodeBackend for LosslessModularBackend {
         for upload in uploads {
             upload.record(&mut commands, &buffers.parameters, &buffers.artifact);
         }
+        plan.record_inputs(
+            super::upload::InputUploadContext {
+                context,
+                pipeline: self.pipeline()?,
+                source: &source,
+                parameters: &buffers.parameters,
+                artifact: &buffers.artifact,
+            },
+            &plan.batches[0],
+            &mut commands,
+        );
         {
             let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("jxl-wgpu lossless modular tokenization"),
@@ -1142,6 +1274,14 @@ impl GpuEncodeBackend for LosslessModularBackend {
         let lifetime = Arc::new(EncodeJobLifetime {
             buffer_lease,
             _memory_permit: memory_permit,
+            _source_buffers: std::iter::once(Arc::clone(&source.buffer))
+                .chain(
+                    source
+                        .extra_channels()
+                        .iter()
+                        .map(|input| Arc::clone(&input.buffer)),
+                )
+                .collect(),
             mapped: AtomicBool::new(false),
         });
         let callback_lifetime = Arc::clone(&lifetime);

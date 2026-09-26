@@ -98,6 +98,7 @@ fn mixed_palette_preserves_every_predictor_rct_precision_and_squeeze_order() {
                 } else {
                     Lz77::Greedy
                 },
+                ..Default::default()
             },
         );
         let mut case = case(
@@ -354,6 +355,7 @@ fn mixed_palette_scratch_obeys_admission_cancellation_and_reuse() {
                     .unwrap(),
                 lz77: Lz77::Greedy,
                 color_transform: Transform::LocalRct(Rct::new(41).unwrap()),
+                ..Default::default()
             },
             delta::check_frame_oracles,
         );

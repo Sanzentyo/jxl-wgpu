@@ -717,7 +717,19 @@ fn build_palette_residuals(params: Params) {
 fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if global_id.y != 0u || global_id.z != 0u || global_id.x >= arrayLength(&group_params) { return; }
     let params = group_params[global_id.x];
-    if (palette_enabled && params.palette_capacity != 0u) || transform_program_enabled {
+    // Checked source loads precede all transform/token dispatches in a separate pass.
+    // The destination is one disjoint input view in the planned transform arena.
+    if params.sample_source == 7u {
+        for (var y = 0u; y < params.height; y += 1u) {
+            for (var x = 0u; x < params.width; x += 1u) {
+                output_words[params.output_word_offset + y * params.width + x] =
+                    load_source_component(params.sources[0], x, y, params.big_endian, params.sample_mask);
+            }
+        }
+        return;
+    }
+    let have_program = transform_program_enabled && params.transform_program_word_offset != 0u;
+    if (palette_enabled && params.palette_capacity != 0u) || have_program {
         if params.channel != 0u { return; }
         if palette_enabled && params.palette_capacity != 0u {
             build_palette_residuals(params);
@@ -726,7 +738,7 @@ fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 return;
             }
         }
-        if transform_program_enabled {
+        if have_program {
             squeeze_failed = false;
             palette_failed = false;
             execute_transform_program(params);

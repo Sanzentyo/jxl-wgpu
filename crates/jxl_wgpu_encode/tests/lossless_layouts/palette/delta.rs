@@ -17,6 +17,7 @@ fn delta_palette_scratch_obeys_exact_admission_cancellation_and_pool_reuse() {
                     .unwrap(),
                 lz77: Lz77::Greedy,
                 color_transform: Transform::LocalRct(Rct::new(41).unwrap()),
+                ..Default::default()
             },
             check_frame_oracles,
         );
@@ -72,6 +73,7 @@ fn delta_palette_composes_every_predictor_rct_precision_and_squeeze_policy() {
                 } else {
                     Lz77::Greedy
                 },
+                ..Default::default()
             },
         );
         let mut case = case(

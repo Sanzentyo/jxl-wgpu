@@ -1098,7 +1098,34 @@ permit retain all records through cancellation. Tests include missing/forged rec
 artifact corruption, an actual binding limit equal to the raster arena, exact/one-byte-deficient
 tiled and mixed budgets, abandoned completion, successful reuse and all linear variants.
 
+## Modular independent input arenas
+
+Independent scalar inputs reuse the 256-byte `ModularParams` record and existing source bindings
+0/3/4/5, artifact binding 1 and parameter binding 2. A checked load record uses `sample_source = 7`
+with one scalar source, declared byte order/mask, region dimensions and a disjoint artifact-arena
+destination. Its parameter binding exposes exactly one record. Loads execute before transform/token
+passes in the same submission; they neither map source samples nor add per-source queue submissions.
+
+The transform program reserves all initial input views before retiring spans for ordered jobs.
+Independent inputs and transformed outputs use arena tag 6; final channels retain checked offsets.
+Named Squeeze with heterogeneous sources lowers to these jobs. LF-only streams have separate shapes
+and no color-local operations. Each stream's complete channel set stays in one artifact batch and
+shares one entropy state. The frame's global prefix, LF/pass geometry and actual channel order belong
+to that plan, not shader flags or post-completion configuration.
+
+`transform_scratch_bytes` includes load destinations, operation metadata and peak live samples.
+Parameter bytes include aligned input records as well as transform/ANS metadata; readback and
+admission use the same total artifact allocation. Source exposure unions windows across actual GPU
+allocation identities, including aliasing independent declarations. Map-completion ownership retains
+the supplied color and all extra buffer handles through cancellation. Whole-image variable metadata
+has one still/session reservation (`extra_channel_metadata_bytes`), shared with ICC accounting when
+present. GPU arenas and source handles retire at actual completion; unused host header storage
+can retire on cancellation.
+[Conformance evidence](CONFORMANCE_CORPUS.md#independent-modular-and-mixed-input) covers exact budgets,
+word preservation, cancellation and invalid output authority.
+
 ## Modular ANS serialization
+
 
 `EntropyArtifactPlan` reserves output after the first channel's event/scratch arena in each
 complete group. With `E` maximum events summed across its channels, capacity is

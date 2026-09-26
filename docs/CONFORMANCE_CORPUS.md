@@ -2109,7 +2109,43 @@ nonfinite color samples retain the existing completion-owned byte contract. Raw-
 alpha readback tails share one map and are accounted once. No capability row is promoted to Done;
 independently sized/quantized arbitrary extras, YUV, CMYK and texture inputs remain open.
 
+## Independent Modular and mixed input
+
+The `jxl_wgpu_encode` integration target `modular_extras` covers independent scalar GPU sources
+as one input/transform/sequence contract. Its matrix includes all 31 integer and 154 legal floating
+precisions in a 256-extra declaration under Prefix and ANS, unequal Gray/GrayAlpha/RGB/RGBA main
+precision, packed alpha, distinct byte order and poisoned shifted packing. Native libjxl's pinned
+scalar `--channel-words` mode and independent jxl-oxide Modular decoding compare physical dimensions
+and every raw word before interpolation, float conversion or blending. NaN payloads and signed zero
+remain bit-exact. Native parsing and transforms remain unmodified.
+
+Odd 17×9, 259×131, 2051×9 and 9×2051 sources exercise global, pass and multiple LF streams. Frame color
+factors 1/2/4/8 combine with independent factors and intrinsic shifts through effective 64, using
+shared and local trees. Selected Palette, named Squeeze and ordered RCT/Squeeze include independent
+pass/global channels, while LF scalar streams retain their source topology. A separate 256-extra
+Squeeze matrix checks full-count and selected scalar ranges, wire-count splitting and tail/in-place
+ordering under both entropy modes. Group/source planning, wire serialization and GPU arenas are
+checked by independent decoders, not planner-derived expected
+topologies. Existing no-extra matrices and checked-in Gray8 byte comparisons remain required.
+
+Native libjxl 0.12 rejects effective extra factors above eight. The eight extended-factor streams
+retain exact independent Rust words plus real GPU output against the existing F64 interpolation and
+WGSL arithmetic intervals; the eight native-compatible sampling streams additionally compare exact
+native words and coded/header geometry. The bounds and native implementation are unchanged.
+
+Mixed M/V/M sequences change sampling before cropped/reference composition across all five blend
+modes. Native RGBA/extra presentation comparisons retain the established `2e-4` color and `2e-6`
+scalar bounds; whole and fragmented GPU output must be byte-identical. A V/M sequence separately
+checks packed associated alpha before an independent depth plane, including reversed completion
+insertion. Alias-union accounting, exact/one-byte-short GPU and image-header budgets, cancellation,
+source-handle retirement, invalid source precision/count/extent, bounded metadata and GPU Squeeze
+overflow cover admission and validation-before-output. Tests use two libtest threads on Metal.
+
+This advances the input domain and its integration. It does not establish CMYK input, adaptive
+quality, per-extra lossy encoding or arbitrary/global Palette/Squeeze placement.
+
 ## Independent VarDCT extra input
+
 
 `vardct_encoder::tests::extras` extends the same scalar GPU plan to independently declared
 source buffers. The precision matrix puts all 31 integer and 154 floating formats in one image
@@ -2155,8 +2191,9 @@ budgets, separate image-header ownership, abandoned jobs and release of retained
 Wrong source count, precision, extent, nesting and buffer usage reject before admission.
 Corrupt scalar artifacts include cross-plane swaps, channel identity, lengths, missing planes,
 trailing bytes and padding; all validation precedes packet authority. Legacy alpha tests remain
-in the full suite. Independent Modular/mixed inputs, lossy extra distance and broader
-invisible-color conformance remain open (`ENC-04` Partial). Per-frame scalar sampling is covered below.
+in the full suite. [Independent Modular/mixed inputs](#independent-modular-and-mixed-input) extend
+this contract. Lossy extra distance and broader invisible-color conformance remain open
+(`ENC-04` Partial). Per-frame scalar sampling is covered below.
 
 Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib extra_input -- --test-threads=2`,
 then the [full capability gates](DEVELOPMENT.md#capability-change-gates).
@@ -2201,7 +2238,8 @@ Incorrect factor counts, full-size inputs supplied for reduced planes, absent de
 attempts to resize packed alpha reject before allocation. These factor-one-color cases keep
 packed alpha at one. The default still API and memory query remain factor one; the shared
 [color/extra sampling extension](#per-frame-color-and-relative-extra-sampling) covers reduced
-color sources. Independent Modular/mixed extras and lossy scalar coding remain open.
+color sources. [Independent Modular/mixed extras](#independent-modular-and-mixed-input) now share
+this sampling plan; lossy scalar coding remains open.
 
 Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib extra_sampling_ -- --test-threads=2`,
 the decoder `extra_upsampling` target after the shared-oracle move, then the

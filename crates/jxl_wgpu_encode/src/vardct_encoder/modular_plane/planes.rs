@@ -1,7 +1,7 @@
 //! One image-wide routing plan for all scalar sources, including packed legacy alpha.
 use super::*;
 use crate::extra_channel::sampling::ExtraChannelSamplingPlan;
-use crate::source::{SourceChannels, SourceLayout, SourceWindows};
+use crate::source::{SourceLayout, SourceWindows};
 use crate::{BufferImageSource, sample_format::ImageSamplePlan};
 
 #[derive(Clone, Copy)]
@@ -50,13 +50,13 @@ impl ImagePlan {
         limits: Limits,
     ) -> Result<Self, EncodeError> {
         let packed = usize::from(samples.alpha.is_some());
-        if source.extra_channels().len() + packed != samples.extra_channels.len()
-            || sampling.channels.len() != samples.extra_channels.len()
-        {
-            return Err(EncodeError::InvalidSource(
-                "extra source count differs from the image declaration",
-            ));
-        }
+        let inputs = crate::extra_channel::input::ExtraInputPlan::new(
+            samples,
+            sampling,
+            source,
+            main,
+            limits.alignment,
+        )?;
         let mut global_prefix = true;
         let mut planes = Vec::with_capacity(samples.extra_channels.len());
         let mut memory = VarDctExtraChannelMemoryPlan {
@@ -72,26 +72,8 @@ impl ImagePlan {
             .enumerate()
         {
             let input = sampled.source;
-            let independent;
             let (layout, component) = if let Some(input) = input {
-                let scalar = &source.extra_channels()[input];
-                if scalar.layout.extent != sampled.extent
-                    || !scalar.buffer.usage().contains(wgpu::BufferUsages::STORAGE)
-                {
-                    return Err(EncodeError::InvalidSource(
-                        "extra source extent or buffer usage differs from its declaration",
-                    ));
-                }
-                independent =
-                    SourceLayout::new(&scalar.layout, scalar.buffer.size(), limits.alignment)?;
-                let precision = definition.precision().color(crate::ColorChannels::Gray);
-                if independent.spec.format != SourceChannels::Gray
-                    || independent.spec.bits_per_sample != precision.bits_per_sample()
-                    || independent.spec.exponent_bits_per_sample != precision.exponent_bits()
-                {
-                    return Err(EncodeError::Unsupported(UnsupportedFeature::InputFormat));
-                }
-                (&independent, 0)
+                (&inputs.independent[input], 0)
             } else {
                 (main, samples.alpha_component().expect("packed alpha"))
             };
@@ -101,19 +83,19 @@ impl ImagePlan {
             let region = layout.region(0, 0, plane_extent.width, plane_extent.height)?;
             let mut components = [region.components[component]];
             windows.rebase(&mut components, [region.offsets[component], 0, 0, 0])?;
-            // Global Modular stops at the first oversized channel. Later small channels
-            // still belong to their LF/pass streams; the serializer must not rediscover this.
-            global_prefix &= plane_extent.width <= GROUP_DIM && plane_extent.height <= GROUP_DIM;
             let shift = sampled.shift;
-            let (route, group_dim) = if global_prefix {
-                (Route::Global, GROUP_DIM)
-            } else if shift >= 3 {
-                (Route::Lf, 2048 >> shift)
-            } else {
-                (
-                    Route::Pass(pass_for_shift(progressive, shift)),
-                    GROUP_DIM >> shift,
-                )
+            let (route, group_dim) = crate::extra_channel::input::route(
+                &mut global_prefix,
+                plane_extent,
+                shift,
+                GROUP_DIM,
+            );
+            let route = match route {
+                crate::extra_channel::input::ScalarRoute::Global => Route::Global,
+                crate::extra_channel::input::ScalarRoute::Lf => Route::Lf,
+                crate::extra_channel::input::ScalarRoute::Pass => {
+                    Route::Pass(pass_for_shift(progressive, shift))
+                }
             };
             let plan = Plan::for_channel(
                 Geometry {
@@ -139,18 +121,7 @@ impl ImagePlan {
             memory.readback_bytes += plan.memory.readback_bytes;
             memory.total_bytes += plan.memory.total_bytes;
         }
-        let source_bytes = SourceWindows::addressed_bytes_many(
-            std::iter::once((source.buffer.as_ref(), main.full_windows)).chain(
-                planes.iter().filter_map(|plane| {
-                    plane.source.map(|index| {
-                        (
-                            source.extra_channels()[index].buffer.as_ref(),
-                            plane.windows,
-                        )
-                    })
-                }),
-            ),
-        )?;
+        let source_bytes = inputs.source_bytes;
         let packed_alpha_memory = (packed != 0).then(|| planes[0].plan.memory);
         Ok(Self {
             planes,

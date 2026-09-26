@@ -94,6 +94,7 @@ fn greedy_lz77_preserves_every_predictor_with_integer_ieee_and_rct_words() {
                         } else {
                             Transform::LocalRct(rct)
                         },
+                        ..Default::default()
                     },
                 );
                 let case = Case {
@@ -210,6 +211,7 @@ fn greedy_lz77_keeps_streamed_admission_cancellation_and_reuse() {
                 },
                 weighted_predictor: Weighted::new([31; 7], [15; 4]).unwrap(),
                 color_transform: Transform::LocalRct(Rct::new(41).unwrap()),
+                ..Default::default()
             },
         );
         groups::lifetime::check_admission(
@@ -245,6 +247,7 @@ fn greedy_lz77_keeps_animation_words_crops_and_independent_references() {
                 tree_mode: TREES[index],
                 weighted_predictor: Weighted::new([31; 7], [0, 15, 1, 8]).unwrap(),
                 color_transform: Transform::LocalRct(Rct::new(41).unwrap()),
+                ..Default::default()
             },
         );
         groups::animation::check_animation_words(

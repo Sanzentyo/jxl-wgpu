@@ -186,9 +186,14 @@ fn extra_input_budget_union_cancellation_and_source_mismatch_preserve_admission(
             .with_extra_channels(vec![scalar.clone(); 257])
             .is_err()
     );
-    let mut unsupported = crate::MixedModeConfig::default();
-    unsupported.vardct.extra_channels = config.extra_channels.clone();
-    assert!(crate::MixedModeEncoder::new(context.clone(), unsupported).is_err());
+    let mut mixed = crate::MixedModeConfig::default();
+    mixed.vardct.extra_channels = config.extra_channels.clone();
+    assert!(crate::MixedModeEncoder::new(context.clone(), mixed.clone()).is_ok());
+    mixed.modular.extra_channels = vec![config.extra_channels[0].clone()];
+    assert!(matches!(
+        crate::MixedModeEncoder::new(context.clone(), mixed),
+        Err(EncodeError::InvalidConfiguration(_))
+    ));
     assert_eq!(context.memory_stats().reserved_bytes, 0);
 }
 

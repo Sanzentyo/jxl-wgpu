@@ -153,6 +153,7 @@ fn palette_composes_with_all_rcts_predictors_and_full_precision_words() {
                 } else {
                     Lz77::Greedy
                 },
+                ..Default::default()
             },
         );
         let mut case = case(

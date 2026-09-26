@@ -22,6 +22,7 @@ pub(crate) struct FrameHeaderPlan {
 }
 
 impl FrameHeaderPlan {
+    #[cfg(test)]
     pub(crate) fn new(
         request: &FrameEncodeRequest,
         source_extent: (u32, u32),

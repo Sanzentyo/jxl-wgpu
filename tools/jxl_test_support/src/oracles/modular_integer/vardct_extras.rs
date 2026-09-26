@@ -14,10 +14,24 @@ pub struct ExtraWords {
 /// Color coefficients are decoded only to locate each stream's Modular suffix.
 /// This intentionally requires a complete VarDCT frame and never rounds a rendered F32 plane.
 pub fn vardct_extra_words(data: &[u8], frame_index: usize) -> Vec<ExtraWords> {
+    physical_words(data, frame_index, jxl_frame::header::Encoding::VarDct)
+}
+
+/// Exact physical original-color Modular grids, before presentation or float conversion.
+/// Native and GPU results are deliberately not used to prepare this independent decoder.
+pub fn modular_channel_words(data: &[u8], frame_index: usize) -> Vec<ExtraWords> {
+    physical_words(data, frame_index, jxl_frame::header::Encoding::Modular)
+}
+
+fn physical_words(
+    data: &[u8],
+    frame_index: usize,
+    encoding: jxl_frame::header::Encoding,
+) -> Vec<ExtraWords> {
     let image = jxl_oxide::JxlImage::read_with_defaults(data).unwrap();
     let frame = image.frame(frame_index).unwrap();
     let header = frame.header();
-    assert_eq!(header.encoding, jxl_frame::header::Encoding::VarDct);
+    assert_eq!(header.encoding, encoding);
     assert_eq!(header.jpeg_upsampling, [0; 3]);
     let lf = frame.try_parse_lf_global::<i32>().unwrap().unwrap();
     assert!(!lf.gmodular.is_partial());
@@ -44,30 +58,36 @@ pub fn vardct_extra_words(data: &[u8], frame_index: usize) -> Vec<ExtraWords> {
         })
         .collect();
     assert!(lf_images.next().is_none());
-    let hf = frame.try_parse_hf_global(Some(&lf)).unwrap().unwrap();
-    let mut coefficients: Vec<[AlignedGrid<i32>; 3]> = (0..header.num_groups())
-        .map(|group| {
-            let (width, height) = header.group_size_for(group);
-            std::array::from_fn(|_| {
-                AlignedGrid::with_alloc_tracker(
-                    width.div_ceil(8) as usize * 8,
-                    height.div_ceil(8) as usize * 8,
-                    None,
-                )
-                .unwrap()
+    let hf = (encoding == jxl_frame::header::Encoding::VarDct)
+        .then(|| frame.try_parse_hf_global(Some(&lf)).unwrap().unwrap());
+    let mut coefficients: Vec<[AlignedGrid<i32>; 3]> =
+        (0..if hf.is_some() { header.num_groups() } else { 0 })
+            .map(|group| {
+                let (width, height) = header.group_size_for(group);
+                std::array::from_fn(|_| {
+                    AlignedGrid::with_alloc_tracker(
+                        width.div_ceil(8) as usize * 8,
+                        height.div_ceil(8) as usize * 8,
+                        None,
+                    )
+                    .unwrap()
+                })
             })
-        })
-        .collect();
+            .collect();
     for (pass, images) in groups.pass_groups.into_iter().enumerate() {
         let mut images = images.into_iter();
         for group in 0..header.num_groups() {
-            let mut input = frame
-                .pass_group_bitstream(pass as u32, group)
-                .unwrap()
-                .unwrap();
+            let modular_image = images.next();
+            let Some(input) = frame.pass_group_bitstream(pass as u32, group) else {
+                assert_eq!(encoding, jxl_frame::header::Encoding::Modular);
+                assert!(modular_image.is_none(), "missing physical Modular stream");
+                continue;
+            };
+            let mut input = input.unwrap();
             assert!(!input.partial);
-            let [x, y, b] = &mut coefficients[group as usize];
-            let mut output = [x.as_subgrid_mut(), y.as_subgrid_mut(), b.as_subgrid_mut()];
+            let mut output = coefficients
+                .get_mut(group as usize)
+                .map(|[x, y, b]| [x.as_subgrid_mut(), y.as_subgrid_mut(), b.as_subgrid_mut()]);
             decode_pass_group(
                 &mut input.bitstream,
                 PassGroupParams {
@@ -76,11 +96,13 @@ pub fn vardct_extra_words(data: &[u8], frame_index: usize) -> Vec<ExtraWords> {
                     pass_idx: pass as u32,
                     group_idx: group,
                     global_ma_config: lf.gmodular.ma_config(),
-                    modular: images.next(),
-                    vardct: Some(PassGroupParamsVardct {
-                        lf_vardct: lf.vardct.as_ref().unwrap(),
-                        hf_global: &hf,
-                        hf_coeff_output: &mut output,
+                    modular: modular_image,
+                    vardct: hf.as_ref().zip(output.as_mut()).map(|(hf, output)| {
+                        PassGroupParamsVardct {
+                            lf_vardct: lf.vardct.as_ref().unwrap(),
+                            hf_global: hf,
+                            hf_coeff_output: output,
+                        }
                     }),
                     allow_partial: false,
                     tracker: None,

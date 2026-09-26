@@ -84,8 +84,8 @@ assembly keep their existing byte-accounted owners.
   already multiplied by alpha. The default is `Unassociated`. This image-wide declaration applies
   to stills and every animation frame; encoding never multiplies, divides or discards source
   values, including invisible color at zero alpha. Associated input without an alpha channel is
-  rejected before GPU admission. Independent alpha precision and additional extra channels remain
-  unsupported.
+  rejected before GPU admission. Independently declared alpha and other scalar inputs use the
+  [shared extra-channel contract](#independent-modular-and-mixed-input).
 - `Defined` full-range RGB/Gray accepts BT.709, BT.2020, Display-P3 and nonsingular custom RGB
   geometry, with D65, E, DCI or custom white. Linear, sRGB (including the Sycc alias), BT.709,
   PQ, HLG, DCI and Gamma transfer declarations are serialized without changing samples.
@@ -129,6 +129,9 @@ assembly keep their existing byte-accounted owners.
   `with_channels(begin, count)` selects a nonempty contiguous range in that post-Palette image
   topology, excluding the meta table. For example, Palette on RGBA components 1–2 leaves image
   channels `[component 0, index, component 3]`; Squeeze range `(1, 1)` selects only the index.
+  Independent scalar inputs follow those channels within each color stream; scalar LF streams
+  retain their own topology. Named ranges support the full input count and lower to bounded
+  wire steps in the checked transform plan.
   Unselected channels retain their dimensions and samples. Invalid ranges return
   `EncodeError::InvalidModularSqueezeChannels` before GPU admission, including on one-pixel groups.
   `with_in_place(true)` places residuals immediately after each step's selected range; the default
@@ -455,7 +458,7 @@ compositions against independent native/Rust decoders, with retained output and 
 The [embedded-ICC matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-embedded-icc)
 checks independent original-profile bytes and source words, requested color output, private tags,
 all intents, animation identity, size limits and shared-budget lifetime.
-Independent extra-channel declarations, CMYK, YUV and textures remain outside this profile.
+Independent scalar declarations use the plan described below. CMYK, YUV and textures remain outside this profile.
 The [group-size matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-group-sizes) covers every
 size with shared/local trees, integer/IEEE source words, LF boundaries, full tiles, cropped and
 Replace animations, bounded GPU output and admission/cancellation. The default 256 configuration
@@ -493,7 +496,40 @@ checks every contiguous range in the four input formats with all four policies, 
 unselected components, every integer/IEEE precision, RCT/Squeeze composition, relative implicit
 entries, animation, invalid ranges, overflow and resident/streamed lifetime.
 
+### Independent Modular and mixed input
+
+`LosslessModularConfig::extra_channels` declares independently supplied scalar planes using the
+same `ExtraChannel` types as VarDCT. Attach buffers with `BufferImageSource::with_extra_channels`
+in declaration order; any packed GrayAlpha/RGBA alpha remains first in the image header and blend
+indices. The resolved total is at most 256 extras. Each independent source has its own 1–31-bit
+integer or legal floating precision, packing, byte order and intrinsic shift 0–3. Raw floating
+representations, including NaN payloads and signed zero, remain exact. A scalar declaration does
+not convert the color input into CMYK.
+
+`max_extra_channel_metadata_bytes` defaults to 1 MiB. Each name plus 32 bytes of bounded declaration
+metadata, including packed alpha, counts against that limit. The complete encoder's memory query
+also reports `extra_channel_metadata_bytes` for the actual image-header reservation; ICC already
+owns the whole header and is not charged twice. Source exposure counts unions across aliased
+buffers. Input handles, parameter records and arenas stay owned through GPU completion or cancellation.
+
+The common frame sampling plan checks each supplied grid against its displayed crop and requested
+factor. The transform plan resolves the Global/LF/Pass stream, input windows, channel order and
+local operations before admission. Independent words load on GPU into disjoint arena spans before
+local transforms/tokenization. Color streams retain source RCT, component-selected Palette,
+separable/ordered Squeeze and ordered RCT; ranges address the current image-channel list including
+its independent pass/global inputs. LF-only scalar streams retain their declared topology with
+the same prediction/entropy policy. Global Palette/Squeeze and arbitrary transform placement remain
+unimplemented. Both Prefix/ANS and shared/local MA trees use the same plan in resident and streamed
+execution, without CPU pixel conversion or another queue submission per input.
+
+`MixedModeConfig::vardct` owns the sequence's image-wide scalar declarations. They are shared with
+the Modular backend; an explicitly different nonempty Modular declaration is rejected. Color
+sampling, crops, reference slots, independent blends and packed alpha keep the common frame
+contract. [Conformance and native-oracle limits](../../docs/CONFORMANCE_CORPUS.md#independent-modular-and-mixed-input)
+cover physical words, composition, fragmented GPU decoding, admission and cancellation.
+
 ## Experimental VarDCT profile
+
 
 
 
@@ -641,7 +677,7 @@ without consuming frame finality. [Sampling evidence and oracle limits](../../do
 cover factors through 64, exact coded words, interpolation, references and ownership.
 [Color sampling coverage](../../docs/CONFORMANCE_CORPUS.md#per-frame-color-and-relative-extra-sampling)
 adds both codecs, all VarDCT topologies, mixed references, odd/thin group boundaries and
-immutable progressive output. Independent Modular/mixed extras remain unsupported.
+immutable progressive output. [Modular and mixed extras](#independent-modular-and-mixed-input) use the same sampling contract.
 
 `VarDctMemoryPlan::extra_channels` includes every scalar plane, while `alpha` is the overlapping
 packed-alpha breakdown (`VarDctAlphaMemoryPlan` remains a compatibility alias). Aggregate readback
@@ -655,8 +691,7 @@ Fixed-VarDCT sequences retain these declarations across frames. Supply either an
 selects an existing extra index 0–10 for Blend/MultiplyAdd; other modes require zero. Each plane
 retains its own reference slot and clamp contract. [Conformance evidence](../../docs/CONFORMANCE_CORPUS.md#independent-vardct-extra-input)
 covers exact words, shifted progressive streams, native/GPU composition and ownership.
-Independent extras for complete Modular or mixed-codec encoding remain unsupported and are
-explicitly rejected. CMYK input, NonOptional/unknown semantics and per-extra lossy encoding are
+Modular and mixed sequences share this scalar input contract. CMYK input, NonOptional/unknown semantics and per-extra lossy encoding are
 not introduced by the Black/Optional scalar declarations.
 
 The logical input API is `ColorSampleFormat` and `ImageSequenceDescriptor`; these replace
@@ -1097,7 +1132,7 @@ quantization, matrices/orders and AC passes. Single transforms and maps retain t
 extent on each frame; tiled DCT8 accepts separately checked crop extents through its 16K axis
 bound. Both support all five blend modes with alpha, signed crops, hidden zero-duration regular frames
 and four post-color-transform references. Alpha has an independent blend/reference field.
-Pre-color-transform reference storage remains unsupported. Fixed-VarDCT sequences accept the independent extra-channel declarations described above; mixed sequences currently accept packed alpha only. Mixed Modular/VarDCT sessions use
+Pre-color-transform reference storage remains unsupported. Fixed-VarDCT sequences accept the independent extra-channel declarations described above; mixed sequences share them, including packed alpha followed by independent sources. Mixed Modular/VarDCT sessions use
 `MixedModeEncoder`. These sessions also support the independent preview described below.
 
 `ImageOptions::orientation` selects any of the eight `jxl_gpu_protocol::OutputOrientation`

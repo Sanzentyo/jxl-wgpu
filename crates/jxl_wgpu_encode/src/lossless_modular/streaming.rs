@@ -296,6 +296,17 @@ fn submit_streaming_batch(
     for upload in uploads {
         upload.record(&mut commands, &buffers.parameters, &buffers.artifact);
     }
+    plan.record_inputs(
+        super::upload::InputUploadContext {
+            context,
+            pipeline,
+            source,
+            parameters: &buffers.parameters,
+            artifact: &buffers.artifact,
+        },
+        batch,
+        &mut commands,
+    );
     {
         let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("jxl-wgpu streamed lossless modular tokenization"),
@@ -333,6 +344,14 @@ fn submit_streaming_batch(
     let lifetime = Arc::new(EncodeJobLifetime {
         buffer_lease,
         _memory_permit: memory_permit,
+        _source_buffers: std::iter::once(Arc::clone(&source.buffer))
+            .chain(
+                source
+                    .extra_channels()
+                    .iter()
+                    .map(|input| Arc::clone(&input.buffer)),
+            )
+            .collect(),
         mapped: AtomicBool::new(false),
     });
     let callback_lifetime = Arc::clone(&lifetime);
@@ -722,6 +741,8 @@ pub(super) struct ResidentLosslessModularJob {
 pub(super) struct EncodeJobLifetime {
     pub(super) buffer_lease: crate::buffer_pool::EncoderBufferLease,
     pub(super) _memory_permit: MemoryPermit,
+    // Mapping completion, including cancellation, owns all externally supplied GPU buffers.
+    pub(super) _source_buffers: Vec<Arc<wgpu::Buffer>>,
     pub(super) mapped: AtomicBool,
 }
 

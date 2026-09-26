@@ -169,7 +169,11 @@ impl ImageHeaderPlan {
         // Mixed sequences must retain that same image-wide working-buffer contract.
         let modular_16_bit = matches!(coding, ImageCoding::Modular)
             && samples.color.exponent_bits() == 0
-            && samples.color.bits_per_sample() <= 14;
+            && samples.color.bits_per_sample() <= 14
+            && samples.extra_channels.iter().all(|extra| {
+                let precision = extra.precision().color(crate::ColorChannels::Gray);
+                precision.exponent_bits() == 0 && precision.bits_per_sample() <= 14
+            });
         output.write_bits(u64::from(modular_16_bit), 1)?;
         samples.write_extra_channels(&mut output)?;
         output.write_bits(

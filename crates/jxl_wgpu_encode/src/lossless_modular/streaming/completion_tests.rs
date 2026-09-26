@@ -32,6 +32,7 @@ fn map_notification_releases_callback_ownership_before_waking_the_consumer() {
             let readback = Arc::clone(&lease.buffers().readback);
             let lifetime = Arc::new(EncodeJobLifetime {
                 buffer_lease: lease,
+                _source_buffers: Vec::new(),
                 _memory_permit: context.memory_budget().try_reserve(BYTES).unwrap(),
                 mapped: AtomicBool::new(false),
             });

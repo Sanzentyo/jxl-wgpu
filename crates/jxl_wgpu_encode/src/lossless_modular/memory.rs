@@ -59,6 +59,9 @@ pub struct LosslessModularMemoryPlan {
     /// Shared-budget reservation for the ICC image header and a temporary assembly copy.
     /// Included in `owned_bytes_per_job` for the complete encoder; the frame backend sets zero.
     pub icc_storage_bytes: u64,
+    /// Variable extra-channel image metadata, included in owned bytes for the complete
+    /// encoder. Zero in frame backends, or when ICC already accounts for the whole header.
+    pub extra_channel_metadata_bytes: u64,
     pub owned_bytes_per_job: u64,
     pub addressed_bytes_per_job: u64,
 }

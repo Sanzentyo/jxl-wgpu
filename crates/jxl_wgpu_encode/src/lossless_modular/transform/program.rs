@@ -29,6 +29,14 @@ const _: () = {
 pub(in crate::lossless_modular) struct TransformProgram {
     pub(in crate::lossless_modular) jobs: Vec<TransformJob>,
     pub(in crate::lossless_modular) arena_words: u32,
+    pub(in crate::lossless_modular) inputs: Vec<InputLoad>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(in crate::lossless_modular) struct InputLoad {
+    pub source: usize,
+    pub extent: [u32; 2],
+    pub offset: u32,
 }
 
 impl TransformProgram {
@@ -37,7 +45,7 @@ impl TransformProgram {
         meta: usize,
         steps: &[LosslessModularSqueezeStep],
     ) -> Result<(Self, Vec<SqueezeStep>), EncodeError> {
-        let mut builder = Builder::default();
+        let mut builder = Builder::with_inputs(channels)?;
         let wire = steps
             .iter()
             .enumerate()
@@ -51,7 +59,7 @@ impl TransformProgram {
         meta: usize,
         operations: &[LosslessModularTransform],
     ) -> Result<(Self, Vec<TransformOperation>), EncodeError> {
-        let mut builder = Builder::default();
+        let mut builder = Builder::with_inputs(channels)?;
         let mut wire = Vec::with_capacity(operations.len());
         for (index, operation) in operations.iter().enumerate() {
             wire.push(match *operation {
@@ -69,6 +77,56 @@ impl TransformProgram {
                     index,
                 )?),
             });
+        }
+        Ok((builder.finish(), wire))
+    }
+
+    /// Heterogeneous source grids use the same arena program as explicit steps. Selection
+    /// follows lineages, skips one-pixel axes and splits wire parameters at their count bound.
+    pub(super) fn named(
+        channels: &mut Vec<PlannedChannel>,
+        meta: usize,
+        axes: super::SqueezeAxes,
+        in_place: bool,
+    ) -> Result<(Self, Vec<SqueezeStep>), EncodeError> {
+        let mut builder = Builder::with_inputs(channels)?;
+        let mut wire = Vec::new();
+        for stage in 0..axes.stages() {
+            let horizontal = axes.first_horizontal() ^ (stage != 0);
+            let axis = usize::from(!horizontal);
+            let mut ranges = Vec::new();
+            let mut cursor = meta;
+            while cursor < channels.len() {
+                if channels[cursor].squeeze == super::SqueezeAxes::None
+                    || channels[cursor].extent[axis] <= 1
+                {
+                    cursor += 1;
+                    continue;
+                }
+                let begin = cursor;
+                while cursor < channels.len()
+                    && cursor - begin < 19
+                    && channels[cursor].squeeze != super::SqueezeAxes::None
+                    && channels[cursor].extent[axis] > 1
+                {
+                    cursor += 1;
+                }
+                ranges.push(begin..cursor);
+            }
+            let mut inserted = 0;
+            for range in ranges {
+                let count = range.len();
+                let step = LosslessModularSqueezeStep::new(
+                    horizontal,
+                    (range.start + inserted - meta) as u32,
+                    count as u32,
+                    in_place,
+                )?;
+                wire.push(builder.squeeze(channels, meta, step, wire.len())?);
+                if in_place {
+                    inserted += count;
+                }
+            }
         }
         Ok((builder.finish(), wire))
     }
@@ -91,13 +149,35 @@ impl TransformProgram {
 struct Builder {
     arena: Arena,
     jobs: Vec<TransformJob>,
+    inputs: Vec<InputLoad>,
 }
 
 impl Builder {
+    fn with_inputs(channels: &mut [PlannedChannel]) -> Result<Self, EncodeError> {
+        let mut builder = Self::default();
+        // Reserve every input before any job may reuse a retired span. All loads precede
+        // execution, so a later input must never overwrite an earlier job's live output.
+        for channel in channels {
+            if let SampleSource::Independent(source) = channel.source {
+                let offset = builder
+                    .arena
+                    .allocate(channel.extent[0] * channel.extent[1])?;
+                builder.inputs.push(InputLoad {
+                    source,
+                    extent: channel.extent,
+                    offset,
+                });
+                channel.source = SampleSource::Arena(offset);
+            }
+        }
+        Ok(builder)
+    }
+
     fn finish(self) -> TransformProgram {
         TransformProgram {
             jobs: self.jobs,
             arena_words: self.arena.high_water,
+            inputs: self.inputs,
         }
     }
 

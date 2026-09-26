@@ -37,6 +37,7 @@ fn implicit_cubes_cover_every_interoperable_depth_and_component_count() {
                     } else {
                         Lz77::Greedy
                     },
+                    ..Default::default()
                 },
             );
             let case = case(format, bits, kind);
@@ -183,6 +184,7 @@ fn implicit_policy_composes_rct_all_predictors_squeeze_and_ieee_special_words() 
                 } else {
                     Lz77::Greedy
                 },
+                ..Default::default()
             },
         );
         let mut case = case(
@@ -343,6 +345,7 @@ fn implicit_palette_hash_obeys_exact_admission_cancellation_and_pool_reuse() {
                     .unwrap(),
                 lz77: Lz77::Greedy,
                 color_transform: Transform::LocalRct(Rct::new(41).unwrap()),
+                ..Default::default()
             },
             delta::check_frame_oracles,
         );

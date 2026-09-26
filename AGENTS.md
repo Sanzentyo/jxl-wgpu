@@ -42,6 +42,14 @@ the [encoder planning direction](docs/ENCODER_ARCHITECTURE.md#modular-transform-
 
 ## Completion
 
+Choose work units by a shared design boundary, rather than one small feature at a time.
+Complete closely related paths, shared planning, resource ownership, independent evidence,
+and documentation together within the authorized scope. Use focused checks during local
+iterations; run the applicable final gates once the coherent source is finalized, then
+complete the authorized commit/push and end the turn. Keep feature-specific scope and
+acceptance criteria in the roadmap and owning design/test documents. Do not bundle
+unrelated work merely to increase the change size.
+
 Carry the authorized change through implementation, documentation, and the
 [applicable checks](docs/DEVELOPMENT.md#validation-by-change), fixing regressions it
 introduces without seeking approval between local iterations. Run tests with exactly two

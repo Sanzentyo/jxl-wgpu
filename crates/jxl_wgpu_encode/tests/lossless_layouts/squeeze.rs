@@ -96,6 +96,7 @@ fn squeeze_composes_with_all_rcts_predictors_group_sizes_and_entropy_policies() 
             } else {
                 Lz77::Greedy
             },
+            ..Default::default()
         };
         let encoder = LosslessModularEncoder::with_config(rig.context.clone(), config);
         let extent = Extent2d::new(group_size.dimension() + 1, 5);
