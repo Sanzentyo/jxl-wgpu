@@ -39,13 +39,24 @@ own quantization/progression checks. Codec-specific headers supply coding mode, 
 and pass layout; the common plan supplies the wire kind, field presence, suffix and disabled restoration.
 The stream serializers also share one checked animation-timebase writer.
 
-`ImageOptions` owns orientation, rendering intent and image white. The common `ImageHeaderPlan`
-now writes dimensions, orientation, timebase, precision, extra declarations, color and tone fields
-for Modular, VarDCT and mixed output; Modular no longer has a parallel image-header serializer.
+`ImageOptions` owns orientation, rendering intent, intrinsic display size and source luminance.
+The common `ImageHeaderPlan` writes dimensions, orientation, timebase, precision, extra declarations,
+color and tone fields for Modular, VarDCT and mixed output; Modular no longer has a parallel image-header serializer.
 The explicit coding domain preserves Modular's eligible 16-bit working-buffer declaration and
 VarDCT/mixed i32 buffers. Orientation does not reinterpret source geometry, crops or references:
 it is applied after reconstruction/composition, or retained under decoder `Keep` policy.
 It can require the image's extra-fields bundle without requiring non-default tone metadata.
+
+One checked `ImageSize` owns the SizeHeader grammar for both canvas and intrinsic dimensions,
+including explicit width and integer-derived aspect ratios. Canvas construction and Modular grid
+planning retain their existing narrower coordinate bound; `IntrinsicSize` can use the full grammar
+without authorizing pixel storage. The decoder keeps that hint only on the main image.
+`ImageOptions::validate` checks exact binary16 intensity/minimum bounds and protected-light units
+before admission in every encoder. `ToneMappingThreshold` distinguishes absolute nits from a
+display fraction; the image writer serializes those units once. These are declarations, separate
+from GPU tone-mapping output policy and validated codec results. Minimum/protected light and the
+intrinsic hint change neither source addressing nor GPU resource plans. Default fields retain
+their previous bytes. [Contract and evidence](CONFORMANCE_CORPUS.md#encoder-intrinsic-size-and-tone-metadata).
 
 `PreviewSize` validates the independent preview axes before image-header construction. Both
 sequence descriptors feed that declaration to the same `ImageHeaderPlan` and `PreviewState`.

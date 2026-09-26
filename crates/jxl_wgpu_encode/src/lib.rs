@@ -63,6 +63,7 @@ mod frame_header;
 mod gpu;
 mod image_options;
 mod image_sequence;
+mod image_size;
 mod lossless_modular;
 mod mixed_encoder;
 mod name;
@@ -90,8 +91,9 @@ pub use gpu::{
     BufferImageSource, GpuEncodeBackend, GpuEncodeJob, GpuEncoder, GpuFrameSource,
     TextureImageSource, WgpuContext,
 };
-pub use image_options::ImageOptions;
+pub use image_options::{ImageOptions, ToneMappingThreshold};
 pub use image_sequence::ImageSequenceDescriptor;
+pub use image_size::IntrinsicSize;
 pub use jxl_gpu_bitstream::FiniteF16;
 pub use lossless_modular::{
     AlphaAssociation, LOSSLESS_MODULAR_GROUP_DIMENSION, LosslessModularAnimationDescriptor,

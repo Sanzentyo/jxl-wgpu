@@ -10,6 +10,9 @@ fn bounded_metadata_keeps_gpu_admission_retry_and_cancellation_contracts() {
             color_transform: VarDctColorTransform::Original,
             image_options: ImageOptions {
                 orientation: OutputOrientation::from_exif_value(6).unwrap(),
+                intrinsic_size: Some(IntrinsicSize::new(1 << 31, 1 << 30).unwrap()),
+                min_nits: display::half(0x2c00),
+                linear_below: ToneMappingThreshold::DisplayFraction(display::half(0x3000)),
                 ..Default::default()
             },
             ..Default::default()

@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn mixed_preview_keeps_animation_timebase_separate_from_main_frames_and_index() {
     let rig = Rig::new();
+    let native = jxl_test_support::oracles::icc_profile::IccProfileOracle::compile();
     let main = Extent2d::new(33, 19);
     let preview = PreviewSize::new(17, 11).unwrap();
     let animation = AnimationHeader::Animation {
@@ -24,6 +25,11 @@ fn mixed_preview_keeps_animation_timebase_separate_from_main_frames_and_index() 
                     alpha: Some(AlphaAssociation::Associated),
                     image_options: ImageOptions {
                         orientation,
+                        intrinsic_size: Some(IntrinsicSize::new(1 << 31, 1 << 30).unwrap()),
+                        min_nits: jxl_gpu_bitstream::FiniteF16::from_bits(0x2c00).unwrap(),
+                        linear_below: ToneMappingThreshold::DisplayFraction(
+                            jxl_gpu_bitstream::FiniteF16::from_bits(0x3000).unwrap(),
+                        ),
                         ..Default::default()
                     },
                     progressive: progression(),
@@ -114,6 +120,26 @@ fn mixed_preview_keeps_animation_timebase_separate_from_main_frames_and_index() 
             inventory.frames[1].header_bits.offset / 8
         );
         let selected = inventory.select_image(ImageSelection::Main).unwrap();
+        let metadata = native.image_info(&bytes);
+        assert_eq!(metadata.intrinsic_size, (1 << 31, 1 << 30));
+        assert_eq!(
+            metadata.preview,
+            Some((preview.extent().width, preview.extent().height))
+        );
+        assert!(metadata.animation && metadata.relative_to_max_display);
+        assert_eq!(metadata.min_nits, 0.0625);
+        assert_eq!(metadata.linear_below, 0.125);
+        assert_eq!(
+            selected.image_header.intrinsic_size,
+            Some(metadata.intrinsic_size)
+        );
+        let selected_preview = inventory.select_image(ImageSelection::Preview).unwrap();
+        assert_eq!(selected_preview.image_header.intrinsic_size, None);
+        assert_eq!(selected_preview.image_header.animation, None);
+        assert_eq!(
+            selected_preview.image_header.tone_mapping,
+            selected.image_header.tone_mapping
+        );
         assert_eq!(selected.frames, inventory.frames[1..]);
         assert_eq!(selected.frames[0].frame_index, 1);
         let request = GpuOutputRequest::color(PixelFormat::rgb_f32(

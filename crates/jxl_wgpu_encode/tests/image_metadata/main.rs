@@ -1,8 +1,10 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 mod admission;
+mod display;
 mod sequences;
 mod stills;
+mod tone;
 
 use std::num::{NonZeroU8, NonZeroU64};
 use std::sync::Arc;

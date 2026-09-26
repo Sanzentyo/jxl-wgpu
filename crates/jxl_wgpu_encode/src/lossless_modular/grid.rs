@@ -21,11 +21,7 @@ impl LosslessModularGroupGrid {
         height: u32,
         group_size: LosslessModularGroupSize,
     ) -> Result<Self, EncodeError> {
-        if width == 0 || height == 0 || width >= (1 << 30) || height >= (1 << 30) {
-            return Err(EncodeError::InvalidConfiguration(
-                "Modular dimensions must be in 1..2^30",
-            ));
-        }
+        crate::image_size::ImageSize::canvas(width, height)?;
         let dimension = group_size.dimension();
         let columns = width.div_ceil(dimension);
         let rows = height.div_ceil(dimension);

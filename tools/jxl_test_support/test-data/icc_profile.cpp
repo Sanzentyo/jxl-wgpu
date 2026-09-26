@@ -1,4 +1,4 @@
-// Development-only original ICC oracle, using the public libjxl 0.12.0 API.
+// Development-only original ICC and image metadata oracle, using public libjxl 0.12.0.
 // No production library compiles or links this executable.
 #include <jxl/decode.h>
 #include <jxl/encode.h>
@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -18,9 +19,16 @@ static void check(bool ok, const char* message) {
 static void word(uint32_t value) {
   for (unsigned i = 0; i < 4; ++i) check(std::fputc((value >> (8*i)) & 255, stdout) != EOF, "write");
 }
+static void real(float value) {
+  uint32_t bits;
+  static_assert(sizeof(bits) == sizeof(value));
+  std::memcpy(&bits, &value, sizeof(bits));
+  word(bits);
+}
 int main(int argc, char** argv) {
   check(JxlDecoderVersion() == 12000, "libjxl 0.12.0 required");
-  check(argc >= 2, "read/create");
+  check(argc >= 2, "read/read-info/create");
+  const bool info_only = std::string(argv[1]) == "read-info";
   std::vector<uint8_t> input;
   if (std::string(argv[1]) == "create") {
     int space, white, primaries, transfer, intent;
@@ -58,7 +66,7 @@ int main(int argc, char** argv) {
     check(JxlEncoderProcessOutput(enc.get(), &next, &available) == JXL_ENC_SUCCESS, "encode");
     input.resize(input.size() - available);
   } else {
-    check(std::string(argv[1]) == "read" && argc == 3, "read path");
+    check((std::string(argv[1]) == "read" || info_only) && argc == 3, "read path");
     std::ifstream file(argv[2], std::ios::binary | std::ios::ate);
     check(bool(file) && file.tellg() > 0 && file.tellg() <= (64 << 20), "input size");
     input.resize(static_cast<size_t>(file.tellg()));
@@ -67,10 +75,25 @@ int main(int argc, char** argv) {
   }
   std::unique_ptr<JxlDecoder, decltype(&JxlDecoderDestroy)> dec(JxlDecoderCreate(nullptr), JxlDecoderDestroy);
   check(bool(dec), "decoder");
-  check(JxlDecoderSubscribeEvents(dec.get(), JXL_DEC_COLOR_ENCODING) == JXL_DEC_SUCCESS, "subscribe");
+  const auto event = info_only ? JXL_DEC_BASIC_INFO : JXL_DEC_COLOR_ENCODING;
+  check(JxlDecoderSetKeepOrientation(dec.get(), JXL_TRUE) == JXL_DEC_SUCCESS, "keep orientation");
+  check(JxlDecoderSubscribeEvents(dec.get(), event) == JXL_DEC_SUCCESS, "subscribe");
   check(JxlDecoderSetInput(dec.get(), input.data(), input.size()) == JXL_DEC_SUCCESS, "input");
   JxlDecoderCloseInput(dec.get());
-  check(JxlDecoderProcessInput(dec.get()) == JXL_DEC_COLOR_ENCODING, "color event");
+  check(JxlDecoderProcessInput(dec.get()) == event, "metadata event");
+  if (info_only) {
+    JxlBasicInfo info{};
+    check(JxlDecoderGetBasicInfo(dec.get(), &info) == JXL_DEC_SUCCESS, "basic info");
+    word(JxlDecoderVersion());
+    word(info.xsize); word(info.ysize); word(info.orientation);
+    word(info.intrinsic_xsize); word(info.intrinsic_ysize);
+    real(info.intensity_target); real(info.min_nits);
+    word(info.relative_to_max_display); real(info.linear_below);
+    word(info.have_preview); word(info.preview.xsize); word(info.preview.ysize);
+    word(info.have_animation);
+    check(std::fflush(stdout) == 0, "flush");
+    return 0;
+  }
   size_t size = 0;
   check(JxlDecoderGetICCProfileSize(dec.get(), JXL_COLOR_PROFILE_TARGET_ORIGINAL, &size) == JXL_DEC_SUCCESS && size <= (16 << 20), "profile size");
   std::vector<uint8_t> profile(size);

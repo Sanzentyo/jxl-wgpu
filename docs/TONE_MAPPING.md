@@ -8,6 +8,12 @@ finite `0 <= black <= white` and positive white. The default request performs it
 conversion without this mapping. Numeric channels, private reference surfaces, and native samples
 with Default/Undefined color specifications retain their original domain.
 
+Encoders declare these source fields through the common
+[`ImageOptions`](../crates/jxl_wgpu_encode/README.md#image-presentation-metadata). Exact binary16
+minimum light must lie between zero and positive image intensity. `ToneMappingThreshold`
+distinguishes nonnegative absolute nits from a display fraction in `0..=1`. Encoding those fields
+does not apply a display curve; the output request below remains explicit.
+
 ```rust
 use jxl_gpu_protocol::LuminanceRange;
 use jxl_wgpu_decode::{GpuOutputRequest, vardct_rgb8_format};

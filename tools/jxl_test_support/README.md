@@ -27,6 +27,10 @@ creates tiny color-declaration inputs; the public decoder exports `JXL_COLOR_PRO
 at its color event without requesting pixel decode. Tests compare every profile byte, including
 the ICC ID, against the production metadata writer and unchanged official inputs. Missing tools,
 version mismatches or native failure fail the test. No production dependency links this oracle.
+Its `image_info` method uses `JXL_DEC_BASIC_INFO`/`JxlDecoderGetBasicInfo` with orientation kept
+to read canvas, intrinsic size, preview/animation presence and all four tone fields independently.
+The fixed-size response retains exact F32 bits and runtime version identity; it never requests
+pixel decoding or allocates according to an intrinsic display hint.
 
 `oracles::frame_index` compiles [`test-data/frame_index.cpp`](test-data/frame_index.cpp) against
 the public libjxl 0.12.0 encoder, requiring build/runtime identity. Tiny still and dense/sparse

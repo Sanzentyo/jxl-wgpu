@@ -1,4 +1,4 @@
-//! Public libjxl original-profile export and native metadata-only test-input generation.
+//! Public libjxl original-profile/image metadata inspection and metadata-only input generation.
 use std::{
     fs,
     io::Write,
@@ -13,6 +13,18 @@ pub struct IccProfileOracle {
 pub struct NativeIccProfile {
     pub input: Vec<u8>,
     pub profile: Vec<u8>,
+}
+#[derive(Debug)]
+pub struct NativeImageInfo {
+    pub size: (u32, u32),
+    pub orientation: u32,
+    pub intrinsic_size: (u32, u32),
+    pub intensity_target: f32,
+    pub min_nits: f32,
+    pub relative_to_max_display: bool,
+    pub linear_below: f32,
+    pub preview: Option<(u32, u32)>,
+    pub animation: bool,
 }
 fn checked(command: &mut Command) -> Output {
     let output = command
@@ -80,6 +92,34 @@ impl IccProfileOracle {
         let path = self.directory.join("input.jxl");
         fs::write(&path, input).unwrap();
         decode(checked(Command::new(&self.executable).arg("read").arg(path)).stdout)
+    }
+    /// Raw image declarations with orientation kept; no decoding, resampling or tone mapping.
+    pub fn image_info(&self, input: &[u8]) -> NativeImageInfo {
+        let path = self.directory.join("input.jxl");
+        fs::write(&path, input).unwrap();
+        let bytes = checked(Command::new(&self.executable).arg("read-info").arg(path)).stdout;
+        assert_eq!(bytes.len(), 14 * 4);
+        let words = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
+            .collect::<Vec<_>>();
+        assert_eq!(words[0], 12000);
+        for i in [8, 10, 13] {
+            assert!(words[i] <= 1);
+        }
+        NativeImageInfo {
+            size: (words[1], words[2]),
+            orientation: words[3],
+            intrinsic_size: (words[4], words[5]),
+            intensity_target: f32::from_bits(words[6]),
+            min_nits: f32::from_bits(words[7]),
+            relative_to_max_display: words[8] != 0,
+            linear_below: f32::from_bits(words[9]),
+            preview: (words[10] != 0).then_some((words[11], words[12])),
+            animation: words[13] != 0,
+        }
     }
 }
 fn decode(bytes: Vec<u8>) -> NativeIccProfile {

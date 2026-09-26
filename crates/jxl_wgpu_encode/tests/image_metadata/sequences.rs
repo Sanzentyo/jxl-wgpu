@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn mixed_names_belong_to_physical_frames_and_orientation_follows_composition() {
     let rig = Rig::new();
+    let native = jxl_test_support::oracles::icc_profile::IccProfileOracle::compile();
     let canvas = Extent2d::new(33, 19);
     let animation = AnimationHeader::Animation {
         ticks_per_second_numerator: 1000.try_into().unwrap(),
@@ -12,6 +13,13 @@ fn mixed_names_belong_to_physical_frames_and_orientation_follows_composition() {
     };
     for value in 1..=8 {
         let orientation = OutputOrientation::from_exif_value(value).unwrap();
+        let image_options = ImageOptions {
+            orientation,
+            intrinsic_size: Some(IntrinsicSize::new(8193, 262145).unwrap()),
+            min_nits: display::half(0x2c00),
+            linear_below: ToneMappingThreshold::AbsoluteNits(display::half(0x4d00)),
+            ..Default::default()
+        };
         let encoder = MixedModeEncoder::new(
             rig.context.clone(),
             MixedModeConfig {
@@ -19,10 +27,7 @@ fn mixed_names_belong_to_physical_frames_and_orientation_follows_composition() {
                     color_transform: VarDctColorTransform::Original,
                     alpha: Some(AlphaAssociation::Unassociated),
                     progressive: progression(),
-                    image_options: ImageOptions {
-                        orientation,
-                        ..Default::default()
-                    },
+                    image_options,
                     ..Default::default()
                 },
                 modular: LosslessModularConfig {
@@ -111,6 +116,7 @@ fn mixed_names_belong_to_physical_frames_and_orientation_follows_composition() {
         }
         let bytes = session.finish_raw().unwrap();
         check_headers(&bytes, orientation, &names);
+        display::check_metadata(&bytes, &native, canvas, image_options);
         rig.check_output(&bytes, canvas, orientation, true);
         assert_eq!(rig.context.memory_stats().reserved_bytes, 0);
     }

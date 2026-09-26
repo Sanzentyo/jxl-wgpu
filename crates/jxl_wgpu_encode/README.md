@@ -15,6 +15,36 @@ Brotli-compressed metadata with explicit size, ratio and window limits; `as_cont
 feeds `FragmentedContainerWriter`. Existing payloads can be preserved or replaced independently
 of image encoding. [Metadata API and native interoperability](../../docs/CONTAINER_METADATA.md).
 
+## Image presentation metadata
+
+`ImageOptions` is shared by `LosslessModularEncoder::with_image_options` and
+`VarDctConfig::image_options`, including mixed sequences and embedded previews. It declares
+orientation, rendering intent, intrinsic display size and image luminance before GPU admission.
+Encoding does not apply tone mapping or resize source pixels. Source primaries, white point and
+transfer still come from `PixelFormat`; an ICC rendering intent must match its profile header.
+
+`IntrinsicSize::new(width, height)` supplies the main image's intended display dimensions before
+orientation. Both axes must be positive. Height and explicitly encoded width reach `2^30`
+inclusive; a wider width must equal a normative aspect-ratio derivation from height, with integer
+truncation, reaching at most `2^31`. The shared size writer checks representability. Actual canvas,
+crop, source and device limits stay separate and unchanged. Decoding retains the hint without
+resizing output; a selected preview has its own canvas and no intrinsic hint.
+
+Luminance uses exact `FiniteF16` values, without implicit rounding. `intensity_target` is positive
+and defaults to 255 cd/m². `min_nits` defaults to zero and must be in `0..=intensity_target`.
+`ToneMappingThreshold::AbsoluteNits` declares nonnegative protected light in cd/m²;
+`DisplayFraction` declares a fraction in `0..=1` of the requested display peak. The default is
+absolute zero. Invalid combinations return `EncodeError::InvalidConfiguration` before admission.
+These declarations do not enable tone mapping; the decoder applies that curve only with an
+explicit [tone-mapping request](../../docs/TONE_MAPPING.md).
+
+The common image header preserves explicit binary16 declarations, including signed zero, and
+uses the existing tone defaults when no custom field is needed. Intrinsic size, minimum light and
+protected-light metadata add no GPU allocation or submission and do not alter encoded image-data
+sections. Image white retains its existing role in HDR/XYB conversion. Header storage and final
+assembly keep their existing byte-accounted owners.
+[Independent header, pixel and lifetime evidence](../../docs/CONFORMANCE_CORPUS.md#encoder-intrinsic-size-and-tone-metadata).
+
 ## Lossless Modular profile
 
 - Extents are `1..2^30` on each axis, further bounded by the selected WebGPU device's storage
@@ -73,10 +103,10 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   profile streams must also fit JPEG XL's 256 MiB limits. Limit failures use `EncodeError::IccLimit`
   before variable-sized header allocation or GPU admission. CMYK and other device spaces remain
   unsupported.
-- `with_image_options(ImageOptions)` selects presentation orientation, all four ICC rendering intents and
-  a positive exact `FiniteF16` image white in cd/m². Defaults are Relative and 255 cd/m², also for
-  HDR; the caller explicitly selects another known source white. This declares metadata and
-  performs no tone mapping, primary conversion or alpha-association change. For ICC input, select
+- `with_image_options(ImageOptions)` selects the shared [presentation metadata](#image-presentation-metadata).
+  Defaults include Relative intent and 255 cd/m² image white, also for HDR; the caller explicitly
+  selects another known source white. It performs no primary conversion or alpha-association change.
+  For ICC input, select
   the intent from `profile.header().rendering_intent`; a conflict is rejected instead of modifying
   the profile. Image metadata is validated before GPU admission. GPU storage and submission counts
   are unchanged; variable-sized ICC headers use the shared byte budget described below.

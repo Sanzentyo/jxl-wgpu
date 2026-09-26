@@ -2241,8 +2241,49 @@ they do not add GPU allocations. All reservations return to zero.
 Rebuild the [native Modular word helper](../tools/jxl_test_support/README.md#native-modular-word-oracle)
 and run `cargo test --locked -p jxl_wgpu_encode --test image_metadata -- --test-threads=2`, then
 the [full capability gates](DEVELOPMENT.md#capability-change-gates). This adds explicit metadata
-declarations, not automatic source-metadata preservation or intrinsic-size encoding. Preview
-encoding has separate evidence below.
+declarations, not automatic source-metadata preservation. Intrinsic-size/tone metadata and preview
+encoding have separate evidence below.
+
+## Encoder intrinsic size and tone metadata
+
+`crates/jxl_wgpu_encode/tests/image_metadata` uses the same checked image options for Modular,
+single/mapped/tiled VarDCT and mixed sequences on Apple M5/Metal. Thirty-two new streams plus
+four default baselines cover all eight orientations, thin/partial groups, Original/XYB, every
+explicit intrinsic-size bucket boundary and the maximum derived width (`2^31` by `2^30`).
+Native public libjxl 0.12.0 basic info, the independent Rust header parser and production inventory
+agree on exact size and tone declarations. No image-sized allocation follows a display hint.
+Every image-data section and GPU memory estimate equals the corresponding default baseline;
+Modular original words remain exact. Whole and 256-byte fragmented output under Apply/Keep
+orientation retains the native `2e-4 * (1 + abs(reference))` bound, actual canvas dimensions,
+identical fragmented bytes and retained-output lifetime.
+
+Nine Gray streams exercise binary16 subnormal/normal endpoints, maximum finite intensity and
+absolute threshold, minimum equal to intensity, signed zero, and fractional thresholds zero,
+subnormal and one. All header readers preserve exact expanded bits. Exhaustive finite-binary16
+unit checks cover each light constraint. Independent Rust SizeHeader parsing covers all 64
+explicit bucket-boundary pairs plus 12 wide-ratio cases with integer truncation. Invalid sizes
+fail before construction; accepting a large hint does not extend executable canvas limits.
+
+Six new RGB F32+alpha streams cross Modular/Original VarDCT with unprotected, absolute and relative
+protected light at 1000-nit source white, 1/16-nit source black and a requested [1/32, 80]-nit
+display range. Dark/protected/shoulder/highlight samples are independently decoded by native
+libjxl and evaluated by the F64 BT.2408/E.3 oracle. The existing codec interval above propagates
+through luminance bounds with the unchanged `8e-5 * (1 + abs(expected))` arithmetic allowance.
+Whole/fragmented GPU output agrees exactly, alpha is exact and retained output survives session
+drop. This checks an explicit display policy, not native automatic display adaptation.
+
+The existing eight ICC and eight mixed-animation cases now carry intrinsic/tone declarations,
+retaining exact ICC export, crops/references, physical names and output comparisons. Both mixed
+preview-animation cases also retain their main-only hint, preview dimensions and separate timing;
+native basic info agrees and indexed seeks remain identical. Invalid light combinations fail in
+Modular, single/mapped/tiled VarDCT and mixed constructors without admitted bytes. Exact/one-byte-short
+budgets, byte-identical retry and cancellation/source release run with the largest intrinsic hint
+and non-default tone metadata. Reservations return to zero.
+
+Run `cargo test --locked -p jxl_wgpu_encode --test image_metadata --test preview -- --test-threads=2`
+with the pinned native oracles, then the [full capability gates](DEVELOPMENT.md#capability-change-gates).
+These are caller-supplied declarations. Automatic metadata preservation, intrinsic resampling,
+adaptive display policy, broader extreme-value pixel conformance and full JPEG XL remain open.
 
 ## Embedded preview encoding
 

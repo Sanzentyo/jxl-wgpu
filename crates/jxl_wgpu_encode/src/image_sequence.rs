@@ -85,30 +85,6 @@ impl ImageSequenceDescriptor {
     }
 }
 
-fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), EncodeError> {
-    if !(1..(1 << 30)).contains(&size) {
-        return Err(EncodeError::InvalidConfiguration(
-            "image dimensions must be in 1..2^30",
-        ));
-    }
-    let value = size - 1;
-    let (selector, bits) = if value < 1 << 9 {
-        (0, 9)
-    } else if value < 1 << 13 {
-        (1, 13)
-    } else if value < 1 << 18 {
-        (2, 18)
-    } else {
-        (3, 30)
-    };
-    output.write_bits(selector, 2)?;
-    output.write_bits(u64::from(value), bits)?;
-    if ratio {
-        output.write_bits(0, 3)?;
-    }
-    Ok(())
-}
-
 /// Checked geometry/timebase, bound to the backend's color plan when a sequence begins.
 /// Geometry and timebase are independent of the selected frame codecs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,9 +106,7 @@ impl ImageHeaderPlan {
         };
         let mut prefix = BitWriter::new();
         prefix.write_bits(0x0aff, 16)?;
-        prefix.write_bits(0, 1)?; // dimensions are not multiples of eight
-        write_size(&mut prefix, height, true)?;
-        write_size(&mut prefix, width, false)?;
+        crate::image_size::ImageSize::canvas(width, height)?.write(&mut prefix)?;
         let animation = if animation.is_animation() {
             let mut writer = BitWriter::new();
             write_animation_header(&mut writer, animation)?;
@@ -173,7 +147,10 @@ impl ImageHeaderPlan {
         output.write_bits(u64::from(extra_fields), 1)?;
         if extra_fields {
             output.write_bits(u64::from(options.orientation.to_exif_value() - 1), 3)?;
-            output.write_bits(0, 1)?; // no intrinsic size
+            output.write_bits(u64::from(options.intrinsic_size.is_some()), 1)?;
+            if let Some(intrinsic) = options.intrinsic_size {
+                intrinsic.write(&mut output)?;
+            }
             output.write_bits(u64::from(self.preview.is_some()), 1)?;
             if let Some(preview) = self.preview {
                 preview.write(&mut output)?;

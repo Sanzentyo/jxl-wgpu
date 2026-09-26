@@ -224,6 +224,9 @@ fn orientation_and_names_coexist_with_icc_and_tone_metadata() {
                 orientation: OutputOrientation::from_exif_value(value).unwrap(),
                 rendering_intent: profile.header().rendering_intent,
                 intensity_target: jxl_gpu_bitstream::FiniteF16::from_bits(intensity).unwrap(),
+                intrinsic_size: Some(IntrinsicSize::new(8193, 513).unwrap()),
+                min_nits: display::half(0x2c00),
+                linear_below: ToneMappingThreshold::DisplayFraction(display::half(0x3000)),
             };
             for modular in [true, false] {
                 let name = name(7);
@@ -319,6 +322,7 @@ fn orientation_and_names_coexist_with_icc_and_tone_metadata() {
                     native_profile.read(&bytes).profile,
                     profile.bytes().as_ref()
                 );
+                display::check_metadata(&bytes, &native_profile, extent, options);
                 assert_eq!(rig.context.memory_stats().reserved_bytes, 0);
             }
         }
