@@ -44,7 +44,7 @@ pub struct ExtraChannel {
     kind: ExtraChannelKind,
     precision: SamplePrecision,
     dimension_shift: u8,
-    name: Vec<u8>,
+    name: crate::CodestreamName,
 }
 
 impl ExtraChannel {
@@ -54,9 +54,9 @@ impl ExtraChannel {
         dimension_shift: u8,
         name: Vec<u8>,
     ) -> Result<Self, EncodeError> {
-        if dimension_shift > 3 || name.len() > 1071 || std::str::from_utf8(&name).is_err() {
+        if dimension_shift > 3 {
             return Err(EncodeError::InvalidConfiguration(
-                "extra channels require shifts 0..=3 and UTF-8 names of at most 1071 bytes",
+                "extra channels require shifts 0..=3",
             ));
         }
         if matches!(kind, ExtraChannelKind::Cfa { channel } if channel > 274) {
@@ -68,7 +68,7 @@ impl ExtraChannel {
             kind,
             precision,
             dimension_shift,
-            name,
+            name: crate::CodestreamName::new(name)?,
         })
     }
 
@@ -89,7 +89,7 @@ impl ExtraChannel {
 
     #[must_use]
     pub fn name(&self) -> &[u8] {
-        &self.name
+        self.name.as_str().as_bytes()
     }
 
     #[must_use]
@@ -113,7 +113,7 @@ impl ExtraChannel {
             kind: ExtraChannelKind::Alpha(association),
             precision,
             dimension_shift: 0,
-            name: Vec::new(),
+            name: crate::CodestreamName::default(),
         }
     }
 
@@ -123,7 +123,7 @@ impl ExtraChannel {
             && samples.bits_per_sample() == 8
             && samples.exponent_bits() == 0
             && self.dimension_shift == 0
-            && self.name.is_empty();
+            && self.name.as_str().is_empty();
         output.write_bits(u64::from(default), 1)?;
         if default {
             return Ok(());
@@ -159,25 +159,7 @@ impl ExtraChannel {
                 output.write_bits(u64::from(shift - 1), 3)?;
             }
         }
-        let length = self.name.len() as u64;
-        match length {
-            0 => output.write_bits(0, 2)?,
-            1..=15 => {
-                output.write_bits(1, 2)?;
-                output.write_bits(length, 4)?;
-            }
-            16..=47 => {
-                output.write_bits(2, 2)?;
-                output.write_bits(length - 16, 5)?;
-            }
-            _ => {
-                output.write_bits(3, 2)?;
-                output.write_bits(length - 48, 10)?;
-            }
-        }
-        for &byte in &self.name {
-            output.write_bits(u64::from(byte), 8)?;
-        }
+        self.name.write(output)?;
         match self.kind {
             ExtraChannelKind::Alpha(association) => {
                 output.write_bits(u64::from(association == AlphaAssociation::Associated), 1)?

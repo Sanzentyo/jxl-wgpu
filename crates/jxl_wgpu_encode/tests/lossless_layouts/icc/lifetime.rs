@@ -64,7 +64,7 @@ fn icc_headers_share_resident_and_streamed_budgets_and_retire_on_cancel_or_ready
                 )
                 .unwrap(),
             )
-            .with_color_options(ImageColorOptions {
+            .with_image_options(ImageOptions {
                 rendering_intent: profile.header().rendering_intent,
                 ..Default::default()
             })
@@ -175,7 +175,7 @@ fn icc_limits_intents_and_device_components_reject_before_gpu_admission() {
         jxl_gpu_protocol::icc::IccRenderingIntent::Relative
     };
     let conflicting = super::encoder(&rig, &profile, TREES[0])
-        .with_color_options(ImageColorOptions {
+        .with_image_options(ImageOptions {
             rendering_intent: mismatch,
             ..Default::default()
         })
@@ -283,7 +283,7 @@ fn icc_animation_header_admission_and_drop_are_independent_of_live_frames() {
             )
             .unwrap(),
         )
-        .with_color_options(ImageColorOptions {
+        .with_image_options(ImageOptions {
             rendering_intent: profile.header().rendering_intent,
             ..Default::default()
         })

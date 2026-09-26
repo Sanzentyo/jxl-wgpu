@@ -1,5 +1,3 @@
-use crate::sample_format::write_sample_bit_depth;
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -26,8 +24,8 @@ use super::types::{
     AlphaAssociation, LosslessModularFormat, LosslessModularTreeMode, ModularArtifactHeader,
     ModularEvent, modular_sample_depth,
 };
-use crate::ImageColorOptions;
-use crate::frame_header::{FrameHeaderPlan, write_animation_header};
+use crate::ImageOptions;
+use crate::frame_header::FrameHeaderPlan;
 use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS, RawPrefixCode};
 use crate::source_color::SourceColorEncoding;
 use crate::source_color::icc::{DEFAULT_PROFILE_LIMIT, PreparedImageHeader};
@@ -43,7 +41,7 @@ use crate::{
 /// `jxlc` container from a GPU-resident Gray, GrayAlpha, RGB, or RGBA integer/IEEE floating buffer.
 pub struct LosslessModularEncoder {
     encoder: GpuEncoder<LosslessModularBackend>,
-    color_options: ImageColorOptions,
+    image_options: ImageOptions,
     alpha_association: AlphaAssociation,
     max_icc_profile_bytes: u64,
 }
@@ -60,7 +58,7 @@ impl LosslessModularEncoder {
         let backend = LosslessModularBackend::with_config(&context, config);
         Self {
             encoder: GpuEncoder::new(context, backend),
-            color_options: ImageColorOptions::default(),
+            image_options: ImageOptions::default(),
             alpha_association: AlphaAssociation::default(),
             max_icc_profile_bytes: DEFAULT_PROFILE_LIMIT,
         }
@@ -88,7 +86,7 @@ impl LosslessModularEncoder {
         backend.set_buffer_pool_limit(limit_bytes);
         Self {
             encoder: GpuEncoder::new(context, backend),
-            color_options: ImageColorOptions::default(),
+            image_options: ImageOptions::default(),
             alpha_association: AlphaAssociation::default(),
             max_icc_profile_bytes: DEFAULT_PROFILE_LIMIT,
         }
@@ -97,9 +95,9 @@ impl LosslessModularEncoder {
     /// Selects the declaration shared by subsequent stills and animations.
     /// Source primaries/white/transfer or ICC bytes continue to come from each source format.
     /// ICC input requires the selected intent to match the profile header.
-    pub fn with_color_options(mut self, options: ImageColorOptions) -> Result<Self, EncodeError> {
+    pub fn with_image_options(mut self, options: ImageOptions) -> Result<Self, EncodeError> {
         options.validate()?;
-        self.color_options = options;
+        self.image_options = options;
         Ok(self)
     }
 
@@ -153,7 +151,7 @@ impl LosslessModularEncoder {
             AnimationHeader::Still,
             ModularImageMetadata::new(
                 spec.color.clone(),
-                self.color_options,
+                self.image_options,
                 self.alpha_association,
                 self.max_icc_profile_bytes,
             ),
@@ -255,7 +253,7 @@ impl LosslessModularEncoder {
             descriptor.animation,
             ModularImageMetadata::new(
                 descriptor.color.clone(),
-                self.color_options,
+                self.image_options,
                 self.alpha_association,
                 self.max_icc_profile_bytes,
             ),
@@ -319,7 +317,7 @@ impl LosslessModularEncoder {
             AnimationHeader::Still,
             ModularImageMetadata::new(
                 source_spec.color.clone(),
-                self.color_options,
+                self.image_options,
                 self.alpha_association,
                 self.max_icc_profile_bytes,
             ),
@@ -333,7 +331,7 @@ impl LosslessModularEncoder {
             codestream_header: Some(codestream_header),
             metadata_permit,
             default_color: source_spec.color == SourceColorEncoding::default()
-                && self.color_options == ImageColorOptions::default(),
+                && self.image_options == ImageOptions::default(),
             container,
             group_grid,
             format,
@@ -367,7 +365,7 @@ impl LosslessModularSequenceDescriptor {
     /// Frame storage may differ, but every submitted frame must have the same encoded color
     /// declaration (custom xy rounded to 1e-6 and gamma to 1e-7, or identical original ICC
     /// bytes). Image white and rendering intent come from the encoder's
-    /// [`ImageColorOptions`]; the intent must agree with an embedded profile.
+    /// [`ImageOptions`]; the intent must agree with an embedded profile.
     pub fn from_pixel_format(
         canvas_width: u32,
         canvas_height: u32,
@@ -1777,30 +1775,7 @@ pub(super) fn image_header(
     animation: AnimationHeader,
     color: ModularImageMetadata,
 ) -> Result<PreparedImageHeader, EncodeError> {
-    color.options.validate()?;
     color.alpha.validate(format)?;
-    let extra_fields = animation.is_animation() || color.options.extra_fields();
-    let mut output = BitWriter::new();
-    output.write_bits(0x0aff, 16)?;
-    output.write_bits(0, 1)?;
-    write_size(&mut output, height, true)?;
-    write_size(&mut output, width, false)?;
-    output.write_bits(0, 1)?;
-    output.write_bits(u64::from(extra_fields), 1)?;
-    if extra_fields {
-        output.write_bits(0, 3)?; // identity orientation minus one
-        output.write_bits(0, 1)?; // no intrinsic size
-        output.write_bits(0, 1)?; // no preview
-        output.write_bits(u64::from(animation.is_animation()), 1)?;
-        if animation.is_animation() {
-            write_animation_header(&mut output, animation)?;
-        }
-    }
-    write_sample_bit_depth(&mut output, bits_per_sample, exponent_bits_per_sample)?;
-    output.write_bits(
-        u64::from(exponent_bits_per_sample == 0 && bits_per_sample <= 14),
-        1,
-    )?;
     let samples = if exponent_bits_per_sample == 0 {
         crate::ColorSampleFormat::integer(format.color_channels(), bits_per_sample)?
     } else {
@@ -1810,48 +1785,17 @@ pub(super) fn image_header(
             exponent_bits_per_sample,
         )?
     };
-    crate::sample_format::ImageSamplePlan::new(samples, format.has_alpha().then_some(color.alpha))
-        .write_extra_channels(&mut output)?;
-    output.write_bits(0, 1)?; // original color
-    color.encoding.write(
-        &mut output,
-        format.color_channels(),
-        color.options.rendering_intent,
-    )?;
-    if extra_fields {
-        color.options.write_tone(&mut output)?;
-    }
-    output.write_bits(0, 2)?;
-    output.write_bits(1, 1)?;
-    PreparedImageHeader::new(
-        output,
-        color.encoding.icc_profile(),
+    let samples = crate::sample_format::ImageSamplePlan::new(
+        samples,
+        format.has_alpha().then_some(color.alpha),
+    );
+    crate::image_sequence::ImageHeaderPlan::new(width, height, animation)?.encode(
+        crate::image_sequence::ImageCoding::Modular,
+        &samples,
+        &color.encoding,
+        color.options,
         color.max_icc_profile_bytes,
     )
-}
-
-fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), EncodeError> {
-    if !(1..(1 << 30)).contains(&size) {
-        return Err(EncodeError::InvalidConfiguration(
-            "Modular dimensions must be in 1..2^30",
-        ));
-    }
-    let value = size - 1;
-    let (selector, bits) = if value < 1 << 9 {
-        (0, 9)
-    } else if value < 1 << 13 {
-        (1, 13)
-    } else if value < 1 << 18 {
-        (2, 18)
-    } else {
-        (3, 30)
-    };
-    output.write_bits(selector, 2)?;
-    output.write_bits(u64::from(value), bits)?;
-    if ratio {
-        output.write_bits(0, 3)?;
-    }
-    Ok(())
 }
 
 pub(super) fn frame_header(

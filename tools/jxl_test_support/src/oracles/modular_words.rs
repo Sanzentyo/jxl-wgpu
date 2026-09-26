@@ -150,3 +150,26 @@ pub fn sampling_headers(encoded: &[u8]) -> Vec<FrameSampling> {
     assert!(words.next().is_none(), "trailing sampling headers");
     frames
 }
+
+/// Original orientation and raw names of every physical frame, including hidden/reference
+/// frames. Uses the same pinned header/TOC walk and transport limits as sampling inspection.
+pub fn presentation_headers(encoded: &[u8]) -> Vec<(u32, Vec<u8>)> {
+    let output = run_input(encoded, Some("--presentation-headers"));
+    let mut words = words(&output, b"JXLMET12");
+    let count = words.next().expect("physical frame count");
+    assert!((1..=64).contains(&count));
+    let frames = (0..count)
+        .map(|_| {
+            let orientation = words.next().expect("orientation");
+            assert!((1..=8).contains(&orientation));
+            let length = words.next().expect("name length");
+            assert!(length <= 1071);
+            let name = (0..length)
+                .map(|_| u8::try_from(words.next().expect("name byte")).unwrap())
+                .collect();
+            (orientation, name)
+        })
+        .collect();
+    assert!(words.next().is_none(), "trailing presentation headers");
+    frames
+}

@@ -1954,7 +1954,7 @@ ICC, subsampling and textures remain open.
 `vardct_encoder/tests/enumerated.rs` and its `oracle`, `boundaries` and `sequence` modules
 exercise the checked color plan on Apple M5/Metal (2026-09-25). The common source-color writer
 owns serialized primaries/white/transfer; GPU normalization consumes those same quantized
-values and the shared transfer shader. `ImageColorOptions` supplies both codecs' intent and
+values and the shared transfer shader. `ImageOptions` supplies both codecs' intent and
 positive exact binary16 image white. The 64-byte color parameter tail is included in exact
 admission; original components bypass conversion, and no image-sized allocation is added.
 
@@ -2207,6 +2207,42 @@ Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib extra_sampling_ -- -
 the decoder `extra_upsampling` target after the shared-oracle move, then the
 [full capability gates](DEVELOPMENT.md#capability-change-gates).
 
+## Encoder orientation and physical-frame names
+
+`crates/jxl_wgpu_encode/tests/image_metadata` exercises the common image/header plans on
+Apple M5/Metal. Image orientation is independent of source/crop/reference coordinates; names
+belong to physical frames. Both use the same checked metadata path across the encoders.
+
+Thirty-two Modular streams cross all eight orientations with Gray8, RGB8+alpha, Gray13+alpha
+and RGB F32, one-pixel axes or partial 128-pixel groups, Prefix/ANS and poisoned planar padding.
+Pinned native libjxl exports every original component word exactly. Changing orientation/name
+leaves every image-data section byte-identical; the eligible 16-bit working-buffer flag remains
+intact. Four additional convenience stills check image-option inheritance and empty names.
+Sixteen VarDCT streams cross Original/XYB with every orientation, rotating among single,
+mapped and tiled transforms, three AC passes and 2× reconstruction from reduced sources.
+These cases validate final output; existing progressive tests retain intermediate-image coverage.
+
+Eight four-frame animations alternate both codec orders, reference-only and hidden producers,
+zero/positive duration, timecodes, Add/Replace references, negative-origin crops and changing
+1×/2×/4× color/packed-alpha factors. Reverse completion retains every physical name. A pinned
+native header/TOC walk compares all name bytes and orientation; the production inventory agrees.
+Name lengths 0/1/15/16/47/48/1070/1071 cover every wire bucket, multibyte UTF-8 and embedded NULs.
+Eight ICC streams cross Modular/VarDCT, identity/rotation and default/non-default image white:
+the independent Rust header reader checks orientation/name and native libjxl exports the exact
+original profile. Separate checks reject overlong/invalid UTF-8 names, including multibyte limits.
+
+For the enumerated-color cases, whole and 256-byte fragmented GPU final output matches native libjxl under both Apply and Keep
+orientation, retaining the existing `2e-4 * (1 + abs(reference))` RGBA bound. Output dimensions
+follow the selected policy, fragmented bytes are identical, and held outputs survive session
+drop. Both codecs retain exact/one-byte-short budget admission, byte-identical retry and cancelled
+source/budget release with a maximum-length name. Names share immutable bounded host storage;
+they do not add GPU allocations. All reservations return to zero.
+
+Rebuild the [native Modular word helper](../tools/jxl_test_support/README.md#native-modular-word-oracle)
+and run `cargo test --locked -p jxl_wgpu_encode --test image_metadata -- --test-threads=2`, then
+the [full capability gates](DEVELOPMENT.md#capability-change-gates). This adds explicit metadata
+declarations, not automatic source-metadata preservation, intrinsic-size or preview encoding.
+
 ## Per-frame color and relative extra sampling
 
 `crates/jxl_wgpu_encode/tests/frame_sampling` exercises the shared `FrameSamplingPlan` on
@@ -2388,8 +2424,10 @@ one-byte-deficient and exact budgets check rejection, overlapping admission, unc
 completion, abandoned jobs/sessions, GPU-delayed release and successful reuse. Tests require the
 real adapter and native oracles; no skipped producer entropy is treated as validated.
 
-`FRAME-05` remains Partial. Mixed coding modes, VarDCT pre-transform references,
-arbitrary extra channels, names, previews and broader indexing policy remain open.
+`FRAME-05` remains Partial. Later [mixed-codec](#mixed-codec-sequence-encoding) and
+[orientation/name](#encoder-orientation-and-physical-frame-names) evidence extends this checkpoint.
+VarDCT pre-transform references, broader independent-extra combinations, previews and broader
+indexing policy remain open.
 
 ## Layered-still encoding
 

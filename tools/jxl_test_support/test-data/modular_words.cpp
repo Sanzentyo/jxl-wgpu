@@ -2,7 +2,7 @@
 // The pinned scalar library owns header/entropy parsing, prediction and all transforms.
 // This reader intentionally accepts only original-color one-pass encoder frames, with
 // equal-grid components, empty LF/HF groups and optional global RCT. Sampling-header
-// inspection accepts either frame codec without decoding image samples.
+// and presentation inspection accept either frame codec without decoding image samples.
 #include <jxl/decode.h>
 #include <jxl/version.h>
 
@@ -214,8 +214,9 @@ void Word(uint32_t value) {
   if (fwrite(bytes, 1, 4, stdout) != 4) std::abort();
 }
 
-jxl::Status SamplingHeaders(const std::vector<uint8_t>& raw,
-                            std::vector<std::vector<uint32_t>>* frames) {
+jxl::Status InspectHeaders(const std::vector<uint8_t>& raw,
+                           std::vector<std::vector<uint32_t>>* frames,
+                           bool presentation) {
   jxl::CodecMetadata metadata;
   size_t pos;
   {
@@ -241,10 +242,15 @@ jxl::Status SamplingHeaders(const std::vector<uint8_t>& raw,
       JXL_RETURN_IF_ERROR(jxl::ReadFrameHeader(&reader, &header));
       const auto dim = header.ToFrameDimensions();
       JXL_ENSURE(header.dc_level == 0 && header.extra_channel_upsampling.size() <= 256);
-      frames->push_back({uint32_t(dim.xsize_upsampled), uint32_t(dim.ysize_upsampled),
+      if (presentation) {
+        frames->push_back({metadata.m.orientation, uint32_t(header.name.size())});
+        for (unsigned char byte : header.name) frames->back().push_back(byte);
+      } else {
+        frames->push_back({uint32_t(dim.xsize_upsampled), uint32_t(dim.ysize_upsampled),
                          uint32_t(dim.xsize), uint32_t(dim.ysize), header.upsampling,
                          header.passes.num_passes, uint32_t(header.extra_channel_upsampling.size())});
-      for (uint32_t factor : header.extra_channel_upsampling) frames->back().push_back(factor);
+        for (uint32_t factor : header.extra_channel_upsampling) frames->back().push_back(factor);
+      }
       JXL_RETURN_IF_ERROR(jxl::ReadToc(&memory, jxl::NumTocEntries(dim.num_groups, dim.num_dc_groups, header.passes.num_passes), &reader, &sizes, &permutation));
       JXL_RETURN_IF_ERROR(reader.JumpToByteBoundary());
       pos += reader.TotalBitsConsumed() / 8;
@@ -275,8 +281,9 @@ int main(int argc, char** argv) {
   }
   const bool audit = argc == 3 && std::strcmp(argv[1], "--palette-audit") == 0;
   const bool headers = argc == 3 && std::strcmp(argv[1], "--sampling-headers") == 0;
-  if (argc != 2 && !audit && !headers) return 2;
-  std::ifstream input(argv[(audit || headers) ? 2 : 1], std::ios::binary);
+  const bool presentation = argc == 3 && std::strcmp(argv[1], "--presentation-headers") == 0;
+  if (argc != 2 && !audit && !headers && !presentation) return 2;
+  std::ifstream input(argv[(audit || headers || presentation) ? 2 : 1], std::ios::binary);
   if (!input) return 2;
   std::vector<uint8_t> file{std::istreambuf_iterator<char>(input), {}};
   if (file.size() > (1u << 26)) return 2;
@@ -284,10 +291,10 @@ int main(int argc, char** argv) {
   std::vector<Frame> frames;
   std::array<uint32_t, 3> counts{};
   if (!Codestream(file, &raw)) return 1;
-  if (headers) {
+  if (headers || presentation) {
     std::vector<std::vector<uint32_t>> sampling;
-    if (!SamplingHeaders(raw, &sampling)) return 1;
-    if (fwrite("JXLSMP12", 1, 8, stdout) != 8) return 2;
+    if (!InspectHeaders(raw, &sampling, presentation)) return 1;
+    if (fwrite(presentation ? "JXLMET12" : "JXLSMP12", 1, 8, stdout) != 8) return 2;
     Word(JxlDecoderVersion());
     Word(sampling.size());
     for (const auto& fields : sampling) for (uint32_t value : fields) Word(value);

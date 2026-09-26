@@ -97,7 +97,7 @@ fn check_header(bytes: &[u8], config: &VarDctConfig, profiles: &IccProfileOracle
     );
     assert_eq!(
         header.tone_mapping.intensity_target.to_f32(),
-        config.color_options.intensity_target.to_f32()
+        config.image_options.intensity_target.to_f32()
     );
     assert_eq!(
         profiles.read(bytes).profile,

@@ -235,6 +235,10 @@ word-decoding scope. `oracles::modular_words::sampling_headers` uses its `--samp
 mode to inspect up to 64 Modular/VarDCT physical frames with the native frame-header and TOC
 readers. It reports displayed/coded dimensions, color/extra factors and pass counts without
 rendering; raw/plain-container input, no preview/ICC and no LF frames are required.
+`presentation_headers` uses `--presentation-headers` on the same header/TOC walk to export
+orientation and exact name bytes for every physical frame, including hidden/reference-only
+frames. It has the same scope restrictions and pinned runtime check; it does not implement a
+second header parser or derive expectations from the production writer.
 
 Run the workspace checks from the repository root with Rust 1.98 or later, keeping that oracle
 environment available:

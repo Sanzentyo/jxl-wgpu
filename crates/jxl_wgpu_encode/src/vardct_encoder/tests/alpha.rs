@@ -451,7 +451,7 @@ fn alpha_input_icc_device_channels_keep_profile_color_and_alpha_storage_independ
                 alpha: Some(AlphaAssociation::Unassociated),
                 color_transform,
                 source_color: ColorSpecification::Icc(profile.clone()),
-                color_options: crate::ImageColorOptions {
+                image_options: crate::ImageOptions {
                     rendering_intent: profile.header().rendering_intent,
                     ..Default::default()
                 },

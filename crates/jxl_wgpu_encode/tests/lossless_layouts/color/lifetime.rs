@@ -13,12 +13,13 @@ fn color_declarations_keep_exact_admission_and_cancelled_source_release() {
         shifted: true,
     };
     let color = spec(ColorSpace::Bt2020, TransferFunction::Pq);
-    let options = ImageColorOptions {
+    let options = ImageOptions {
         rendering_intent: IccRenderingIntent::Absolute,
         intensity_target: FiniteF16::from_bits(0x63d0).unwrap(),
+        ..Default::default()
     };
     let encoder = LosslessModularEncoder::new(rig.context.clone())
-        .with_color_options(options)
+        .with_image_options(options)
         .unwrap();
     for extent in [Extent2d::new(257, 9), Extent2d::new(16_384, 1)] {
         let expected = case.samples(extent);
@@ -36,7 +37,7 @@ fn color_declarations_keep_exact_admission_and_cancelled_source_release() {
                 )
                 .unwrap(),
             )
-            .with_color_options(options)
+            .with_image_options(options)
             .unwrap()
         };
         let short = limited(plan.owned_bytes_per_job - 1);
@@ -125,12 +126,11 @@ fn unsupported_source_metadata_never_allocates_a_gpu_job() {
         assert_eq!(encoder.buffer_pool_stats().allocation_misses, 0);
     }
     for bits in [0, 0x8000, 0xbc00] {
-        let result = LosslessModularEncoder::new(rig.context.clone()).with_color_options(
-            ImageColorOptions {
+        let result =
+            LosslessModularEncoder::new(rig.context.clone()).with_image_options(ImageOptions {
                 intensity_target: FiniteF16::from_bits(bits).unwrap(),
                 ..Default::default()
-            },
-        );
+            });
         assert!(matches!(result, Err(EncodeError::InvalidConfiguration(_))));
     }
 }

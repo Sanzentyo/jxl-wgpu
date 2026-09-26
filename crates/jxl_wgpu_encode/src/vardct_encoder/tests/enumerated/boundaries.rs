@@ -344,7 +344,7 @@ fn enumerated_plan_checks_metadata_and_accepts_only_equivalent_wire_aliases() {
         for bits in [0, 0x8000, 0xbc00] {
             assert!(
                 VarDctColorPlan::new(&VarDctConfig {
-                    color_options: crate::ImageColorOptions {
+                    image_options: crate::ImageOptions {
                         intensity_target: FiniteF16::from_bits(bits).unwrap(),
                         ..Default::default()
                     },
@@ -356,7 +356,7 @@ fn enumerated_plan_checks_metadata_and_accepts_only_equivalent_wire_aliases() {
         for bits in [1, 0x03ff, 0x7bff] {
             let value = FiniteF16::from_bits(bits).unwrap();
             let plan = VarDctColorPlan::new(&VarDctConfig {
-                color_options: crate::ImageColorOptions {
+                image_options: crate::ImageOptions {
                     intensity_target: value,
                     ..Default::default()
                 },

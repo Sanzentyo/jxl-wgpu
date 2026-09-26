@@ -61,9 +61,11 @@ mod error;
 mod extra_channel;
 mod frame_header;
 mod gpu;
+mod image_options;
 mod image_sequence;
 mod lossless_modular;
 mod mixed_encoder;
+mod name;
 mod packet;
 mod permutation;
 mod prefix;
@@ -87,6 +89,7 @@ pub use gpu::{
     BufferImageSource, GpuEncodeBackend, GpuEncodeJob, GpuEncoder, GpuFrameSource,
     TextureImageSource, WgpuContext,
 };
+pub use image_options::ImageOptions;
 pub use image_sequence::ImageSequenceDescriptor;
 pub use jxl_gpu_bitstream::FiniteF16;
 pub use lossless_modular::{
@@ -105,6 +108,7 @@ pub use mixed_encoder::{
     MixedModeConfig, MixedModeEncoder, MixedModeFrameEncoding, MixedModeJob, MixedModeMemoryPlan,
     MixedModeSequenceSession, VarDctTransformSelection,
 };
+pub use name::CodestreamName;
 pub use packet::{
     BitFragment, EncodedFrame, FrameGroupLayout, FramePacketSet, GroupPacket, GroupPacketKind,
     assemble_frame,
@@ -116,7 +120,6 @@ pub use session::{
     FrameEncodeRequest, FrameIndex, FrameKind, FrameOptions, FrameSubmission, FrameTiming,
     GpuAccelerationArtifact, GpuFrameArtifacts, ReferenceSlot, SessionDescriptor,
 };
-pub use source_color::ImageColorOptions;
 pub use vardct_encoder::{
     TiledVarDctEncoder, TiledVarDctGrid, VarDctAlphaMemoryPlan, VarDctAnimationDescriptor,
     VarDctAnimationSession, VarDctBackend, VarDctCoefficientOrders, VarDctColorTransform,

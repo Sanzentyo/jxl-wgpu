@@ -199,7 +199,7 @@ fn mixed_strategies_have_native_checked_ac_and_interoperate_across_lf_groups_and
             max_extra_channel_metadata_bytes: 1 << 20,
             sample_format: Default::default(),
             source_color: jxl_gpu_formats::ColorSpecification::Default,
-            color_options: Default::default(),
+            image_options: Default::default(),
             max_icc_profile_bytes: VarDctConfig::default().max_icc_profile_bytes,
             color_transform: VarDctColorTransform::Xyb,
             progressive: Default::default(),

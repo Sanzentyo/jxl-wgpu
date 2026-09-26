@@ -162,6 +162,8 @@ pub enum FrameKind {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FrameOptions {
     pub kind: FrameKind,
+    /// UTF-8 name of this physical frame, including hidden and reference-only frames.
+    pub name: crate::CodestreamName,
     pub timing: FrameTiming,
     pub crop: Option<FrameCrop>,
     /// Reconstruction factor for the supplied color grid. Source dimensions must be

@@ -73,7 +73,7 @@ of image encoding. [Metadata API and native interoperability](../../docs/CONTAIN
   profile streams must also fit JPEG XL's 256 MiB limits. Limit failures use `EncodeError::IccLimit`
   before variable-sized header allocation or GPU admission. CMYK and other device spaces remain
   unsupported.
-- `with_color_options(ImageColorOptions)` selects all four ICC rendering intents and
+- `with_image_options(ImageOptions)` selects presentation orientation, all four ICC rendering intents and
   a positive exact `FiniteF16` image white in cd/m². Defaults are Relative and 255 cd/m², also for
   HDR; the caller explicitly selects another known source white. This declares metadata and
   performs no tone mapping, primary conversion or alpha-association change. For ICC input, select
@@ -488,7 +488,7 @@ The map is caller-selected metadata; content-adaptive strategy selection remains
 the configured integer or floating Gray/RGB source layout. `source_color` declares full-range
 enumerated BT.709, BT.2020, Display-P3 or custom primaries with D65, E, DCI or custom white;
 Linear, sRGB/Sycc, BT.709, PQ, HLG, DCI and checked Gamma transfers are supported.
-The default remains sRGB/D65. `color_options: ImageColorOptions` binds all four rendering
+The default remains sRGB/D65. `image_options: ImageOptions` binds presentation orientation, all four rendering
 intents and positive exact binary16 image white (default 255 cd/m²), shared with Modular.
 XYB applies the shared GPU EOTF, PQ/HLG display luminance, Bradford-adapted primary matrix,
 image-white scaling and opsin transform. Original directly transforms normalized components.
@@ -508,7 +508,7 @@ covers all three backends, sequences, progressive passes and independent pixel/c
 
 `source_color: ColorSpecification::Icc(profile)` also accepts RGB or Gray profiles with matching
 logical channels, ordinary swizzles or explicit `IccDevice` components. The original profile is
-preserved byte-for-byte; `color_options.rendering_intent` must equal its unchanged header intent.
+preserved byte-for-byte; `image_options.rendering_intent` must equal its unchanged header intent.
 `max_icc_profile_bytes` defaults to 16 MiB; zero disables ICC input, and the standard's original
 and transformed profile limits also apply. Original coding preserves normalized device components
 without selecting an ICC method. XYB selects the profile's relative device-to-PCS method and
@@ -993,7 +993,7 @@ encoder.encode(source_13_by_21)
 `MixedModeFrameEncoding::{Modular, VarDct}`. `begin_sequence(ImageSequenceDescriptor)` creates
 one layered still or animation with a shared integer/floating Gray/GrayAlpha/RGB/RGBA image contract. Both codecs
 use the precision in `config.vardct.sample_format` (1–31 integer bits or a legal floating precision, default RGB8) and the
-`source_color` and `color_options` in that same VarDCT configuration. Each physical frame may independently select any supported
+`source_color` and `image_options` in that same VarDCT configuration. Each physical frame may independently select any supported
 packed, planar or split layout, swizzle, bit position and word byte order; channels, precision and color stay fixed. The default config uses original-component
 VarDCT, tiled DCT8 and default lossless Modular. An explicit XYB configuration is rejected.
 
@@ -1068,7 +1068,25 @@ extent on each frame; tiled DCT8 accepts separately checked crop extents through
 bound. Both support all five blend modes with alpha, signed crops, hidden zero-duration regular frames
 and four post-color-transform references. Alpha has an independent blend/reference field.
 Pre-color-transform reference storage remains unsupported. Fixed-VarDCT sequences accept the independent extra-channel declarations described above; mixed sequences currently accept packed alpha only. Mixed Modular/VarDCT sessions use
-`MixedModeEncoder`; frame names and previews remain unimplemented.
+`MixedModeEncoder`; preview encoding remains unimplemented.
+
+`ImageOptions::orientation` selects any of the eight `jxl_gpu_protocol::OutputOrientation`
+values, defaulting to `Identity`. Set it through Modular's `with_image_options` or
+`VarDctConfig::image_options` (also the image owner in mixed sequences). All source layouts,
+transform maps, canvas dimensions, crops, references and memory estimates remain in the encoded
+coordinate system. Reconstruction and composition precede decoder presentation orientation;
+decoder `OrientationPolicy::Keep` exposes the unrotated result. Orientation alone does not
+change image white, color conversion or GPU work.
+
+`FrameOptions::name` accepts a checked `CodestreamName`, defaulting to empty. For example,
+`CodestreamName::new("frame 1")?` constructs a UTF-8 name of at most 1071 **bytes**, preserving
+embedded NULs. Each regular, hidden or reference-only physical frame owns its name independently
+of duration and presentation numbering. Clones share immutable storage. The same checked name
+syntax writes extra-channel names; oversized/invalid UTF-8 names reject before submission.
+Use a one-frame sequence to name a still. Convenience `encode`/`submit` writes an empty name.
+The public image declaration is now `ImageOptions`; the former `ImageColorOptions`,
+`with_color_options` and `VarDctConfig::color_options` names are replaced, without aliases.
+See the [image-metadata evidence](../../docs/CONFORMANCE_CORPUS.md#encoder-orientation-and-physical-frame-names).
 
 Both codecs accept `FrameOptions { kind: FrameKind::ReferenceOnly, .. }` in either sequence kind.
 Such a frame stores its decoded source in any of the four `save_as_reference` slots without a

@@ -29,14 +29,31 @@ implementation audits.
 ## Frame control and sequences
 
 `FrameHeaderPlan` owns regular/reference-only kind, crop geometry, per-channel blend-field presence,
-timing, reference-field presence, pass-bundle presence and finality. Construction validates source/crop agreement and wire
-bounds, then compiles at most 256 control bits before GPU memory admission. Its fields are
+timing, reference-field presence, pass-bundle presence, physical-frame name and finality. Construction validates source/crop agreement and wire
+bounds, then compiles at most 256 control bits plus 12 per extra channel and the name before GPU memory
+admission. The name adds at most 12 + 1071 * 8 bits, replacing the default two-bit empty name. Its fields are
 private; frame jobs use the retained bits and index/finality accessors instead of reinterpreting
 caller options after GPU completion. `LosslessModularBackend` uses this representation in
 resident, native-streamed and browser-streamed execution, and `VarDctBackend` uses it after its
 own quantization/progression checks. Codec-specific headers supply coding mode, group geometry
 and pass layout; the common plan supplies the wire kind, field presence, suffix and disabled restoration.
 The stream serializers also share one checked animation-timebase writer.
+
+`ImageOptions` owns orientation, rendering intent and image white. The common `ImageHeaderPlan`
+now writes dimensions, orientation, timebase, precision, extra declarations, color and tone fields
+for Modular, VarDCT and mixed output; Modular no longer has a parallel image-header serializer.
+The explicit coding domain preserves Modular's eligible 16-bit working-buffer declaration and
+VarDCT/mixed i32 buffers. Orientation does not reinterpret source geometry, crops or references:
+it is applied after reconstruction/composition, or retained under decoder `Keep` policy.
+It can require the image's extra-fields bundle without requiring non-default tone metadata.
+
+`CodestreamName` validates the 1071-byte UTF-8 bound before allocating shared immutable storage.
+Frame control and extra metadata consume the same serializer, including all length buckets and
+embedded NUL bytes. Names stay attached to physical frames through out-of-order job completion;
+hidden and reference-only names are not mapped onto visible frame numbers. Name/control storage
+is bounded host metadata, not pixel-sized GPU work; variable image metadata retains the existing
+`PreparedImageHeader` reservation. GPU admission, permits, dispatch and completion ownership do
+not depend on orientation or names. [Independent evidence](CONFORMANCE_CORPUS.md#encoder-orientation-and-physical-frame-names).
 
 Image timing and physical-frame controls are separate contracts. `AnimationHeader::Still` omits
 time fields but permits any number of hidden regular/reference-only layers before one final
@@ -92,7 +109,7 @@ by the shared geometry plan below.
 Modular metadata. Custom xy and gamma are quantized once to wire precision, then expanded for
 GPU transfer/Bradford matrix/luminance lowering. The plan rejects undefined/limited-range
 or unsupported color before creating pipelines and compares each source's wire encoding before
-budget admission. `ImageColorOptions` owns the common intent/positive exact-F16 image-white
+budget admission. `ImageOptions` owns the common intent/positive exact-F16 image-white
 contract; the image writer emits tone metadata for either stills or animations when needed.
 XYB includes the existing `IMAGE_TRANSFER_SHADER` and its shared selector ABI, preserving PQ
 absolute scaling and HLG's coupled OOTF before primary conversion and intensity/255 opsin scaling.
@@ -122,7 +139,7 @@ rejects inconsistent extents/strides/overlap, and resolves each logical componen
 word width, bit shift, pixel stride and absolute origin. Regions retain u64 absolute offsets
 until dispatch windows rebase them into checked WGSL-u32 addresses. Modular groups/streaming
 and whole-image VarDCT use the same plan and window-union accounting. Shared `source_color`
-lowering writes Gray/RGB color syntax and owns shared `ImageColorOptions`; shared `source_color::icc::PreparedImageHeader` owns variable ICC serialization and its reservation. Gaps between aligned windows are neither bound nor charged as addressed
+lowering writes Gray/RGB color syntax and owns shared `ImageOptions`; shared `source_color::icc::PreparedImageHeader` owns variable ICC serialization and its reservation. Gaps between aligned windows are neither bound nor charged as addressed
 bytes; alignment overlap is counted once. Source addressing introduces no host sample scan or repacking.
 
 Logical channels do not describe VarDCT's working-plane count. The color plan lowers Gray

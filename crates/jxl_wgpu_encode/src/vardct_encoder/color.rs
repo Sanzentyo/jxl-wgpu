@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::source_color::{SourceColorEncoding, icc::PreparedImageHeader};
-use crate::{EncodeError, ImageColorOptions, UnsupportedFeature};
+use crate::{EncodeError, ImageOptions, UnsupportedFeature};
 use jxl_gpu_formats::{ColorSpecification, PixelFormat};
 use jxl_gpu_protocol::icc::{IccRenderingIntent, IccTransform};
 use jxl_gpu_protocol::{ColorMatrix, RgbColorSpace, WhitePointAdaptation};
@@ -27,7 +27,7 @@ pub enum VarDctColorTransform {
 pub(super) struct VarDctColorPlan {
     pub(super) samples: crate::sample_format::ImageSamplePlan,
     encoding: SourceColorEncoding,
-    options: ImageColorOptions,
+    options: ImageOptions,
     max_icc_profile_bytes: u64,
     pub(super) icc_transform: Option<Arc<IccTransform>>,
     pub(super) gpu: SourceColorParams,
@@ -39,7 +39,7 @@ pub(super) struct VarDctColorPlan {
 
 impl VarDctColorPlan {
     pub(super) fn new(config: &super::VarDctConfig) -> Result<Self, EncodeError> {
-        config.color_options.validate()?;
+        config.image_options.validate()?;
         let encoding = source_encoding(&config.pixel_format())?;
         let xyb = config.color_transform == VarDctColorTransform::Xyb;
         let icc_transform = if let Some(profile) = encoding.icc_profile() {
@@ -47,7 +47,7 @@ impl VarDctColorPlan {
                 profile.bytes().len() as u64,
                 config.max_icc_profile_bytes,
             )?;
-            if profile.header().rendering_intent != config.color_options.rendering_intent {
+            if profile.header().rendering_intent != config.image_options.rendering_intent {
                 return Err(EncodeError::InvalidConfiguration(
                     "encoder intent must match the unchanged embedded ICC profile",
                 ));
@@ -75,7 +75,7 @@ impl VarDctColorPlan {
             SourceColorEncoding::Icc(_) => jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709,
         };
         let (transfer, gamma) = jxl_wgpu::transfer_parameters(rgb.transfer);
-        let intensity = config.color_options.intensity_target.to_f32();
+        let intensity = config.image_options.intensity_target.to_f32();
         let luminance = jxl_wgpu::display_luminance(rgb.space, intensity, false)?;
         let matrix = ColorMatrix::between_rgb(
             rgb.space,
@@ -95,7 +95,7 @@ impl VarDctColorPlan {
                     config.max_extra_channel_metadata_bytes,
                 )?,
             encoding,
-            options: config.color_options,
+            options: config.image_options,
             max_icc_profile_bytes: config.max_icc_profile_bytes,
             icc_transform,
             gpu: SourceColorParams {

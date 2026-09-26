@@ -66,9 +66,10 @@ pub(super) fn config(
     VarDctConfig {
         sample_format: ColorSampleFormat::integer(channels, 12).unwrap(),
         source_color: spec(spaces()[index / 7 % 7], transfers()[index % 7]),
-        color_options: crate::ImageColorOptions {
+        image_options: crate::ImageOptions {
             rendering_intent: INTENTS[index % 4],
             intensity_target: FiniteF16::from_bits([0x5bf8, 0x63d0, 0x6bd0][index % 3]).unwrap(),
+            ..Default::default()
         },
         ..precision::configuration(8, color)
     }
@@ -118,7 +119,7 @@ pub(super) fn wire_spec(config: &VarDctConfig) -> ColorSpec {
 pub(super) fn components(values: &[[f64; 3]], config: &VarDctConfig) -> Vec<[f64; 3]> {
     let spec = wire_spec(config);
     let matrix = color::matrix(spec.space, ColorSpace::Bt709);
-    let nits = f64::from(config.color_options.intensity_target.to_f32());
+    let nits = f64::from(config.image_options.intensity_target.to_f32());
     values
         .iter()
         .map(|&rgb| {
@@ -178,7 +179,7 @@ pub(super) fn declaration(config: &VarDctConfig) -> String {
     format!(
         "{} {white} {primaries} {transfer} {} {} {} {} {} {} {} {} {} {gamma}",
         u32::from(config.sample_format.channels() == ColorChannels::Gray),
-        config.color_options.rendering_intent as u32,
+        config.image_options.rendering_intent as u32,
         xy.white.x(),
         xy.white.y(),
         xy.red.x(),
@@ -191,7 +192,7 @@ pub(super) fn declaration(config: &VarDctConfig) -> String {
 }
 
 pub(super) fn pixels(bytes: &[u8], config: &VarDctConfig) -> Vec<f32> {
-    let nits = f64::from(config.color_options.intensity_target.to_f32());
+    let nits = f64::from(config.image_options.intensity_target.to_f32());
     let exponent = (1.2 * 1.111_f64.powf((nits / 1000.0).log2())).recip() - 1.0;
     let hlg_threshold_mismatch = wire_spec(config).transfer == TransferFunction::Hlg
         && (0.01..0.1).contains(&exponent.abs());
@@ -211,7 +212,7 @@ pub(super) fn pixels(bytes: &[u8], config: &VarDctConfig) -> Vec<f32> {
     let opsin = &image.image_header().metadata.opsin_inverse_matrix;
     let bias = opsin.opsin_bias.map(f64::from);
     let matrix = opsin.inv_mat.map(|row| row.map(f64::from));
-    let nits = f64::from(config.color_options.intensity_target.to_f32());
+    let nits = f64::from(config.image_options.intensity_target.to_f32());
     let spec = wire_spec(config);
     let render = image.render_frame(0).unwrap();
     let pixels = render.image_all_channels();
@@ -278,7 +279,7 @@ pub(super) fn rust_frames(bytes: &[u8], config: &VarDctConfig) -> Vec<Vec<f32>> 
                         [p[0], p[1], p[2]].map(f64::from),
                         spec.transfer,
                         spec.space,
-                        f64::from(config.color_options.intensity_target.to_f32()),
+                        f64::from(config.image_options.intensity_target.to_f32()),
                     );
                     [rgb[0] as f32, rgb[1] as f32, rgb[2] as f32, p[3]]
                 })

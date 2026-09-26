@@ -111,8 +111,8 @@ pub struct VarDctConfig {
     pub max_extra_channel_metadata_bytes: u64,
     /// Stream-wide enumerated or embedded RGB/Gray ICC source color; defaults to sRGB/D65.
     pub source_color: jxl_gpu_formats::ColorSpecification,
-    /// Rendering intent and positive exact binary16 image white (default 255 cd/m²).
-    pub color_options: crate::ImageColorOptions,
+    /// Image-wide orientation, rendering intent and positive exact binary16 image white.
+    pub image_options: crate::ImageOptions,
     /// Maximum original ICC profile bytes, checked before serialization or GPU lowering (default 16 MiB).
     pub max_icc_profile_bytes: u64,
     /// Stream-wide coding domain for integer or floating Gray/RGB sources; defaults to XYB.
@@ -137,7 +137,7 @@ impl Default for VarDctConfig {
             extra_channels: Vec::new(),
             max_extra_channel_metadata_bytes: 1 << 20,
             source_color: jxl_gpu_formats::ColorSpecification::Default,
-            color_options: Default::default(),
+            image_options: Default::default(),
             max_icc_profile_bytes: crate::source_color::icc::DEFAULT_PROFILE_LIMIT,
             color_transform: Default::default(),
             progressive: Default::default(),

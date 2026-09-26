@@ -46,7 +46,7 @@ fn icc_admission_checks_profile_identity_intent_method_and_limits() {
                 Err(EncodeError::IccLimit { .. })
             ));
             config.max_icc_profile_bytes += 1;
-            config.color_options.rendering_intent =
+            config.image_options.rendering_intent =
                 if profile.header().rendering_intent == IccRenderingIntent::Relative {
                     IccRenderingIntent::Absolute
                 } else {
@@ -56,7 +56,7 @@ fn icc_admission_checks_profile_identity_intent_method_and_limits() {
                 VarDctColorPlan::new(&config),
                 Err(EncodeError::InvalidConfiguration(_))
             ));
-            config.color_options.rendering_intent = profile.header().rendering_intent;
+            config.image_options.rendering_intent = profile.header().rendering_intent;
             config.sample_format = ColorSampleFormat::float(
                 if gray {
                     ColorChannels::Rgb

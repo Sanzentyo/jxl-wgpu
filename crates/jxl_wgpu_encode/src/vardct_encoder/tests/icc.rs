@@ -45,7 +45,7 @@ pub(super) fn config(profile: &IccProfile, transform: VarDctColorTransform) -> V
         )
         .unwrap(),
         source_color: ColorSpecification::Icc(profile.clone()),
-        color_options: crate::ImageColorOptions {
+        image_options: crate::ImageOptions {
             rendering_intent: profile.header().rendering_intent,
             ..Default::default()
         },

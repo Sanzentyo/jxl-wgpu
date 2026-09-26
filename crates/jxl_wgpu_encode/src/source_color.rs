@@ -16,8 +16,6 @@ use crate::ColorChannels;
 use crate::{EncodeError, UnsupportedFeature};
 
 pub(crate) mod icc;
-mod options;
-pub use options::ImageColorOptions;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EnumeratedColorEncoding {

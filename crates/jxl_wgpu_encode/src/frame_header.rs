@@ -8,7 +8,8 @@ use crate::{sample_format::ImageSamplePlan, sampling::FrameSamplingPlan};
 use jxl_gpu_bitstream::BitWriter;
 
 /// Checked frame kind, color/scalar sampling, crop, blending, timing, references and restoration.
-/// The suffix occupies at most 256 + 12 bits per extra channel, independent of pixels;
+/// The suffix occupies at most 256 control bits plus 12 per extra channel and the bounded name,
+/// independent of pixels. The name uses at most 12 + 1071 * 8 bits;
 /// each extra's sampling factor adds two bits in the codec-specific prefix.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FrameHeaderPlan {
@@ -121,14 +122,14 @@ impl FrameHeaderPlan {
             }
         }
 
-        output.write_bits(0, 2)?; // empty frame name
+        request.options.name.write(&mut output)?;
         output.write_bits(0, 1)?; // non-default restoration filter
         output.write_bits(0, 1)?; // no Gaborish
         output.write_bits(0, 2)?; // no EPF iterations
         output.write_bits(0, 2)?; // no restoration-filter extensions
         output.write_bits(0, 2)?; // no frame extensions
         let bit_len = output.bit_len();
-        if bit_len > 256 + 12 * extra_channels {
+        if bit_len > 256 + 12 * extra_channels + request.options.name.encoded_bits() - 2 {
             return Err(EncodeError::InvalidConfiguration(
                 "frame control exceeds its fixed storage bound",
             ));

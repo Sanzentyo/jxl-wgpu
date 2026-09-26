@@ -7,7 +7,7 @@ use jxl_gpu_formats::{
 use jxl_gpu_protocol::{Chromaticity, GammaExponent, RgbChromaticities, icc::IccRenderingIntent};
 use jxl_test_support::oracles::icc_profile::IccProfileOracle;
 use jxl_wgpu_encode::{
-    AnimationHeader, FiniteF16, FrameOptions, FrameTiming, ImageColorOptions,
+    AnimationHeader, FiniteF16, FrameOptions, FrameTiming, ImageOptions,
     LosslessModularAnimationDescriptor,
 };
 
@@ -218,10 +218,11 @@ fn enumerated_source_colors_preserve_native_profiles_and_exact_gpu_words() {
     let encoders: Vec<_> = (0..4)
         .map(|index| {
             LosslessModularEncoder::with_tree_mode(rig.context.clone(), TREES[index % 2])
-                .with_color_options(ImageColorOptions {
+                .with_image_options(ImageOptions {
                     rendering_intent: INTENTS[index],
                     intensity_target: FiniteF16::from_bits([0x5bf8, 0x63d0, 0x70e2, 0x7bff][index])
                         .unwrap(),
+                    ..Default::default()
                 })
                 .unwrap()
         })
@@ -337,9 +338,10 @@ fn color_animations_bind_stream_metadata_across_layout_changes_and_completion_or
             shifted: true,
         };
         let encoder = LosslessModularEncoder::with_tree_mode(rig.context.clone(), TREES[index % 2])
-            .with_color_options(ImageColorOptions {
+            .with_image_options(ImageOptions {
                 rendering_intent: INTENTS[index],
                 intensity_target: FiniteF16::from_bits(0x63d0).unwrap(),
+                ..Default::default()
             })
             .unwrap();
         let expected = case.samples(extent);
