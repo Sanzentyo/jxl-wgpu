@@ -63,7 +63,10 @@ impl Packing {
             extent.width as usize * extent.height as usize * channels
         );
         let mut order: Vec<_> = (0..channels).collect();
-        if self.reversed && gray_alpha {
+        let device = pixel_format.swizzle == Swizzle::Device;
+        if self.reversed && device {
+            order.reverse();
+        } else if self.reversed && gray_alpha {
             order.reverse();
             pixel_format.swizzle = Swizzle::Xyzw([
                 SwizzleComponent::W,
@@ -72,7 +75,7 @@ impl Packing {
                 SwizzleComponent::X,
             ]);
         }
-        if self.reversed && channels >= 3 {
+        if self.reversed && !device && channels >= 3 {
             order[..3].reverse();
             pixel_format.swizzle = if channels == 4 {
                 Swizzle::ZYXW
@@ -105,7 +108,10 @@ impl Packing {
                     let mut fields = Vec::new();
                     for (index, &position) in physical.iter().enumerate() {
                         let shift = storage_bits - bits * (index as u8 + 1);
-                        fields.push(PackingField::channel(ids[position], bits));
+                        fields.push(PackingField::channel(
+                            ids[if device { order[position] } else { position }],
+                            bits,
+                        ));
                         samples.push(Sample {
                             logical: order[position],
                             word: 0,
@@ -121,7 +127,7 @@ impl Packing {
                         .map(|(word, &position)| {
                             let storage_bits = match self.storage {
                                 Storage::ThreeBytes => 24,
-                                Storage::MixedWords => [8, 16, 24, 32][position],
+                                Storage::MixedWords => [8, 16, 24, 32][position % 4],
                                 _ if self.shifted && bits == 16 => 32,
                                 _ => bits.next_power_of_two().max(8),
                             };
@@ -134,7 +140,10 @@ impl Packing {
                             if storage_bits > bits + shift {
                                 fields.push(PackingField::padding(storage_bits - bits - shift));
                             }
-                            fields.push(PackingField::channel(ids[position], bits));
+                            fields.push(PackingField::channel(
+                                ids[if device { order[position] } else { position }],
+                                bits,
+                            ));
                             if shift != 0 {
                                 fields.push(PackingField::padding(shift));
                             }

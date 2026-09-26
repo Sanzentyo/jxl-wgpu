@@ -16,8 +16,7 @@ pub(in crate::vardct_encoder) struct Limits {
 struct BoundPlane {
     plan: Plan,
     windows: SourceWindows,
-    // None means the packed alpha in the main color source.
-    source: Option<usize>,
+    source: crate::extra_channel::input::ScalarBuffer,
     offset: u64,
 }
 
@@ -73,7 +72,7 @@ impl ImagePlan {
         {
             let input = sampled.source;
             let (layout, component) = if let Some(input) = input {
-                (&inputs.independent[input], 0)
+                (&inputs.independent[input].layout, 0)
             } else {
                 (main, samples.alpha_component().expect("packed alpha"))
             };
@@ -113,7 +112,10 @@ impl ImagePlan {
             planes.push(BoundPlane {
                 plan,
                 windows,
-                source: input,
+                source: input.map_or(
+                    crate::extra_channel::input::ScalarBuffer::Primary,
+                    |input| inputs.independent[input].buffer,
+                ),
                 offset: memory.artifact_bytes,
             });
             memory.parameter_bytes += plan.memory.parameter_bytes;
@@ -143,9 +145,7 @@ impl ImagePlan {
         self.planes
             .iter()
             .map(|plane| {
-                let buffer = plane.source.map_or(&source.buffer, |index| {
-                    &source.extra_channels()[index].buffer
-                });
+                let buffer = plane.source.buffer(source);
                 pipeline.encode(
                     device,
                     commands,

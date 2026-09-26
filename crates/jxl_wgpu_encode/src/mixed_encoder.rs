@@ -168,6 +168,7 @@ impl MixedModeBackend {
         source: &BufferImageSource,
         request: &FrameEncodeRequest,
     ) -> Result<(), EncodeError> {
+        source.validate_alpha_association(self.vardct.alpha_association().unwrap_or_default())?;
         if !self.vardct.matches_source_format(&source.layout.format) {
             return Err(UnsupportedFeature::InputFormat.into());
         }

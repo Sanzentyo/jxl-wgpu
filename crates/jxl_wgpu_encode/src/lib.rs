@@ -35,8 +35,11 @@
 //! [`MixedModeEncoder`] selects Modular or VarDCT explicitly for each physical frame under one
 //! checked [`ImageSequenceDescriptor`]. Its shared original-component color contract supports layered stills,
 //! animations and post-color-transform references across both codecs. Automatic mode selection
-//! and arbitrary extra-channel inputs remain unimplemented. Both codecs use the
-//! same checked image-sample plan, including optional lossless alpha, packed/planar/split storage and a GPU byte/word loader.
+//! remains unimplemented. Both codecs use the same checked image-sample plan, including optional
+//! lossless alpha and independently declared scalar inputs. CMYK ICC buffers share that plan:
+//! CMY and optional alpha form the primary view, with K encoded as an exact Black extra.
+//! [`CmykSampleEncoding`] distinguishes integer ink amounts from already complemented words;
+//! floating input requires the latter. Packed/planar/split storage uses a shared GPU byte/word loader.
 //! [`VarDctCoefficientOrders`] selects independent X/Y/B permutations for every standard size class;
 //! GPU serializers consume them without exposing image coefficients to the host.
 //!
@@ -77,6 +80,8 @@ mod session;
 mod source;
 mod source_color;
 mod vardct_encoder;
+
+pub use source::CmykSampleEncoding;
 
 pub use buffer_pool::{
     DEFAULT_ENCODER_BUFFER_POOL_BYTES, EncoderBufferPoolStats, MAX_ENCODER_BUFFER_POOL_IDLE_SETS,

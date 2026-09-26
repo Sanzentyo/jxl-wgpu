@@ -416,7 +416,7 @@ pub(super) struct VarDctKernelParams {
     pub(super) source_validation_offset: u32,
     pub(super) source_validation_groups: u32,
     pub(super) source_big_endian: u32,
-    pub(super) sources: [crate::source::SourceParams; 3],
+    pub(super) sources: [crate::source::SourceParams; 4],
     pub(super) source_color: super::color::SourceColorParams,
 }
 
@@ -471,8 +471,8 @@ pub(super) struct DcFragmentDescriptor {
 const _: () = {
     assert!(std::mem::size_of::<GpuPrefixEntry>() == 8);
     assert!(std::mem::align_of::<GpuPrefixEntry>() == 4);
-    assert!(std::mem::size_of::<VarDctKernelParams>() == 892);
-    assert!(std::mem::offset_of!(VarDctKernelParams, source_color) == 828);
+    assert!(std::mem::size_of::<VarDctKernelParams>() == 916);
+    assert!(std::mem::offset_of!(VarDctKernelParams, source_color) == 852);
     assert!(std::mem::align_of::<VarDctKernelParams>() == 4);
     assert!(std::mem::size_of::<VarDctArtifactHeader>() == 272);
     assert!(std::mem::align_of::<VarDctArtifactHeader>() == 4);

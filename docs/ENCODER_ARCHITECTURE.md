@@ -162,6 +162,24 @@ Original ICC selects no conversion program and preserves device components. Head
 is common to both codecs, with one session/still metadata permit through assembly. These plans
 keep profile policy, resource bounds and validated GPU results separate.
 
+CMYK extends the same plan with one primary Black extra, following packed alpha and preceding
+attached scalar sources. The checked `SourceLayout` builds CMY/alpha, Black and four-component ICC
+views of the original buffer; consumers resolve each scalar's owner as primary or attached.
+Five physical CMYKA planes therefore require no fifth shader binding or host sample copy.
+The image plan owns extra order and rejects duplicate Black; the sampling plan requires primary
+alpha/Black to use the color factor, even when rounded extents happen to coincide. Transform and
+Modular-plane lowering consume those resolved views rather than reconstructing channel meaning.
+
+Input convention is distinct from profile and storage: integer ink amounts use exact GPU
+complementation; explicit complemented words preserve every supported integer/floating precision.
+Implicit floating ink conversion is rejected because subtraction cannot preserve all words.
+Associated CMY also requires explicit complemented words: multiplying alpha and complementing ink
+do not commute. This checked source contract applies before still, sequence and mixed admission.
+Original CMY skips ICC evaluation. XYB normalizes four device planes and uses the resident
+complemented 4-to-3 ICC connection before opsin conversion. Black still has its independently
+validated raw-word artifact. Its source view shares the primary buffer lifetime and range-union
+accounting. [CMYK evidence](CONFORMANCE_CORPUS.md#cmyk-encoder-input).
+
 `ColorSampleFormat` owns `ColorChannels::Gray` or `Rgb`, 1–31-bit integer or checked
 `FloatPrecision` logical precision, and a
 canonical format constructor. The shared `source` module owns physical packing, swizzle and

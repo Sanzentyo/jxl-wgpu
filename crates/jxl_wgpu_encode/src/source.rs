@@ -11,6 +11,9 @@ use jxl_gpu_formats::{
 
 use crate::{EncodeError, UnsupportedFeature};
 
+mod cmyk;
+pub use cmyk::CmykSampleEncoding;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct SourceParams {
@@ -18,6 +21,7 @@ pub(crate) struct SourceParams {
     pub(crate) byte_offset: u32,
     pub(crate) pixel_stride: u32,
     pub(crate) word_bytes: u32,
+    /// Low five bits are the sample shift; bit five selects exact integer complement.
     pub(crate) bit_shift: u32,
     pub(crate) plane: u32,
 }
@@ -178,6 +182,13 @@ pub(crate) struct SourceSpec {
     pub(crate) exponent_bits_per_sample: u8,
     pub(crate) big_endian: bool,
     components: [SourceParams; 4],
+    black: Option<SourceParams>,
+}
+
+impl SourceSpec {
+    pub(crate) fn is_cmyk(&self) -> bool {
+        self.black.is_some()
+    }
 }
 
 fn component_index(component: SwizzleComponent) -> Option<usize> {
@@ -197,7 +208,7 @@ pub(crate) fn source_spec(format: &PixelFormat) -> Result<SourceSpec, EncodeErro
             SampleKind::Unsigned | SampleKind::Float | SampleKind::CustomFloat(_)
         )
         || format.chroma_subsampling != ChromaSubsampling::None
-        || format.planes.len() > 4
+        || format.planes.len() > 5
     {
         return Err(UnsupportedFeature::InputFormat.into());
     }
@@ -211,6 +222,7 @@ pub(crate) fn source_spec(format: &PixelFormat) -> Result<SourceSpec, EncodeErro
         match &profile.header().device_space.0 {
             b"GRAY" => Some(1),
             b"RGB " => Some(3),
+            b"CMYK" => Some(4),
             _ => return Err(UnsupportedFeature::InputFormat.into()),
         }
     } else {
@@ -284,7 +296,7 @@ pub(crate) fn source_spec(format: &PixelFormat) -> Result<SourceSpec, EncodeErro
         }
         _ => return Err(UnsupportedFeature::InputFormat.into()),
     };
-    let mut stored = [None; 4];
+    let mut stored = [None; 5];
     let mut bits_per_sample = None;
     let mut bytes_per_sample = 0;
     for (plane_index, plane) in format.planes.iter().enumerate() {
@@ -369,12 +381,20 @@ pub(crate) fn source_spec(format: &PixelFormat) -> Result<SourceSpec, EncodeErro
         } else {
             logical
         };
-        let index =
-            component_index(swizzle[swizzle_index]).ok_or(UnsupportedFeature::InputFormat)?;
+        let index = if device_channels == Some(4) && swizzle_index == 3 {
+            4 // CMYK's physical alpha follows K; the coded main view remains CMY/alpha.
+        } else {
+            component_index(swizzle[swizzle_index]).ok_or(UnsupportedFeature::InputFormat)?
+        };
         *component = stored[index]
             .take()
             .ok_or(UnsupportedFeature::InputFormat)?;
     }
+    let black = if device_channels == Some(4) {
+        Some(stored[3].take().ok_or(UnsupportedFeature::InputFormat)?)
+    } else {
+        None
+    };
     // Duplicated, absent or discarded channels are not a lossless source contract.
     if stored.iter().any(Option::is_some) {
         return Err(UnsupportedFeature::InputFormat.into());
@@ -398,6 +418,7 @@ pub(crate) fn source_spec(format: &PixelFormat) -> Result<SourceSpec, EncodeErro
         },
         big_endian: format.byte_order == ByteOrder::Big,
         components,
+        black,
     })
 }
 
@@ -538,12 +559,15 @@ impl SourceWindows {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct SourceLayout {
     pub(crate) spec: SourceSpec,
     pub(crate) full_windows: SourceWindows,
     offsets: [u64; 4],
     alignment: u64,
     extent: jxl_gpu_protocol::Extent2d,
+    pub(crate) black: Option<Box<SourceLayout>>,
+    pub(crate) cmyk_color: Option<Box<SourceLayout>>,
 }
 
 pub(crate) struct SourceRegion {
@@ -553,12 +577,39 @@ pub(crate) struct SourceRegion {
 }
 
 impl SourceLayout {
+    #[cfg(test)]
     pub(crate) fn new(
         layout: &ImageLayout,
         buffer_bytes: u64,
         alignment: u64,
     ) -> Result<Self, EncodeError> {
-        let mut spec = source_spec(&layout.format)?;
+        Self::with_encoding(
+            layout,
+            buffer_bytes,
+            alignment,
+            CmykSampleEncoding::default(),
+        )
+    }
+
+    pub(crate) fn for_source(
+        source: &crate::BufferImageSource,
+        alignment: u64,
+    ) -> Result<Self, EncodeError> {
+        Self::with_encoding(
+            &source.layout,
+            source.buffer.size(),
+            alignment,
+            source.cmyk_encoding(),
+        )
+    }
+
+    fn with_encoding(
+        layout: &ImageLayout,
+        buffer_bytes: u64,
+        alignment: u64,
+        encoding: CmykSampleEncoding,
+    ) -> Result<Self, EncodeError> {
+        let spec = source_spec(&layout.format)?.with_cmyk_encoding(encoding)?;
         // Public layout fields can be modified after construction. Revalidate every plane,
         // including extents, pitches, non-overlap, and the claimed logical allocation size.
         let checked =
@@ -568,9 +619,7 @@ impl SourceLayout {
                 "inconsistent logical source size",
             ));
         }
-        let alignment = alignment.max(4);
-        let mut full_windows = SourceWindows::default();
-        for (index, plane) in layout.planes.iter().enumerate() {
+        for plane in &layout.planes {
             let end = align_up(plane.end_offset()?, 4)
                 .ok_or(EncodeError::InvalidSource("source binding size overflow"))?;
             if end > buffer_bytes {
@@ -578,7 +627,65 @@ impl SourceLayout {
                     "source binding does not contain the final addressable sample word",
                 ));
             }
-            full_windows.0[index] = SourceWindow {
+        }
+        Self::view(layout, spec, alignment.max(4))
+    }
+
+    /// Bind only the physical planes addressed by this view. CMY/alpha and Black can
+    /// therefore share a five-plane input without adding a fifth shader source binding.
+    fn view(
+        layout: &ImageLayout,
+        mut spec: SourceSpec,
+        alignment: u64,
+    ) -> Result<Self, EncodeError> {
+        let cmyk_color = spec
+            .black
+            .map(|black| {
+                let mut components = spec.components;
+                components[3] = black;
+                Self::view(
+                    layout,
+                    SourceSpec {
+                        format: SourceChannels::Rgba,
+                        components,
+                        black: None,
+                        ..spec.clone()
+                    },
+                    alignment,
+                )
+                .map(Box::new)
+            })
+            .transpose()?;
+        let black = spec
+            .black
+            .map(|component| {
+                let mut components = [SourceParams::zeroed(); 4];
+                components[0] = component;
+                Self::view(
+                    layout,
+                    SourceSpec {
+                        format: SourceChannels::Gray,
+                        components,
+                        black: None,
+                        ..spec.clone()
+                    },
+                    alignment,
+                )
+                .map(Box::new)
+            })
+            .transpose()?;
+        let mut planes: Vec<_> = spec.components[..spec.format.channel_count() as usize]
+            .iter()
+            .map(|component| component.plane as usize)
+            .collect();
+        planes.sort_unstable();
+        planes.dedup();
+        let mut full_windows = SourceWindows::default();
+        for (binding, &index) in planes.iter().enumerate() {
+            let plane = &layout.planes[index];
+            let end = align_up(plane.end_offset()?, 4)
+                .ok_or(EncodeError::InvalidSource("source binding size overflow"))?;
+            full_windows.0[binding] = SourceWindow {
                 start: plane.offset - plane.offset % alignment,
                 end,
             };
@@ -601,6 +708,9 @@ impl SourceLayout {
                     "source component offset overflow",
                 ))?;
             component.byte_offset = 0;
+            component.plane = planes
+                .binary_search(&(component.plane as usize))
+                .expect("selected source plane") as u32;
         }
         Ok(Self {
             spec,
@@ -608,6 +718,8 @@ impl SourceLayout {
             offsets,
             alignment,
             extent: layout.extent,
+            black,
+            cmyk_color,
         })
     }
 

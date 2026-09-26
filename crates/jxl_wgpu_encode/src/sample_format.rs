@@ -39,6 +39,7 @@ pub(crate) struct ImageSamplePlan {
     pub(crate) color: ColorSampleFormat,
     pub(crate) alpha: Option<AlphaAssociation>,
     pub(crate) extra_channels: std::sync::Arc<[crate::ExtraChannel]>,
+    pub(crate) cmyk: bool,
 }
 
 impl ImageSamplePlan {
@@ -51,7 +52,29 @@ impl ImageSamplePlan {
             color,
             alpha,
             extra_channels,
+            cmyk: false,
         }
+    }
+
+    /// The embedded CMYK profile owns one full-resolution Black in the primary buffer.
+    /// It follows packed alpha and precedes independently attached scalar inputs.
+    pub(crate) fn with_cmyk(mut self, cmyk: bool) -> Result<Self, EncodeError> {
+        if cmyk {
+            if self.color.channels() != ColorChannels::Rgb {
+                return Err(EncodeError::InvalidConfiguration(
+                    "CMYK requires three coded color components",
+                ));
+            }
+            let black = crate::ExtraChannel::new(
+                crate::ExtraChannelKind::Black,
+                self.color.precision(),
+                0,
+                Vec::new(),
+            )?;
+            self.extra_channels = self.extra_channels.iter().cloned().chain([black]).collect();
+            self.cmyk = true;
+        }
+        Ok(self)
     }
 
     pub(crate) fn with_extra_channels(
@@ -59,6 +82,15 @@ impl ImageSamplePlan {
         channels: &[crate::ExtraChannel],
         limit: u64,
     ) -> Result<Self, EncodeError> {
+        if self.cmyk
+            && channels
+                .iter()
+                .any(|channel| channel.kind() == crate::ExtraChannelKind::Black)
+        {
+            return Err(EncodeError::InvalidConfiguration(
+                "CMYK has one primary Black channel",
+            ));
+        }
         if self.extra_channels.len() + channels.len() > crate::extra_channel::MAX_EXTRA_CHANNELS {
             return Err(EncodeError::InvalidConfiguration(
                 "extra-channel count exceeds the JPEG XL profile limit",
@@ -117,6 +149,30 @@ impl ImageSamplePlan {
         format
     }
 
+    pub(crate) fn pixel_format_with_color(&self, color: ColorSpecification) -> PixelFormat {
+        let mut format = self.pixel_format();
+        if matches!(&color, ColorSpecification::Icc(profile) if profile.header().device_space.0 == *b"CMYK")
+        {
+            format.model = ColorModel::IccDevice;
+            format.swizzle = Swizzle::Device;
+            let words = &mut format.planes[0].words;
+            for (index, word) in words.iter_mut().enumerate() {
+                word.fields.last_mut().expect("canonical sample").kind =
+                    jxl_gpu_formats::PackingFieldKind::Channel(if index == 3 {
+                        Channel::Alpha
+                    } else {
+                        Channel::Device(index as u8)
+                    });
+            }
+            let mut black = words[0].clone();
+            black.fields.last_mut().expect("canonical sample").kind =
+                jxl_gpu_formats::PackingFieldKind::Channel(Channel::Device(3));
+            words.insert(3.min(words.len()), black);
+        }
+        format.color_spec = color;
+        format
+    }
+
     pub(crate) fn matches_format(&self, format: &PixelFormat) -> bool {
         let Ok(spec) = crate::source::source_spec(format) else {
             return false;
@@ -131,6 +187,7 @@ impl ImageSamplePlan {
                 (ColorModel::IccDevice, ColorSpecification::Icc(_))
             ))
             && spec.format == self.channels()
+            && spec.is_cmyk() == self.cmyk
             && spec.bits_per_sample == self.color.bits_per_sample()
             && spec.exponent_bits_per_sample == self.color.exponent_bits()
     }
@@ -144,7 +201,8 @@ impl ImageSamplePlan {
     }
 }
 
-/// Logical color channels, separate from physical packing and VarDCT's working planes.
+/// Coded color channels, separate from physical packing and VarDCT's working planes.
+/// A CMYK ICC source uses `Rgb` for its three coded CMY channels and adds a primary Black extra.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ColorChannels {
     Gray,

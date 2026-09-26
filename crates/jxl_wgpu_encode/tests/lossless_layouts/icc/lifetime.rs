@@ -225,7 +225,7 @@ fn icc_limits_intents_and_device_components_reject_before_gpu_admission() {
     let mut cmyk = upload(&rig.context, &case, extent, &case.samples(extent), 0);
     attach(&mut cmyk, &profile, true);
     cmyk.layout.format.planes[0].words[3].fields[0].kind =
-        PackingFieldKind::Channel(Channel::Device(3));
+        PackingFieldKind::Channel(Channel::Device(4));
     cmyk.layout.format.color_spec = ColorSpecification::Icc(
         IccProfile::parse(
             std::fs::read(

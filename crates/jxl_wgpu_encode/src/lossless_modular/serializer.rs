@@ -141,6 +141,7 @@ impl LosslessModularEncoder {
     ) -> Result<LosslessModularMemoryPlan, EncodeError> {
         let mut plan = self.encoder.backend().memory_plan(source)?;
         self.alpha_association.validate(plan.format)?;
+        source.validate_alpha_association(self.alpha_association)?;
         let spec = lossless_modular_source_spec(&source.layout.format)?;
         let header = image_header(
             source.layout.extent.width,
@@ -273,6 +274,7 @@ impl LosslessModularEncoder {
             canvas_height: descriptor.canvas_height,
         })?;
         Ok(LosslessModularSequenceSession {
+            alpha_association: self.alpha_association,
             session,
             assembler: CodestreamAssembler::new(codestream_header)?
                 .with_preview(descriptor.preview()),
@@ -289,6 +291,7 @@ impl LosslessModularEncoder {
         // Preserve typed address/device-limit failures before the generic
         // backend admission predicate maps unsupported inputs to InputFormat.
         self.encoder.backend().memory_plan(&source)?;
+        source.validate_alpha_association(self.alpha_association)?;
         let width = source.layout.extent.width;
         let height = source.layout.extent.height;
         let source_spec = lossless_modular_source_spec(&source.layout.format)?;
@@ -498,6 +501,7 @@ impl LosslessModularSequenceDescriptor {
 
 /// Multi-frame assembly state for a lossless Modular layered still or animation.
 pub struct LosslessModularSequenceSession {
+    alpha_association: AlphaAssociation,
     session: EncodeSession<LosslessModularBackend>,
     assembler: CodestreamAssembler,
     descriptor: LosslessModularSequenceDescriptor,
@@ -602,6 +606,7 @@ impl LosslessModularSequenceSession {
     }
 
     fn validate_source(&self, source: &crate::BufferImageSource) -> Result<(), EncodeError> {
+        source.validate_alpha_association(self.alpha_association)?;
         let spec = lossless_modular_source_spec(&source.layout.format)?;
         if spec.packing.format != self.descriptor.format
             || spec.packing.bits_per_sample != self.descriptor.bits_per_sample
@@ -1869,6 +1874,7 @@ fn image_header_with_plan(
         samples,
         format.has_alpha().then_some(color.alpha),
     )
+    .with_cmyk(color.encoding.is_cmyk())?
     .with_extra_channels(
         &color.extra_channels,
         color.max_extra_channel_metadata_bytes,

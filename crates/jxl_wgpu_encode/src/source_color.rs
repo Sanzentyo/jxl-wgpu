@@ -43,6 +43,7 @@ impl SourceColorEncoding {
                 (format.model, &profile.header().device_space.0),
                 (ColorModel::Rgb | ColorModel::IccDevice, b"RGB ")
                     | (ColorModel::Gray | ColorModel::IccDevice, b"GRAY")
+                    | (ColorModel::IccDevice, b"CMYK")
             ) {
                 return Ok(Self::Icc(profile.clone()));
             }
@@ -133,6 +134,11 @@ impl SourceColorEncoding {
             Self::Icc(profile) => Some(profile),
             Self::Enumerated(_) => None,
         }
+    }
+
+    pub(crate) fn is_cmyk(&self) -> bool {
+        self.icc_profile()
+            .is_some_and(|profile| profile.header().device_space.0 == *b"CMYK")
     }
 
     pub(crate) fn write(

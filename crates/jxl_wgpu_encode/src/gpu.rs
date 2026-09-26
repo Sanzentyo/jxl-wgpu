@@ -114,6 +114,7 @@ pub struct BufferImageSource {
     pub buffer: Arc<wgpu::Buffer>,
     pub layout: ImageLayout,
     extra_channels: Vec<BufferImageSource>,
+    cmyk_encoding: crate::CmykSampleEncoding,
 }
 
 impl BufferImageSource {
@@ -127,7 +128,32 @@ impl BufferImageSource {
             buffer,
             layout,
             extra_channels: Vec::new(),
+            cmyk_encoding: Default::default(),
         })
+    }
+
+    /// Select the CMYK sample convention. ICC device storage defaults to integer ink amounts.
+    /// Floating CMYK requires `Complemented` to retain every supplied component word.
+    /// Alpha and independently attached scalar inputs keep their own sample conventions.
+    pub fn with_cmyk_encoding(
+        mut self,
+        encoding: crate::CmykSampleEncoding,
+    ) -> Result<Self, EncodeError> {
+        if !matches!(&self.layout.format.color_spec,
+            jxl_gpu_formats::ColorSpecification::Icc(profile) if profile.header().device_space.0 == *b"CMYK")
+            || self.layout.format.model != jxl_gpu_formats::ColorModel::IccDevice
+        {
+            return Err(EncodeError::InvalidSource(
+                "CMYK sample convention requires a CMYK ICC input",
+            ));
+        }
+        self.cmyk_encoding = encoding;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn cmyk_encoding(&self) -> crate::CmykSampleEncoding {
+        self.cmyk_encoding
     }
 
     /// Attach scalar sources in `VarDctConfig::extra_channels` order (after any packed alpha).

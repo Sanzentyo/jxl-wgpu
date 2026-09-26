@@ -213,6 +213,22 @@ CMYK, failed admission, retry, concurrent submissions and cancellation. These ch
 complete broader CMYK-suggested XYB conformance, uncommon device-space image conformance, HDR,
 full profile range/conditioning or the remaining full JPEG XL requirements.
 
+## CMYK encoder input
+
+Encoder CMYK buffers bind the same profile domain as decoding. The common checked input plan
+maps C/M/Y plus optional alpha to its primary view and K to one lossless Black extra, with alpha
+before Black in the header. Integer ink amounts are complemented exactly on GPU. Floating inputs
+must explicitly supply complemented words to avoid lossy host or GPU `1-x` conversion. Original
+Modular retains every word; Original VarDCT quantizes CMY and retains Black/alpha words.
+
+XYB encoding evaluates the unchanged profile through the resident relative CMYK-to-linear-BT.709
+connection, with four input planes and three working output planes, then applies opsin conversion.
+The checked image/frame plans retain profile limits, intent agreement and F.2 reference restrictions.
+No CPU CMS or image encoder enters the production path. Independent frozen PCS/native coefficient,
+raw-word, mixed sequence, preview and ownership evidence is recorded in the
+[CMYK encoder corpus](CONFORMANCE_CORPUS.md#cmyk-encoder-input). This does not complete floating
+ink-amount normalization or every device/profile/range combination.
+
 ## CMYK-suggested XYB and numeric output
 
 XYB's original ICC profile suggests an output encoding. Numeric color selection now evaluates

@@ -547,7 +547,7 @@ fn abi_records_are_pod_and_word_aligned() {
     assert_pod::<VarDctKernelParams>();
     assert_pod::<VarDctArtifactHeader>();
     assert_pod::<DcFragmentDescriptor>();
-    assert_eq!(std::mem::size_of::<VarDctKernelParams>(), 892);
+    assert_eq!(std::mem::size_of::<VarDctKernelParams>(), 916);
     assert_eq!(std::mem::size_of::<VarDctArtifactHeader>(), 272);
     assert_eq!(std::mem::size_of::<DcFragmentDescriptor>(), 8);
 
@@ -597,7 +597,7 @@ fn abi_records_are_pod_and_word_aligned() {
     assert_eq!(parameter_words[184], 0x129);
     assert_eq!(&parameter_words[185..188], &[0x130, 0x131, 0x132]);
     assert_eq!(parameter_words[188], 0x133);
-    assert_eq!(&parameter_words[189..207], &(1..=18).collect::<Vec<_>>());
+    assert_eq!(&parameter_words[189..213], &(1..=24).collect::<Vec<_>>());
 
     let mut header: VarDctArtifactHeader = bytemuck::Zeroable::zeroed();
     header.fragment_descriptor_offset = 0x41;
@@ -642,7 +642,7 @@ fn naga_validates_vardct_shaders() {
                 let naga::TypeInner::Struct { members, span } = &ty.inner else {
                     panic!("parameters must be a structure")
                 };
-                assert_eq!(*span, 892);
+                assert_eq!(*span, 916);
                 for (name, offset) in [
                     ("saliency_offset", 181 * 4),
                     ("saliency_groups", 182 * 4),
@@ -653,7 +653,7 @@ fn naga_validates_vardct_shaders() {
                     ("source_validation_groups", 187 * 4),
                     ("source_big_endian", 188 * 4),
                     ("sources", 189 * 4),
-                    ("source_color", 207 * 4),
+                    ("source_color", 213 * 4),
                 ] {
                     assert_eq!(
                         members
@@ -812,10 +812,10 @@ fn gpu_profile_encodes_exact_black_from_padded_rgb() {
     let plan = encoder.memory_plan(&source).unwrap();
     assert_eq!(plan.kernel_layout, VarDctKernelLayout::SingleTransform);
     assert_eq!(plan.source_binding_bytes, 232);
-    assert_eq!(plan.parameter_storage_bytes, 892);
+    assert_eq!(plan.parameter_storage_bytes, 916);
     assert_eq!(plan.artifact_storage_bytes, 3_072);
     assert_eq!(plan.readback_bytes, 3_072);
-    assert_eq!(plan.owned_bytes_per_job, 12_304);
+    assert_eq!(plan.owned_bytes_per_job, 12_328);
     assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
 
     let codestream = encoder.encode(source).unwrap();
@@ -945,7 +945,7 @@ fn tiled_dct8_emits_multiple_ac_groups_for_odd_black_extent() {
     let plan = encoder.memory_plan(&source).unwrap();
     let grid = encoder.grid(&source).unwrap();
     assert_eq!(plan.kernel_layout, VarDctKernelLayout::TiledDct8);
-    assert_eq!(plan.parameter_storage_bytes, 892);
+    assert_eq!(plan.parameter_storage_bytes, 916);
     assert_eq!((grid.block_columns, grid.block_rows), (33, 3));
     assert_eq!(grid.block_count().unwrap(), 99);
     assert_eq!((grid.ac_group_columns, grid.ac_group_rows), (2, 1));
@@ -1115,7 +1115,7 @@ fn abandoned_tiled_job_holds_and_releases_its_exact_budget() {
     assert_eq!(plan.kernel_layout, VarDctKernelLayout::TiledDct8);
     assert_eq!(
         plan.owned_bytes_per_job,
-        892 + 2 * plan.artifact_storage_bytes + plan.quantization_metadata_bytes
+        916 + 2 * plan.artifact_storage_bytes + plan.quantization_metadata_bytes
     );
 
     let limited_context = WgpuContext::with_memory_budget(
@@ -1254,14 +1254,14 @@ fn every_executable_strategy_emits_a_standard_black_codestream() {
 
         let layout = ArtifactLayout::new(strategy, &fixed_prefix_code().unwrap()).unwrap();
         assert_eq!(plan.kernel_layout, VarDctKernelLayout::SingleTransform);
-        assert_eq!(plan.parameter_storage_bytes, 892);
+        assert_eq!(plan.parameter_storage_bytes, 916);
         assert_eq!(plan.artifact_storage_bytes, layout.artifact_bytes());
         assert_eq!(plan.readback_bytes, layout.artifact_bytes());
         let transform = super::types::VarDctTransformMemoryPlan::new(strategy);
         assert_eq!(plan.transform, Some(transform));
         assert_eq!(
             plan.owned_bytes_per_job,
-            892 + 2 * layout.artifact_bytes() + transform.total_bytes
+            916 + 2 * layout.artifact_bytes() + transform.total_bytes
         );
         let codestream = encoder.encode(source).unwrap();
         assert_eq!(

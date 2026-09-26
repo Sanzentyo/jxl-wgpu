@@ -101,8 +101,8 @@ assembly keep their existing byte-accounted owners.
   storage rules above apply to both forms. No profile evaluation or image conversion is needed.
   `with_max_icc_profile_bytes` defaults to 16 MiB; zero disables ICC input. Original and transformed
   profile streams must also fit JPEG XL's 256 MiB limits. Limit failures use `EncodeError::IccLimit`
-  before variable-sized header allocation or GPU admission. CMYK and other device spaces remain
-  unsupported.
+  before variable-sized header allocation or GPU admission. CMYK uses the separate
+  [primary Black contract](#cmyk-icc-input); other device spaces remain unsupported.
 - `with_image_options(ImageOptions)` selects the shared [presentation metadata](#image-presentation-metadata).
   Defaults include Relative intent and 255 cd/m² image white, also for HDR; the caller explicitly
   selects another known source white. It performs no primary conversion or alpha-association change.
@@ -458,7 +458,8 @@ compositions against independent native/Rust decoders, with retained output and 
 The [embedded-ICC matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-embedded-icc)
 checks independent original-profile bytes and source words, requested color output, private tags,
 all intents, animation identity, size limits and shared-budget lifetime.
-Independent scalar declarations use the plan described below. CMYK, YUV and textures remain outside this profile.
+Independent scalar declarations use the plan described below. CMYK uses the shared input plan
+described below; YUV and textures remain outside this profile.
 The [group-size matrix](../../docs/CONFORMANCE_CORPUS.md#lossless-modular-group-sizes) covers every
 size with shared/local trees, integer/IEEE source words, LF boundaries, full tiles, cropped and
 Replace animations, bounded GPU output and admission/cancellation. The default 256 configuration
@@ -527,6 +528,40 @@ the Modular backend; an explicitly different nonempty Modular declaration is rej
 sampling, crops, reference slots, independent blends and packed alpha keep the common frame
 contract. [Conformance and native-oracle limits](../../docs/CONFORMANCE_CORPUS.md#independent-modular-and-mixed-input)
 cover physical words, composition, fragmented GPU decoding, admission and cancellation.
+
+## CMYK ICC input
+
+Both codecs and Original mixed sequences accept `IccDevice` buffers with a CMYK ICC profile,
+`Swizzle::Device`, four `Channel::Device(0..4)` components and optional `Channel::Alpha`.
+Use `ColorChannels::Rgb` for the three coded CMY components in `VarDctConfig`; its `source_color`
+profile makes `pixel_format()` return canonical CMYK or CMYKA storage. Modular sequence descriptors
+use `LosslessModularSequenceDescriptor::from_pixel_format`. All primary components share precision
+and sampling. Packed, split and up to five planar inputs retain checked bit positions, byte order,
+unaligned offsets and pitches. The shared source plan binds separate CMY/alpha, Black and ICC CMYK
+views of the same buffer within the existing four source bindings.
+
+`BufferImageSource` defaults to `CmykSampleEncoding::InkAmounts`: unsigned 1–31-bit input means
+zero ink at zero, and the GPU computes `mask - word` exactly for C, M, Y and K. Alpha is untouched.
+`with_cmyk_encoding(CmykSampleEncoding::Complemented)` instead accepts JPEG XL component words,
+where zero means full ink. It preserves all integer and all 154 floating precisions, including
+Modular signed zero, subnormals, infinities and NaN payloads. Floating ink amounts are rejected;
+`1 - x` cannot reversibly preserve every floating word. VarDCT color conversion still rejects
+nonfinite color input; XYB also validates K because the ICC conversion consumes it.
+Associated alpha requires explicitly complemented CMY words, because alpha multiplication and
+ink complementation do not commute. Ink-amount input with associated alpha rejects before admission.
+
+The header order is CMY, optional packed alpha, one primary Black, then independently attached
+extras. Black is an exact scalar plane under both codecs, shares the color sampling factor, and
+retains independent blend/reference control. It counts toward the 256-extra limit and metadata
+budget. A second attached Black is rejected. Palette retains its primary four-component selection
+contract; Squeeze and ordered local transforms can include Black through the scalar transform plan.
+
+Original coding preserves complemented CMY. XYB evaluates the profile's relative 4-to-3 connection
+on GPU, then converts linear BT.709 to XYB. The original ICC bytes remain unchanged; generated
+presentation K is distinct from the lossless encoded Black. ICC's forbidden XYB post-transform
+references remain rejected. Preview, sampling/crop, mixed references, exact admission and cancellation
+use the existing frame/input and completion ownership plans. No CPU image conversion is introduced.
+[Conformance evidence](../../docs/CONFORMANCE_CORPUS.md#cmyk-encoder-input).
 
 ## Experimental VarDCT profile
 
@@ -691,8 +726,9 @@ Fixed-VarDCT sequences retain these declarations across frames. Supply either an
 selects an existing extra index 0–10 for Blend/MultiplyAdd; other modes require zero. Each plane
 retains its own reference slot and clamp contract. [Conformance evidence](../../docs/CONFORMANCE_CORPUS.md#independent-vardct-extra-input)
 covers exact words, shifted progressive streams, native/GPU composition and ownership.
-Modular and mixed sequences share this scalar input contract. CMYK input, NonOptional/unknown semantics and per-extra lossy encoding are
-not introduced by the Black/Optional scalar declarations.
+Modular and mixed sequences share this scalar input contract. CMYK requires the
+[profile-bound primary input](#cmyk-icc-input); a Black declaration alone does not change the color
+domain. NonOptional/unknown semantics and per-extra lossy encoding remain unsupported.
 
 The logical input API is `ColorSampleFormat` and `ImageSequenceDescriptor`; these replace
 the former RGB-only names. A sequence fixes channels and precision together, even when
@@ -887,10 +923,10 @@ fallback. The independently concatenable block format relies on the single-distr
 policy; future contextual or ANS encoders must maintain their state on GPU.
 
 `VarDctMemoryPlan::kernel_layout` distinguishes `SingleTransform`, `StrategyMap` and `TiledDct8`. All use
-892-byte parameters and a runtime-sized artifact with a 272-byte header. The former carries
+916-byte parameters and a runtime-sized artifact with a 272-byte header. The former carries
 the pass count, per-pass word stride and eleven spectral/shift descriptors; the latter records
-the pass count. The source layout replaces three old geometry/width words with three 24-byte
-component records, increasing parameters by 60 bytes; the artifact header is unchanged. LF descriptors
+the pass count. The source layout contains four 24-byte component records; the fourth supplies
+K during CMYK ICC normalization. The artifact header is unchanged. LF descriptors
 follow the header; the subsequent strategy, sample and entropy sections align to 256 bytes. Single-transform plans additionally report exact normalized-color, raw coefficient,
 LF, quantized coefficient, matrix/order, transform-task and forward scratch allocations in `transform`.
 Mapped plans report their aggregate allocation sizes: basis/uniform storage is shared per strategy,
@@ -903,14 +939,14 @@ also work on devices requiring 1024-byte storage offsets without padding each ch
 Raw input instead uses four aligned plane bindings (unused entries alias the first); the reported
 `source_binding_bytes` is their union, with overlap counted once and gaps between windows excluded.
 Each general-transform matrix/order entry contains three F32 scales and three U32 indices in
-24 bytes. An 8×8 DCT submission owns 12,304 bytes: 892 parameters, 3,072 artifact, 3,072 readback
+24 bytes. An 8×8 DCT submission owns 12,328 bytes: 916 parameters, 3,072 artifact, 3,072 readback
 and 5,268 resident transform bytes. Tiled DCT8 retains the same 24-byte entry layout in a
 1,536-byte matrix/order table at read-only storage binding 3, reported by
 `quantization_metadata_bytes` and included in the
 job's owned bytes. It requires seven storage bindings and retains the table through completion
 or cancellation. No coefficient readback is added.
 XYB ICC adds `VarDctMemoryPlan::icc`: padded input and linear output planes (one plane each for
-Gray, three for RGB), the lowered program, an original 892-byte source-layout record and the
+Gray, three for RGB, four input and three output for CMYK), the lowered program, an original 916-byte source-layout record and the
 resident 320-byte dispatch record. All belong to the existing job reservation, command submission
 and map completion. Saliency still reads original device samples. Original ICC adds no color
 intermediate. `icc_profile_bytes` includes the caller-owned retained profile in addressed bytes.

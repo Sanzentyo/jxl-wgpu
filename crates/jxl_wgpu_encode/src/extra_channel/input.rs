@@ -5,8 +5,28 @@ use crate::source::{SourceChannels, SourceLayout, SourceWindows};
 use crate::{BufferImageSource, EncodeError, UnsupportedFeature};
 
 pub(crate) struct ExtraInputPlan {
-    pub(crate) independent: Vec<SourceLayout>,
+    pub(crate) independent: Vec<ScalarInput>,
     pub(crate) source_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ScalarBuffer {
+    Primary,
+    Attached(usize),
+}
+
+impl ScalarBuffer {
+    pub(crate) fn buffer(self, source: &BufferImageSource) -> &wgpu::Buffer {
+        match self {
+            Self::Primary => &source.buffer,
+            Self::Attached(index) => &source.extra_channels()[index].buffer,
+        }
+    }
+}
+
+pub(crate) struct ScalarInput {
+    pub(crate) layout: SourceLayout,
+    pub(crate) buffer: ScalarBuffer,
 }
 
 impl ExtraInputPlan {
@@ -17,29 +37,51 @@ impl ExtraInputPlan {
         main: &SourceLayout,
         alignment: u64,
     ) -> Result<Self, EncodeError> {
+        source.validate_alpha_association(samples.alpha.unwrap_or_default())?;
         let packed = usize::from(samples.alpha.is_some());
-        if source.extra_channels().len() + packed != samples.extra_channels.len()
+        if source.extra_channels().len() + packed + usize::from(samples.cmyk)
+            != samples.extra_channels.len()
             || sampling.channels.len() != samples.extra_channels.len()
         {
             return Err(EncodeError::InvalidSource(
                 "extra source count differs from the image declaration",
             ));
         }
-        let mut independent = Vec::with_capacity(source.extra_channels().len());
+        let mut independent =
+            Vec::with_capacity(source.extra_channels().len() + usize::from(samples.cmyk));
         for (definition, sampled) in samples.extra_channels.iter().zip(&*sampling.channels) {
             let Some(input) = sampled.source else {
                 continue;
             };
-            let scalar = &source.extra_channels()[input];
-            if scalar.layout.extent != sampled.extent
-                || !scalar.buffer.usage().contains(wgpu::BufferUsages::STORAGE)
-                || !scalar.extra_channels().is_empty()
-            {
-                return Err(EncodeError::InvalidSource(
-                    "extra source extent or buffer usage differs from its declaration",
-                ));
-            }
-            let layout = SourceLayout::new(&scalar.layout, scalar.buffer.size(), alignment)?;
+            let (layout, buffer) = if samples.cmyk && input == 0 {
+                if source.layout.extent != sampled.extent {
+                    return Err(EncodeError::InvalidSource(
+                        "primary Black must use the color sample grid",
+                    ));
+                }
+                (
+                    main.black
+                        .as_deref()
+                        .ok_or(EncodeError::InvalidSource("CMYK input has no Black source"))?
+                        .clone(),
+                    ScalarBuffer::Primary,
+                )
+            } else {
+                let index = input - usize::from(samples.cmyk);
+                let scalar = &source.extra_channels()[index];
+                if scalar.layout.extent != sampled.extent
+                    || !scalar.buffer.usage().contains(wgpu::BufferUsages::STORAGE)
+                    || !scalar.extra_channels().is_empty()
+                {
+                    return Err(EncodeError::InvalidSource(
+                        "extra source extent or buffer usage differs from its declaration",
+                    ));
+                }
+                (
+                    SourceLayout::for_source(scalar, alignment)?,
+                    ScalarBuffer::Attached(index),
+                )
+            };
             let precision = definition.precision().color(crate::ColorChannels::Gray);
             if layout.spec.format != SourceChannels::Gray
                 || layout.spec.bits_per_sample != precision.bits_per_sample()
@@ -47,14 +89,13 @@ impl ExtraInputPlan {
             {
                 return Err(UnsupportedFeature::InputFormat.into());
             }
-            independent.push(layout);
+            independent.push(ScalarInput { layout, buffer });
         }
         let source_bytes = SourceWindows::addressed_bytes_many(
             std::iter::once((source.buffer.as_ref(), main.full_windows)).chain(
                 independent
                     .iter()
-                    .zip(source.extra_channels())
-                    .map(|(layout, input)| (input.buffer.as_ref(), layout.full_windows)),
+                    .map(|input| (input.buffer.buffer(source), input.layout.full_windows)),
             ),
         )?;
         Ok(Self {

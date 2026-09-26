@@ -106,10 +106,9 @@ impl ModularDispatchPlan {
             load.dispatch >= batch.first_dispatch
                 && load.dispatch < batch.first_dispatch + batch.dispatch_count
         }) {
-            let [source0, source1, source2, source3] = load.windows.entries(
-                &upload.source.extra_channels()[load.source].buffer,
-                [0, 3, 4, 5],
-            );
+            let [source0, source1, source2, source3] = load
+                .windows
+                .entries(load.source.buffer(upload.source), [0, 3, 4, 5]);
             let bindings = upload
                 .context
                 .device()

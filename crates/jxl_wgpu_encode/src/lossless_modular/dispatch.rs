@@ -98,7 +98,7 @@ pub(super) struct ModularDispatchBatch {
 #[derive(Clone, Debug)]
 pub(super) struct ModularInputLoad {
     pub(super) dispatch: usize,
-    pub(super) source: usize,
+    pub(super) source: crate::extra_channel::input::ScalarBuffer,
     pub(super) windows: SourceWindows,
     pub(super) params: ModularParams,
     pub(super) parameter_offset: u64,
@@ -190,13 +190,6 @@ impl LosslessModularBackend {
                         entry_point: Some("encode"),
                         compilation_options: wgpu::PipelineCompilationOptions {
                             constants: &[
-                                (
-                                    "transform_program_enabled",
-                                    f64::from(u32::from(
-                                        config.local_transforms.uses_program()
-                                            || !config.extra_channels.is_empty(),
-                                    )),
-                                ),
                                 (
                                     "squeeze_enabled",
                                     f64::from(u32::from(config.local_transforms.uses_squeeze())),
@@ -301,6 +294,7 @@ impl LosslessModularBackend {
             spec.format,
             spec.bits_per_sample,
             spec.exponent_bits_per_sample,
+            spec.is_cmyk(),
         )?;
         let header = FrameHeaderPlan::with_extra_channels(
             request,
@@ -364,6 +358,7 @@ impl LosslessModularBackend {
             spec.format,
             spec.bits_per_sample,
             spec.exponent_bits_per_sample,
+            spec.is_cmyk(),
         )?;
         let sampling =
             crate::sampling::FrameSamplingPlan::unscaled(source.layout.extent, &samples)?;
@@ -384,11 +379,7 @@ impl LosslessModularBackend {
         )?;
         let source_color =
             crate::source_color::SourceColorEncoding::from_format(&source.layout.format)?;
-        let source_layout = SourceLayout::new(
-            &source.layout,
-            source.buffer.size(),
-            self.storage_offset_alignment,
-        )?;
+        let source_layout = SourceLayout::for_source(source, self.storage_offset_alignment)?;
         let source_spec = &source_layout.spec;
         let format = source_spec.format;
         let transforms = Arc::new(ModularTransformPlan::with_sampling(
@@ -423,6 +414,7 @@ impl LosslessModularBackend {
             format,
             source_spec.bits_per_sample,
             source_spec.exponent_bits_per_sample,
+            source_spec.is_cmyk(),
         )?;
         let inputs = crate::extra_channel::input::ExtraInputPlan::new(
             &samples,
@@ -619,7 +611,7 @@ impl LosslessModularBackend {
                         .iter()
                         .find(|extra| extra.source == load.source)
                         .ok_or(BackendError::Invariant("missing planned scalar source"))?;
-                    let mut view = input.region(
+                    let mut view = input.layout.region(
                         region.origin[0],
                         region.origin[1],
                         load.extent[0],
@@ -633,7 +625,7 @@ impl LosslessModularBackend {
                         + u64::from(load.offset);
                     input_loads.push(ModularInputLoad {
                         dispatch: parameters.len(),
-                        source: load.source,
+                        source: input.buffer,
                         windows: view.windows,
                         parameter_offset: 0,
                         params: ModularParams {
@@ -643,8 +635,8 @@ impl LosslessModularBackend {
                                 EncodeError::InvalidSource("scalar arena exceeds WGSL indexing")
                             })?,
                             sample_source: 7,
-                            sample_mask: u32::MAX >> (32 - input.spec.bits_per_sample),
-                            big_endian: u32::from(input.spec.big_endian),
+                            sample_mask: u32::MAX >> (32 - input.layout.spec.bits_per_sample),
+                            big_endian: u32::from(input.layout.spec.big_endian),
                             sources: view.components,
                             ..ModularParams::zeroed()
                         },
@@ -940,12 +932,7 @@ impl LosslessModularBackend {
                             load.dispatch >= batch.first_dispatch
                                 && load.dispatch < batch.first_dispatch + batch.dispatch_count
                         })
-                        .map(|load| {
-                            (
-                                source.extra_channels()[load.source].buffer.as_ref(),
-                                load.windows,
-                            )
-                        }),
+                        .map(|load| (load.source.buffer(source), load.windows)),
                 ),
             )
             .map(|bytes| peak.max(bytes))

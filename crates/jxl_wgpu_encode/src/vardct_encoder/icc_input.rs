@@ -17,7 +17,7 @@ use crate::{EncodeError, UnsupportedFeature};
 /// Allocations added by one XYB ICC source conversion. Included in the job's total reservation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VarDctIccMemoryPlan {
-    /// Padded normalized device planes, one for Gray or three for RGB.
+    /// Padded normalized device planes: Gray, RGB or CMYK.
     pub input_bytes: u64,
     /// Padded linear Gray/BT.709 planes, consumed directly by the forward-transform loader.
     pub linear_bytes: u64,
@@ -35,6 +35,7 @@ pub(super) struct Pipeline {
     workgroup: (u32, u32),
     max_workgroups: u32,
     channels: usize,
+    working_channels: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -60,7 +61,8 @@ impl Pipeline {
     ) -> Result<Self, EncodeError> {
         let memory = ResidentIccMemoryPlan::new(&transform, &device.limits())?;
         let channels = transform.program().input_channels();
-        if !matches!(channels, 1 | 3) || transform.program().output_channels() != channels {
+        let working_channels = transform.program().output_channels();
+        if !matches!((channels, working_channels), (1, 1) | (3, 3) | (4, 3)) {
             return Err(EncodeError::InvalidConfiguration(
                 "ICC input and working channel plans disagree",
             ));
@@ -100,6 +102,7 @@ impl Pipeline {
             workgroup: variant.workgroup_size(),
             max_workgroups: device.limits().max_compute_workgroups_per_dimension,
             channels,
+            working_channels,
         })
     }
 
@@ -130,6 +133,7 @@ impl Pipeline {
         }
         let plane_bytes = u64::from(extent.width) * u64::from(extent.height) * 4;
         let image_bytes = plane_bytes * self.channels as u64;
+        let linear_bytes = plane_bytes * self.working_channels as u64;
         if image_bytes > limit.min(u64::from(u32::MAX)) {
             return Err(UnsupportedFeature::DeviceLimit {
                 name: "ICC input storage bytes",
@@ -142,10 +146,10 @@ impl Pipeline {
             std::mem::size_of::<VarDctKernelParams>() as u64 + self.memory.dispatch_bytes;
         let memory = VarDctIccMemoryPlan {
             input_bytes: image_bytes,
-            linear_bytes: image_bytes,
+            linear_bytes,
             program_bytes: self.memory.program_bytes,
             parameter_bytes,
-            total_bytes: image_bytes * 2 + self.memory.program_bytes + parameter_bytes,
+            total_bytes: image_bytes + linear_bytes + self.memory.program_bytes + parameter_bytes,
         };
         let mut original = *params;
         original.color_normalization = 1; // validation names nonfinite original device samples
@@ -154,7 +158,7 @@ impl Pipeline {
         params.source_big_endian = 0; // GPU storage F32 words, independent of host/source byte order
         params.sources = std::array::from_fn(|channel| crate::source::SourceParams {
             row_stride: extent.width * 4,
-            byte_offset: (channel % self.channels) as u32 * plane_bytes as u32,
+            byte_offset: (channel % self.working_channels) as u32 * plane_bytes as u32,
             pixel_stride: 4,
             word_bytes: 4,
             bit_shift: 0,
@@ -228,7 +232,7 @@ impl Pipeline {
             );
         }
         let program = ResidentIccProgram::new(device, &self.transform)?;
-        let planes: [_; 3] = std::array::from_fn(|channel| ResidentIccPlane {
+        let planes: [_; 4] = std::array::from_fn(|channel| ResidentIccPlane {
             offset: channel as u32 * plan.extent.width * plan.extent.height,
             stride: plan.extent.width,
         });
@@ -250,7 +254,11 @@ impl Pipeline {
                 extent: plan.extent,
                 input_planes: &planes[..program.input_channels()],
                 output_planes: &planes[..program.output_channels()],
-                input_encoding: ResidentIccSampleEncoding::Direct,
+                input_encoding: if self.channels == 4 {
+                    ResidentIccSampleEncoding::Complement
+                } else {
+                    ResidentIccSampleEncoding::Direct
+                },
                 output_encoding: ResidentIccSampleEncoding::Direct,
             },
         )?;

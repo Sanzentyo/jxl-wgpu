@@ -1,6 +1,5 @@
 override squeeze_enabled: bool = false;
 override palette_enabled: bool = false;
-override transform_program_enabled: bool = false;
 
 /*__JXL_SOURCE__*/
 
@@ -403,7 +402,7 @@ fn squeeze_first(params: Params, component: u32, band: u32, point: vec2<u32>) ->
 }
 
 fn sample_at(params: Params, x: u32, y: u32) -> i32 {
-    if transform_program_enabled && params.sample_source == 6u {
+    if params.sample_source == 6u {
         return bitcast<i32>(output_words[params.transform_sample_word_offset + y * params.width + x]);
     }
     if palette_enabled && params.sample_source == 5u {
@@ -728,7 +727,7 @@ fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
         return;
     }
-    let have_program = transform_program_enabled && params.transform_program_word_offset != 0u;
+    let have_program = params.transform_program_word_offset != 0u;
     if (palette_enabled && params.palette_capacity != 0u) || have_program {
         if params.channel != 0u { return; }
         if palette_enabled && params.palette_capacity != 0u {

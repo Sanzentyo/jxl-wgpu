@@ -429,7 +429,7 @@ impl ModularTransformPlan {
         exponent_bits: u8,
         config: LosslessModularConfig,
     ) -> Result<Self, EncodeError> {
-        let samples = config.samples(format, depth, exponent_bits)?;
+        let samples = config.samples(format, depth, exponent_bits, false)?;
         let sampling = crate::sampling::FrameSamplingPlan::unscaled(
             jxl_gpu_protocol::Extent2d::new(grid.width, grid.height),
             &samples,
@@ -508,34 +508,37 @@ impl ModularTransformPlan {
             .ok_or(BackendError::Invariant("empty Modular topology"))?;
         // Keep the established prefix-table policy even when a group's one-pixel axes elide
         // Squeeze. This is an entropy upper bound, not another physical channel topology.
-        let prefix_channels =
-            if !config.extra_channels.is_empty() || config.local_transforms.uses_program() {
-                max_channels.min(4) as usize
-            } else {
-                let squeeze_range = config
-                    .local_transforms
-                    .squeeze_policy()
-                    .map_or(Ok(0..image_count), |squeeze| {
-                        squeeze.resolve_range(image_count)
-                    })?;
-                (u32::from(config.palette.is_some())
-                    + image_count
-                    + squeeze_range.len() as u32
-                        * ((1
-                            << config
-                                .local_transforms
-                                .squeeze_policy()
-                                .map_or(0, |squeeze| squeeze.stages()))
-                            - 1))
-                    .min(4) as usize
-            };
+        let independent_inputs = sampling
+            .channels
+            .iter()
+            .any(|channel| channel.source.is_some());
+        let prefix_channels = if independent_inputs || config.local_transforms.uses_program() {
+            max_channels.min(4) as usize
+        } else {
+            let squeeze_range = config
+                .local_transforms
+                .squeeze_policy()
+                .map_or(Ok(0..image_count), |squeeze| {
+                    squeeze.resolve_range(image_count)
+                })?;
+            (u32::from(config.palette.is_some())
+                + image_count
+                + squeeze_range.len() as u32
+                    * ((1
+                        << config
+                            .local_transforms
+                            .squeeze_policy()
+                            .map_or(0, |squeeze| squeeze.stages()))
+                        - 1))
+                .min(4) as usize
+        };
         Ok(Self {
             global_operations,
             rct_type: rct.map_or(42, |rct| rct.rct_type.value()),
             max_channels,
             dispatches,
             prefix_channels,
-            extended_prediction_domain: !config.extra_channels.is_empty()
+            extended_prediction_domain: independent_inputs
                 || config.palette.is_some()
                 || config.local_transforms.uses_program()
                 || config.local_transforms.uses_squeeze(),

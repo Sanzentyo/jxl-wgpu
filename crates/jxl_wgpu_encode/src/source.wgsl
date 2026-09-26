@@ -27,5 +27,6 @@ fn load_source_component(source: Source, x: u32, y: u32, big_endian: u32, sample
         let shift = select(byte, source.word_bytes - 1u - byte, big_endian != 0u) * 8u;
         value |= source_byte(source.plane, byte_index + byte) << shift;
     }
-    return (value >> source.bit_shift) & sample_mask;
+    let word = (value >> (source.bit_shift & 31u)) & sample_mask;
+    return select(word, sample_mask - word, (source.bit_shift & 32u) != 0u);
 }

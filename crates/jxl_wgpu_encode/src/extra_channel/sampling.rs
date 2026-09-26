@@ -27,23 +27,30 @@ pub(crate) struct ExtraChannelSamplingPlan {
 impl ExtraChannelSamplingPlan {
     pub(crate) fn new(
         extent: Extent2d,
-        shifts: impl ExactSizeIterator<Item = u8>,
-        packed_alpha: bool,
+        samples: &crate::sample_format::ImageSamplePlan,
         color: UpsamplingFactor,
         requested: &[UpsamplingFactor],
     ) -> Result<Self, EncodeError> {
-        let count = shifts.len();
+        let count = samples.extra_channels.len();
         if count > MAX_EXTRA_CHANNELS || (!requested.is_empty() && requested.len() != count) {
             return Err(EncodeError::InvalidConfiguration(
                 "extra-channel upsampling count differs from the image declaration",
             ));
         }
-        if packed_alpha && requested.first().is_some_and(|&value| value != color) {
+        let primary_count = usize::from(samples.alpha.is_some()) + usize::from(samples.cmyk);
+        if requested
+            .iter()
+            .take(primary_count)
+            .any(|&value| value != color)
+        {
             return Err(EncodeError::InvalidConfiguration(
-                "packed alpha must use the color upsampling factor",
+                "primary alpha and Black must use the color upsampling factor",
             ));
         }
-        let channels = shifts
+        let channels = samples
+            .extra_channels
+            .iter()
+            .map(|channel| channel.dimension_shift())
             .enumerate()
             .map(|(index, intrinsic)| {
                 let upsampling = requested.get(index).copied().unwrap_or(color);
@@ -56,7 +63,7 @@ impl ExtraChannelSamplingPlan {
                 // ExtraChannel checks intrinsic shifts <= 3; the wire factor contributes <= 3.
                 let factor = 1u32 << effective_shift;
                 Ok(SampledExtraChannel {
-                    source: index.checked_sub(usize::from(packed_alpha)),
+                    source: index.checked_sub(usize::from(samples.alpha.is_some())),
                     extent: Extent2d::new(
                         extent.width.div_ceil(factor),
                         extent.height.div_ceil(factor),

@@ -24,6 +24,7 @@
 #include "lib/jxl/dec_modular.h"
 #include "lib/jxl/fields.h"
 #include "lib/jxl/image_metadata.h"
+#include "lib/jxl/icc_codec.h"
 #include "lib/jxl/modular/encoding/encoding.h"
 #include "lib/jxl/modular/transform/palette.h"
 #include "lib/jxl/toc.h"
@@ -71,6 +72,21 @@ jxl::Status FinishSection(Reader& reader) {
   return true;
 }
 
+// The pinned native ICC reader owns entropy decoding and exact bit consumption.
+// Sample-word inspection does not evaluate the profile or replace it with RGB.
+jxl::Status ReadICC(JxlMemoryManager* memory, Reader* reader, jxl::CodecMetadata* metadata) {
+  if (!metadata->m.color_encoding.WantICC()) return true;
+  jxl::ICCReader decoder(memory);
+  jxl::PaddedBytes decoded(memory);
+  JXL_RETURN_IF_ERROR(decoder.Init(reader));
+  JXL_RETURN_IF_ERROR(decoder.Process(reader, &decoded));
+  JXL_ENSURE(!decoded.empty());
+  jxl::IccBytes icc;
+  jxl::Bytes(decoded).AppendTo(icc);
+  metadata->m.color_encoding.SetICCRaw(std::move(icc));
+  return true;
+}
+
 jxl::Status AuditPalette(const jxl::Image& image, const jxl::GroupHeader& header,
                          std::array<uint32_t, 3>* counts) {
   JXL_ENSURE(!header.transforms.empty());
@@ -97,7 +113,8 @@ jxl::Status Decode(const std::vector<uint8_t>& raw, std::vector<Frame>* frames,
     JXL_RETURN_IF_ERROR(jxl::ReadImageMetadata(&reader, &metadata.m));
     metadata.transform_data.nonserialized_xyb_encoded = metadata.m.xyb_encoded;
     JXL_RETURN_IF_ERROR(jxl::Bundle::Read(&reader, &metadata.transform_data));
-    JXL_ENSURE(!metadata.m.xyb_encoded && metadata.m.have_preview == preview && !metadata.m.color_encoding.WantICC());
+    JXL_ENSURE(!metadata.m.xyb_encoded && metadata.m.have_preview == preview);
+    JXL_RETURN_IF_ERROR(ReadICC(&memory, &reader, &metadata));
     if (!independent) for (const auto& extra : metadata.m.extra_channel_info) {
       JXL_ENSURE(extra.dim_shift == 0);
       JXL_ENSURE(extra.bit_depth.bits_per_sample == metadata.m.bit_depth.bits_per_sample);
@@ -270,6 +287,7 @@ void Word(uint32_t value) {
 jxl::Status InspectHeaders(const std::vector<uint8_t>& raw,
                            std::vector<std::vector<uint32_t>>* frames,
                            bool presentation) {
+  JxlMemoryManager memory{nullptr, [](void*, size_t size) -> void* { return std::malloc(size); }, [](void*, void* p) { std::free(p); }};
   jxl::CodecMetadata metadata;
   size_t pos;
   {
@@ -277,13 +295,13 @@ jxl::Status InspectHeaders(const std::vector<uint8_t>& raw,
     JXL_ENSURE(reader.ReadBits(16) == 0x0aff);
     JXL_RETURN_IF_ERROR(jxl::ReadSizeHeader(&reader, &metadata.size));
     JXL_RETURN_IF_ERROR(jxl::ReadImageMetadata(&reader, &metadata.m));
-    JXL_ENSURE(!metadata.m.have_preview && !metadata.m.color_encoding.WantICC());
+    JXL_ENSURE(!metadata.m.have_preview);
     metadata.transform_data.nonserialized_xyb_encoded = metadata.m.xyb_encoded;
     JXL_RETURN_IF_ERROR(jxl::Bundle::Read(&reader, &metadata.transform_data));
+    JXL_RETURN_IF_ERROR(ReadICC(&memory, &reader, &metadata));
     JXL_RETURN_IF_ERROR(reader.JumpToByteBoundary());
     pos = reader.TotalBitsConsumed() / 8;
   }
-  JxlMemoryManager memory{nullptr, [](void*, size_t size) -> void* { return std::malloc(size); }, [](void*, void* p) { std::free(p); }};
   bool last = false;
   while (!last) {
     JXL_ENSURE(pos < raw.size() && frames->size() < 64);

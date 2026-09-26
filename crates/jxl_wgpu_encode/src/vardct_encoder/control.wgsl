@@ -54,7 +54,7 @@ struct Params {
     source_validation_offset: u32,
     source_validation_groups: u32,
     source_big_endian: u32,
-    sources: array<Source, 3>,
+    sources: array<Source, 4>,
     source_color: SourceColor,
 }
 

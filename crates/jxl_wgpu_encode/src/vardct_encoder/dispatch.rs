@@ -489,15 +489,20 @@ impl VarDctBackend {
                 "extra source count differs from the image declaration",
             ));
         }
-        let source_layout = crate::source::SourceLayout::new(
-            &source.layout,
-            source.buffer.size(),
-            self.storage_offset_alignment,
-        )?;
-        let source_windows = source_layout.full_windows;
+        let source_layout =
+            crate::source::SourceLayout::for_source(source, self.storage_offset_alignment)?;
+        let color_source = if self.color_plan.icc_transform.is_some() {
+            source_layout
+                .cmyk_color
+                .as_deref()
+                .unwrap_or(&source_layout)
+        } else {
+            &source_layout
+        };
+        let source_windows = color_source.full_windows;
         source_windows.validate(self.max_storage_binding_size)?;
         let source_binding_bytes = source_windows.addressed_bytes()?;
-        let region = source_layout.region(0, 0, extent.width, extent.height)?;
+        let region = color_source.region(0, 0, extent.width, extent.height)?;
         let (mut sources, offsets) = self.color_plan.bind_sources(&region);
         source_windows.rebase(&mut sources, offsets)?;
         let blocks_x = frame.blocks_x;

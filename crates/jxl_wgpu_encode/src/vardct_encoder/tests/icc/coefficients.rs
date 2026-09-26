@@ -1,6 +1,8 @@
 use super::*;
 use crate::{GpuEncodeBackend, GpuFrameSource, VarDctBackend};
 
+mod cmyk;
+
 struct Profile {
     name: &'static str,
     channels: usize,

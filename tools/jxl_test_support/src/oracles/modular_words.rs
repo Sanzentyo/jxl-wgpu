@@ -168,7 +168,7 @@ fn read_frames(output: Vec<u8>) -> Vec<FrameWords> {
 }
 
 /// Independent physical-frame sampling metadata, parsed by pinned libjxl without rendering.
-/// The helper accepts raw/plain-container, no-preview enumerated-color encoder sequences.
+/// The helper accepts raw/plain-container, no-preview enumerated or ICC encoder sequences.
 #[derive(Debug)]
 pub struct FrameSampling {
     pub presented: [u32; 2],

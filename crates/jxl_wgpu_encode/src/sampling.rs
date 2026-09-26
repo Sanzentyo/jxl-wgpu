@@ -53,8 +53,7 @@ impl FrameSamplingPlan {
     pub(crate) fn for_request(
         request: &FrameEncodeRequest,
         source_extent: (u32, u32),
-        intrinsic_shifts: impl ExactSizeIterator<Item = u8>,
-        packed_alpha: bool,
+        samples: &ImageSamplePlan,
     ) -> Result<Self, EncodeError> {
         let frame = request.options.crop.map_or(
             Extent2d::new(request.canvas_width, request.canvas_height),
@@ -72,8 +71,7 @@ impl FrameSamplingPlan {
             factor,
             extras: ExtraChannelSamplingPlan::new(
                 frame,
-                intrinsic_shifts,
-                packed_alpha,
+                samples,
                 factor,
                 &request.options.extra_channel_upsampling,
             )?,
@@ -88,16 +86,7 @@ impl FrameSamplingPlan {
         Ok(Self {
             color_extent: extent,
             factor: UpsamplingFactor::One,
-            extras: ExtraChannelSamplingPlan::new(
-                extent,
-                samples
-                    .extra_channels
-                    .iter()
-                    .map(|channel| channel.dimension_shift()),
-                samples.alpha.is_some(),
-                UpsamplingFactor::One,
-                &[],
-            )?,
+            extras: ExtraChannelSamplingPlan::new(extent, samples, UpsamplingFactor::One, &[])?,
         })
     }
 

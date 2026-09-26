@@ -31,8 +31,10 @@ impl FrameHeaderPlan {
         let sampling = FrameSamplingPlan::for_request(
             request,
             source_extent,
-            (0..usize::from(has_alpha)).map(|_| 0),
-            has_alpha,
+            &ImageSamplePlan::new(
+                crate::ColorSampleFormat::RGB8,
+                has_alpha.then_some(crate::AlphaAssociation::Unassociated),
+            ),
         )?;
         Self::with_sampling(request, sampling)
     }
@@ -42,15 +44,7 @@ impl FrameHeaderPlan {
         source_extent: (u32, u32),
         samples: &ImageSamplePlan,
     ) -> Result<Self, EncodeError> {
-        let sampling = FrameSamplingPlan::for_request(
-            request,
-            source_extent,
-            samples
-                .extra_channels
-                .iter()
-                .map(|channel| channel.dimension_shift()),
-            samples.alpha.is_some(),
-        )?;
+        let sampling = FrameSamplingPlan::for_request(request, source_extent, samples)?;
         Self::with_sampling(request, sampling)
     }
 

@@ -197,6 +197,7 @@ impl LosslessModularConfig {
         format: LosslessModularFormat,
         bits: u8,
         exponent: u8,
+        cmyk: bool,
     ) -> Result<crate::sample_format::ImageSamplePlan, crate::EncodeError> {
         let color = if exponent == 0 {
             crate::ColorSampleFormat::integer(format.color_channels(), bits)?
@@ -207,6 +208,7 @@ impl LosslessModularConfig {
             color,
             format.has_alpha().then_some(Default::default()),
         )
+        .with_cmyk(cmyk)?
         .with_extra_channels(&self.extra_channels, self.max_extra_channel_metadata_bytes)
     }
 }

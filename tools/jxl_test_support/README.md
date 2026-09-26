@@ -238,11 +238,13 @@ coded dimensions before interpolation. `channel_frames` uses `--channel-words` t
 export each independently sized Modular grid, including different precision and LF/pass routing.
 The same native header/entropy/transform decoder owns those results; the versioned output records
 all plane dimensions before raw words. Libjxl's effective extra-factor limit remains eight.
+Embedded profiles are consumed by the pinned native `ICCReader`, with exact bit consumption and
+unchanged profile bytes. This admits CMYK/ICC word inspection without a CMS or production parser.
 `modular_integer::modular_channel_words` independently reconstructs the physical grids through
 jxl-oxide, including extended factors; neither helper rounds rendered F32 data back to source words. `oracles::modular_words::sampling_headers` uses its `--sampling-headers`
 mode to inspect up to 64 Modular/VarDCT physical frames with the native frame-header and TOC
 readers. It reports displayed/coded dimensions, color/extra factors and pass counts without
-rendering; raw/plain-container input, no preview/ICC and no LF frames are required.
+rendering; raw/plain-container input, no preview and no LF frames are required.
 `presentation_headers` uses `--presentation-headers` on the same header/TOC walk to export
 orientation and exact name bytes for every physical frame, including hidden/reference-only
 frames. It has the same scope restrictions and pinned runtime check; it does not implement a
@@ -251,7 +253,7 @@ second header parser or derive expectations from the production writer.
 `original_preview` uses `--preview-words` to decode one final original-color Modular preview
 with the native preview frame context. It exports exact pre-interpolation words and coded extents
 without removing or rewriting the following main bytes. Its equal-precision/equal-grid extra and
-no-ICC restrictions match original-word decoding. Main entropy is outside this specific check;
+at-most-four-plane restriction matches original-word decoding. Main entropy is outside this specific check;
 the preview integration target separately compares main and preview rendering through libjxl's
 public output API. Rebuild the existing helper when changing this mode.
 

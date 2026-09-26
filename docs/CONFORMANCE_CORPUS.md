@@ -2141,8 +2141,55 @@ insertion. Alias-union accounting, exact/one-byte-short GPU and image-header bud
 source-handle retirement, invalid source precision/count/extent, bounded metadata and GPU Squeeze
 overflow cover admission and validation-before-output. Tests use two libtest threads on Metal.
 
-This advances the input domain and its integration. It does not establish CMYK input, adaptive
-quality, per-extra lossy encoding or arbitrary/global Palette/Squeeze placement.
+This advances the input domain and its integration. CMYK has separate evidence below; adaptive
+quality, per-extra lossy encoding and arbitrary/global Palette/Squeeze placement remain open.
+
+## CMYK encoder input
+
+The `cmyk_input` integration target covers one profile-bound input contract across Modular,
+Original/XYB VarDCT and mixed sequences. All 31 integer and 154 floating precisions preserve
+raw complemented CMY/alpha/Black words in Modular under Prefix and ANS, compared independently
+with pinned scalar libjxl and jxl-oxide. VarDCT preserves every Black/alpha word across the same
+185 precisions while its CMY input stays finite. Cases include signed zero, subnormals, infinities
+and noncanonical NaN payloads; integer ink amounts instead undergo exact `mask-word` conversion.
+Implicit floating ink amounts reject before admission.
+Associated-alpha sources require explicit complemented samples. Mixed references cover this
+association; all three frontends reject associated ink amounts without advancing sequence state.
+
+Packed, split, reversed five-plane layouts, shared/mixed/24-bit words, shifted fields, big-endian
+words and poisoned unaligned row/plane gaps exercise the shared source views. Prefix/ANS streams
+at 17×9, 19×13, 259×5 and 2051×9 combine primary Palette, Black-inclusive Squeeze and independent
+shifted depth through global/pass/LF routes. Palette's existing four-component selection boundary
+is unchanged. Every physical plane and dimension remains checked against both word oracles.
+
+`tests::icc::coefficients::cmyk` covers all eight existing four-channel LUT families (8/16-bit,
+XYZ/Lab, mAB with and without curves) and all 27 VarDCT strategies in Original and XYB. The 70
+submissions use the frozen independent PCS records, F64 PCS-to-BT.709/opsin equations and pinned
+native transform bases at the existing one-quantizer-step bound. The selected 36 source tuples
+per profile have exactly reversible F32 complements, asserted before comparison; references
+are not relabeled after rounded input conversion. Original CMY and linear XYB reconstruction
+use native output and real GPU comparisons at the existing relative `2e-4` and one-code bounds.
+Original ICC profile bytes and physical Black words remain independently exact.
+
+Mixed M/V/M and V/M/V sequences cover hidden references, 2× color/Black sampling, shifted depth,
+signed crops and Replace/Blend composition. Black selects a different saved reference from color.
+Fixed Modular sequence descriptors separately cover color/alpha/Black factors 1/2/4/8.
+Native libjxl parses sampling/ICC metadata and compares full presentations; whole and fragmented
+256-byte-window GPU output is byte-identical (`2e-4` color, `2e-6` scalar bounds). Both preview
+codecs share the image profile and preserve alpha/Black, with independent native preview color
+and explicit retained preview-storage accounting.
+
+Admission tests include identical rounded extents with invalid Black sampling factors, duplicate
+Black declarations, implicit float convention and nonfinite XYB CMY/K. Exact/one-byte-short budgets
+cover Modular and both VarDCT domains; padded ICC storage counts four input and three output
+planes. Aliased primary views have equal source-union accounting in both codecs, and abandoned
+jobs release their sole source owner and reservation after GPU completion. No numerical bounds,
+fixtures, native implementation or existing negative matrices are weakened.
+
+Reproduction: run the `cmyk_input` target with `JXL_MODULAR_WORD_ORACLE`, and the library filter
+`cmyk_icc_working`, each with `--test-threads=2`. The full capability gates remain required. This
+does not establish floating ink-amount conversion, other device spaces, YUV/texture input or
+adaptive quality; the related roadmap entries remain Partial.
 
 ## Independent VarDCT extra input
 

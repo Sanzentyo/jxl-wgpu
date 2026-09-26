@@ -154,10 +154,7 @@ impl VarDctConfig {
     /// Canonical source storage with this configuration's channels, precision and color.
     #[must_use]
     pub fn pixel_format(&self) -> jxl_gpu_formats::PixelFormat {
-        jxl_gpu_formats::PixelFormat {
-            color_spec: self.source_color.clone(),
-            ..crate::sample_format::ImageSamplePlan::new(self.sample_format, self.alpha)
-                .pixel_format()
-        }
+        crate::sample_format::ImageSamplePlan::new(self.sample_format, self.alpha)
+            .pixel_format_with_color(self.source_color.clone())
     }
 }

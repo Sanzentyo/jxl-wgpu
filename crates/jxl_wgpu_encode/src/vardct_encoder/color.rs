@@ -41,6 +41,13 @@ impl VarDctColorPlan {
     pub(super) fn new(config: &super::VarDctConfig) -> Result<Self, EncodeError> {
         config.image_options.validate()?;
         let encoding = source_encoding(&config.pixel_format())?;
+        let samples =
+            crate::sample_format::ImageSamplePlan::new(config.sample_format, config.alpha)
+                .with_cmyk(encoding.is_cmyk())?
+                .with_extra_channels(
+                    &config.extra_channels,
+                    config.max_extra_channel_metadata_bytes,
+                )?;
         let xyb = config.color_transform == VarDctColorTransform::Xyb;
         let icc_transform = if let Some(profile) = encoding.icc_profile() {
             crate::source_color::icc::IccStreamPlan::new(
@@ -89,11 +96,7 @@ impl VarDctColorPlan {
             return Err(UnsupportedFeature::InputFormat.into());
         }
         Ok(Self {
-            samples: crate::sample_format::ImageSamplePlan::new(config.sample_format, config.alpha)
-                .with_extra_channels(
-                    &config.extra_channels,
-                    config.max_extra_channel_metadata_bytes,
-                )?,
+            samples,
             encoding,
             options: config.image_options,
             max_icc_profile_bytes: config.max_icc_profile_bytes,
@@ -164,10 +167,20 @@ impl VarDctColorPlan {
     pub(super) fn bind_sources(
         &self,
         region: &crate::source::SourceRegion,
-    ) -> ([crate::source::SourceParams; 3], [u64; 4]) {
-        let components = self.source_components.map(|index| region.components[index]);
+    ) -> ([crate::source::SourceParams; 4], [u64; 4]) {
+        let indices = [
+            self.source_components[0],
+            self.source_components[1],
+            self.source_components[2],
+            if self.samples.cmyk && self.icc_transform.is_some() {
+                3
+            } else {
+                0
+            },
+        ];
+        let components = indices.map(|index| region.components[index]);
         let mut offsets = [0; 4];
-        for (destination, source) in offsets.iter_mut().zip(self.source_components) {
+        for (destination, source) in offsets.iter_mut().zip(indices) {
             *destination = region.offsets[source];
         }
         (components, offsets)
