@@ -85,7 +85,8 @@ All planes share the color job's submission and map; its permit and completion o
 source buffers, parameters, artifacts and readback through cancellation or assembly. Image-header
 storage has a separate still/session permit, shared with ICC when present. This boundary leaves
 the color transform and complete Modular frame encoder in their owning layers. Independent
-distance/upsampling policy and Modular transform integration remain later work.
+lossy distance and Modular transform integration remain later work; frame sampling is resolved
+by the shared geometry plan below.
 
 `VarDctConfig::source_color` is lowered to the same checked enumerated encoding that writes
 Modular metadata. Custom xy and gamma are quantized once to wire precision, then expanded for
@@ -183,14 +184,20 @@ This profile emits post-color-transform references and rejects pre-transform sto
 VarDCT's image-sample plan enables all five blend modes, independent extra blend/reference fields
 and explicit weight-plane selection. Mixed encoding currently shares only packed alpha.
 
-`ExtraChannelSamplingPlan`, retained by `FrameHeaderPlan`, resolves each requested frame factor
-with its image-wide intrinsic shift. It owns the wire factor, effective shift/extent and packed
-versus independent source index. VarDCT's scalar plan consumes those resolved entries for source
-validation, global-prefix/LF/pass routing and GPU bounds; the header writes the same factors.
-Neither layer infers a policy from supplied dimensions. This matters on one-pixel axes where
-several factors have the same source extent. Packed alpha remains full-resolution and rejects
-any frame factor other than one. Independent scalar inputs accept effective factors through 64;
-the encoder losslessly codes caller-supplied reduced samples without resizing or resampling color.
+`FrameSamplingPlan`, retained by `FrameHeaderPlan`, resolves the displayed crop/canvas into the
+coded color extent and an `ExtraChannelSamplingPlan`. Both codec headers and VarDCT dispatch
+consume that same plan; Modular's existing transform/source plan operates on the checked coded
+extent. Supplied pixels are already reduced. The encoder performs no source downsampling, and
+crop/reference coordinates remain in the displayed grid. The Gray8 direct-copy acceleration is
+eligible only at color factor one; reconstructed output otherwise uses the decoder's filter.
+
+The nested scalar plan owns wire factors, effective extents, shifts relative to the coded color
+grid and packed versus independent source indices. Empty scalar policy inherits the color
+factor; packed alpha must match it. Independent VarDCT planes accept effective factors through
+64, never below the color factor. The scalar planner uses relative shifts for global-prefix,
+LF/pass routing and GPU bounds; the header writes the corresponding wire factors. Neither
+layer infers policy from supplied dimensions, including one-pixel axes where several factors
+have identical extents. Selection policy, checked geometry and validated GPU words stay distinct.
 Generic input preflight identifies a supported source family. Request-dependent geometry,
 precision, binding/device limits and byte admission are checked together by frame preparation.
 The default memory query resolves factors of one; the request-specific query uses the same

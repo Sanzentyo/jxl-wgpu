@@ -2198,13 +2198,65 @@ factor and source identity; 255/257-entry tables reject without consuming finali
 Request-specific memory bounds use the reduced extents. Exact/one-byte-deficient admission,
 cancellation, retained-source release and invalid-input retry use the existing completion owner.
 Incorrect factor counts, full-size inputs supplied for reduced planes, absent declarations and
-attempts to resize packed alpha reject before allocation. Modular and mixed sequences keep their
-packed-alpha factor-one contract. The default still API and memory query remain factor one;
-color resampling, independently sourced Modular/mixed extras and lossy scalar coding remain open.
+attempts to resize packed alpha reject before allocation. These factor-one-color cases keep
+packed alpha at one. The default still API and memory query remain factor one; the shared
+[color/extra sampling extension](#per-frame-color-and-relative-extra-sampling) covers reduced
+color sources. Independent Modular/mixed extras and lossy scalar coding remain open.
 
 Reproduction: `cargo test --locked -p jxl_wgpu_encode --lib extra_sampling_ -- --test-threads=2`,
 the decoder `extra_upsampling` target after the shared-oracle move, then the
 [full capability gates](DEVELOPMENT.md#capability-change-gates).
+
+## Per-frame color and relative extra sampling
+
+`crates/jxl_wgpu_encode/tests/frame_sampling` exercises the shared `FrameSamplingPlan` on
+Apple M5/Metal. Caller-supplied color/packed-alpha grids use factors 1/2/4/8; frame crops,
+canvas dimensions and reference coordinates retain their displayed-pixel meaning. Admission,
+both header writers and scalar routing consume one checked geometry. No host/GPU source
+downsampling is introduced, and exact Modular words do not imply exact interpolated pixels.
+
+Forty-eight Modular streams cross factors 2/4/8, all four group sizes, Prefix/ANS, Weighted
+prediction and local Squeeze. Gray8, RGB8 with alpha, Gray13 with alpha and RGB F32 include
+one-pixel axes and partial groups. Native scalar libjxl exports every original word on the coded
+grid exactly; native output and GPU numeric color/alpha retain the independent F64 interpolation
+oracle's unchanged arithmetic intervals. Factor-eight fragmented input matches whole output.
+
+Thirty-six VarDCT streams cover Gray F32/RGB8, Original/XYB, single/mapped/tiled transforms and
+factors 2/4/8. Independent header/TOC checks distinguish coded and displayed extents; every
+physical section stays byte-identical to its factor-one control. GPU/native original RGBA uses
+the existing `2e-4 * (1 + abs(reference))` bound. Six further single/three-pass streams exercise
+every legal intrinsic-shift/wire-factor pair for each color factor, global-prefix termination,
+relative LF/pass routing and partial LF groups. Independent physical scalar words remain exact;
+selected global/LF/pass planes retain the F64/WGSL interpolation bounds through effective factor
+64. Native effective-factor limits from the preceding section still apply.
+
+Twenty-four three-pass streams cross all four color factors with coded extents 1×1, 1×17,
+255×3, 256×3, 257×3 and 2049×3. Center-first TOCs retain DC, intermediate and final snapshots.
+RGB/XYB uses scalar native linear output. Original Gray uses verified original-profile scalar
+RGBA followed by the existing independent F64 sRGB EOTF on each RGB component: native Gray CMS
+instead selects component zero and would compare a different output contract. All samples keep
+the absolute linear bounds `1e-5` (DC), `2e-4` (intermediate) and `1e-4` (final), plus one RGB8 code
+against both scalar and SIMD native references. Whole/256-byte fragmented snapshots are identical,
+final updates equal final-only output, and held snapshots remain unchanged after later updates.
+
+Forty three-frame mixed sequences cross Gray13/RGB F32 with both alpha associations, both codec
+orders and all five blend modes. Factors 2/4/8 change across reference-only producers, two
+reference slots and a signed crop. Explicit/default packed-alpha sampling agree. Native header
+inspection checks all 120 frames; native libjxl and Rust `jxl` check 80 presentations at the same
+RGBA bound. Native headers are used because jxl-oxide 0.12's extra-blend field-presence parsing
+does not support the full-frame color-Add/extra-Replace combination. No stream rewriting is used.
+
+Packed/planar/split, swizzled and bit-shifted sources use Native/Little/Big word order and poisoned
+padding. Wrong geometry and incompatible factors reject before admission without consuming
+finality. Forty-eight one-pixel color/extra combinations check factor constraints even when every
+candidate grid has the same dimensions. Prefix/ANS and both codecs retain exact/one-byte-short
+budget admission, byte-identical retry, cancellation-owned source release, out-of-order packet
+insertion and retained decoder output after session drop. All reservations return to zero.
+
+Reproduce with both pinned native helpers from the [test-support recipe](../tools/jxl_test_support/README.md):
+`cargo test --locked -p jxl_wgpu_encode --test frame_sampling -- --test-threads=2`, then the
+[full capability gates](DEVELOPMENT.md#capability-change-gates). This does not add independent
+Modular/mixed extras, automatic source resampling, responsive Modular or a lossy quality policy.
 
 ## Mixed-codec sequence encoding
 

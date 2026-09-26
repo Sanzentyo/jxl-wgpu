@@ -1,4 +1,4 @@
-/* Offline libjxl oracle: INPUT [CHUNK_BYTES [SNAPSHOT_PREFIX [linear] [keep] [prefix] [no-spots] [extras]]].
+/* Offline libjxl oracle: INPUT [CHUNK_BYTES [SNAPSHOT_PREFIX [linear|original] [keep] [prefix] [no-spots] [extras]]].
  * Production decoding does not link to this helper. Use whole input for noisy
  * images: libjxl 0.12.0 retries incomplete frame headers without rolling back
  * its persistent noise-frame counters. GPU fragmented input is tested separately.
@@ -29,15 +29,17 @@ int main(int argc, char **argv) {
   }
 #endif
   if (argc < 2 || argc > 9) return 2;
-  int linear = 0, keep = 0, flush_prefix = 0, spots = 1, extras = 0;
+  int linear = 0, original = 0, keep = 0, flush_prefix = 0, spots = 1, extras = 0;
   for (int arg = 4; arg < argc; ++arg) {
     if (strcmp(argv[arg], "linear") == 0) linear = 1;
+    else if (strcmp(argv[arg], "original") == 0) original = 1;
     else if (strcmp(argv[arg], "keep") == 0) keep = 1;
     else if (strcmp(argv[arg], "prefix") == 0) flush_prefix = 1;
     else if (strcmp(argv[arg], "no-spots") == 0) spots = 0;
     else if (strcmp(argv[arg], "extras") == 0) extras = 1;
     else return 2;
   }
+  if (linear && original) return 2;
   FILE *input = fopen(argv[1], "rb");
   if (!input || fseek(input, 0, SEEK_END)) return 2;
   long length = ftell(input);
@@ -66,6 +68,21 @@ int main(int argc, char **argv) {
       if (JxlDecoderGetBasicInfo(decoder, &info) != JXL_DEC_SUCCESS) return 3;
       printf("image,%u,%u,%u,%u\n", info.xsize, info.ysize, info.num_extra_channels, info.have_animation);
     } else if (status == JXL_DEC_COLOR_ENCODING) {
+      if (original) {
+        /* No CMS connection: preserve and verify this original-profile stream's
+         * declared RGBA components, including all three VarDCT working planes. */
+        size_t declared_size = 0, actual_size = 0;
+        if (JxlDecoderVersion() != 12000 || !info.uses_original_profile
+            || JxlDecoderGetICCProfileSize(decoder, JXL_COLOR_PROFILE_TARGET_ORIGINAL, &declared_size) != JXL_DEC_SUCCESS
+            || JxlDecoderGetICCProfileSize(decoder, JXL_COLOR_PROFILE_TARGET_DATA, &actual_size) != JXL_DEC_SUCCESS
+            || !declared_size || declared_size > (16 << 20) || actual_size != declared_size) return 3;
+        uint8_t *declared = malloc(declared_size), *actual = malloc(actual_size);
+        if (!declared || !actual) return 2;
+        if (JxlDecoderGetColorAsICCProfile(decoder, JXL_COLOR_PROFILE_TARGET_ORIGINAL, declared, declared_size) != JXL_DEC_SUCCESS
+            || JxlDecoderGetColorAsICCProfile(decoder, JXL_COLOR_PROFILE_TARGET_DATA, actual, actual_size) != JXL_DEC_SUCCESS
+            || memcmp(declared, actual, declared_size)) return 3;
+        free(declared); free(actual);
+      }
       if (linear) {
         JxlColorEncoding color;
         JxlColorEncodingSetToLinearSRGB(&color, info.num_color_channels == 1);

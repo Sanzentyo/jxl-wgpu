@@ -24,15 +24,33 @@ pub fn native_updates(encoded: &[u8], linear: bool) -> Option<Vec<NativeUpdate>>
 /// `JXL_PROGRESSIVE_SCALAR_ORACLE` to that executable. This never changes the native
 /// SIMD oracle selected by the other entry points.
 pub fn scalar_linear_updates(encoded: &[u8]) -> Vec<NativeUpdate> {
-    scalar_updates(encoded, false)
+    scalar_updates(encoded, false, OutputColor::Linear)
+}
+
+/// Required scalar snapshots in the declared original encoding, verified by exact
+/// original/data ICC identity. Keep the native RGBA working components unchanged.
+pub fn scalar_original_updates(encoded: &[u8]) -> Vec<NativeUpdate> {
+    scalar_updates(encoded, false, OutputColor::Original)
+}
+
+/// Native SIMD counterpart to [`scalar_original_updates`].
+pub fn native_original_updates(encoded: &[u8]) -> Option<Vec<NativeUpdate>> {
+    decode_updates(encoded, OutputColor::Original, false, false, true, false)
 }
 
 /// Flushes an incomplete input prefix using the same required scalar reference.
 pub fn scalar_linear_prefix_updates(encoded: &[u8]) -> Vec<NativeUpdate> {
-    scalar_updates(encoded, true)
+    scalar_updates(encoded, true, OutputColor::Linear)
 }
 
-fn scalar_updates(encoded: &[u8], flush_prefix: bool) -> Vec<NativeUpdate> {
+#[derive(Clone, Copy)]
+enum OutputColor {
+    Default,
+    Linear,
+    Original,
+}
+
+fn scalar_updates(encoded: &[u8], flush_prefix: bool, color: OutputColor) -> Vec<NativeUpdate> {
     static BINARY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     let binary = BINARY.get_or_init(|| {
         let path = std::env::var_os("JXL_PROGRESSIVE_SCALAR_ORACLE")
@@ -46,7 +64,7 @@ fn scalar_updates(encoded: &[u8], flush_prefix: bool) -> Vec<NativeUpdate> {
         assert_eq!(identity.stdout, b"libjxl,0.12.0,scalar\n");
         path
     });
-    run_updates(binary, encoded, true, false, flush_prefix, true, false)
+    run_updates(binary, encoded, color, false, flush_prefix, true, false)
 }
 
 pub fn native_updates_oriented(
@@ -73,7 +91,14 @@ pub fn native_updates_with_spots(
     flush_prefix: bool,
     render_spots: bool,
 ) -> Option<Vec<NativeUpdate>> {
-    decode_updates(encoded, linear, keep, flush_prefix, render_spots, false)
+    decode_updates(
+        encoded,
+        output_color(linear),
+        keep,
+        flush_prefix,
+        render_spots,
+        false,
+    )
 }
 
 /// Each snapshot contains packed RGBA followed by every extra channel as a separate f32 plane.
@@ -83,12 +108,27 @@ pub fn native_updates_all_channels(
     keep: bool,
     flush_prefix: bool,
 ) -> Option<Vec<NativeUpdate>> {
-    decode_updates(encoded, linear, keep, flush_prefix, false, true)
+    decode_updates(
+        encoded,
+        output_color(linear),
+        keep,
+        flush_prefix,
+        false,
+        true,
+    )
+}
+
+fn output_color(linear: bool) -> OutputColor {
+    if linear {
+        OutputColor::Linear
+    } else {
+        OutputColor::Default
+    }
 }
 
 fn decode_updates(
     encoded: &[u8],
-    linear: bool,
+    color: OutputColor,
     keep: bool,
     flush_prefix: bool,
     render_spots: bool,
@@ -130,7 +170,7 @@ fn decode_updates(
     Some(run_updates(
         binary,
         encoded,
-        linear,
+        color,
         keep,
         flush_prefix,
         render_spots,
@@ -141,7 +181,7 @@ fn decode_updates(
 fn run_updates(
     binary: &std::path::Path,
     encoded: &[u8],
-    linear: bool,
+    color: OutputColor,
     keep: bool,
     flush_prefix: bool,
     render_spots: bool,
@@ -163,8 +203,14 @@ fn run_updates(
         .arg(&input)
         .arg(encoded.len().to_string())
         .arg(&prefix);
-    if linear {
-        command.arg("linear");
+    match color {
+        OutputColor::Default => {}
+        OutputColor::Linear => {
+            command.arg("linear");
+        }
+        OutputColor::Original => {
+            command.arg("original");
+        }
     }
     if keep {
         command.arg("keep");

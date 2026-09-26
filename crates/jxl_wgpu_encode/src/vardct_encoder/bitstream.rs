@@ -37,8 +37,7 @@ fn frame_header(
     if !color.xyb_encoded() {
         output.write_bits(0, 1)?; // original RGB, not YCbCr
     }
-    output.write_bits(0, 2)?; // no upsampling
-    control.extra_channels().write(&mut output)?;
+    control.sampling().write(&mut output)?;
     if let Some(scales) = color.qm_scales() {
         for scale in scales {
             output.write_bits(u64::from(scale), 3)?;

@@ -4,11 +4,10 @@ use crate::{
     AnimationHeader, BitFragment, BlendMode, EncodeError, FrameBlend, FrameEncodeRequest,
     FrameIndex, FrameKind, ProgressivePlan,
 };
-use crate::{extra_channel::sampling::ExtraChannelSamplingPlan, sample_format::ImageSamplePlan};
+use crate::{sample_format::ImageSamplePlan, sampling::FrameSamplingPlan};
 use jxl_gpu_bitstream::BitWriter;
-use jxl_gpu_protocol::Extent2d;
 
-/// Checked frame kind, scalar sampling, crop, blending, timing, references and restoration.
+/// Checked frame kind, color/scalar sampling, crop, blending, timing, references and restoration.
 /// The suffix occupies at most 256 + 12 bits per extra channel, independent of pixels;
 /// each extra's sampling factor adds two bits in the codec-specific prefix.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,7 +16,7 @@ pub(crate) struct FrameHeaderPlan {
     is_last: bool,
     kind: FrameKind,
     post_color_reference: bool,
-    extras: ExtraChannelSamplingPlan,
+    sampling: FrameSamplingPlan,
     suffix: BitFragment,
 }
 
@@ -27,12 +26,13 @@ impl FrameHeaderPlan {
         source_extent: (u32, u32),
         has_alpha: bool,
     ) -> Result<Self, EncodeError> {
-        let extras = ExtraChannelSamplingPlan::for_packed_alpha(
-            Extent2d::new(source_extent.0, source_extent.1),
+        let sampling = FrameSamplingPlan::for_request(
+            request,
+            source_extent,
+            (0..usize::from(has_alpha)).map(|_| 0),
             has_alpha,
-            &request.options.extra_channel_upsampling,
         )?;
-        Self::with_sampling(request, source_extent, extras)
+        Self::with_sampling(request, sampling)
     }
 
     pub(crate) fn with_extra_channels(
@@ -40,21 +40,24 @@ impl FrameHeaderPlan {
         source_extent: (u32, u32),
         samples: &ImageSamplePlan,
     ) -> Result<Self, EncodeError> {
-        let extras = ExtraChannelSamplingPlan::for_image(
-            samples,
-            Extent2d::new(source_extent.0, source_extent.1),
-            &request.options.extra_channel_upsampling,
+        let sampling = FrameSamplingPlan::for_request(
+            request,
+            source_extent,
+            samples
+                .extra_channels
+                .iter()
+                .map(|channel| channel.dimension_shift()),
+            samples.alpha.is_some(),
         )?;
-        Self::with_sampling(request, source_extent, extras)
+        Self::with_sampling(request, sampling)
     }
 
     fn with_sampling(
         request: &FrameEncodeRequest,
-        source_extent: (u32, u32),
-        extras: ExtraChannelSamplingPlan,
+        sampling: FrameSamplingPlan,
     ) -> Result<Self, EncodeError> {
-        let extra_channels = extras.channels.len();
-        validate_frame(request, source_extent, extra_channels)?;
+        let extra_channels = sampling.extras.channels.len();
+        validate_frame(request, extra_channels)?;
         let has_alpha = extra_channels != 0;
         let regular = request.options.kind == FrameKind::Regular;
         let can_be_referenced = can_be_referenced(request);
@@ -135,13 +138,13 @@ impl FrameHeaderPlan {
             is_last: request.is_last,
             kind: request.options.kind,
             post_color_reference: can_be_referenced && !request.options.save_before_color_transform,
-            extras,
+            sampling,
             suffix: BitFragment::new(output.into_bytes(), bit_len)?,
         })
     }
 
-    pub(crate) fn extra_channels(&self) -> &ExtraChannelSamplingPlan {
-        &self.extras
+    pub(crate) fn sampling(&self) -> &FrameSamplingPlan {
+        &self.sampling
     }
 
     pub(crate) const fn frame_index(&self) -> FrameIndex {
@@ -185,11 +188,7 @@ impl FrameHeaderPlan {
     }
 }
 
-fn validate_frame(
-    request: &FrameEncodeRequest,
-    source_extent: (u32, u32),
-    extra_channels: usize,
-) -> Result<(), EncodeError> {
+fn validate_frame(request: &FrameEncodeRequest, extra_channels: usize) -> Result<(), EncodeError> {
     let has_alpha = extra_channels != 0;
     if request.canvas_width == 0 || request.canvas_height == 0 {
         return Err(EncodeError::InvalidConfiguration(
@@ -200,7 +199,7 @@ fn validate_frame(
         write_animation_header(&mut BitWriter::new(), request.animation)?;
     }
     crate::session::validate_frame_timing(request.animation, &request.options)?;
-    validate_extent(request, source_extent)?;
+    validate_crop(request)?;
     if request.options.kind == FrameKind::ReferenceOnly {
         if request.is_last
             || request.options.color_blend != FrameBlend::default()
@@ -314,16 +313,7 @@ fn can_be_referenced(request: &FrameEncodeRequest) -> bool {
             || request.options.save_as_reference.get() != 0)
 }
 
-fn validate_extent(
-    request: &FrameEncodeRequest,
-    source_extent: (u32, u32),
-) -> Result<(), EncodeError> {
-    let (frame_width, frame_height) = request
-        .options
-        .crop
-        .map_or((request.canvas_width, request.canvas_height), |crop| {
-            (crop.width(), crop.height())
-        });
+fn validate_crop(request: &FrameEncodeRequest) -> Result<(), EncodeError> {
     if let Some(crop) = request.options.crop {
         for value in [
             pack_signed(crop.x()),
@@ -337,11 +327,6 @@ fn validate_extent(
                 ));
             }
         }
-    }
-    if frame_width != source_extent.0 || frame_height != source_extent.1 {
-        return Err(EncodeError::InvalidConfiguration(
-            "the GPU source extent must match the frame crop",
-        ));
     }
     Ok(())
 }

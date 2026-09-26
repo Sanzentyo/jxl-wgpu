@@ -68,6 +68,7 @@ mod packet;
 mod permutation;
 mod prefix;
 mod sample_format;
+mod sampling;
 mod session;
 mod source;
 mod source_color;
@@ -81,7 +82,7 @@ pub use capability::{
     ProgressiveDownsampling, ProgressivePass, ProgressivePlan,
 };
 pub use error::{BackendError, EncodeError, PacketError, UnsupportedFeature};
-pub use extra_channel::{ExtraChannel, ExtraChannelKind, ExtraChannelUpsampling};
+pub use extra_channel::{ExtraChannel, ExtraChannelKind};
 pub use gpu::{
     BufferImageSource, GpuEncodeBackend, GpuEncodeJob, GpuEncoder, GpuFrameSource,
     TextureImageSource, WgpuContext,
@@ -109,6 +110,7 @@ pub use packet::{
     assemble_frame,
 };
 pub use sample_format::{ColorChannels, ColorSampleFormat, SamplePrecision};
+pub use sampling::UpsamplingFactor;
 pub use session::{
     AnimationHeader, BlendMode, CodestreamAssembler, EncodeSession, FrameBlend, FrameCrop,
     FrameEncodeRequest, FrameIndex, FrameKind, FrameOptions, FrameSubmission, FrameTiming,

@@ -164,15 +164,19 @@ pub struct FrameOptions {
     pub kind: FrameKind,
     pub timing: FrameTiming,
     pub crop: Option<FrameCrop>,
+    /// Reconstruction factor for the supplied color grid. Source dimensions must be
+    /// ceil(frame rectangle / factor); crop and canvas remain in displayed pixels.
+    /// Both codecs and mixed sequences accept reduced inputs without resizing pixels.
+    pub upsampling: crate::UpsamplingFactor,
     pub color_blend: FrameBlend,
     /// One entry per image-header extra channel. An empty vector requests default Replace
     /// contracts for every extra channel.
     pub extra_channel_blends: Vec<FrameBlend>,
     /// Per-frame factors in image-header extra-channel order, including packed alpha.
-    /// Empty means factor one for all channels; otherwise the count must match exactly.
-    /// VarDCT accepts reduced independent scalar inputs. Packed alpha (also in Modular
-    /// and mixed sequences) requires factor one. Intrinsic dimension shifts still apply.
-    pub extra_channel_upsampling: Vec<crate::ExtraChannelUpsampling>,
+    /// Empty uses the color factor for every channel; otherwise the count must match.
+    /// VarDCT accepts reduced independent scalar inputs. Packed alpha must match color.
+    /// Intrinsic shifts still apply, and each effective factor must be at least color's.
+    pub extra_channel_upsampling: Vec<crate::UpsamplingFactor>,
     /// Standard two-bit destination slot. Slot zero means no persistent reference for a visible
     /// frame, while a zero-duration frame is referenceable even when it selects slot zero.
     pub save_as_reference: ReferenceSlot,

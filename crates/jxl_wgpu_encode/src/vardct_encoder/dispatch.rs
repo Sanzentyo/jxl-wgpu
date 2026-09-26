@@ -29,8 +29,8 @@ use super::types::{
     VarDctLfMetadata, VarDctMemoryPlan, VarDctStrategy, VarDctTopology,
 };
 use super::{icc_input, modular_plane, raw_matrices, saliency, transforms};
-use crate::extra_channel::sampling::ExtraChannelSamplingPlan;
 use crate::frame_header::FrameHeaderPlan;
+use crate::sampling::FrameSamplingPlan;
 use crate::{
     AnimationHeader, BackendError, BitFragment, BufferImageSource, Determinism, EncodeError,
     EncodeProfile, EncoderCapabilities, FrameEncodeRequest, FrameIndex, FrameOptions,
@@ -381,13 +381,9 @@ impl VarDctBackend {
 
     /// Computes frame admission with configured regular-frame passes and extra factors of one.
     /// The still/sequence frontend owns the separate ICC/extra-channel header reservation.
-    /// Use `memory_plan_for_request` for per-frame extra sampling or reference-only passes.
+    /// Use `memory_plan_for_request` for per-frame sampling or reference-only passes.
     pub fn memory_plan(&self, source: &BufferImageSource) -> Result<VarDctMemoryPlan, EncodeError> {
-        let sampling = ExtraChannelSamplingPlan::for_image(
-            &self.color_plan.samples,
-            source.layout.extent,
-            &[],
-        )?;
+        let sampling = FrameSamplingPlan::unscaled(source.layout.extent, &self.color_plan.samples)?;
         Ok(self
             .dispatch_plan(source, &self.config.progressive, &sampling)?
             .memory)
@@ -445,7 +441,7 @@ impl VarDctBackend {
         self.color_plan.validate_frame(&control)?;
         let mut config = self.config.clone();
         config.progressive = control.effective_progressive(&config.progressive);
-        let plan = self.dispatch_plan(source, &config.progressive, control.extra_channels())?;
+        let plan = self.dispatch_plan(source, &config.progressive, control.sampling())?;
         Ok((plan, control, config))
     }
 
@@ -453,9 +449,9 @@ impl VarDctBackend {
         &self,
         source: &BufferImageSource,
         progressive: &ProgressivePlan,
-        sampling: &ExtraChannelSamplingPlan,
+        sampling: &FrameSamplingPlan,
     ) -> Result<VarDctDispatchPlan, EncodeError> {
-        let extent = source.layout.extent;
+        let extent = sampling.color_extent;
         let frame = match self.topology {
             VarDctTopology::SingleTransform(strategy) => {
                 let frame = VarDctFrameLayout::single(strategy);
@@ -738,7 +734,7 @@ impl VarDctBackend {
             .then(|| {
                 modular_plane::ImagePlan::new(
                     &self.color_plan.samples,
-                    sampling,
+                    &sampling.extras,
                     source,
                     &source_layout,
                     progressive,

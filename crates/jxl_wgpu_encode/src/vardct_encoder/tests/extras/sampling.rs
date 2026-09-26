@@ -1,24 +1,24 @@
 use super::*;
 use crate::{
-    AnimationHeader, ExtraChannelUpsampling, FrameOptions, GpuEncodeBackend, GpuEncoder,
-    GpuFrameSource, ImageSequenceDescriptor, ProgressiveDownsampling, VarDctBackend,
+    AnimationHeader, FrameOptions, GpuEncodeBackend, GpuEncoder, GpuFrameSource,
+    ImageSequenceDescriptor, ProgressiveDownsampling, UpsamplingFactor, VarDctBackend,
 };
 use jxl_test_support::oracles::resampling::{Arithmetic, Plane, Sample};
 
 mod sequence;
 
-const FACTORS: [ExtraChannelUpsampling; 4] = [
-    ExtraChannelUpsampling::One,
-    ExtraChannelUpsampling::Two,
-    ExtraChannelUpsampling::Four,
-    ExtraChannelUpsampling::Eight,
+const FACTORS: [UpsamplingFactor; 4] = [
+    UpsamplingFactor::One,
+    UpsamplingFactor::Two,
+    UpsamplingFactor::Four,
+    UpsamplingFactor::Eight,
 ];
 
 fn input(
     context: &WgpuContext,
     extent: Extent2d,
     definitions: &[ExtraChannel],
-    factors: &[ExtraChannelUpsampling],
+    factors: &[UpsamplingFactor],
     seed: usize,
 ) -> (BufferImageSource, Vec<modular_integer::ExtraWords>) {
     let expected: Vec<_> = definitions
@@ -73,7 +73,7 @@ fn check_header(
     bytes: &[u8],
     index: usize,
     definitions: &[ExtraChannel],
-    factors: &[ExtraChannelUpsampling],
+    factors: &[UpsamplingFactor],
 ) {
     let image = jxl_oxide::JxlImage::read_with_defaults(bytes).unwrap();
     let frame = image.frame(index).unwrap().header();
@@ -149,7 +149,7 @@ fn extra_sampling_all_intrinsic_and_frame_factors_route_exact_words_and_render_i
     // A leading small global channel, then a full-size channel that terminates the prefix,
     // followed by every intrinsic/frame pair. Later small planes must retain LF/pass routing.
     let mut definitions = vec![declaration(ExtraChannelKind::Depth, 13, 3)];
-    let mut factors = vec![ExtraChannelUpsampling::Eight];
+    let mut factors = vec![UpsamplingFactor::Eight];
     for shift in 0..=3 {
         for factor in FACTORS {
             definitions.push(declaration(ExtraChannelKind::Depth, 13, shift));
@@ -374,19 +374,13 @@ fn extra_sampling_request_admission_uses_reduced_sources_and_releases_cancelled_
     let context = test_context().unwrap();
     let extent = Extent2d::new(259, 263);
     let definitions = vec![declaration(ExtraChannelKind::Depth, 13, 1)];
-    let factors = [ExtraChannelUpsampling::Four];
+    let factors = [UpsamplingFactor::Four];
     let config = VarDctConfig {
         extra_channels: definitions.clone(),
         ..Default::default()
     };
     let (source, _) = input(&context, extent, &definitions, &factors, 0);
-    let (full_source, _) = input(
-        &context,
-        extent,
-        &definitions,
-        &[ExtraChannelUpsampling::One],
-        0,
-    );
+    let (full_source, _) = input(&context, extent, &definitions, &[UpsamplingFactor::One], 0);
     let backend = VarDctBackend::new_tiled_dct8_with_config(&context, config.clone()).unwrap();
     let mut request = layouts::request(extent, &config);
     request.options.extra_channel_upsampling = factors.to_vec();
@@ -447,7 +441,7 @@ fn extra_sampling_request_admission_uses_reduced_sources_and_releases_cancelled_
     for options in [
         FrameOptions::default(),
         FrameOptions {
-            extra_channel_upsampling: vec![ExtraChannelUpsampling::Four; 2],
+            extra_channel_upsampling: vec![UpsamplingFactor::Four; 2],
             ..Default::default()
         },
     ] {
@@ -491,7 +485,7 @@ fn extra_sampling_maximum_channel_table_retains_every_factor_and_source_identity
             session.submit_last_frame(
                 source.clone(),
                 FrameOptions {
-                    extra_channel_upsampling: vec![ExtraChannelUpsampling::One; count],
+                    extra_channel_upsampling: vec![UpsamplingFactor::One; count],
                     ..Default::default()
                 }
             ),

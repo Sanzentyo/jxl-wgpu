@@ -61,19 +61,19 @@ fn extra_sampling_changes_per_frame_before_reference_crop_and_all_blend_modes() 
                 .unwrap();
             let factors = [
                 [
-                    ExtraChannelUpsampling::Two,
-                    ExtraChannelUpsampling::Four,
-                    ExtraChannelUpsampling::One,
+                    UpsamplingFactor::Two,
+                    UpsamplingFactor::Four,
+                    UpsamplingFactor::One,
                 ],
                 [
-                    ExtraChannelUpsampling::Four,
-                    ExtraChannelUpsampling::One,
-                    ExtraChannelUpsampling::Two,
+                    UpsamplingFactor::Four,
+                    UpsamplingFactor::One,
+                    UpsamplingFactor::Two,
                 ],
                 [
-                    ExtraChannelUpsampling::Eight,
-                    ExtraChannelUpsampling::Two,
-                    ExtraChannelUpsampling::Four,
+                    UpsamplingFactor::Eight,
+                    UpsamplingFactor::Two,
+                    UpsamplingFactor::Four,
                 ],
             ];
             let mut physical = Vec::new();
@@ -212,8 +212,8 @@ fn extra_sampling_all_topologies_share_packed_alpha_order_and_reject_implicit_re
         let encoder = GpuEncoder::new(context.clone(), backend);
         let mut request = layouts::request(extent, &config);
         for factors in [
-            vec![ExtraChannelUpsampling::Four],
-            vec![ExtraChannelUpsampling::Two, ExtraChannelUpsampling::Four],
+            vec![UpsamplingFactor::Four],
+            vec![UpsamplingFactor::Two, UpsamplingFactor::Four],
         ] {
             request.options.extra_channel_upsampling = factors;
             assert!(matches!(
@@ -223,7 +223,7 @@ fn extra_sampling_all_topologies_share_packed_alpha_order_and_reject_implicit_re
             assert_eq!(context.memory_stats().reserved_bytes, 0);
         }
         request.options.extra_channel_upsampling =
-            vec![ExtraChannelUpsampling::One, ExtraChannelUpsampling::Four];
+            vec![UpsamplingFactor::One, UpsamplingFactor::Four];
         let artifacts = encoder
             .submit_frame(GpuFrameSource::Buffer(source.clone()), request)
             .unwrap()
@@ -272,7 +272,7 @@ fn extra_sampling_all_topologies_share_packed_alpha_order_and_reject_implicit_re
         .submit_last_frame(
             primary.clone(),
             FrameOptions {
-                extra_channel_upsampling: vec![ExtraChannelUpsampling::One],
+                extra_channel_upsampling: vec![UpsamplingFactor::One],
                 ..Default::default()
             },
         )
@@ -286,19 +286,19 @@ fn extra_sampling_all_topologies_share_packed_alpha_order_and_reject_implicit_re
     request.profile = crate::EncodeProfile::ModularLossless {
         sample_bit_depth: SamplePrecision::integer(8).unwrap().bit_depth(),
     };
-    request.options.extra_channel_upsampling = vec![ExtraChannelUpsampling::Two];
+    request.options.extra_channel_upsampling = vec![UpsamplingFactor::Two];
     assert!(matches!(
         modular.memory_plan_for_request(&primary, &request),
         Err(EncodeError::InvalidConfiguration(_))
     ));
-    request.options.extra_channel_upsampling = vec![ExtraChannelUpsampling::One];
+    request.options.extra_channel_upsampling = vec![UpsamplingFactor::One];
     modular.memory_plan_for_request(&primary, &request).unwrap();
-    request.options.extra_channel_upsampling = vec![ExtraChannelUpsampling::One; 257];
+    request.options.extra_channel_upsampling = vec![UpsamplingFactor::One; 257];
     assert!(matches!(
         modular.memory_plan_for_request(&primary, &request),
         Err(EncodeError::InvalidConfiguration(_))
     ));
-    request.options.extra_channel_upsampling = vec![ExtraChannelUpsampling::One];
+    request.options.extra_channel_upsampling = vec![UpsamplingFactor::One];
     assert!(matches!(
         modular.memory_plan_for_request(&color_source(&context, extent), &request),
         Err(EncodeError::InvalidConfiguration(_))
@@ -315,7 +315,7 @@ fn extra_sampling_all_topologies_share_packed_alpha_order_and_reject_implicit_re
         crate::MixedModeFrameEncoding::VarDct,
     ] {
         let options = FrameOptions {
-            extra_channel_upsampling: vec![ExtraChannelUpsampling::Two],
+            extra_channel_upsampling: vec![UpsamplingFactor::Two],
             ..Default::default()
         };
         assert!(matches!(
@@ -333,7 +333,7 @@ fn extra_sampling_all_topologies_share_packed_alpha_order_and_reject_implicit_re
                 &primary,
                 encoding,
                 FrameOptions {
-                    extra_channel_upsampling: vec![ExtraChannelUpsampling::One],
+                    extra_channel_upsampling: vec![UpsamplingFactor::One],
                     ..Default::default()
                 },
                 true,

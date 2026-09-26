@@ -206,12 +206,10 @@ fn extra_input_artifact_identity_prevents_plane_swaps_and_malformed_publication(
     .unwrap();
     let code = fixed_prefix_code().unwrap();
     let samples = VarDctColorPlan::new(&config).unwrap().samples;
-    let sampling =
-        crate::extra_channel::sampling::ExtraChannelSamplingPlan::for_image(&samples, extent, &[])
-            .unwrap();
+    let sampling = crate::sampling::FrameSamplingPlan::unscaled(extent, &samples).unwrap();
     let plan = ImagePlan::new(
         &samples,
-        &sampling,
+        &sampling.extras,
         &source,
         &main,
         &config.progressive,

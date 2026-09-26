@@ -1067,15 +1067,16 @@ impl ModularPacketAssembler {
                     && self.exponent_bits_per_sample == 0
                     && self.predictor == LosslessModularPredictor::Gradient
                     && !self.transforms.extended_prediction_domain
-                    && self.lz77 == LosslessModularLz77::ZeroRuns)
-                    .then(|| GpuAccelerationArtifact::Gray8Prefix {
-                        width: self.width,
-                        height: self.height,
-                        token_bit_offset_in_group: self.token_bit_offset_in_group,
-                        token_bit_len,
-                        raw_prefix: std::array::from_fn(|index| codes[0].raw_entries()[index]),
-                        lz77_prefix: codes[0].lz77_entries(),
-                    })
+                    && self.lz77 == LosslessModularLz77::ZeroRuns
+                    && self.frame.sampling().is_unscaled())
+                .then(|| GpuAccelerationArtifact::Gray8Prefix {
+                    width: self.width,
+                    height: self.height,
+                    token_bit_offset_in_group: self.token_bit_offset_in_group,
+                    token_bit_len,
+                    raw_prefix: std::array::from_fn(|index| codes[0].raw_entries()[index]),
+                    lz77_prefix: codes[0].lz77_entries(),
+                })
             } else {
                 None
             };
@@ -1863,8 +1864,7 @@ pub(super) fn frame_header(
     output.write_bits(1, 1)?; // Modular encoding
     output.write_bits(0, 2)?; // zero frame flags
     output.write_bits(0, 1)?; // no YCbCr transform
-    output.write_bits(0, 2)?; // color upsampling factor one
-    frame.extra_channels().write(&mut output)?;
+    frame.sampling().write(&mut output)?;
     output.write_bits(u64::from(group_size.size_shift()), 2)?;
     if frame.has_passes() {
         output.write_bits(0, 2)?; // one pass when present

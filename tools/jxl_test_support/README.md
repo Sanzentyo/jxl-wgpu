@@ -186,6 +186,13 @@ complete AC-pass boundaries. It requests the helper's existing `prefix` mode; co
 decoding and color arithmetic are unchanged. The encoder tests compare the flushed pixels
 and intended resolution with the corresponding whole-input pass, including permuted TOCs.
 
+`scalar_original_updates` and `native_original_updates` require original-profile streams and
+verify exact original/data ICC identity before exporting unconverted RGBA snapshots. They
+preserve all three independently reconstructed VarDCT components. Native Gray CMS conversion
+selects component zero, so it is not an oracle for component-wise RGB conversion of an original
+Gray stream. The frame-sampling tests instead apply the existing independent F64 sRGB EOTF to
+each original RGB component and compare linear output at the unchanged DC/pass/final bounds.
+
 Reuse the existing pinned libjxl checkout and scalar native build, when available. The existing
 Modular YCbCr CMake project supplies the shared scalar library and now also builds
 `decode_progressive_scalar` from the unchanged pass-decoding algorithm in `decode_progressive.c`.
@@ -221,6 +228,13 @@ cmake -S crates/jxl_wgpu_decode/test-data/modular_ycbcr_generator \
 cmake --build "$JXL_SCALAR_BUILD" --target decode_modular_words --parallel 4
 export JXL_MODULAR_WORD_ORACLE="$JXL_SCALAR_BUILD/decode_modular_words"
 ```
+
+Original-word decoding accepts color factors 1/2/4/8 with equal-grid extras and exports native
+coded dimensions before interpolation. Independent scalar grids remain outside that helper's
+word-decoding scope. `oracles::modular_words::sampling_headers` uses its `--sampling-headers`
+mode to inspect up to 64 Modular/VarDCT physical frames with the native frame-header and TOC
+readers. It reports displayed/coded dimensions, color/extra factors and pass counts without
+rendering; raw/plain-container input, no preview/ICC and no LF frames are required.
 
 Run the workspace checks from the repository root with Rust 1.98 or later, keeping that oracle
 environment available:

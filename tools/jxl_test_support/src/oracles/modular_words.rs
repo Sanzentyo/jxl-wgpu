@@ -111,3 +111,42 @@ pub fn original_frames(encoded: &[u8]) -> Vec<FrameWords> {
     assert!(words.next().is_none(), "trailing native word data");
     frames
 }
+
+/// Independent physical-frame sampling metadata, parsed by pinned libjxl without rendering.
+/// The helper accepts raw/plain-container, no-preview enumerated-color encoder sequences.
+#[derive(Debug)]
+pub struct FrameSampling {
+    pub presented: [u32; 2],
+    pub coded: [u32; 2],
+    pub factor: u32,
+    pub passes: u32,
+    pub extras: Vec<u32>,
+}
+
+pub fn sampling_headers(encoded: &[u8]) -> Vec<FrameSampling> {
+    let output = run_input(encoded, Some("--sampling-headers"));
+    let mut words = words(&output, b"JXLSMP12");
+    let count = words.next().expect("physical frame count");
+    assert!((1..=64).contains(&count));
+    let frames = (0..count)
+        .map(|_| {
+            let presented = std::array::from_fn(|_| words.next().expect("presented dimension"));
+            let coded = std::array::from_fn(|_| words.next().expect("coded dimension"));
+            let factor = words.next().expect("color factor");
+            let passes = words.next().expect("coefficient passes");
+            let extras = words.next().expect("extra count");
+            assert!(extras <= 256);
+            FrameSampling {
+                presented,
+                coded,
+                factor,
+                passes,
+                extras: (0..extras)
+                    .map(|_| words.next().expect("extra factor"))
+                    .collect(),
+            }
+        })
+        .collect();
+    assert!(words.next().is_none(), "trailing sampling headers");
+    frames
+}

@@ -576,33 +576,42 @@ image header and needs no attachment. `encoder.extra_channels()` returns this re
 `alpha_association()` continues to describe packed alpha only. Each attachment is a single scalar
 STORAGE-buffer view, using the shared byte-order, bit-position and unaligned-pitch addressing.
 `SamplePrecision::pixel_format()` provides its canonical non-color layout. For intrinsic shift
-`s` in 0–3, the default is `ceil(frame_width / 2^s)` by `ceil(frame_height / 2^s)` samples. Geometry is
+`s` in 0–3 and color factor one, the default is `ceil(frame_width / 2^s)` by `ceil(frame_height / 2^s)` samples. Geometry is
 relative to each physical frame/crop. Nested attachments, count/precision/extent mismatches and
 unreadable buffers reject before admission; input planes may alias the same allocation.
 
 All extra samples are encoded losslessly on GPU. A common image plan resolves the leading small
 channels that belong to global Modular; after the first channel larger than 256 on either axis,
-effective shifts three through six use LF groups and shifts zero/one/two use the applicable progressive
+shifts relative to the coded color grid of three through six use LF groups and shifts zero/one/two use the applicable progressive
 pass. Small channels after that boundary stay in their LF/pass streams. The serializer consumes
 the same plan. Presentation interpolation is separate from exact encoded sample preservation.
 
-`FrameOptions::extra_channel_upsampling` selects `ExtraChannelUpsampling::{One, Two, Four, Eight}`
-per resolved extra channel for each physical VarDCT frame, including reference-only frames.
-An empty list requests all `One`; a nonempty list must include every channel, starting with
-packed alpha when present. Packed alpha requires `One` in all codecs. For an independent plane,
-the effective factor is `factor * 2^s`, through 64. Supply an already reduced source of
-`ceil(frame_extent / effective_factor)` on each axis; the encoder does not resize source pixels.
-`ExtraChannel::source_extent_with_upsampling` computes that extent, while `source_extent` keeps
-its factor-one behavior. The checked frame plan owns both wire factors and effective geometry,
-which drives the existing global/LF/pass routing and memory admission.
+`FrameOptions::upsampling` selects `UpsamplingFactor::{One, Two, Four, Eight}` for color
+reconstruction in Modular, VarDCT and mixed sequences. Supply already reduced pixels of extent
+`factor.source_extent(frame_extent)` (ceil division); the encoder does not downsample source
+pixels. Canvas, crop offsets/sizes, blending and references remain in displayed pixels. Source
+layout, transform maps, groups, progression and GPU memory use the coded extent. Modular retains
+every supplied word exactly; interpolated display pixels are a separate reconstruction contract.
+
+`FrameOptions::extra_channel_upsampling` selects a factor per resolved extra channel, including
+reference-only frames. An empty list uses the color factor for every channel; a nonempty list
+must include every channel, starting with packed alpha when present. Packed alpha must equal the
+color factor. Independent VarDCT planes use `factor * 2^s`, through 64, and that effective factor
+must be at least the color factor. `ExtraChannel::source_extent_with_upsampling` computes the
+required reduced extent; `source_extent` retains factor-one behavior. The shared
+`UpsamplingFactor` replaces `ExtraChannelUpsampling`. One checked frame plan owns coded geometry,
+wire factors and relative shifts for source validation, global/LF/pass routing and admission.
 
 Use `begin_sequence` with `AnimationHeader::Still` and one `submit_last_frame` to select factors
-for a still. Timed and layered sequences can change factors per physical frame; image metadata,
-canvas and color sampling stay fixed. `memory_plan_for_request` reports their exact resources;
+for a still. Timed and layered sequences can change color and extra factors per physical frame;
+image metadata and canvas stay fixed. `memory_plan_for_request` reports their exact resources;
 the ordinary `memory_plan` and `encode`/`submit` methods retain factor-one defaults. Invalid
-counts, attempts to shrink packed alpha and source extent mismatches reject before admission
+counts, incompatible color/extra factors and source extent mismatches reject before admission
 without consuming frame finality. [Sampling evidence and oracle limits](../../docs/CONFORMANCE_CORPUS.md#per-frame-vardct-extra-sampling)
 cover factors through 64, exact coded words, interpolation, references and ownership.
+[Color sampling coverage](../../docs/CONFORMANCE_CORPUS.md#per-frame-color-and-relative-extra-sampling)
+adds both codecs, all VarDCT topologies, mixed references, odd/thin group boundaries and
+immutable progressive output. Independent Modular/mixed extras remain unsupported.
 
 `VarDctMemoryPlan::extra_channels` includes every scalar plane, while `alpha` is the overlapping
 packed-alpha breakdown (`VarDctAlphaMemoryPlan` remains a compatibility alias). Aggregate readback
@@ -641,7 +650,7 @@ Subnormals enter the lossy F32 arithmetic contract; VarDCT is not a bit-preservi
 General transforms budget per-workgroup completion/error records inside the artifact/readback;
 tiled DCT8 carries errors in its existing block records. Missing or malformed validation
 records cannot publish an artifact. XYB ICC additionally budgets those records for integer and tiled sources.
-Color subsampling, per-extra lossy distance/additional frame upsampling and texture inputs remain outside the VarDCT contract.
+Chroma subsampling, per-extra lossy distance, automatic source downsampling and texture inputs remain outside the VarDCT contract.
 
 VarDCT and mixed sequences declare 32-bit Modular working buffers, independently of input
 depth: their quantized LF coefficients are checked i32 values. This corrects the earlier
